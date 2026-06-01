@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+.simpleagent/sessions/
+**/.simpleagent/sessions/
+.dwoagent/sessions/
+**/.dwoagent/sessions/

@@ -1,0 +1,70 @@
+[package]
+name = "dwo-agent"
+version = "0.1.0"
+edition = "2024"
+description = "Dwo Agent (赤铎) — modular multi-turn agent runtime"
+readme = "README.md"
+rust-version = "1.95"
+
+[[bin]]
+name = "dwo-agent"
+path = "src/main.rs"
+
+[lib]
+name = "dwo_agent"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# LLM / Agent ecosystem
+agent-client-protocol = "0.11"
+rmcp = { version = "0.8", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client",
+] }
+tiktoken-rs = "0.7"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+eventsource-stream = "0.2"
+weixin-agent = "0.2"
+# monty (Rust Python sandbox, https://github.com/pydantic/monty) is the
+# sandbox behind `exec_chain`. Requires Rust 1.95+. With Windows long paths
+# enabled (LongPathsEnabled=1) ruff's snapshot tree fits fine.
+monty = { git = "https://github.com/pydantic/monty", package = "monty" }
+
+# CLI / Logging / Errors
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+tokio-util = { version = "0.7", features = ["compat"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+once_cell = "1"
+bytes = "1"
+dirs = "5"
+base64 = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+pretty_assertions = "1"

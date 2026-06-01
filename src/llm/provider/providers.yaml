@@ -1,0 +1,28 @@
+providers:
+  deepseek:
+    api_base: https://api.deepseek.com
+    models:
+      deepseek-v4-pro:
+        context_window: 1024000
+        max_output_tokens: 4096
+        capabilities:
+          tool_use: true
+          vision: false
+        reasoning_modes:
+          - auto
+          - nonthink
+          - high
+          - max
+        default_reasoning_mode: auto
+      deepseek-v4-flash:
+        context_window: 1024000
+        max_output_tokens: 4096
+        capabilities:
+          tool_use: true
+          vision: false
+        reasoning_modes:
+          - auto
+          - nonthink
+          - high
+          - max
+        default_reasoning_mode: auto

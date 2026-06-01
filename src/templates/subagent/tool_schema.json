@@ -1,0 +1,123 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "spawn_subagent",
+      "description": "Start one native subagent thread. Returns a subagent_run_id immediately while progress remains visible through ACP updates.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "The task this subagent should work on."
+          },
+          "policy": {
+            "type": "string",
+            "description": "Requested tool policy for this subagent.",
+            "enum": ["allow_all", "confirm", "block_all"]
+          }
+        },
+        "required": ["task"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_subagents",
+      "description": "List active or waiting subagent threads by id and status.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "checkout_subagent",
+      "description": "Return a non-blocking snapshot of a subagent thread's status, progress, flow, and latest result.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subagent_run_id": {
+            "type": "string",
+            "description": "The subagent id returned by spawn_subagent."
+          }
+        },
+        "required": ["subagent_run_id"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "wait_subagent",
+      "description": "Wait for the subagent's current turn to finish. If it is already waiting for input, returns immediately.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subagent_run_id": {
+            "type": "string",
+            "description": "The subagent id returned by spawn_subagent."
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Maximum seconds to wait.",
+            "default": 30
+          }
+        },
+        "required": ["subagent_run_id"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "send_subagent",
+      "description": "Send another message to a waiting or failed subagent thread. Can interrupt a running turn if interrupt is true.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subagent_run_id": {
+            "type": "string",
+            "description": "The subagent id returned by spawn_subagent."
+          },
+          "message": {
+            "type": "string",
+            "description": "The next instruction or message for the subagent."
+          },
+          "interrupt": {
+            "type": "boolean",
+            "description": "Whether to cancel the current running turn before sending this message.",
+            "default": false
+          }
+        },
+        "required": ["subagent_run_id", "message"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "close_subagent",
+      "description": "Close a subagent thread and cancel any running turn.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subagent_run_id": {
+            "type": "string",
+            "description": "The subagent id returned by spawn_subagent."
+          }
+        },
+        "required": ["subagent_run_id"],
+        "additionalProperties": false
+      }
+    }
+  }
+]

@@ -1,0 +1,8 @@
+weixin:
+  enabled: true
+  workspace_dir: .
+  markdown_filter: true
+  media_input: true
+  media_output: true
+  override_model: deepseek-v4-pro
+  override_reasoning_mode: high

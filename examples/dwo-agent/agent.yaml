@@ -1,0 +1,10 @@
+agent_id: dwo-agent
+name: dwo-agent
+description: Dwo Agent runtime
+policy_mode: confirm
+session_store_dir: .dwoagent/sessions
+tools:
+  mcp: enable
+  file_edit: enable
+  terminal: enable
+  subagent: enable

@@ -1,0 +1,573 @@
+//! Weixin assistant channel.
+
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use tokio::sync::Mutex;
+use weixin_agent::{
+    LoginStatus, MediaInfo, MediaType, MessageContext, MessageHandler, StandaloneQrLogin,
+    WeixinClient, WeixinConfig,
+};
+
+use super::config::WeixinChannelConfig;
+use crate::agent::activity::event::{EVENT_AGENT_MESSAGE_CHUNK, update_type};
+use crate::agent::constants::PERMISSION_REJECT_ONCE;
+use crate::agent::service::AgentService;
+use crate::agent::session_agent::SessionAgent;
+use crate::config::loader::resolve_agent_structure_dir;
+use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
+use crate::tools::{
+    WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor, weixin_tool_schemas,
+};
+use crate::utils::files::{read_json_utf8, read_utf8_text, write_json_utf8};
+
+const WEIXIN_SECRET_DIR: &str = "channel_secret/weixin";
+const WEIXIN_SESSION_DIR: &str = "channel_session/weixin/session";
+const WEIXIN_AUTH_FILE: &str = "auth.yaml";
+const WEIXIN_CONTEXT_TOKENS_FILE: &str = "context_tokens.json";
+const WEIXIN_SYNC_BUF_FILE: &str = "sync_buf.txt";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WeixinAuth {
+    bot_token: String,
+    base_url: String,
+    ilink_bot_id: String,
+    bound_user_id: String,
+    #[serde(default)]
+    route_tag: Option<u32>,
+}
+
+pub struct WeixinChannel {
+    client: Arc<WeixinClient>,
+    initial_sync_buf: Option<String>,
+    context_tokens_path: PathBuf,
+}
+
+#[derive(Clone)]
+struct WeixinHandler {
+    session: Arc<SessionAgent>,
+    auth: WeixinAuth,
+    workspace_dir: PathBuf,
+    session_dir: PathBuf,
+    sync_buf_path: PathBuf,
+    context_tokens_path: PathBuf,
+    media_input: bool,
+    media_output: bool,
+    client: Arc<OnceLock<Arc<WeixinClient>>>,
+    message_lock: Arc<Mutex<()>>,
+}
+
+struct WeixinReplyMediaBridge {
+    client: Arc<WeixinClient>,
+    to: String,
+    context_token: Option<String>,
+}
+
+pub fn run_weixin_login_sync(agent_folder: PathBuf) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(run_weixin_login(&agent_folder))
+}
+
+pub async fn run_weixin_login(agent_folder: &Path) -> Result<()> {
+    let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
+    let secret_dir = agent_structure_dir.join(WEIXIN_SECRET_DIR);
+    std::fs::create_dir_all(&secret_dir)
+        .with_context(|| format!("create {}", secret_dir.display()))?;
+
+    let config = WeixinConfig::builder().token("").build()?;
+    let qr = StandaloneQrLogin::new(&config);
+    let local_tokens = read_existing_token(&secret_dir.join(WEIXIN_AUTH_FILE))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let session = qr.start(None, &local_tokens).await?;
+
+    println!("Scan this Weixin QR code URL:");
+    println!("{}", session.qrcode_img_content);
+
+    let mut verify_code: Option<String> = None;
+    loop {
+        match qr.poll_status(&session, verify_code.as_deref()).await? {
+            LoginStatus::Confirmed {
+                bot_token,
+                ilink_bot_id,
+                base_url,
+                ilink_user_id,
+            } => {
+                let auth = WeixinAuth {
+                    bot_token,
+                    base_url,
+                    ilink_bot_id,
+                    bound_user_id: ilink_user_id,
+                    route_tag: None,
+                };
+                validate_auth(&auth)?;
+                write_auth(&secret_dir.join(WEIXIN_AUTH_FILE), &auth)?;
+                println!(
+                    "Weixin credentials saved to {}",
+                    secret_dir.join(WEIXIN_AUTH_FILE).display()
+                );
+                return Ok(());
+            }
+            LoginStatus::Expired => bail!("Weixin QR code expired; run login again."),
+            LoginStatus::NeedVerifyCode => {
+                print!("Enter the verification code shown on your phone: ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                verify_code = Some(input.trim().to_string());
+            }
+            LoginStatus::VerifyCodeBlocked => {
+                bail!("Too many wrong verification codes; run login again.")
+            }
+            LoginStatus::BindedRedirect => {
+                bail!("Weixin reported this bot is already bound; no credentials were issued.")
+            }
+            LoginStatus::ScannedButRedirect { redirect_host } => {
+                println!("QR scanned; waiting on redirected host: {redirect_host}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            LoginStatus::Scanned => {
+                println!("QR scanned; confirm login on your phone.");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            LoginStatus::Wait => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+impl WeixinChannel {
+    pub async fn new(
+        agent: Arc<AgentService>,
+        agent_structure_dir: &Path,
+        config: &WeixinChannelConfig,
+    ) -> Result<Self> {
+        let secret_dir = agent_structure_dir.join(WEIXIN_SECRET_DIR);
+        let session_dir = agent_structure_dir.join(WEIXIN_SESSION_DIR);
+        let auth_path = secret_dir.join(WEIXIN_AUTH_FILE);
+        let context_tokens_path = secret_dir.join(WEIXIN_CONTEXT_TOKENS_FILE);
+        let sync_buf_path = session_dir.join(WEIXIN_SYNC_BUF_FILE);
+        let auth = read_auth(&auth_path)?;
+        let workspace_dir = resolve_config_path(agent_structure_dir, &config.workspace_dir);
+
+        let client_ref = Arc::new(OnceLock::new());
+        let channel_tools = if config.media_output {
+            weixin_tool_schemas()
+        } else {
+            Vec::new()
+        };
+        let session = agent
+            .load_or_create_channel_session(
+                &workspace_dir.to_string_lossy(),
+                session_dir.clone(),
+                channel_tools,
+                config.override_model.as_deref(),
+                config.override_reasoning_mode,
+            )
+            .await?;
+        let handler = WeixinHandler {
+            session,
+            auth: auth.clone(),
+            workspace_dir: workspace_dir.clone(),
+            session_dir: session_dir.clone(),
+            sync_buf_path: sync_buf_path.clone(),
+            context_tokens_path: context_tokens_path.clone(),
+            media_input: config.media_input,
+            media_output: config.media_output,
+            client: client_ref.clone(),
+            message_lock: Arc::new(Mutex::new(())),
+        };
+
+        let mut builder = WeixinConfig::builder()
+            .token(auth.bot_token.clone())
+            .base_url(auth.base_url.clone())
+            .markdown_filter(config.markdown_filter);
+        if let Some(route_tag) = auth.route_tag {
+            builder = builder.route_tag(route_tag);
+        }
+        let sdk_config = builder.build()?;
+        let client = Arc::new(
+            WeixinClient::builder(sdk_config)
+                .on_message(handler)
+                .build()?,
+        );
+        let _ = client_ref.set(client.clone());
+        import_context_tokens(&client, &context_tokens_path)?;
+
+        Ok(Self {
+            client,
+            initial_sync_buf: read_sync_buf(&sync_buf_path)?,
+            context_tokens_path,
+        })
+    }
+
+    pub fn client(&self) -> Arc<WeixinClient> {
+        self.client.clone()
+    }
+
+    pub async fn run(self) -> Result<()> {
+        self.client.start(self.initial_sync_buf).await?;
+        export_context_tokens(&self.client, Some(&self.context_tokens_path))
+    }
+}
+
+#[async_trait::async_trait]
+impl MessageHandler for WeixinHandler {
+    async fn on_message(&self, ctx: &MessageContext) -> weixin_agent::Result<()> {
+        if ctx.to != self.auth.ilink_bot_id || ctx.from != self.auth.bound_user_id {
+            return Ok(());
+        }
+
+        let _guard = self.message_lock.lock().await;
+        let _ = ctx.send_typing().await;
+        let result = self.handle_message(ctx).await;
+        let _ = ctx.cancel_typing().await;
+
+        if let Err(err) = result {
+            tracing::warn!(target: "weixin", error = %err, "failed to handle weixin message");
+            let _ = ctx.reply_text(&format!("处理微信消息失败：{err:#}")).await;
+        }
+        Ok(())
+    }
+
+    async fn on_sync_buf_updated(&self, sync_buf: &str) -> weixin_agent::Result<()> {
+        if let Some(parent) = self.sync_buf_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&self.sync_buf_path, sync_buf)?;
+        Ok(())
+    }
+
+    async fn on_shutdown(&self) -> weixin_agent::Result<()> {
+        if let Some(client) = self.client.get() {
+            if let Err(err) = export_context_tokens(client, Some(&self.context_tokens_path)) {
+                tracing::warn!(target: "weixin", error = %err, "failed to export context tokens");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WeixinHandler {
+    async fn handle_message(&self, ctx: &MessageContext) -> Result<()> {
+        let Some((user_input, user_blocks)) = self.build_user_input(ctx).await? else {
+            return Ok(());
+        };
+        let agent = self.session.clone();
+
+        let tool_manager = agent.tool_manager().await;
+        if self.media_output {
+            let client = self
+                .client
+                .get()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Weixin client is not initialized."))?;
+            let reply_media_bridge = Arc::new(WeixinReplyMediaBridge {
+                client,
+                to: ctx.from.clone(),
+                context_token: ctx.context_token.clone(),
+            });
+            let reply_media = Arc::new(WeixinToolExecutor::new(
+                reply_media_bridge,
+                vec![self.workspace_dir.clone(), self.session_dir.clone()],
+            ));
+            tool_manager
+                .set_channel_tool_executor(Some(reply_media))
+                .await;
+        }
+
+        let response_text = Arc::new(Mutex::new(String::new()));
+        let emit_update = response_collector(response_text.clone());
+        let request_permission = rejecting_permission_requester();
+        let run_result = agent
+            .clone()
+            .run_prompt(user_input, user_blocks, emit_update, request_permission)
+            .await;
+
+        if self.media_output {
+            tool_manager.set_channel_tool_executor(None).await;
+        }
+        run_result?;
+
+        let text = response_text.lock().await.trim().to_string();
+        if !text.is_empty() {
+            ctx.reply_text(&text).await?;
+        }
+        if let Some(client) = self.client.get() {
+            export_context_tokens(client, Some(&self.context_tokens_path))?;
+        }
+        Ok(())
+    }
+
+    async fn build_user_input(&self, ctx: &MessageContext) -> Result<Option<(Value, Vec<Value>)>> {
+        let mut blocks: Vec<Value> = Vec::new();
+        if let Some(text) = ctx.body.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            blocks.push(text_block(text));
+        }
+
+        if let Some(media) = &ctx.media {
+            if !self.media_input {
+                if blocks.is_empty() {
+                    ctx.reply_text("当前微信通道未开启媒体输入。").await?;
+                    return Ok(None);
+                }
+            } else {
+                let path = download_message_media(ctx, media, &self.session_dir).await?;
+                let label = media_label(media.media_type);
+                blocks.push(text_block(&format!(
+                    "收到{label}文件：{}",
+                    path.to_string_lossy()
+                )));
+                if media.media_type == MediaType::Image
+                    && let Some(image) = image_block_from_file(&path)?
+                {
+                    blocks.push(image);
+                }
+            }
+        }
+
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+
+        let user_input = if blocks.len() == 1 {
+            blocks[0]
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| Value::String(text.to_string()))
+                .unwrap_or_else(|| Value::Array(blocks.clone()))
+        } else {
+            Value::Array(blocks.clone())
+        };
+        Ok(Some((user_input, blocks)))
+    }
+}
+
+#[async_trait::async_trait]
+impl WeixinToolBridge for WeixinReplyMediaBridge {
+    async fn reply_media(&self, path: &Path) -> Result<WeixinReplyMediaResult> {
+        let result = self
+            .client
+            .send_media(&self.to, path, self.context_token.as_deref())
+            .await?;
+        Ok(WeixinReplyMediaResult {
+            message_id: result.message_id,
+        })
+    }
+}
+
+fn response_collector(buffer: Arc<Mutex<String>>) -> UpdateEmitter {
+    Arc::new(move |_target: String, update: Map<String, Value>| {
+        let buffer = buffer.clone();
+        Box::pin(async move {
+            if update_type(&update) == EVENT_AGENT_MESSAGE_CHUNK
+                && let Some(text) = update
+                    .get("content")
+                    .and_then(|content| content.get("text"))
+                    .and_then(Value::as_str)
+            {
+                buffer.lock().await.push_str(text);
+            }
+            Ok(())
+        })
+    })
+}
+
+fn rejecting_permission_requester() -> PermissionRequester {
+    Arc::new(move |_target: String, _payload: Map<String, Value>| {
+        Box::pin(async move { Ok(PERMISSION_REJECT_ONCE.to_string()) })
+    })
+}
+
+fn read_auth(path: &Path) -> Result<WeixinAuth> {
+    if !path.is_file() {
+        bail!(
+            "Weixin auth file not found: {}. Run `dwo-agent channel login weixin` first.",
+            path.display()
+        );
+    }
+    let text = read_utf8_text(path)?;
+    let auth: WeixinAuth =
+        serde_yaml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    validate_auth(&auth)?;
+    Ok(auth)
+}
+
+fn write_auth(path: &Path, auth: &WeixinAuth) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_yaml::to_string(auth)?;
+    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn validate_auth(auth: &WeixinAuth) -> Result<()> {
+    if auth.bot_token.trim().is_empty() {
+        bail!("bot_token is required in Weixin auth.");
+    }
+    if auth.base_url.trim().is_empty() {
+        bail!("base_url is required in Weixin auth.");
+    }
+    if auth.ilink_bot_id.trim().is_empty() {
+        bail!("ilink_bot_id is required in Weixin auth.");
+    }
+    if auth.bound_user_id.trim().is_empty() {
+        bail!("bound_user_id is required in Weixin auth.");
+    }
+    Ok(())
+}
+
+fn read_existing_token(path: &Path) -> Option<String> {
+    read_auth(path).ok().map(|auth| auth.bot_token)
+}
+
+fn import_context_tokens(client: &WeixinClient, path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let map = read_json_utf8(path)?;
+    let tokens: HashMap<String, String> = serde_json::from_value(Value::Object(map))?;
+    client.context_tokens().import(tokens);
+    Ok(())
+}
+
+fn export_context_tokens(client: &WeixinClient, path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_value(client.context_tokens().export_all())?;
+    write_json_utf8(path, &payload)
+}
+
+fn read_sync_buf(path: &Path) -> Result<Option<String>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = read_utf8_text(path)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn resolve_config_path(agent_structure_dir: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        agent_structure_dir.join(path)
+    };
+    std::fs::canonicalize(&resolved).unwrap_or(resolved)
+}
+
+async fn download_message_media(
+    ctx: &MessageContext,
+    media: &MediaInfo,
+    session_dir: &Path,
+) -> Result<PathBuf> {
+    let attachments_dir = session_dir
+        .join("attachments")
+        .join(sanitize_filename(&message_key(ctx)));
+    tokio::fs::create_dir_all(&attachments_dir).await?;
+    let filename = media
+        .file_name
+        .as_deref()
+        .map(sanitize_filename)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_media_filename(media.media_type));
+    let dest = attachments_dir.join(filename);
+    let path = ctx.download_media(media, &dest).await?;
+    Ok(path)
+}
+
+fn message_key(ctx: &MessageContext) -> String {
+    ctx.server_message_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| ctx.message_id.clone())
+}
+
+fn text_block(text: &str) -> Value {
+    json!({"type": "text", "text": text})
+}
+
+fn image_block_from_file(path: &Path) -> Result<Option<Value>> {
+    let Some(mime_type) = image_mime_type(path) else {
+        return Ok(None);
+    };
+    let data = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    Ok(Some(json!({
+        "type": "image",
+        "data": encoded,
+        "mimeType": mime_type,
+    })))
+}
+
+fn image_mime_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn media_label(media_type: MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "图片",
+        MediaType::Video => "视频",
+        MediaType::Voice => "语音",
+        MediaType::File => "文件",
+    }
+}
+
+fn default_media_filename(media_type: MediaType) -> String {
+    match media_type {
+        MediaType::Image => "image.jpg",
+        MediaType::Video => "video.mp4",
+        MediaType::Voice => "voice.dat",
+        MediaType::File => "file.bin",
+    }
+    .to_string()
+}
+
+fn sanitize_filename(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitized.trim_matches('.').trim().to_string()
+}

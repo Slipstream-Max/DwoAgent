@@ -1,0 +1,10 @@
+agent_id: weixin-agent
+name: weixin-agent
+description: Weixin single-user assistant example
+policy_mode: allow_all
+session_store_dir: .dwoagent/sessions
+tools:
+  mcp: disable
+  file_edit: enable
+  terminal: enable
+  subagent: disable

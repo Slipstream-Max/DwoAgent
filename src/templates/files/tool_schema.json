@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "file_edit",
-      "description": "Edit files inside the current workspace by applying a small patch. Use this for creating, updating, deleting, or moving files. The patch string must start with '*** Begin Patch' and its last non-empty line must be exactly '*** End Patch'.",
+      "description": "Edit files by applying a small patch. Relative paths are resolved against the current workspace. Use this for creating, updating, deleting, or moving files. The patch string must start with '*** Begin Patch' and its last non-empty line must be exactly '*** End Patch'.",
       "parameters": {
         "type": "object",
         "properties": {

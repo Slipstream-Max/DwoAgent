@@ -1,4 +1,4 @@
-//! Small file edit runtime for workspace-scoped text edits.
+//! Small file edit runtime for text edits.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -61,7 +61,7 @@ pub enum Operation {
     Update(UpdateFile),
 }
 
-/// Entry point — parses a patch and applies it to *cwd*.
+/// Entry point — parses a patch and resolves relative paths against *cwd*.
 pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
     let operations = parse_patch(patch)?;
     let root = std::fs::canonicalize(cwd)
@@ -417,11 +417,7 @@ fn resolve_workspace_path(root: &Path, raw_path: &str) -> Result<PathBuf> {
     } else {
         root.join(path)
     };
-    let resolved = resolve_existing_prefix(&lexical_resolve(&joined))?;
-    if resolved != *root && !resolved.starts_with(root) {
-        return Err(FileEditError::new(format!("Path outside workspace: {raw_path}")).into());
-    }
-    Ok(resolved)
+    resolve_existing_prefix(&lexical_resolve(&joined))
 }
 
 /// Normalize `.`, `..`, and duplicate separators before resolving existing
@@ -639,35 +635,38 @@ mod tests {
     }
 
     #[test]
-    fn file_edit_rejects_parent_escape() {
+    fn file_edit_allows_parent_paths() {
         let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
         let patch = r#"
 *** Begin Patch
 *** Add File: ../outside.txt
-+nope
++outside
 *** End Patch
 "#;
 
-        let error = file_edit_text(patch, tmp.path()).unwrap_err();
-        assert!(error.to_string().contains("Path outside workspace"));
+        let output = file_edit_text(patch, &workspace).unwrap();
+
+        let path = tmp.path().join("outside.txt");
+        assert_eq!(output["status"], "completed_success");
+        assert!(has_utf8_bom(&path).unwrap());
+        assert_eq!(read_utf8_bom_text(&path).unwrap(), "outside\n");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn file_edit_rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
+    fn file_edit_allows_absolute_paths() {
         let tmp = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        symlink(outside.path(), tmp.path().join("link")).unwrap();
-        let patch = r#"
-*** Begin Patch
-*** Add File: link/escaped.txt
-+nope
-*** End Patch
-"#;
+        let path = tmp.path().join("absolute.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+absolute\n*** End Patch\n",
+            path.display()
+        );
 
-        let error = file_edit_text(patch, tmp.path()).unwrap_err();
-        assert!(error.to_string().contains("Path outside workspace"));
+        let output = file_edit_text(&patch, tmp.path()).unwrap();
+
+        assert_eq!(output["status"], "completed_success");
+        assert!(has_utf8_bom(&path).unwrap());
+        assert_eq!(read_utf8_bom_text(&path).unwrap(), "absolute\n");
     }
 }

@@ -308,6 +308,13 @@ impl ToolRunManager {
 
         let total = tool_calls.len();
         let mut indexed_outputs: Vec<Option<Value>> = vec![None; total];
+        let has_multiple_file_edits = tool_calls
+            .iter()
+            .filter(|call| {
+                call.get("name").and_then(Value::as_str).map(str::trim) == Some("file_edit")
+            })
+            .count()
+            > 1;
 
         // Save per-call metadata so the cancel path can emit updates.
         let mut call_metadata: Vec<(String, Option<Value>)> = Vec::with_capacity(total);
@@ -338,6 +345,21 @@ impl ToolRunManager {
                 None,
             )
             .await;
+
+            if has_multiple_file_edits && tool_name == "file_edit" {
+                let output = multiple_file_edit_error();
+                self.emit_tool_update(
+                    context,
+                    &tool_call_id,
+                    "failed",
+                    None,
+                    tool_args.clone(),
+                    Some(output.clone()),
+                )
+                .await;
+                indexed_outputs[index] = Some(output);
+                continue;
+            }
 
             let call_context = context.map(|parent| ToolExecutionContext {
                 session_id: parent.session_id.clone(),
@@ -793,6 +815,13 @@ fn tool_error(tool_name: &str, message: &str) -> Value {
     })
 }
 
+fn multiple_file_edit_error() -> Value {
+    tool_error(
+        "file_edit",
+        "Multiple file_edit calls in one assistant turn are not allowed. Combine all file operations into one file_edit patch.",
+    )
+}
+
 fn is_subagent_output(output: &Value) -> bool {
     output
         .get("runtime")
@@ -1010,5 +1039,66 @@ mod tests {
             output.get("error").and_then(Value::as_str),
             Some("Tool is disabled: file_edit")
         );
+    }
+
+    #[tokio::test]
+    async fn multiple_file_edits_are_rejected_but_other_tools_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = AgentTools {
+            mcp: crate::config::models::ToolSwitch::Disable,
+            subagent: crate::config::models::ToolSwitch::Disable,
+            ..AgentTools::default()
+        };
+        let manager = ToolRunManager::new(None, Some(tmp.path()), 30, tools)
+            .await
+            .unwrap();
+        let terminal_command = if cfg!(windows) {
+            "Write-Output terminal-ok"
+        } else {
+            "printf 'terminal-ok\\n'"
+        };
+
+        let outputs = manager
+            .execute_tool_calls(
+                vec![
+                    json!({
+                        "tool_call_id": "edit-1",
+                        "name": "file_edit",
+                        "arguments": {"patch": "*** Begin Patch\n*** Add File: a.txt\n+alpha\n*** End Patch"},
+                    }),
+                    json!({
+                        "tool_call_id": "term-1",
+                        "name": "terminal_exec",
+                        "arguments": {"command": terminal_command, "timeout": 5},
+                    }),
+                    json!({
+                        "tool_call_id": "edit-2",
+                        "name": "file_edit",
+                        "arguments": {"patch": "*** Begin Patch\n*** Add File: b.txt\n+beta\n*** End Patch"},
+                    }),
+                ],
+                None,
+            )
+            .await;
+
+        assert_eq!(outputs.len(), 3);
+        for output in [&outputs[0], &outputs[2]] {
+            assert_eq!(output["status"], "error");
+            assert!(
+                output["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Multiple file_edit calls")
+            );
+        }
+        assert_eq!(outputs[1]["status"], "completed_success");
+        assert!(
+            outputs[1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("terminal-ok")
+        );
+        assert!(!tmp.path().join("a.txt").exists());
+        assert!(!tmp.path().join("b.txt").exists());
     }
 }

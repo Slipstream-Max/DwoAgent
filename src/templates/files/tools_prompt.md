@@ -2,8 +2,9 @@
 
 ### Rules
 
-- `file_edit` only edits files inside the current workspace.
+- Relative paths are resolved against the current workspace. Absolute paths are allowed.
 - Keep patches small and exact. Use enough context lines to identify the target text.
+- Call `file_edit` at most once in a single assistant turn. If you need to edit multiple files, combine all file operations into one patch.
 
 ### `file_edit`
 
@@ -60,7 +61,7 @@ Important:
 - Always include an `Add File`, `Delete File`, or `Update File` header.
 - Prefix new lines with `+`, even when creating a file.
 - In `Update File`, every content line must start with a leading space, `-`, or `+`.
-- File references must be relative paths, never absolute paths.
+- File references may be relative to the current workspace or absolute.
 
 ### Examples
 

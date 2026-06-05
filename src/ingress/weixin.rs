@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use weixin_agent::{
     LoginStatus, MediaInfo, MediaType, MessageContext, MessageHandler, StandaloneQrLogin,
@@ -22,6 +22,7 @@ use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::agent::session_agent::SessionAgent;
 use crate::config::loader::resolve_agent_structure_dir;
+use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 use crate::tools::{
     WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor, weixin_tool_schemas,
@@ -316,7 +317,7 @@ impl WeixinHandler {
     async fn build_user_input(&self, ctx: &MessageContext) -> Result<Option<(Value, Vec<Value>)>> {
         let mut blocks: Vec<Value> = Vec::new();
         if let Some(text) = ctx.body.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            blocks.push(text_block(text));
+            blocks.push(content_block::text(text)?);
         }
 
         if let Some(media) = &ctx.media {
@@ -327,13 +328,12 @@ impl WeixinHandler {
                 }
             } else {
                 let path = download_message_media(ctx, media, &self.session_dir).await?;
-                let label = media_label(media.media_type);
-                blocks.push(text_block(&format!(
-                    "收到{label}文件：{}",
-                    path.to_string_lossy()
-                )));
+                let uri = file_uri_from_path(&path);
+                let name = path.file_name().and_then(|name| name.to_str());
+                let mime_type = mime_type_for_media(&path, media.media_type);
+                blocks.push(content_block::resource_link(&uri, name, Some(mime_type))?);
                 if media.media_type == MediaType::Image
-                    && let Some(image) = image_block_from_file(&path)?
+                    && let Some(image) = image_url_block_from_file(&path)?
                 {
                     blocks.push(image);
                 }
@@ -506,21 +506,13 @@ fn message_key(ctx: &MessageContext) -> String {
         .unwrap_or_else(|| ctx.message_id.clone())
 }
 
-fn text_block(text: &str) -> Value {
-    json!({"type": "text", "text": text})
-}
-
-fn image_block_from_file(path: &Path) -> Result<Option<Value>> {
+fn image_url_block_from_file(path: &Path) -> Result<Option<Value>> {
     let Some(mime_type) = image_mime_type(path) else {
         return Ok(None);
     };
     let data = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-    Ok(Some(json!({
-        "type": "image",
-        "data": encoded,
-        "mimeType": mime_type,
-    })))
+    Ok(Some(content_block::image_url_data(mime_type, &encoded)?))
 }
 
 fn image_mime_type(path: &Path) -> Option<&'static str> {
@@ -539,13 +531,60 @@ fn image_mime_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn media_label(media_type: MediaType) -> &'static str {
-    match media_type {
-        MediaType::Image => "图片",
-        MediaType::Video => "视频",
-        MediaType::Voice => "语音",
-        MediaType::File => "文件",
+fn mime_type_for_media(path: &Path, media_type: MediaType) -> &'static str {
+    if let Some(mime_type) = image_mime_type(path) {
+        return mime_type;
     }
+
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("txt") => "text/plain",
+        Some("md") | Some("markdown") => "text/markdown",
+        Some("json") => "application/json",
+        Some("yaml") | Some("yml") => "application/yaml",
+        Some("pdf") => "application/pdf",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("m4a") => "audio/mp4",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        _ => match media_type {
+            MediaType::Voice => "audio/mpeg",
+            MediaType::Video => "video/mp4",
+            _ => "application/octet-stream",
+        },
+    }
+}
+
+fn file_uri_from_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let encoded = percent_encode_file_path(&normalized);
+    if encoded.starts_with("//") {
+        format!("file:{encoded}")
+    } else if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+fn percent_encode_file_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn default_media_filename(media_type: MediaType) -> String {
@@ -570,4 +609,39 @@ fn sanitize_filename(raw: &str) -> String {
         })
         .collect();
     sanitized.trim_matches('.').trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_uri_from_path_encodes_spaces() {
+        let uri = file_uri_from_path(Path::new("/tmp/a b.png"));
+
+        assert_eq!(uri, "file:///tmp/a%20b.png");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_uri_from_path_formats_windows_drive_paths() {
+        let uri = file_uri_from_path(Path::new(r"C:\tmp\a b.png"));
+
+        assert_eq!(uri, "file:///C:/tmp/a%20b.png");
+    }
+
+    #[test]
+    fn image_url_block_from_file_uses_data_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        std::fs::write(&path, b"abc").unwrap();
+
+        let block = image_url_block_from_file(&path).unwrap().unwrap();
+
+        assert_eq!(block["type"].as_str(), Some("image_url"));
+        assert_eq!(
+            block["image_url"]["url"].as_str(),
+            Some("data:image/png;base64,YWJj")
+        );
+    }
 }

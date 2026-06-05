@@ -1,5 +1,0 @@
-# Make cargo shell out to system git, which honors `core.longpaths=true` and
-# Windows' LongPathsEnabled registry key. libgit2 (cargo's default) does not,
-# and checking out `ruff` as a transitive dep of `monty` blows past MAX_PATH.
-[net]
-git-fetch-with-cli = true

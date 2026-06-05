@@ -7,6 +7,7 @@ use once_cell::sync::OnceCell;
 use serde_json::{Map, Value, json};
 use tiktoken_rs::{CoreBPE, o200k_base};
 
+use super::content_block::{image_placeholder, text as text_block};
 use super::manager::CancelEvent;
 use crate::llm::client::{BaseLlmClient, LlmRequestOptions};
 use crate::templates;
@@ -75,7 +76,7 @@ pub async fn compact_context(
 
     let summary_text = build_summary_text(summary_prefix, &summary_suffix);
     let mut out = compacted_user_messages;
-    out.push(json!({"role": "user", "content": summary_text}));
+    out.push(json!({"role": "user", "content": [text_block(&summary_text)?]}));
     Ok(Some(out))
 }
 
@@ -355,7 +356,7 @@ fn compact_user_part(part: &Value) -> Result<Value> {
         .map(str::trim)
         .unwrap_or("");
     match part_type {
-        "image" | "image_url" | "input_image" => Ok(json!({"type": "text", "text": "[image]"})),
+        "image" | "image_url" | "input_image" => Ok(image_placeholder()),
         "text" | "input_text" | "resource" | "resource_link" => Ok(Value::Object(obj.clone())),
         other => bail!("Unsupported user content block type: {other}"),
     }

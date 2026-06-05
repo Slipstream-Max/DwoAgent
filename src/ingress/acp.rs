@@ -24,7 +24,7 @@ use agent_client_protocol::{
 };
 use anyhow::Result;
 use futures::io::AsyncRead;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::agent::activity::event::{
@@ -37,6 +37,7 @@ use crate::agent::constants::{
 };
 use crate::agent::service::AgentService;
 use crate::config::models::ModelProfile;
+use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 
 /// Run the agent over ACP stdio transport.
@@ -694,7 +695,7 @@ fn normalize_prompt_blocks(prompt: &[ContentBlock]) -> Result<(Value, Vec<Value>
                 if text_value.is_empty() {
                     continue;
                 }
-                blocks.push(json!({"type": "text", "text": text_value}));
+                blocks.push(content_block::text(text_value)?);
             }
             ContentBlock::Image(img) => {
                 if img.data.trim().is_empty()
@@ -702,19 +703,21 @@ fn normalize_prompt_blocks(prompt: &[ContentBlock]) -> Result<(Value, Vec<Value>
                 {
                     anyhow::bail!("image block at index {index} must provide either data or uri");
                 }
-                let mut block = json!({"type": "image"});
                 if !img.data.trim().is_empty() {
-                    block["data"] = Value::String(img.data.clone());
-                }
-                if !img.mime_type.trim().is_empty() {
-                    block["mimeType"] = Value::String(img.mime_type.clone());
-                }
-                if let Some(uri) = &img.uri {
-                    if !uri.trim().is_empty() {
-                        block["uri"] = Value::String(uri.to_string());
+                    if img.mime_type.trim().is_empty() {
+                        anyhow::bail!("image block at index {index} must provide mimeType");
                     }
+                    blocks.push(content_block::image_url_data(&img.mime_type, &img.data)?);
+                    continue;
                 }
-                blocks.push(block);
+                if let Some(uri) = img
+                    .uri
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|uri| !uri.is_empty())
+                {
+                    blocks.push(content_block::image_url(uri)?);
+                }
             }
             ContentBlock::Resource(_) | ContentBlock::ResourceLink(_) => {
                 blocks.push(serde_json::to_value(item)?);
@@ -1082,6 +1085,7 @@ fn truncate_text(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::ImageContent;
+    use serde_json::json;
 
     #[test]
     fn normalize_prompt_blocks_rejects_empty_prompt() {
@@ -1142,6 +1146,22 @@ mod tests {
             error
                 .to_string()
                 .contains("image block at index 0 must provide either data or uri")
+        );
+    }
+
+    #[test]
+    fn normalize_prompt_blocks_converts_image_data_to_image_url() {
+        let prompt = vec![ContentBlock::Image(ImageContent::new("abc", "image/png"))];
+
+        let (user_input, user_blocks) = normalize_prompt_blocks(&prompt).unwrap();
+
+        assert_eq!(user_input, Value::Array(user_blocks.clone()));
+        assert_eq!(
+            user_blocks,
+            vec![json!({
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"}
+            })]
         );
     }
 

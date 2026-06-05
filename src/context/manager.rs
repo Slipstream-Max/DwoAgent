@@ -5,10 +5,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use super::compact::compact_context;
+use super::content_block::{image_placeholder, is_image_part, normalize_user_content};
 use crate::llm::client::{BaseLlmClient, LlmRequestOptions};
 
 /// Builder that rebuilds the stable system-message prefix when compaction
@@ -257,120 +258,6 @@ fn split_stable_prefix(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
     (prefix, messages[index..].to_vec())
 }
 
-fn normalize_user_content(content: &Value) -> Result<Value> {
-    match content {
-        Value::String(s) => {
-            let text = s.trim();
-            if text.is_empty() {
-                bail!("user_input cannot be empty");
-            }
-            Ok(Value::String(text.to_string()))
-        }
-        Value::Array(parts) => {
-            if parts.is_empty() {
-                bail!("user_input content blocks cannot be empty");
-            }
-            let mut out: Vec<Value> = Vec::with_capacity(parts.len());
-            for (index, part) in parts.iter().enumerate() {
-                out.push(normalize_user_part(part, index)?);
-            }
-            Ok(Value::Array(out))
-        }
-        _ => bail!("user_input must be string or list of content blocks"),
-    }
-}
-
-fn normalize_user_part(part: &Value, index: usize) -> Result<Value> {
-    let obj = part.as_object().ok_or_else(|| {
-        anyhow::anyhow!("user_input content block at index {index} must be object")
-    })?;
-
-    let part_type = obj
-        .get("type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-
-    match part_type {
-        "text" | "input_text" => {
-            let text = obj
-                .get("text")
-                .or_else(|| obj.get("input_text"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let text_str = match text {
-                Value::Null => String::new(),
-                Value::String(s) => s,
-                other => other.to_string(),
-            };
-            let trimmed = text_str.trim();
-            if trimmed.is_empty() {
-                bail!("text block at index {index} cannot be empty");
-            }
-            Ok(json!({"type": "text", "text": trimmed}))
-        }
-        "image_url" | "image" | "input_image" => normalize_image_part(obj, index),
-        "resource" | "resource_link" => Ok(Value::Object(obj.clone())),
-        other => bail!("Unsupported content block type at index {index}: {other}"),
-    }
-}
-
-fn normalize_image_part(obj: &Map<String, Value>, index: usize) -> Result<Value> {
-    let part_type = obj
-        .get("type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-
-    if part_type == "image" {
-        let data = obj
-            .get("data")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !data.is_empty() {
-            let mime_type = obj
-                .get("mimeType")
-                .or_else(|| obj.get("mime_type"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("");
-            if mime_type.is_empty() {
-                bail!("image block at index {index} must provide mimeType");
-            }
-            return Ok(json!({
-                "type": "image_url",
-                "image_url": {"url": format!("data:{mime_type};base64,{data}")},
-            }));
-        }
-    }
-
-    let url = extract_image_url(obj, index)?;
-    Ok(json!({"type": "image_url", "image_url": {"url": url}}))
-}
-
-fn extract_image_url(obj: &Map<String, Value>, index: usize) -> Result<String> {
-    let url_value = match obj.get("image_url") {
-        Some(Value::Object(m)) => m.get("url").cloned().unwrap_or(Value::Null),
-        Some(Value::String(s)) => Value::String(s.clone()),
-        _ => obj
-            .get("url")
-            .or_else(|| obj.get("uri"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    };
-    let url = match url_value {
-        Value::Null => String::new(),
-        Value::String(s) => s,
-        other => other.to_string(),
-    };
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        bail!("image block at index {index} must provide url");
-    }
-    Ok(trimmed.to_string())
-}
-
 fn patch_message_for_text_model(message: &Value) -> Value {
     let Some(obj) = message.as_object() else {
         return message.clone();
@@ -392,16 +279,57 @@ fn patch_content_parts_for_text_model(parts: &[Value]) -> Vec<Value> {
             let Some(obj) = part.as_object() else {
                 return json!({"type": "text", "text": part.to_string()});
             };
-            let part_type = obj
-                .get("type")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("");
-            if matches!(part_type, "image" | "image_url" | "input_image") {
-                json!({"type": "text", "text": "[image]"})
+            if is_image_part(part) {
+                image_placeholder()
             } else {
                 Value::Object(obj.clone())
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_user_stores_plain_text_as_typed_content_block() {
+        let mut manager = ConversationContextManager::new(Vec::new(), 1000, 0.8).unwrap();
+
+        manager.add_user(json!("hello")).unwrap();
+
+        assert_eq!(
+            manager.messages()[0]["content"],
+            json!([{"type": "text", "text": "hello"}])
+        );
+    }
+
+    #[test]
+    fn messages_for_text_model_replaces_image_parts_and_keeps_text_path() {
+        let mut manager = ConversationContextManager::new(Vec::new(), 1000, 0.8).unwrap();
+        manager
+            .add_user(json!([
+                {"type": "text", "text": "收到图片文件：C:/tmp/image.png"},
+                {"type": "image", "data": "abc", "mimeType": "image/png"}
+            ]))
+            .unwrap();
+
+        let text_messages = manager.messages_for_model(false);
+        let vision_messages = manager.messages_for_model(true);
+
+        assert_eq!(
+            text_messages[0]["content"],
+            json!([
+                {"type": "text", "text": "收到图片文件：C:/tmp/image.png"},
+                {"type": "text", "text": "该处为图片消息。"}
+            ])
+        );
+        assert_eq!(
+            vision_messages[0]["content"],
+            json!([
+                {"type": "text", "text": "收到图片文件：C:/tmp/image.png"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+            ])
+        );
+    }
 }

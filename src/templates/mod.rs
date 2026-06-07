@@ -5,11 +5,6 @@
 
 pub const TOOLS_PROMPT_ROOT: &str = include_str!("tools_prompt.md");
 
-pub mod codemode {
-    pub const TOOLS_PROMPT: &str = include_str!("codemode/tools_prompt.md");
-    pub const TOOL_SCHEMA: &str = include_str!("codemode/tool_schema.json");
-}
-
 pub mod compact {
     pub const COMPACT_PROMPT: &str = include_str!("compact/compact_prompt.md");
     pub const SUMMARY_PREFIX: &str = include_str!("compact/summary_prefix.md");

@@ -7,9 +7,6 @@ use crate::templates;
 
 pub fn tool_schemas(tools: &AgentTools) -> Vec<Value> {
     let mut sources: Vec<&str> = Vec::new();
-    if tools.mcp_enabled() {
-        sources.push(templates::codemode::TOOL_SCHEMA);
-    }
     if tools.file_edit_enabled() {
         sources.push(templates::files::TOOL_SCHEMA);
     }
@@ -59,7 +56,6 @@ mod tests {
     #[test]
     fn tool_schemas_follow_agent_tools() {
         let tools = AgentTools {
-            mcp: ToolSwitch::Disable,
             file_edit: ToolSwitch::Disable,
             terminal: ToolSwitch::Enable,
             subagent: ToolSwitch::Disable,
@@ -68,7 +64,6 @@ mod tests {
         let names = schema_names(tool_schemas(&tools));
 
         assert!(names.contains(&"terminal_exec".to_string()));
-        assert!(!names.contains(&"exec_chain".to_string()));
         assert!(!names.contains(&"file_edit".to_string()));
         assert!(!names.contains(&"spawn_subagent".to_string()));
     }

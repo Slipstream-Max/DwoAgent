@@ -33,11 +33,10 @@ use crate::utils::perf::{messages_size, perf_log};
 
 const SNAPSHOT_FLOW_LIMIT: usize = 3;
 
-/// Collect the subagent tool schemas (codemode + terminal) that match the
-/// Python `_SUBAGENT_TOOL_SCHEMA_PATHS` slice.
+/// Collect the subagent tool schemas that match the parent agent's allowed
+/// non-delegating execution tools.
 fn subagent_tool_schemas(tools: &AgentTools) -> Vec<Value> {
     let subagent_tools = AgentTools {
-        mcp: tools.mcp,
         file_edit: ToolSwitch::Disable,
         terminal: tools.terminal,
         subagent: ToolSwitch::Disable,
@@ -906,6 +905,7 @@ async fn run_subagent_turn(
         tool_manager: &inner.tool_manager,
         context_manager,
         rebuild_system_messages: None,
+        watcher_runtime: None,
     };
     let turn_result = run_turn(turn_runtime).await?;
     Ok(turn_result.stop_reason)

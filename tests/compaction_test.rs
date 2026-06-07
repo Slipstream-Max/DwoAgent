@@ -178,7 +178,6 @@ models:
         "You are a test agent.\n",
     )
     .unwrap();
-    std::fs::write(resources_dir.join("mcp.json"), r#"{"mcpServers": {}}"#).unwrap();
     agent_dir
 }
 

@@ -32,7 +32,7 @@ weixin:
 ```
 
 These overrides only apply when the Weixin channel session is first created.
-After `channel_session/weixin/session/session.json` exists, the session keeps
+After `channel_sessions/weixin/session/session.json` exists, the session keeps
 its own model and reasoning mode.
 
 For a newly created Weixin channel session, `media_output: false` hides
@@ -42,6 +42,6 @@ Weixin media sender for tool calls.
 Runtime files are created under:
 
 - `channel_secret/weixin/`
-- `channel_session/weixin/session/`
+- `channel_sessions/weixin/session/`
 
 The checked-in example intentionally does not include real Weixin auth files.

@@ -1,6 +1,5 @@
 //! Tool runtimes and session management.
 
-pub mod codemode;
 pub mod file_edit_runtime;
 pub mod schema;
 pub mod session;

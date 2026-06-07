@@ -30,7 +30,7 @@ use crate::tools::{
 use crate::utils::files::{read_json_utf8, read_utf8_text, write_json_utf8};
 
 const WEIXIN_SECRET_DIR: &str = "channel_secret/weixin";
-const WEIXIN_SESSION_DIR: &str = "channel_session/weixin/session";
+const WEIXIN_SESSION_SUBDIR: &str = "weixin/session";
 const WEIXIN_AUTH_FILE: &str = "auth.yaml";
 const WEIXIN_CONTEXT_TOKENS_FILE: &str = "context_tokens.json";
 const WEIXIN_SYNC_BUF_FILE: &str = "sync_buf.txt";
@@ -158,7 +158,7 @@ impl WeixinChannel {
         config: &WeixinChannelConfig,
     ) -> Result<Self> {
         let secret_dir = agent_structure_dir.join(WEIXIN_SECRET_DIR);
-        let session_dir = agent_structure_dir.join(WEIXIN_SESSION_DIR);
+        let session_dir = agent.channel_session_dir().join(WEIXIN_SESSION_SUBDIR);
         let auth_path = secret_dir.join(WEIXIN_AUTH_FILE);
         let context_tokens_path = secret_dir.join(WEIXIN_CONTEXT_TOKENS_FILE);
         let sync_buf_path = session_dir.join(WEIXIN_SYNC_BUF_FILE);

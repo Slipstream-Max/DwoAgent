@@ -6,12 +6,6 @@ use crate::templates;
 
 pub fn build_tools(tools: &AgentTools) -> String {
     let mut chunks = vec![templates::TOOLS_PROMPT_ROOT.trim().to_string()];
-    if tools.mcp_enabled() {
-        chunks.push(text_block(
-            "codemode",
-            templates::codemode::TOOLS_PROMPT.trim(),
-        ));
-    }
     if tools.file_edit_enabled() {
         chunks.push(text_block("files", templates::files::TOOLS_PROMPT.trim()));
     }
@@ -38,7 +32,6 @@ mod tests {
     #[test]
     fn build_tools_omits_disabled_sections() {
         let tools = AgentTools {
-            mcp: ToolSwitch::Disable,
             file_edit: ToolSwitch::Enable,
             terminal: ToolSwitch::Disable,
             subagent: ToolSwitch::Disable,
@@ -47,7 +40,6 @@ mod tests {
         let prompt = build_tools(&tools);
 
         assert!(prompt.contains("<files>"));
-        assert!(!prompt.contains("<codemode>"));
         assert!(!prompt.contains("<terminal>"));
         assert!(!prompt.contains("<subagent>"));
     }

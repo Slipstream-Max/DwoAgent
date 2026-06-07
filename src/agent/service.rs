@@ -16,7 +16,7 @@ use super::session::{
 use super::session_agent::SessionAgent;
 use crate::config::loader::{
     read_agent_meta, read_json_model, read_model_registry, resolve_agent_structure_dir,
-    resolve_session_store_dir,
+    resolve_channel_session_dir, resolve_session_store_dir,
 };
 use crate::config::models::{
     AgentMeta, AgentState, AgentTools, ModelProfile, PolicyMode, ReasoningMode, SessionMetaPayload,
@@ -35,6 +35,7 @@ pub struct AgentService {
     default_model_id: String,
     model_profiles: HashMap<String, ModelProfile>,
     session_store_dir: PathBuf,
+    channel_session_dir: PathBuf,
     agents: Mutex<HashMap<String, Arc<SessionAgent>>>,
 }
 
@@ -49,6 +50,14 @@ impl AgentService {
             resolve_session_store_dir(&agent_meta.session_store_dir, &agent_structure_dir)?;
         std::fs::create_dir_all(&session_store_dir)
             .with_context(|| format!("create session store {}", session_store_dir.display()))?;
+        let channel_session_dir =
+            resolve_channel_session_dir(&agent_meta.channel_session_dir, &agent_structure_dir)?;
+        std::fs::create_dir_all(&channel_session_dir).with_context(|| {
+            format!(
+                "create channel session store {}",
+                channel_session_dir.display()
+            )
+        })?;
 
         Ok(Self {
             agent_structure_dir,
@@ -56,6 +65,7 @@ impl AgentService {
             default_model_id,
             model_profiles,
             session_store_dir,
+            channel_session_dir,
             agents: Mutex::new(HashMap::new()),
         })
     }
@@ -66,6 +76,10 @@ impl AgentService {
 
     pub fn agent_structure_dir(&self) -> &Path {
         &self.agent_structure_dir
+    }
+
+    pub fn channel_session_dir(&self) -> &Path {
+        &self.channel_session_dir
     }
 
     pub fn default_model_id(&self) -> &str {
@@ -401,11 +415,9 @@ impl AgentService {
         profile: &ModelProfile,
         runtime_tools: AgentTools,
     ) -> Result<SessionAgentFactory> {
-        let mcp_config_path = self.agent_structure_dir.join("resources").join("mcp.json");
         Ok(SessionAgentFactory::new(
             &self.agent_structure_dir,
             &self.agent_meta.agent_id,
-            &mcp_config_path,
             cwd.to_string(),
             profile.context_window,
             profile.compact_threshold,
@@ -413,6 +425,14 @@ impl AgentService {
             profile.capabilities,
             profile.default_reasoning_mode.as_str(),
             runtime_tools,
+            resolve_config_paths(
+                &self.agent_meta.external_skills_dirs,
+                &self.agent_structure_dir,
+            ),
+            resolve_config_paths(
+                &self.agent_meta.external_rule_files,
+                &self.agent_structure_dir,
+            ),
         ))
     }
 
@@ -421,6 +441,14 @@ impl AgentService {
             agent_structure_dir: self.agent_structure_dir.clone(),
             agent_id: self.agent_meta.agent_id.clone(),
             runtime_tools,
+            external_skills_dirs: resolve_config_paths(
+                &self.agent_meta.external_skills_dirs,
+                &self.agent_structure_dir,
+            ),
+            external_rule_files: resolve_config_paths(
+                &self.agent_meta.external_rule_files,
+                &self.agent_structure_dir,
+            ),
         }
     }
 
@@ -524,6 +552,8 @@ struct AgentServiceShape {
     agent_structure_dir: PathBuf,
     agent_id: String,
     runtime_tools: AgentTools,
+    external_skills_dirs: Vec<PathBuf>,
+    external_rule_files: Vec<PathBuf>,
 }
 
 impl AgentServiceShape {
@@ -532,11 +562,9 @@ impl AgentServiceShape {
         cwd: &str,
         profile: &ModelProfile,
     ) -> Result<SessionAgentFactory> {
-        let mcp_config_path = self.agent_structure_dir.join("resources").join("mcp.json");
         Ok(SessionAgentFactory::new(
             &self.agent_structure_dir,
             &self.agent_id,
-            &mcp_config_path,
             cwd.to_string(),
             profile.context_window,
             profile.compact_threshold,
@@ -544,8 +572,25 @@ impl AgentServiceShape {
             profile.capabilities,
             profile.default_reasoning_mode.as_str(),
             self.runtime_tools,
+            self.external_skills_dirs.clone(),
+            self.external_rule_files.clone(),
         ))
     }
+}
+
+fn resolve_config_paths(paths: &[String], base_dir: &Path) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| {
+            let candidate = PathBuf::from(path);
+            let joined = if candidate.is_absolute() {
+                candidate
+            } else {
+                base_dir.join(candidate)
+            };
+            std::fs::canonicalize(&joined).unwrap_or(joined)
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -614,6 +659,22 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_agent_folder(root: &Path, max_running_turn: u32, tools: &str) {
+        write_agent_folder_with_dirs(
+            root,
+            max_running_turn,
+            tools,
+            ".sessions",
+            "channel_sessions",
+        )
+    }
+
+    fn write_agent_folder_with_dirs(
+        root: &Path,
+        max_running_turn: u32,
+        tools: &str,
+        session_store_dir: &str,
+        channel_session_dir: &str,
+    ) {
         let resources_dir = root.join("resources");
         let agents_dir = resources_dir.join("agents");
         let skills_dir = resources_dir.join("skills");
@@ -628,7 +689,8 @@ name: Test Agent
 description: Test
 max_running_turn: {max_running_turn}
 policy_mode: confirm
-session_store_dir: .sessions
+session_store_dir: {session_store_dir}
+channel_session_dir: {channel_session_dir}
 tools:
 {tools}
 "
@@ -653,7 +715,6 @@ models:
             "You are a test agent.\n",
         )
         .unwrap();
-        std::fs::write(resources_dir.join("mcp.json"), r#"{"mcpServers": {}}"#).unwrap();
     }
 
     #[tokio::test]
@@ -664,7 +725,7 @@ models:
         write_agent_folder(
             &agent_dir,
             7,
-            "  mcp: disable\n  file_edit: disable\n  terminal: enable\n  subagent: disable",
+            "  file_edit: disable\n  terminal: enable\n  subagent: disable",
         );
         let cwd = tmp.path().to_string_lossy().to_string();
 
@@ -677,17 +738,43 @@ models:
         write_agent_folder(
             &agent_dir,
             3,
-            "  mcp: enable\n  file_edit: enable\n  terminal: enable\n  subagent: enable",
+            "  file_edit: enable\n  terminal: enable\n  subagent: enable",
         );
         let service = AgentService::new(&agent_dir).unwrap();
         let loaded = service.load_session(&session_id).await.unwrap().unwrap();
         let snapshot = loaded.session_snapshot().await;
 
         assert_eq!(snapshot.max_running_turn, Some(7));
-        assert_eq!(snapshot.runtime_tools.mcp, ToolSwitch::Disable);
         assert_eq!(snapshot.runtime_tools.file_edit, ToolSwitch::Disable);
         assert_eq!(snapshot.runtime_tools.terminal, ToolSwitch::Enable);
         assert_eq!(snapshot.runtime_tools.subagent, ToolSwitch::Disable);
+    }
+
+    #[tokio::test]
+    async fn service_uses_configured_session_dirs() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        write_agent_folder_with_dirs(
+            &agent_dir,
+            7,
+            "  file_edit: enable\n  terminal: enable\n  subagent: enable",
+            "agent-sessions",
+            "channel-state",
+        );
+
+        let service = AgentService::new(&agent_dir).unwrap();
+        assert!(service.channel_session_dir().ends_with("channel-state"));
+        assert!(service.channel_session_dir().is_dir());
+
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let session = service.new_session(&cwd).await.unwrap();
+        assert!(
+            session
+                .session_dir()
+                .parent()
+                .is_some_and(|path| path.ends_with("agent-sessions"))
+        );
     }
 }
 

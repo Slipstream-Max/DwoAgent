@@ -7,9 +7,12 @@ use anyhow::Result;
 use super::xml::{block, tag, text_block};
 use crate::utils::files::read_utf8_text;
 
-const WORKSPACE_RULE_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
-
-pub fn build_rule(resources_dir: &Path, agent_id: &str, cwd: &str) -> Result<String> {
+pub fn build_rule(
+    resources_dir: &Path,
+    agent_id: &str,
+    cwd: &str,
+    external_rule_files: &[PathBuf],
+) -> Result<String> {
     let mut chunks: Vec<String> = Vec::new();
 
     let agent_rule_path = resources_dir
@@ -19,15 +22,28 @@ pub fn build_rule(resources_dir: &Path, agent_id: &str, cwd: &str) -> Result<Str
         chunks.push(rule_source_block("agent_rule", &agent_rule_path, &text));
     }
 
-    let workspace_root = resolve_or_noop(Path::new(cwd));
-    for filename in WORKSPACE_RULE_FILENAMES {
-        let rule_path = workspace_root.join(filename);
+    for rule_path in external_rule_files {
+        if let Some(text) = read_optional_trimmed(rule_path)? {
+            chunks.push(rule_source_block("external_rule", rule_path, &text));
+        }
+    }
+
+    for rule_path in workspace_rule_paths(cwd) {
         if let Some(text) = read_optional_trimmed(&rule_path)? {
             chunks.push(rule_source_block("workspace_rule", &rule_path, &text));
         }
     }
 
     Ok(block("rule", &chunks.join("\n\n")))
+}
+
+fn workspace_rule_paths(cwd: &str) -> Vec<PathBuf> {
+    let workspace_root = resolve_or_noop(Path::new(cwd));
+    vec![
+        workspace_root.join(".agent").join("AGENTS.md"),
+        workspace_root.join("AGENTS.md"),
+        workspace_root.join("CLAUDE.md"),
+    ]
 }
 
 fn rule_source_block(name: &str, path: &Path, content: &str) -> String {

@@ -18,6 +18,7 @@ use crate::context::manager::{
 };
 use crate::llm::client::{BaseLlmClient, LlmRequestCancelled};
 use crate::tools::tool_run_manager::ToolRunManager;
+use crate::watchers::runtime::WatcherRuntime;
 
 /// Signal raised by the turn runner when the `CancelEvent` fires mid-loop.
 #[derive(Debug)]
@@ -67,12 +68,14 @@ pub struct TurnRuntime<'a> {
     pub tool_manager: &'a ToolRunManager,
     pub context_manager: &'a mut ConversationContextManager,
     pub rebuild_system_messages: Option<SystemMessagesBuilder>,
+    pub watcher_runtime: Option<Arc<WatcherRuntime>>,
 }
 
 /// Run a single prompt's multi-turn loop until the model stops, cancellation
 /// fires, an unrecoverable error bubbles out, or an optional max-turn guard
 /// trips.
 pub async fn run_turn(mut runtime: TurnRuntime<'_>) -> Result<TurnResult> {
+    inject_pending_watcher_content(&mut runtime).await;
     runtime
         .context_manager
         .add_user(runtime.user_input.clone())?;
@@ -250,6 +253,7 @@ async fn maybe_compact_with_activity(runtime: &mut TurnRuntime<'_>) -> Result<()
 async fn request_assistant_message_stream(
     runtime: &mut TurnRuntime<'_>,
 ) -> Result<Map<String, Value>> {
+    inject_pending_watcher_content(runtime).await;
     let messages_for_model = runtime
         .context_manager
         .messages_for_model(runtime.model_client.capabilities.vision);
@@ -302,6 +306,15 @@ async fn request_assistant_message_stream(
         .context_manager
         .add_assistant(Value::Object(assistant_message.clone()));
     Ok(assistant_message)
+}
+
+async fn inject_pending_watcher_content(runtime: &mut TurnRuntime<'_>) {
+    let Some(watcher_runtime) = &runtime.watcher_runtime else {
+        return;
+    };
+    for message in watcher_runtime.drain_pending_messages().await {
+        runtime.context_manager.add_watcher_content(message);
+    }
 }
 
 // ── Tool orchestration ─────────────────────────────────────────────────────

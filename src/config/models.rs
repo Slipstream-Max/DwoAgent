@@ -10,6 +10,9 @@ use serde_json::{Map, Value};
 use crate::utils::policy::parse_policy_mode;
 use crate::utils::strings::{normalize_optional_str, normalize_required_str};
 
+pub const DEFAULT_SESSION_STORE_DIR: &str = "sessions";
+pub const DEFAULT_CHANNEL_SESSION_DIR: &str = "channel_sessions";
+
 // ── Literal-style enums ────────────────────────────────────────────────────
 
 macro_rules! str_enum {
@@ -122,11 +125,17 @@ fn default_tool_switch() -> ToolSwitch {
     ToolSwitch::Enable
 }
 
+fn default_session_store_dir() -> String {
+    DEFAULT_SESSION_STORE_DIR.to_string()
+}
+
+fn default_channel_session_dir() -> String {
+    DEFAULT_CHANNEL_SESSION_DIR.to_string()
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTools {
-    #[serde(default = "default_tool_switch")]
-    pub mcp: ToolSwitch,
     #[serde(default = "default_tool_switch")]
     pub file_edit: ToolSwitch,
     #[serde(default = "default_tool_switch")]
@@ -138,7 +147,6 @@ pub struct AgentTools {
 impl Default for AgentTools {
     fn default() -> Self {
         Self {
-            mcp: ToolSwitch::Enable,
             file_edit: ToolSwitch::Enable,
             terminal: ToolSwitch::Enable,
             subagent: ToolSwitch::Enable,
@@ -147,10 +155,6 @@ impl Default for AgentTools {
 }
 
 impl AgentTools {
-    pub fn mcp_enabled(&self) -> bool {
-        self.mcp.enabled()
-    }
-
     pub fn file_edit_enabled(&self) -> bool {
         self.file_edit.enabled()
     }
@@ -300,10 +304,17 @@ pub struct AgentMeta {
     pub description: String,
     #[serde(default)]
     pub max_running_turn: Option<u32>,
+    #[serde(default)]
+    pub external_skills_dirs: Vec<String>,
+    #[serde(default)]
+    pub external_rule_files: Vec<String>,
     #[serde(default, alias = "tools")]
     pub runtime_tools: AgentTools,
     pub policy_mode: PolicyMode,
+    #[serde(default = "default_session_store_dir")]
     pub session_store_dir: String,
+    #[serde(default = "default_channel_session_dir")]
+    pub channel_session_dir: String,
 }
 
 impl AgentMeta {
@@ -313,6 +324,12 @@ impl AgentMeta {
         self.description = normalize_required_str(&self.description, "description")?;
         self.session_store_dir =
             normalize_required_str(&self.session_store_dir, "session_store_dir")?;
+        self.channel_session_dir =
+            normalize_required_str(&self.channel_session_dir, "channel_session_dir")?;
+        self.external_skills_dirs =
+            normalize_string_list(&self.external_skills_dirs, "external_skills_dirs")?;
+        self.external_rule_files =
+            normalize_string_list(&self.external_rule_files, "external_rule_files")?;
         if let Some(max_running_turn) = self.max_running_turn
             && max_running_turn == 0
         {
@@ -323,6 +340,18 @@ impl AgentMeta {
         parse_policy_mode(self.policy_mode.as_str())?;
         Ok(())
     }
+}
+
+fn normalize_string_list(values: &[String], field: &str) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("{field} entries must not be empty");
+        }
+        out.push(trimmed.to_string());
+    }
+    Ok(out)
 }
 
 // ── Session payloads ──────────────────────────────────────────────────────
@@ -425,13 +454,41 @@ mod tests {
     }
 
     #[test]
+    fn agent_meta_uses_default_session_dirs() {
+        let meta = deserialize_agent_meta(serde_json::json!({
+            "agent_id": "test-agent",
+            "name": "Test Agent",
+            "description": "test",
+            "policy_mode": "confirm"
+        }))
+        .unwrap();
+
+        assert_eq!(meta.session_store_dir, "sessions");
+        assert_eq!(meta.channel_session_dir, "channel_sessions");
+    }
+
+    #[test]
+    fn agent_meta_reads_channel_session_dir() {
+        let meta = deserialize_agent_meta(serde_json::json!({
+            "agent_id": "test-agent",
+            "name": "Test Agent",
+            "description": "test",
+            "policy_mode": "confirm",
+            "session_store_dir": ".sessions",
+            "channel_session_dir": " channel-state "
+        }))
+        .unwrap();
+
+        assert_eq!(meta.channel_session_dir, "channel-state");
+    }
+
+    #[test]
     fn agent_meta_reads_tool_switches() {
         let meta = deserialize_agent_meta(serde_json::json!({
             "agent_id": "test-agent",
             "name": "Test Agent",
             "description": "test",
             "tools": {
-                "mcp": "disable",
                 "file_edit": "disable",
                 "terminal": "enable",
                 "subagent": "disable"
@@ -441,10 +498,26 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(!meta.runtime_tools.mcp_enabled());
         assert!(!meta.runtime_tools.file_edit_enabled());
         assert!(meta.runtime_tools.terminal_enabled());
         assert!(!meta.runtime_tools.subagent_enabled());
+    }
+
+    #[test]
+    fn agent_meta_reads_external_context_paths() {
+        let meta = deserialize_agent_meta(serde_json::json!({
+            "agent_id": "test-agent",
+            "name": "Test Agent",
+            "description": "test",
+            "policy_mode": "confirm",
+            "session_store_dir": ".sessions",
+            "external_skills_dirs": [" shared/skills "],
+            "external_rule_files": [" shared/rules/common.md "]
+        }))
+        .unwrap();
+
+        assert_eq!(meta.external_skills_dirs, vec!["shared/skills"]);
+        assert_eq!(meta.external_rule_files, vec!["shared/rules/common.md"]);
     }
 
     #[test]

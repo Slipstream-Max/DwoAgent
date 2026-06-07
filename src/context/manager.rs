@@ -127,6 +127,10 @@ impl ConversationContextManager {
         self.messages.push(message);
     }
 
+    pub fn add_watcher_content(&mut self, message: Value) {
+        self.messages.push(message);
+    }
+
     pub fn add_tool_result(&mut self, tool_call_id: &str, name: &str, output: &Value) {
         self.messages.push(json!({
             "role": "tool",
@@ -241,21 +245,19 @@ fn safe_json(data: &Value) -> String {
 }
 
 fn split_stable_prefix(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
-    let mut prefix: Vec<Value> = Vec::new();
-    let mut index = 0;
-    for item in messages {
-        let role = item
-            .get("role")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if role != "system" {
-            break;
-        }
-        prefix.push(item.clone());
-        index += 1;
+    let Some(first) = messages.first() else {
+        return (Vec::new(), Vec::new());
+    };
+    let role = first
+        .get("role")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if role == "system" {
+        (vec![first.clone()], messages[1..].to_vec())
+    } else {
+        (Vec::new(), messages.to_vec())
     }
-    (prefix, messages[index..].to_vec())
 }
 
 fn patch_message_for_text_model(message: &Value) -> Value {
@@ -331,5 +333,18 @@ mod tests {
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
             ])
         );
+    }
+
+    #[test]
+    fn only_first_system_message_is_stable_prefix() {
+        let messages = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "system", "content": "<watcher_content>\n<env_block></env_block>\n</watcher_content>"}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let (prefix, rest) = split_stable_prefix(&messages);
+
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(rest.len(), 2);
     }
 }

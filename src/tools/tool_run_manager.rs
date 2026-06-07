@@ -11,7 +11,6 @@ use futures::stream::FuturesUnordered;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
-use super::codemode::{CodeExecSession, CodeExecutor};
 use super::file_edit_runtime::file_edit_text;
 use super::session::{Cap, ToolSession};
 use super::subagent_tool_runtime::{
@@ -50,7 +49,7 @@ pub trait ChannelToolExecutor: Send + Sync {
 }
 
 const IMMEDIATE_TOOLS: &[&str] = &["file_edit"];
-const CREATE_TOOLS: &[&str] = &["terminal_exec", "exec_chain", "spawn_subagent"];
+const CREATE_TOOLS: &[&str] = &["terminal_exec", "spawn_subagent"];
 const LIST_TOOLS: &[&str] = &["list_terminals", "list_subagents"];
 const OPERATE_TOOLS: &[&str] = &[
     "terminal_wait",
@@ -66,7 +65,6 @@ const OPERATE_TOOLS: &[&str] = &[
 pub struct ToolRunManager {
     cwd: PathBuf,
     runtime_tools: AgentTools,
-    code_executor: Option<Arc<CodeExecutor>>,
     terminal_executor: TerminalExecutor,
     subagent_executor: Mutex<Option<Arc<dyn SubagentExecutor>>>,
     channel_tool_executor: Mutex<Option<Arc<dyn ChannelToolExecutor>>>,
@@ -82,7 +80,6 @@ struct ToolManagerState {
 
 impl ToolRunManager {
     pub async fn new(
-        mcp_config_path: Option<&Path>,
         cwd: Option<&Path>,
         finished_ttl_seconds: u64,
         runtime_tools: AgentTools,
@@ -91,18 +88,10 @@ impl ToolRunManager {
             Some(p) => std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()),
             None => std::env::current_dir().context("resolve current dir")?,
         };
-        let code_executor = if runtime_tools.mcp_enabled() {
-            Some(Arc::new(
-                CodeExecutor::from_mcp_config(mcp_config_path).await?,
-            ))
-        } else {
-            None
-        };
         let terminal_executor = TerminalExecutor::new(Some(runtime_cwd.clone()));
         Ok(Self {
             cwd: runtime_cwd,
             runtime_tools,
-            code_executor,
             terminal_executor,
             subagent_executor: Mutex::new(None),
             channel_tool_executor: Mutex::new(None),
@@ -125,13 +114,6 @@ impl ToolRunManager {
         *guard = executor;
     }
 
-    pub fn mcp_server_names(&self) -> &[String] {
-        self.code_executor
-            .as_ref()
-            .map(|executor| executor.server_names())
-            .unwrap_or(&[])
-    }
-
     pub async fn ashutdown(&self) {
         let mut state = self.state.lock().await;
         state.closing = true;
@@ -142,9 +124,6 @@ impl ToolRunManager {
         for session in sessions {
             let mut guard = session.lock().await;
             let _ = guard.cancel().await;
-        }
-        if let Some(code_executor) = &self.code_executor {
-            code_executor.shutdown().await;
         }
     }
 
@@ -279,10 +258,7 @@ impl ToolRunManager {
     ///
     /// Matches the Python `execute_tool_calls` semantics: every call's future
     /// is started immediately and driven concurrently on the current task,
-    /// with a 100ms poll window that checks the cancel event. Concurrency is
-    /// cooperative (single-threaded) so `!Send` tool sessions — notably the
-    /// Monty-backed `CodeExecSession` — still cooperate with `terminal_exec`
-    /// and `spawn_subagent` without blocking each other.
+    /// with a 100ms poll window that checks the cancel event.
     pub async fn execute_tool_calls(
         &self,
         tool_calls: Vec<Value>,
@@ -476,7 +452,6 @@ impl ToolRunManager {
 
     fn is_tool_enabled(&self, tool_name: &str) -> bool {
         match tool_name {
-            "exec_chain" => self.runtime_tools.mcp_enabled(),
             "file_edit" => self.runtime_tools.file_edit_enabled(),
             "terminal_exec" | "list_terminals" | "terminal_wait" | "terminal_checkout"
             | "terminal_kill" => self.runtime_tools.terminal_enabled(),
@@ -524,30 +499,6 @@ impl ToolRunManager {
                     startwith,
                 );
                 Arc::new(Mutex::new(terminal))
-            }
-            "exec_chain" => {
-                let code_executor = self
-                    .code_executor
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("exec_chain is disabled."))?
-                    .clone();
-                let code = args
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let timeout = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
-                let output_limit = args
-                    .get("outputlimit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(12_000) as usize;
-                Arc::new(Mutex::new(CodeExecSession::new(
-                    tool_call_id.to_string(),
-                    code_executor,
-                    code,
-                    timeout,
-                    output_limit,
-                )))
             }
             "spawn_subagent" => {
                 let context = context.ok_or_else(|| {
@@ -994,20 +945,20 @@ mod tests {
     fn subagent_progress_output_uses_flow_markdown() {
         let output = json!({
             "runtime": {"kind": "subagent"},
-            "progress": "Agent Flow:\n\n[tool] search_mcp"
+            "progress": "Agent Flow:\n\n[tool] terminal_exec"
         });
 
         let content = render_subagent_as_content(&output).unwrap();
 
         assert_eq!(
             content[0]["content"]["text"],
-            "Agent Flow:\n\n[tool] search_mcp"
+            "Agent Flow:\n\n[tool] terminal_exec"
         );
     }
 
     #[tokio::test]
     async fn cancel_running_tools_keeps_manager_open() {
-        let manager = ToolRunManager::new(None, None, 30, AgentTools::default())
+        let manager = ToolRunManager::new(None, 30, AgentTools::default())
             .await
             .unwrap();
 
@@ -1029,7 +980,7 @@ mod tests {
             file_edit: crate::config::models::ToolSwitch::Disable,
             ..AgentTools::default()
         };
-        let manager = ToolRunManager::new(None, None, 30, tools).await.unwrap();
+        let manager = ToolRunManager::new(None, 30, tools).await.unwrap();
 
         let output = manager
             .execute_tool_call("call-1", "file_edit", Some(&json!({"patch": ""})), None)
@@ -1045,11 +996,10 @@ mod tests {
     async fn multiple_file_edits_are_rejected_but_other_tools_run() {
         let tmp = tempfile::tempdir().unwrap();
         let tools = AgentTools {
-            mcp: crate::config::models::ToolSwitch::Disable,
             subagent: crate::config::models::ToolSwitch::Disable,
             ..AgentTools::default()
         };
-        let manager = ToolRunManager::new(None, Some(tmp.path()), 30, tools)
+        let manager = ToolRunManager::new(Some(tmp.path()), 30, tools)
             .await
             .unwrap();
         let terminal_command = if cfg!(windows) {

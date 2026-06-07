@@ -1201,7 +1201,7 @@ mod tests {
             "type": "content",
             "content": {
                 "type": "text",
-                "text": "Agent Flow:\n\n[tool] search_mcp"
+                "text": "Agent Flow:\n\n[tool] terminal_exec"
             }
         }]))
         .unwrap();
@@ -1209,7 +1209,7 @@ mod tests {
         let rendered = serde_json::to_value(content).unwrap();
         assert_eq!(
             rendered[0]["content"]["text"],
-            "Agent Flow:\n\n[tool] search_mcp"
+            "Agent Flow:\n\n[tool] terminal_exec"
         );
     }
 }

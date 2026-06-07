@@ -19,6 +19,7 @@ use crate::context::manager::{CancelEvent, ConversationContextManager, SystemMes
 use crate::llm::client::BaseLlmClient;
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 use crate::tools::tool_run_manager::ToolRunManager;
+use crate::watchers::runtime::WatcherRuntime;
 
 pub struct SessionAgent {
     /// Immutable session identifier cached on the outside of the mutex so
@@ -35,6 +36,7 @@ pub struct SessionAgent {
     runtime_factory_builder: RuntimeFactoryBuilder,
     cancel_event: CancelEvent,
     tool_manager_cached: Arc<ToolRunManager>,
+    watcher_runtime: Option<Arc<WatcherRuntime>>,
     prompt_lock: Mutex<()>,
 }
 
@@ -52,6 +54,7 @@ impl SessionAgent {
         context_manager: ConversationContextManager,
         model_profiles: HashMap<String, ModelProfile>,
         runtime_factory_builder: RuntimeFactoryBuilder,
+        watcher_runtime: Option<Arc<WatcherRuntime>>,
     ) -> Arc<Self> {
         let session_id_cached = session.session_id.clone();
         let cwd_cached = session.cwd.clone();
@@ -81,6 +84,7 @@ impl SessionAgent {
             runtime_factory_builder,
             cancel_event: CancelEvent::new(),
             tool_manager_cached: tool_manager.clone(),
+            watcher_runtime,
             prompt_lock: Mutex::new(()),
         })
     }
@@ -229,16 +233,11 @@ impl SessionAgent {
             let session = self.session.lock().await;
             session.tool_schemas.clone()
         };
-        // Compaction can invoke this builder while run_turn holds the runtime guard.
-        // Snapshot MCP names here so the builder never re-locks runtime.
-        let mcp_server_names = tool_manager_ref.mcp_server_names().to_vec();
         let rebuild_builder: Option<SystemMessagesBuilder> = Some(Arc::new({
             let this = self.clone();
-            let mcp_server_names = mcp_server_names.clone();
             move || {
                 let this = this.clone();
-                let mcp_server_names = mcp_server_names.clone();
-                Box::pin(async move { this.rebuild_system_messages(&mcp_server_names).await })
+                Box::pin(async move { this.rebuild_system_messages().await })
             }
         }));
 
@@ -256,6 +255,7 @@ impl SessionAgent {
                 tool_manager: &tool_manager_ref,
                 context_manager: &mut rt_parts.context_manager,
                 rebuild_system_messages: rebuild_builder,
+                watcher_runtime: self.watcher_runtime.clone(),
             };
             run_turn(turn_runtime).await
         };
@@ -505,7 +505,7 @@ impl SessionAgent {
         Ok(())
     }
 
-    async fn rebuild_system_messages(&self, mcp_server_names: &[String]) -> Result<Vec<Value>> {
+    async fn rebuild_system_messages(&self) -> Result<Vec<Value>> {
         let (cwd, model_id) = {
             let session = self.session.lock().await;
             (session.cwd.clone(), session.model_id.clone())
@@ -518,7 +518,7 @@ impl SessionAgent {
                 .ok_or_else(|| anyhow::anyhow!("Unknown model_id: {model_id}"))?
         };
         let factory = (self.runtime_factory_builder)(&cwd, &profile)?;
-        factory.rebuild_system_messages(mcp_server_names)
+        factory.rebuild_system_messages()
     }
 
     pub async fn persist_async(&self) -> Result<()> {

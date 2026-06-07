@@ -10,3 +10,4 @@ pub mod llm;
 pub mod templates;
 pub mod tools;
 pub mod utils;
+pub mod watchers;

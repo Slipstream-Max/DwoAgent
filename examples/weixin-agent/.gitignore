@@ -1,3 +1,5 @@
 .dwoagent/
 channel_secret/
 channel_session/
+channel_sessions/
+sessions/

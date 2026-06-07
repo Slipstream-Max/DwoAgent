@@ -40,6 +40,19 @@ pub fn resolve_agent_structure_dir(agent_folder: &Path) -> Result<PathBuf> {
 /// Resolve the session store directory, defaulting to a path relative to the
 /// agent structure directory.
 pub fn resolve_session_store_dir(store_dir: &str, agent_structure_dir: &Path) -> Result<PathBuf> {
+    resolve_agent_profile_dir(store_dir, agent_structure_dir)
+}
+
+/// Resolve the channel session directory, defaulting to a path relative to the
+/// agent structure directory.
+pub fn resolve_channel_session_dir(
+    session_dir: &str,
+    agent_structure_dir: &Path,
+) -> Result<PathBuf> {
+    resolve_agent_profile_dir(session_dir, agent_structure_dir)
+}
+
+fn resolve_agent_profile_dir(store_dir: &str, agent_structure_dir: &Path) -> Result<PathBuf> {
     let path = PathBuf::from(store_dir);
     if path.is_absolute() {
         Ok(path)

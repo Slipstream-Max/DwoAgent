@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -18,12 +19,15 @@ use crate::context::builder::build_agent_system_context;
 use crate::context::manager::ConversationContextManager;
 use crate::llm::client::{BaseLlmClient, create_model_client};
 use crate::tools::tool_run_manager::ToolRunManager;
+use crate::watchers::env_block::EnvBlockWatcher;
+use crate::watchers::runtime::WatcherRuntime;
 
 /// Bundle of runtime parts created together.
 pub struct AgentRuntimeParts {
     pub model_client: BaseLlmClient,
     pub tool_manager: Arc<ToolRunManager>,
     pub context_manager: ConversationContextManager,
+    pub watcher_runtime: Option<Arc<WatcherRuntime>>,
 }
 
 /// Strategy hook used for rebuilding the factory on model switches.
@@ -34,7 +38,6 @@ pub type RuntimeFactoryBuilder =
 pub struct SessionAgentFactory {
     agent_structure_dir: PathBuf,
     agent_id: String,
-    mcp_config_path: PathBuf,
     cwd: String,
     context_window_tokens: u32,
     compact_threshold: f64,
@@ -42,6 +45,8 @@ pub struct SessionAgentFactory {
     model_capabilities: ModelCapabilities,
     default_reasoning_mode: String,
     runtime_tools: AgentTools,
+    external_skills_dirs: Vec<PathBuf>,
+    external_rule_files: Vec<PathBuf>,
 }
 
 /// Shape of the arguments passed to `SessionAgentFactory::create_session_agent`.
@@ -70,7 +75,6 @@ impl SessionAgentFactory {
     pub fn new(
         agent_structure_dir: &Path,
         agent_id: impl Into<String>,
-        mcp_config_path: &Path,
         cwd: impl Into<String>,
         context_window_tokens: u32,
         compact_threshold: f64,
@@ -78,11 +82,11 @@ impl SessionAgentFactory {
         model_capabilities: ModelCapabilities,
         default_reasoning_mode: impl Into<String>,
         runtime_tools: AgentTools,
+        external_skills_dirs: Vec<PathBuf>,
+        external_rule_files: Vec<PathBuf>,
     ) -> Self {
         let structure = std::fs::canonicalize(agent_structure_dir)
             .unwrap_or_else(|_| agent_structure_dir.to_path_buf());
-        let mcp = std::fs::canonicalize(mcp_config_path)
-            .unwrap_or_else(|_| mcp_config_path.to_path_buf());
         let cwd_text = cwd.into();
         let cwd_resolved = std::fs::canonicalize(&cwd_text)
             .map(|p| p.to_string_lossy().into_owned())
@@ -90,7 +94,6 @@ impl SessionAgentFactory {
         Self {
             agent_structure_dir: structure,
             agent_id: agent_id.into(),
-            mcp_config_path: mcp,
             cwd: cwd_resolved,
             context_window_tokens,
             compact_threshold,
@@ -98,11 +101,9 @@ impl SessionAgentFactory {
             model_capabilities,
             default_reasoning_mode: default_reasoning_mode.into(),
             runtime_tools,
+            external_skills_dirs,
+            external_rule_files,
         }
-    }
-
-    pub fn mcp_config_path(&self) -> &Path {
-        &self.mcp_config_path
     }
 
     pub fn cwd(&self) -> &str {
@@ -119,15 +120,8 @@ impl SessionAgentFactory {
 
     pub async fn create_tool_manager(&self) -> Result<Arc<ToolRunManager>> {
         let cwd_path = PathBuf::from(&self.cwd);
-        let mcp_path: Option<&Path> =
-            if self.mcp_config_path.as_os_str().is_empty() || !self.runtime_tools.mcp_enabled() {
-                None
-            } else {
-                Some(self.mcp_config_path.as_path())
-            };
         let manager =
-            ToolRunManager::new(mcp_path, Some(cwd_path.as_path()), 300, self.runtime_tools)
-                .await?;
+            ToolRunManager::new(Some(cwd_path.as_path()), 300, self.runtime_tools).await?;
         Ok(Arc::new(manager))
     }
 
@@ -157,6 +151,7 @@ impl SessionAgentFactory {
             model_client,
             tool_manager,
             context_manager,
+            watcher_runtime: None,
         })
     }
 
@@ -167,7 +162,7 @@ impl SessionAgentFactory {
         let tool_manager = self.create_tool_manager().await?;
         let init_messages = match context_messages {
             Some(messages) => messages,
-            None => vec![self.build_system_context(tool_manager.mcp_server_names())?],
+            None => vec![self.build_system_context()?],
         };
         let context_manager = self.create_context_manager(init_messages)?;
         let model_client = self.create_model_client()?;
@@ -175,6 +170,7 @@ impl SessionAgentFactory {
             model_client,
             tool_manager,
             context_manager,
+            watcher_runtime: Some(self.create_watcher_runtime()),
         })
     }
 
@@ -212,6 +208,7 @@ impl SessionAgentFactory {
             parts.context_manager,
             args.model_profiles,
             args.runtime_factory_builder,
+            parts.watcher_runtime,
         );
 
         self.attach_subagent_runtime(&agent).await?;
@@ -246,13 +243,12 @@ impl SessionAgentFactory {
         Ok(())
     }
 
-    /// Clone just the shape (not the MCP client / tool manager) so subagent
-    /// runs can build their own `AgentRuntimeParts`.
+    /// Clone just the shape so subagent runs can build their own
+    /// `AgentRuntimeParts`.
     pub(crate) fn clone_shape(&self) -> Self {
         Self {
             agent_structure_dir: self.agent_structure_dir.clone(),
             agent_id: self.agent_id.clone(),
-            mcp_config_path: self.mcp_config_path.clone(),
             cwd: self.cwd.clone(),
             context_window_tokens: self.context_window_tokens,
             compact_threshold: self.compact_threshold,
@@ -260,6 +256,8 @@ impl SessionAgentFactory {
             model_capabilities: self.model_capabilities,
             default_reasoning_mode: self.default_reasoning_mode.clone(),
             runtime_tools: self.runtime_tools,
+            external_skills_dirs: self.external_skills_dirs.clone(),
+            external_rule_files: self.external_rule_files.clone(),
         }
     }
 
@@ -278,17 +276,29 @@ impl SessionAgentFactory {
         self.create_parts(init_messages).await
     }
 
-    pub fn build_system_context(&self, mcp_server_names: &[String]) -> Result<Value> {
+    pub fn build_system_context(&self) -> Result<Value> {
         build_agent_system_context(
             &self.agent_structure_dir,
             &self.agent_id,
             &self.cwd,
-            mcp_server_names,
             &self.runtime_tools,
+            &self.external_skills_dirs,
+            &self.external_rule_files,
         )
     }
 
-    pub fn rebuild_system_messages(&self, mcp_server_names: &[String]) -> Result<Vec<Value>> {
-        Ok(vec![self.build_system_context(mcp_server_names)?])
+    pub fn rebuild_system_messages(&self) -> Result<Vec<Value>> {
+        Ok(vec![self.build_system_context()?])
+    }
+
+    fn create_watcher_runtime(&self) -> Arc<WatcherRuntime> {
+        let watcher = EnvBlockWatcher::new(
+            self.agent_structure_dir.clone(),
+            self.agent_id.clone(),
+            self.cwd.clone(),
+            self.external_skills_dirs.clone(),
+            self.external_rule_files.clone(),
+        );
+        WatcherRuntime::start_env_block(watcher, Duration::from_secs(1))
     }
 }

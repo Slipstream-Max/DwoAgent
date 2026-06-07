@@ -11,6 +11,15 @@ use crate::context::contextblock::xml::html_escape;
 pub const DEFAULT_DESCRIPTION_MAX_CHARS: usize = 500;
 const TRUNCATION_MARKER: &str = "... [truncated]";
 
+pub fn build_available_skills(
+    resources_dir: &Path,
+    cwd: &str,
+    external_skills_dirs: &[PathBuf],
+) -> Result<String> {
+    let skill_dirs = discover_context_skills(resources_dir, cwd, external_skills_dirs);
+    to_prompt(&skill_dirs)
+}
+
 /// Discover skill directories under *skills_root*.
 pub fn discover_skills(skills_root: &Path) -> Vec<PathBuf> {
     if !skills_root.exists() {
@@ -98,4 +107,35 @@ fn truncate_description(description: &str, max_chars: usize) -> String {
 
 fn anyhow_from_skill(err: SkillError) -> anyhow::Error {
     anyhow::Error::new(err)
+}
+
+fn discover_context_skills(
+    resources_dir: &Path,
+    cwd: &str,
+    external_skills_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut skill_dirs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut roots = Vec::with_capacity(external_skills_dirs.len() + 2);
+    roots.push(resources_dir.join("skills"));
+    roots.extend(external_skills_dirs.iter().cloned());
+    roots.push(
+        resolve_or_noop(Path::new(cwd))
+            .join(".agent")
+            .join("skills"),
+    );
+
+    for skills_root in roots {
+        for skill_dir in discover_skills(&skills_root) {
+            let key = resolve_or_noop(&skill_dir);
+            if seen.insert(key.clone()) {
+                skill_dirs.push(key);
+            }
+        }
+    }
+    skill_dirs
+}
+
+fn resolve_or_noop(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

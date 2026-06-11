@@ -9,12 +9,12 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use self::event::{
-    ActivityBoxEvent, ActivityEvent, EVENT_TOOL_CALL_UPDATE, ToolCallEvent, ToolCallUpdateEvent,
-    tool_permission_payload, update_type,
+    ActivityBoxEvent, ActivityEvent, EVENT_TOOL_CALL_UPDATE, EVENT_USAGE_UPDATE, ToolCallEvent,
+    ToolCallUpdateEvent, tool_permission_payload, update_type,
 };
 use super::session::{Session, SessionPersistence};
 use crate::config::loader::utc_iso;
-use crate::config::models::{AgentState, SessionTranscriptEvent};
+use crate::config::models::{AgentState, ContextUsageSnapshot, SessionTranscriptEvent};
 use crate::context::manager::CancelEvent;
 use crate::llm::client::{
     LlmCancelToken, LlmRequestOptions, LlmRetryCallback, LlmRetryEvent, LlmRetryKind,
@@ -290,6 +290,14 @@ impl ActivityTurnHandle {
         .await
     }
 
+    pub async fn usage_update(&self, usage: ContextUsageSnapshot) -> Result<()> {
+        self.emit_event_unrecorded(ActivityEvent::UsageUpdate {
+            used: usage.used,
+            size: usage.size,
+        })
+        .await
+    }
+
     pub async fn request_tool_permission(
         &self,
         tool_call_id: &str,
@@ -433,6 +441,9 @@ fn retry_event_text(event: &LlmRetryEvent) -> String {
 
 fn should_persist_update(update: &Map<String, Value>) -> bool {
     let update_type = update_type(update);
+    if update_type == EVENT_USAGE_UPDATE {
+        return false;
+    }
     if update_type == EVENT_TOOL_CALL_UPDATE {
         let tool_call_id = update
             .get("tool_call_id")

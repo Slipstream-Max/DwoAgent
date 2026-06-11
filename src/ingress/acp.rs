@@ -19,6 +19,7 @@ use agent_client_protocol::schema::{
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
     SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCall,
     ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification,
@@ -32,14 +33,14 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::agent::activity::event::{
     EVENT_ACTIVITY_BOX, EVENT_ACTIVITY_BOX_UPDATE, EVENT_AGENT_MESSAGE_CHUNK,
     EVENT_AGENT_THOUGHT_CHUNK, EVENT_CONFIG_OPTION, EVENT_CURRENT_MODE, EVENT_SESSION_INFO,
-    EVENT_TOOL_CALL, EVENT_TOOL_CALL_UPDATE, EVENT_USER_MESSAGE_CHUNK,
+    EVENT_TOOL_CALL, EVENT_TOOL_CALL_UPDATE, EVENT_USAGE_UPDATE, EVENT_USER_MESSAGE_CHUNK,
 };
 use crate::agent::constants::{
     MODE_ALLOW_ALL, MODE_BLOCK_ALL, MODE_CONFIRM, STOP_CANCELLED, STOP_COMPLETED, STOP_MAX_TURNS,
 };
 use crate::agent::service::AgentService;
 use crate::agent::session::SESSION_CLIENT_TRANSCRIPT_FILE;
-use crate::config::models::{ModelProfile, SessionTranscriptEvent};
+use crate::config::models::{ContextUsageSnapshot, ModelProfile, SessionTranscriptEvent};
 use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 
@@ -92,13 +93,15 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
         .on_receive_request(
             async move |req: NewSessionRequest,
                         responder: Responder<NewSessionResponse>,
-                        _cx: ConnectionTo<Client>| {
+                        cx: ConnectionTo<Client>| {
                 let cwd = req.cwd.to_string_lossy().to_string();
                 match agent_for_new.new_session(&cwd).await {
                     Ok(session) => {
                         let snapshot = session.session_meta_snapshot().await;
+                        let usage = session.context_usage_snapshot().await;
                         let profiles = agent_for_new.model_profiles();
-                        let sid = SessionId::new(session.session_id());
+                        let session_id = session.session_id().to_string();
+                        let sid = SessionId::new(session_id.as_str());
                         let response = NewSessionResponse::new(sid)
                             .modes(build_mode_state(snapshot.mode_id.as_str()))
                             .config_options(build_config_options(
@@ -107,7 +110,9 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                                 snapshot.reasoning_mode.as_str(),
                                 &profiles,
                             ));
-                        responder.respond(response)
+                        let result = responder.respond(response);
+                        emit_context_usage_state(&cx, &session_id, usage);
+                        result
                     }
                     Err(err) => responder.respond_with_error(
                         agent_client_protocol::schema::Error::internal_error()
@@ -174,6 +179,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                             && let Some(session) = agent.get_session(&session_id).await
                         {
                             let snapshot = session.session_meta_snapshot().await;
+                            let usage = session.context_usage_snapshot().await;
                             let profiles = agent.model_profiles();
                             emit_mode_and_config_state(
                                 &cx_for_finish,
@@ -183,6 +189,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                                 snapshot.reasoning_mode.as_str(),
                                 &profiles,
                             );
+                            emit_context_usage_state(&cx_for_finish, &session_id, usage);
                         }
 
                         respond_prompt_result(responder, result)
@@ -243,6 +250,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                 match agent_for_load.load_session(&session_id).await {
                     Ok(Some(session)) => {
                         let snapshot = session.session_meta_snapshot().await;
+                        let usage = session.context_usage_snapshot().await;
                         let profiles = agent_for_load.model_profiles();
 
                         // Replay transcript events.
@@ -276,7 +284,9 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                                 snapshot.reasoning_mode.as_str(),
                                 &profiles,
                             ));
-                        responder.respond(response)
+                        let result = responder.respond(response);
+                        emit_context_usage_state(&cx, &session_id, usage);
+                        result
                     }
                     Ok(None) => responder.respond_with_error(
                         agent_client_protocol::schema::Error::invalid_params()
@@ -324,6 +334,9 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                             )),
                         );
                         let _ = cx.send_notification_to(Client, config_notif);
+
+                        let usage = session.context_usage_snapshot().await;
+                        emit_context_usage_state(&cx, &session_id, usage);
 
                         responder.respond(SetSessionModeResponse::new())
                     }
@@ -410,7 +423,13 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                             current_reasoning_mode.as_str(),
                             &profiles,
                         );
-                        responder.respond(SetSessionConfigOptionResponse::new(options))
+                        let response = SetSessionConfigOptionResponse::new(options);
+                        let result = responder.respond(response);
+                        if let Some(session) = agent_for_config.get_session(&session_id).await {
+                            let usage = session.context_usage_snapshot().await;
+                            emit_context_usage_state(&cx, &session_id, usage);
+                        }
+                        result
                     }
                     Err(err) => responder.respond_with_error(
                         agent_client_protocol::schema::Error::invalid_params()
@@ -500,6 +519,18 @@ fn emit_mode_and_config_state(
         ))),
     );
     let _ = cx.send_notification_to(Client, config_notif);
+}
+
+fn emit_context_usage_state(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    usage: ContextUsageSnapshot,
+) {
+    let notif = SessionNotification::new(
+        SessionId::new(session_id),
+        SessionUpdate::UsageUpdate(UsageUpdate::new(usage.used, usage.size)),
+    );
+    let _ = cx.send_notification_to(Client, notif);
 }
 
 fn build_mode_state(current_mode_id: &str) -> SessionModeState {
@@ -978,6 +1009,14 @@ fn emit_session_update(cx: &ConnectionTo<Client>, session_id: &str, update: &Map
             Some(SessionNotification::new(
                 sid,
                 SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(Vec::new())),
+            ))
+        }
+        s if s == EVENT_USAGE_UPDATE => {
+            let used = update.get("used").and_then(Value::as_u64).unwrap_or(0);
+            let size = update.get("size").and_then(Value::as_u64).unwrap_or(0);
+            Some(SessionNotification::new(
+                sid,
+                SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)),
             ))
         }
         s if s == EVENT_SESSION_INFO => {

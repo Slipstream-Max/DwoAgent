@@ -12,6 +12,7 @@ pub const EVENT_ACTIVITY_BOX_UPDATE: &str = "activity_box_update";
 pub const EVENT_CURRENT_MODE: &str = "current_mode_update";
 pub const EVENT_CONFIG_OPTION: &str = "config_option_update";
 pub const EVENT_SESSION_INFO: &str = "session_info_update";
+pub const EVENT_USAGE_UPDATE: &str = "usage_update";
 
 #[derive(Debug, Clone)]
 pub struct ToolCallEvent {
@@ -63,6 +64,10 @@ pub enum ActivityEvent {
         mode_id: String,
     },
     ConfigOptionUpdate,
+    UsageUpdate {
+        used: u64,
+        size: u64,
+    },
     SessionInfoUpdate {
         title: String,
         updated_at: Option<String>,
@@ -145,6 +150,7 @@ impl ActivityEvent {
             Self::ActivityBoxUpdate(_) => EVENT_ACTIVITY_BOX_UPDATE,
             Self::CurrentModeUpdate { .. } => EVENT_CURRENT_MODE,
             Self::ConfigOptionUpdate => EVENT_CONFIG_OPTION,
+            Self::UsageUpdate { .. } => EVENT_USAGE_UPDATE,
             Self::SessionInfoUpdate { .. } => EVENT_SESSION_INFO,
         }
     }
@@ -197,6 +203,10 @@ impl ActivityEvent {
                 payload.insert("current_mode_id".to_string(), Value::String(mode_id));
             }
             Self::ConfigOptionUpdate => {}
+            Self::UsageUpdate { used, size } => {
+                payload.insert("used".to_string(), Value::from(used));
+                payload.insert("size".to_string(), Value::from(size));
+            }
             Self::SessionInfoUpdate { title, updated_at } => {
                 payload.insert("title".to_string(), Value::String(title));
                 payload.insert(

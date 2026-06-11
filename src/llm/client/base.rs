@@ -1097,7 +1097,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex, Once};
     use std::thread;
 
     fn test_client(tool_use: bool) -> BaseLlmClient {
@@ -1105,6 +1105,7 @@ mod tests {
     }
 
     fn test_client_with_base(tool_use: bool, api_base: &str) -> BaseLlmClient {
+        ensure_loopback_no_proxy();
         BaseLlmClient::new(
             ModelConfig {
                 provider: "test".to_string(),
@@ -1125,6 +1126,14 @@ mod tests {
             Box::new(PassthroughReasoning),
         )
         .unwrap()
+    }
+
+    fn ensure_loopback_no_proxy() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe {
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+            std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
+        });
     }
 
     fn read_http_request(stream: &mut TcpStream) {

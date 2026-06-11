@@ -18,13 +18,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
+use super::channel_events::ChannelUpdateCollector;
 use super::config::{FeishuAccessPolicy, FeishuChannelConfig, FeishuChannelDomain};
-use crate::agent::activity::event::{EVENT_AGENT_MESSAGE_CHUNK, update_type};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::config::loader::resolve_agent_structure_dir;
 use crate::context::content_block;
-use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
+use crate::tools::subagent_tool_runtime::PermissionRequester;
 use crate::tools::{
     FeishuReplyCardResult, FeishuReplyMediaKind, FeishuReplyMediaResult, FeishuToolBridge,
     FeishuToolExecutor, feishu_tool_schemas,
@@ -250,8 +250,8 @@ impl FeishuChannel {
             tool_manager.set_channel_tool_executor(Some(executor)).await;
         }
 
-        let response_text = Arc::new(Mutex::new(String::new()));
-        let emit_update = response_collector(response_text.clone());
+        let update_collector = ChannelUpdateCollector::new(self.config.response_detail);
+        let emit_update = update_collector.emitter();
         let request_permission = rejecting_permission_requester();
         let run_result = session
             .run_prompt(user_input, user_blocks, emit_update, request_permission)
@@ -261,9 +261,13 @@ impl FeishuChannel {
         }
         run_result?;
 
-        let text = response_text.lock().await.trim().to_string();
-        if !text.is_empty() {
-            self.channel.send(&text, reply_target(&msg, kind)).await?;
+        let collected = update_collector.finish().await;
+        let target = reply_target(&msg, kind);
+        if let Some(detail) = collected.detail_text.as_deref() {
+            self.channel.send(detail, target).await?;
+        }
+        if !collected.response_text.is_empty() {
+            self.channel.send(&collected.response_text, target).await?;
         }
         Ok(())
     }
@@ -640,23 +644,6 @@ impl FeishuRestClient {
         });
         Ok(value)
     }
-}
-
-fn response_collector(buffer: Arc<Mutex<String>>) -> UpdateEmitter {
-    Arc::new(move |_target: String, update: Map<String, Value>| {
-        let buffer = buffer.clone();
-        Box::pin(async move {
-            if update_type(&update) == EVENT_AGENT_MESSAGE_CHUNK
-                && let Some(text) = update
-                    .get("content")
-                    .and_then(|content| content.get("text"))
-                    .and_then(Value::as_str)
-            {
-                buffer.lock().await.push_str(text);
-            }
-            Ok(())
-        })
-    })
 }
 
 fn rejecting_permission_requester() -> PermissionRequester {

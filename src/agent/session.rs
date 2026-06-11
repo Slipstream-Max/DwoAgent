@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::config::loader::write_json_utf8;
 use crate::config::models::{
-    AgentState, AgentTools, PolicyMode, ReasoningMode, SessionMetaPayload,
+    AgentState, AgentTools, ContextUsageSnapshot, PolicyMode, ReasoningMode, SessionMetaPayload,
     SessionModelContextPayload,
 };
 use crate::utils::strings::{normalize_optional_str, normalize_required_str};
@@ -107,13 +107,19 @@ impl SessionPersistence {
     }
 
     /// Write session metadata and context to disk.
-    pub fn save_session(&self, session: &Session, messages: &[Value]) -> Result<()> {
+    pub fn save_session(
+        &self,
+        session: &Session,
+        messages: &[Value],
+        usage: ContextUsageSnapshot,
+    ) -> Result<()> {
         std::fs::create_dir_all(&self.session_dir)
             .with_context(|| format!("create session dir {}", self.session_dir.display()))?;
 
         self.save_session_meta(session)?;
         let context_payload = SessionModelContextPayload {
             messages: messages.to_vec(),
+            usage: Some(usage),
         };
 
         write_json_utf8(

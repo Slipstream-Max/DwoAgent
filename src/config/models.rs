@@ -374,6 +374,15 @@ impl SessionTranscriptEvent {
 #[serde(deny_unknown_fields)]
 pub struct SessionModelContextPayload {
     pub messages: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ContextUsageSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextUsageSnapshot {
+    pub used: u64,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

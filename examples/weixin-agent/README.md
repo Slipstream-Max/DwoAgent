@@ -27,6 +27,7 @@ from `channels.yaml`:
 weixin:
   media_input: true
   media_output: true
+  response_detail: response_only
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
 ```

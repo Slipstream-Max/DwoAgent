@@ -15,10 +15,13 @@ use super::session::{SESSION_TITLE_LENGTH, Session, SessionPersistence};
 use super::turn::{PolicyModeGetter, TurnRuntime, run_turn};
 use crate::config::loader::utc_iso;
 use crate::config::models::{
-    AgentState, ModelProfile, PolicyMode, ReasoningMode, SessionMetaPayload, StopReason,
+    AgentState, ContextUsageSnapshot, ModelProfile, PolicyMode, ReasoningMode, SessionMetaPayload,
+    StopReason,
 };
-use crate::context::manager::{CancelEvent, ConversationContextManager, SystemMessagesBuilder};
-use crate::llm::client::BaseLlmClient;
+use crate::context::manager::{
+    CancelEvent, CompactionOutcome, ConversationContextManager, SystemMessagesBuilder,
+};
+use crate::llm::client::{BaseLlmClient, LlmRequestOptions};
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 use crate::tools::tool_run_manager::ToolRunManager;
 use crate::watchers::runtime::WatcherRuntime;
@@ -117,6 +120,10 @@ impl SessionAgent {
             .to_vec()
     }
 
+    pub async fn context_usage_snapshot(&self) -> ContextUsageSnapshot {
+        self.runtime.lock().await.context_manager.usage_snapshot()
+    }
+
     pub async fn tool_manager(&self) -> Arc<ToolRunManager> {
         self.tool_manager_cached.clone()
     }
@@ -194,14 +201,14 @@ impl SessionAgent {
                 && let Some(title) = derive_session_title(&user_input, &user_blocks)
             {
                 session.title = Some(title.clone());
-                let messages = self
-                    .runtime
-                    .lock()
-                    .await
-                    .context_manager
-                    .messages()
-                    .to_vec();
-                self.persistence.save_session(&session, &messages)?;
+                let (messages, usage) = {
+                    let runtime = self.runtime.lock().await;
+                    (
+                        runtime.context_manager.messages().to_vec(),
+                        runtime.context_manager.usage_snapshot(),
+                    )
+                };
+                self.persistence.save_session(&session, &messages, usage)?;
                 let updated_at = session.updated_at.clone();
                 drop(session);
                 let _ = activity
@@ -351,6 +358,7 @@ impl SessionAgent {
             return Ok("queued");
         }
         self.apply_model_switch(model_id).await?;
+        let _ = self.compact_if_over_context_window().await?;
         self.persist_async().await?;
         Ok("applied")
     }
@@ -413,20 +421,20 @@ impl SessionAgent {
         Ok(())
     }
 
-    async fn apply_pending_model_switch_if_needed(&self) -> Result<()> {
+    async fn apply_pending_model_switch_if_needed(&self) -> Result<bool> {
         let pending = {
             let session = self.session.lock().await;
             session.pending_model_id.clone()
         };
         let Some(model_id) = pending else {
-            return Ok(());
+            return Ok(false);
         };
         self.apply_model_switch(&model_id).await?;
         {
             let mut session = self.session.lock().await;
             session.pending_model_id = None;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn apply_pending_reasoning_mode_if_needed(&self) -> Result<()> {
@@ -463,8 +471,12 @@ impl SessionAgent {
     }
 
     async fn apply_pending_config_if_needed(&self) -> Result<()> {
-        self.apply_pending_model_switch_if_needed().await?;
-        self.apply_pending_reasoning_mode_if_needed().await
+        let model_switched = self.apply_pending_model_switch_if_needed().await?;
+        self.apply_pending_reasoning_mode_if_needed().await?;
+        if model_switched {
+            let _ = self.compact_if_over_context_window().await?;
+        }
+        Ok(())
     }
 
     async fn apply_model_switch(&self, model_id: &str) -> Result<()> {
@@ -481,14 +493,15 @@ impl SessionAgent {
         };
         let factory = (self.runtime_factory_builder)(&cwd, &profile)?;
         let new_client = factory.create_model_client()?;
-        let current_messages = self
-            .runtime
-            .lock()
-            .await
-            .context_manager
-            .messages()
-            .to_vec();
-        let new_context = factory.rebuild_context_manager(current_messages)?;
+        let (current_messages, current_usage) = {
+            let runtime = self.runtime.lock().await;
+            (
+                runtime.context_manager.messages().to_vec(),
+                runtime.context_manager.usage_snapshot(),
+            )
+        };
+        let mut new_context = factory.rebuild_context_manager(current_messages)?;
+        new_context.sync_token_usage(current_usage.used);
 
         {
             let mut runtime = self.runtime.lock().await;
@@ -511,6 +524,40 @@ impl SessionAgent {
         Ok(())
     }
 
+    async fn compact_if_over_context_window(&self) -> Result<CompactionOutcome> {
+        let over_window = {
+            let runtime = self.runtime.lock().await;
+            runtime.context_manager.is_over_context_window()
+        };
+        if !over_window {
+            return Ok(CompactionOutcome::Skipped);
+        }
+
+        let reasoning_mode = {
+            self.session
+                .lock()
+                .await
+                .reasoning_mode
+                .as_str()
+                .to_string()
+        };
+        let mut runtime = self.runtime.lock().await;
+        let RuntimeState {
+            model_client,
+            context_manager,
+            ..
+        } = &mut *runtime;
+        Ok(context_manager
+            .maybe_compact(
+                model_client,
+                None,
+                None,
+                Some(&reasoning_mode),
+                LlmRequestOptions::default(),
+            )
+            .await)
+    }
+
     async fn rebuild_system_messages(&self) -> Result<Vec<Value>> {
         let (cwd, model_id) = {
             let session = self.session.lock().await;
@@ -529,14 +576,14 @@ impl SessionAgent {
 
     pub async fn persist_async(&self) -> Result<()> {
         let session = self.session.lock().await.clone();
-        let messages = self
-            .runtime
-            .lock()
-            .await
-            .context_manager
-            .messages()
-            .to_vec();
-        self.persistence.save_session(&session, &messages)
+        let (messages, usage) = {
+            let runtime = self.runtime.lock().await;
+            (
+                runtime.context_manager.messages().to_vec(),
+                runtime.context_manager.usage_snapshot(),
+            )
+        };
+        self.persistence.save_session(&session, &messages, usage)
     }
 
     async fn persist_session_meta_async(&self) -> Result<()> {

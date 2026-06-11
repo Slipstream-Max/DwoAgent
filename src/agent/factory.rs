@@ -12,8 +12,8 @@ use super::session::Session;
 use super::session_agent::SessionAgent;
 use crate::config::loader::utc_iso;
 use crate::config::models::{
-    AgentState, AgentTools, ModelCapabilities, ModelConfig, ModelProfile, PolicyMode,
-    ReasoningMode, StopReason,
+    AgentState, AgentTools, ContextUsageSnapshot, ModelCapabilities, ModelConfig, ModelProfile,
+    PolicyMode, ReasoningMode, StopReason,
 };
 use crate::context::builder::build_agent_system_context;
 use crate::context::manager::ConversationContextManager;
@@ -64,6 +64,7 @@ pub struct CreateSessionArgs {
     pub stop_reason: Option<StopReason>,
     pub title: Option<String>,
     pub context_messages: Option<Vec<Value>>,
+    pub context_usage: Option<ContextUsageSnapshot>,
     pub pending_model_id: Option<String>,
     pub reasoning_mode: Option<ReasoningMode>,
     pub pending_reasoning_mode: Option<ReasoningMode>,
@@ -179,7 +180,10 @@ impl SessionAgentFactory {
             .get(&args.model_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Unknown model_id: {}", args.model_id))?;
-        let parts = self.create_main_parts(args.context_messages).await?;
+        let mut parts = self.create_main_parts(args.context_messages).await?;
+        if let Some(usage) = args.context_usage {
+            parts.context_manager.sync_token_usage(usage.used);
+        }
         let session = Session {
             session_id: args.session_id.clone(),
             cwd: args.cwd.clone(),

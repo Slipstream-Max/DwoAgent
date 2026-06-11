@@ -385,6 +385,8 @@ impl AcpClient {
         let binary = find_agent_binary();
         let mut child = Command::new(&binary)
             .args(["acp", "--agent-folder", agent_folder.to_str().unwrap()])
+            .env("NO_PROXY", "127.0.0.1,localhost,::1")
+            .env("no_proxy", "127.0.0.1,localhost,::1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -525,6 +527,11 @@ fn config_current_value<'a>(result: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
+fn usage_update(notification: &Value) -> Option<&Value> {
+    let update = notification.pointer("/params/update")?;
+    (update.get("sessionUpdate").and_then(Value::as_str) == Some("usage_update")).then_some(update)
+}
+
 fn read_utf8_bom_text(path: impl AsRef<Path>) -> String {
     const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
     let bytes = std::fs::read(path.as_ref()).unwrap();
@@ -587,6 +594,8 @@ fn test_stdio_eof_exits_process() {
     let binary = find_agent_binary();
     let mut child = Command::new(&binary)
         .args(["acp", "--agent-folder", folder.to_str().unwrap()])
+        .env("NO_PROXY", "127.0.0.1,localhost,::1")
+        .env("no_proxy", "127.0.0.1,localhost,::1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -730,6 +739,72 @@ fn test_prompt_returns_end_turn() {
             == Some("agent_message_chunk")
     });
     assert!(has_msg, "Expected agent_message_chunk, got: {notifs:?}");
+}
+
+#[test]
+fn test_prompt_emits_usage_update() {
+    let mock = MockLlmServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = create_mock_agent_folder(tmp.path(), mock.port);
+    let mut c = AcpClient::spawn(&folder);
+    c.send_request("initialize", json!({"protocolVersion": 1}));
+    let s = c.send_request("session/new", json!({"cwd": ".", "mcpServers": []}));
+    let sid = s["sessionId"].as_str().unwrap();
+    c.clear_notifications();
+
+    c.send_request(
+        "session/prompt",
+        json!({"sessionId": sid, "prompt": [{"type": "text", "text": "Hi"}]}),
+    );
+
+    let notifs = c.drain_notifications();
+    let usage = notifs
+        .iter()
+        .filter_map(usage_update)
+        .last()
+        .expect("Expected usage_update notification");
+    assert_eq!(usage["used"], 15);
+    assert!(
+        usage["size"].as_u64().unwrap() >= 15,
+        "usage size should expose the context window, got: {usage}"
+    );
+}
+
+#[test]
+fn test_load_session_emits_persisted_usage_update() {
+    let mock = MockLlmServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = create_mock_agent_folder(tmp.path(), mock.port);
+    let sid = {
+        let mut c = AcpClient::spawn(&folder);
+        c.send_request("initialize", json!({"protocolVersion": 1}));
+        let s = c.send_request("session/new", json!({"cwd": ".", "mcpServers": []}));
+        let sid = s["sessionId"].as_str().unwrap().to_string();
+        c.send_request(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type": "text", "text": "Hi"}]}),
+        );
+        sid
+    };
+
+    let mut c = AcpClient::spawn(&folder);
+    c.send_request("initialize", json!({"protocolVersion": 1}));
+    c.send_request(
+        "session/load",
+        json!({"cwd": ".", "sessionId": sid, "mcpServers": []}),
+    );
+
+    let notifs = c.drain_notifications();
+    let usage = notifs
+        .iter()
+        .filter_map(usage_update)
+        .last()
+        .expect("Expected persisted usage_update notification on load");
+    assert_eq!(usage["used"], 15);
+    assert!(
+        usage["size"].as_u64().unwrap() >= 15,
+        "usage size should expose the context window, got: {usage}"
+    );
 }
 
 #[test]

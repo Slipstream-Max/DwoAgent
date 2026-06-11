@@ -17,8 +17,8 @@ use crate::config::loader::{
     resolve_channel_session_dir, resolve_session_store_dir,
 };
 use crate::config::models::{
-    AgentMeta, AgentState, AgentTools, ModelProfile, PolicyMode, ReasoningMode, SessionMetaPayload,
-    SessionModelContextPayload, StopReason,
+    AgentMeta, AgentState, AgentTools, ContextUsageSnapshot, ModelProfile, PolicyMode,
+    ReasoningMode, SessionMetaPayload, SessionModelContextPayload, StopReason,
 };
 use crate::tools::{
     subagent_tool_runtime::{PermissionRequester, UpdateEmitter},
@@ -335,6 +335,7 @@ impl AgentService {
             session_id,
             title,
             context_messages,
+            context_usage,
             max_running_turn,
             runtime_tools,
             state,
@@ -379,6 +380,7 @@ impl AgentService {
             stop_reason,
             title,
             context_messages,
+            context_usage,
             pending_model_id,
             reasoning_mode,
             pending_reasoning_mode,
@@ -470,6 +472,7 @@ impl AgentService {
             session_id: Some(meta.session_id.clone()),
             title: meta.title,
             context_messages: Some(context_payload.messages),
+            context_usage: context_payload.usage,
             max_running_turn: meta.max_running_turn,
             runtime_tools: meta.runtime_tools,
             tool_schemas: meta.tool_schemas,
@@ -577,6 +580,7 @@ struct CreateAgentArgs {
     session_dir: Option<PathBuf>,
     title: Option<String>,
     context_messages: Option<Vec<Value>>,
+    context_usage: Option<ContextUsageSnapshot>,
     max_running_turn: Option<u32>,
     runtime_tools: AgentTools,
     tool_schemas: Vec<Value>,
@@ -597,6 +601,7 @@ impl Default for CreateAgentArgs {
             session_dir: None,
             title: None,
             context_messages: None,
+            context_usage: None,
             max_running_turn: None,
             runtime_tools: AgentTools::default(),
             tool_schemas: Vec::new(),

@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 
 use super::compact::compact_context;
 use super::content_block::{image_placeholder, is_image_part, normalize_user_content};
+use crate::config::models::ContextUsageSnapshot;
 use crate::llm::client::{BaseLlmClient, LlmRequestOptions};
 
 /// Builder that rebuilds the stable system-message prefix when compaction
@@ -104,6 +105,17 @@ impl ConversationContextManager {
 
     pub fn sync_token_usage(&mut self, total_tokens: u64) {
         self.current_tokens = u32::try_from(total_tokens).unwrap_or(u32::MAX);
+    }
+
+    pub fn usage_snapshot(&self) -> ContextUsageSnapshot {
+        ContextUsageSnapshot {
+            used: u64::from(self.current_tokens),
+            size: u64::from(self.context_window_tokens),
+        }
+    }
+
+    pub fn is_over_context_window(&self) -> bool {
+        self.current_tokens >= self.context_window_tokens
     }
 
     pub fn should_compact(&self) -> bool {

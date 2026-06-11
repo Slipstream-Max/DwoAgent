@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod channel_events;
 pub mod config;
 pub mod feishu;
 pub mod runtime;

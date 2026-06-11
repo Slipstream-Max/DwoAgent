@@ -134,6 +134,7 @@ weixin:
   markdown_filter: true
   media_input: true
   media_output: true
+  response_detail: response_only
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
 
@@ -152,6 +153,7 @@ feishu:
   media_input: true
   media_output: true
   card_output: true
+  response_detail: response_only
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
 ```
@@ -173,6 +175,7 @@ Weixin 字段：
 - `markdown_filter`：是否让 Weixin SDK 应用 markdown filtering。默认 `true`。
 - `media_input`：是否下载入站非文本媒体，并作为附件传给 agent。默认 `false`。
 - `media_output`：是否向 Weixin channel session 的模型暴露 `weixin_reply_media(path)`。默认 `false`。
+- `response_detail`：回复细节级别。`response_only` 只发送最终回复；`detailed` 会在最终回复前发送完整 thinking 和截断后的 tool call 参数摘要。默认 `response_only`。
 - `override_model`：可选模型别名，只在 Weixin channel session 首次创建时使用。
 - `override_reasoning_mode`：可选 reasoning mode，只在 Weixin channel session 首次创建时使用。
 
@@ -218,6 +221,7 @@ Feishu 字段：
 - `media_input`：是否下载入站图片和文件，并作为附件传给 agent。默认 `false`。
 - `media_output`：是否向 Feishu channel session 的模型暴露 `feishu_reply_media(path)`，用于上传并回复图片或文件。默认 `false`。
 - `card_output`：是否向 Feishu channel session 的模型暴露 `feishu_reply_card(card)`，用于发送飞书交互卡片。默认 `false`。
+- `response_detail`：回复细节级别。`response_only` 只发送最终回复；`detailed` 会在最终回复前发送完整 thinking 和截断后的 tool call 参数摘要。默认 `response_only`。
 - `override_model`：可选模型别名，只在对应 Feishu channel session 首次创建时使用。
 - `override_reasoning_mode`：可选 reasoning mode，只在对应 Feishu channel session 首次创建时使用。
 

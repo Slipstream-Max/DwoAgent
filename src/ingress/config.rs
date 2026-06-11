@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::channel_events::ChannelResponseDetail;
 use crate::config::models::ReasoningMode;
 use crate::utils::files::read_utf8_text;
 
@@ -38,6 +39,8 @@ pub struct WeixinChannelConfig {
     #[serde(default)]
     pub media_output: bool,
     #[serde(default)]
+    pub response_detail: ChannelResponseDetail,
+    #[serde(default)]
     pub override_model: Option<String>,
     #[serde(default)]
     pub override_reasoning_mode: Option<ReasoningMode>,
@@ -51,6 +54,7 @@ impl Default for WeixinChannelConfig {
             markdown_filter: true,
             media_input: false,
             media_output: false,
+            response_detail: ChannelResponseDetail::default(),
             override_model: None,
             override_reasoning_mode: None,
         }
@@ -110,6 +114,8 @@ pub struct FeishuChannelConfig {
     #[serde(default)]
     pub card_output: bool,
     #[serde(default)]
+    pub response_detail: ChannelResponseDetail,
+    #[serde(default)]
     pub override_model: Option<String>,
     #[serde(default)]
     pub override_reasoning_mode: Option<ReasoningMode>,
@@ -129,6 +135,7 @@ impl Default for FeishuChannelConfig {
             media_input: false,
             media_output: false,
             card_output: false,
+            response_detail: ChannelResponseDetail::default(),
             override_model: None,
             override_reasoning_mode: None,
         }
@@ -211,6 +218,7 @@ mod tests {
 weixin:
   enabled: true
   media_output: true
+  response_detail: detailed
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
 "#,
@@ -219,6 +227,10 @@ weixin:
 
         assert!(config.weixin.enabled);
         assert!(config.weixin.media_output);
+        assert_eq!(
+            config.weixin.response_detail,
+            ChannelResponseDetail::Detailed
+        );
         assert_eq!(
             config.weixin.override_model.as_deref(),
             Some("deepseek-v4-pro")
@@ -245,6 +257,7 @@ feishu:
   media_input: true
   media_output: true
   card_output: true
+  response_detail: detailed
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
 "#,
@@ -261,6 +274,10 @@ feishu:
         assert!(config.feishu.media_input);
         assert!(config.feishu.media_output);
         assert!(config.feishu.card_output);
+        assert_eq!(
+            config.feishu.response_detail,
+            ChannelResponseDetail::Detailed
+        );
         assert_eq!(
             config.feishu.override_model.as_deref(),
             Some("deepseek-v4-pro")

@@ -232,6 +232,10 @@ async fn maybe_compact_with_activity(runtime: &mut TurnRuntime<'_>) -> Result<()
             activity_box
                 .complete_if_started("Context compacted.")
                 .await?;
+            runtime
+                .activity
+                .usage_update(runtime.context_manager.usage_snapshot())
+                .await?;
         }
         CompactionOutcome::Skipped => {
             activity_box
@@ -301,6 +305,10 @@ async fn request_assistant_message_stream(
 
     let total_tokens = response.total_tokens;
     runtime.context_manager.sync_token_usage(total_tokens);
+    runtime
+        .activity
+        .usage_update(runtime.context_manager.usage_snapshot())
+        .await?;
     let assistant_message = response.message.clone();
     runtime
         .context_manager

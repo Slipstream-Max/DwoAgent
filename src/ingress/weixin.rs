@@ -16,14 +16,14 @@ use weixin_agent::{
     WeixinClient, WeixinConfig,
 };
 
+use super::channel_events::{ChannelResponseDetail, ChannelUpdateCollector};
 use super::config::WeixinChannelConfig;
-use crate::agent::activity::event::{EVENT_AGENT_MESSAGE_CHUNK, update_type};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::agent::session_agent::SessionAgent;
 use crate::config::loader::resolve_agent_structure_dir;
 use crate::context::content_block;
-use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
+use crate::tools::subagent_tool_runtime::PermissionRequester;
 use crate::tools::{
     WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor, weixin_tool_schemas,
 };
@@ -62,6 +62,7 @@ struct WeixinHandler {
     context_tokens_path: PathBuf,
     media_input: bool,
     media_output: bool,
+    response_detail: ChannelResponseDetail,
     client: Arc<OnceLock<Arc<WeixinClient>>>,
     message_lock: Arc<Mutex<()>>,
 }
@@ -189,6 +190,7 @@ impl WeixinChannel {
             context_tokens_path: context_tokens_path.clone(),
             media_input: config.media_input,
             media_output: config.media_output,
+            response_detail: config.response_detail,
             client: client_ref.clone(),
             message_lock: Arc::new(Mutex::new(())),
         };
@@ -291,8 +293,8 @@ impl WeixinHandler {
                 .await;
         }
 
-        let response_text = Arc::new(Mutex::new(String::new()));
-        let emit_update = response_collector(response_text.clone());
+        let update_collector = ChannelUpdateCollector::new(self.response_detail);
+        let emit_update = update_collector.emitter();
         let request_permission = rejecting_permission_requester();
         let run_result = agent
             .clone()
@@ -304,9 +306,12 @@ impl WeixinHandler {
         }
         run_result?;
 
-        let text = response_text.lock().await.trim().to_string();
-        if !text.is_empty() {
-            ctx.reply_text(&text).await?;
+        let collected = update_collector.finish().await;
+        if let Some(detail) = collected.detail_text.as_deref() {
+            ctx.reply_text(detail).await?;
+        }
+        if !collected.response_text.is_empty() {
+            ctx.reply_text(&collected.response_text).await?;
         }
         if let Some(client) = self.client.get() {
             export_context_tokens(client, Some(&self.context_tokens_path))?;
@@ -368,23 +373,6 @@ impl WeixinToolBridge for WeixinReplyMediaBridge {
             message_id: result.message_id,
         })
     }
-}
-
-fn response_collector(buffer: Arc<Mutex<String>>) -> UpdateEmitter {
-    Arc::new(move |_target: String, update: Map<String, Value>| {
-        let buffer = buffer.clone();
-        Box::pin(async move {
-            if update_type(&update) == EVENT_AGENT_MESSAGE_CHUNK
-                && let Some(text) = update
-                    .get("content")
-                    .and_then(|content| content.get("text"))
-                    .and_then(Value::as_str)
-            {
-                buffer.lock().await.push_str(text);
-            }
-            Ok(())
-        })
-    })
 }
 
 fn rejecting_permission_requester() -> PermissionRequester {

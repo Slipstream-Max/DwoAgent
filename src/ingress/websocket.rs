@@ -375,7 +375,7 @@ mod tests {
 agent_id: websocket-test
 name: websocket-test
 description: websocket auth test
-policy_mode: allow_all
+policy_mode: full_access
 ",
         )
         .unwrap();

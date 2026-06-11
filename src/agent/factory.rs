@@ -15,6 +15,7 @@ use crate::config::models::{
     AgentState, AgentTools, ContextUsageSnapshot, ModelCapabilities, ModelConfig, ModelProfile,
     PolicyMode, ReasoningMode, StopReason,
 };
+use crate::config::policy::ToolPolicyConfig;
 use crate::context::builder::build_agent_system_context;
 use crate::context::manager::ConversationContextManager;
 use crate::llm::client::{BaseLlmClient, create_model_client};
@@ -45,6 +46,7 @@ pub struct SessionAgentFactory {
     model_capabilities: ModelCapabilities,
     default_reasoning_mode: String,
     runtime_tools: AgentTools,
+    tool_policy: Arc<ToolPolicyConfig>,
     external_skills_dirs: Vec<PathBuf>,
     external_rule_files: Vec<PathBuf>,
 }
@@ -82,6 +84,7 @@ impl SessionAgentFactory {
         model_capabilities: ModelCapabilities,
         default_reasoning_mode: impl Into<String>,
         runtime_tools: AgentTools,
+        tool_policy: Arc<ToolPolicyConfig>,
         external_skills_dirs: Vec<PathBuf>,
         external_rule_files: Vec<PathBuf>,
     ) -> Self {
@@ -101,6 +104,7 @@ impl SessionAgentFactory {
             model_capabilities,
             default_reasoning_mode: default_reasoning_mode.into(),
             runtime_tools,
+            tool_policy,
             external_skills_dirs,
             external_rule_files,
         }
@@ -211,6 +215,7 @@ impl SessionAgentFactory {
             args.model_profiles,
             args.runtime_factory_builder,
             parts.watcher_runtime,
+            self.tool_policy.clone(),
         );
 
         self.attach_subagent_runtime(&agent).await?;
@@ -236,6 +241,7 @@ impl SessionAgentFactory {
             max_running_turn,
             self.clone_shape(),
             self.runtime_tools,
+            self.tool_policy.clone(),
         );
         agent
             .tool_manager()
@@ -258,6 +264,7 @@ impl SessionAgentFactory {
             model_capabilities: self.model_capabilities,
             default_reasoning_mode: self.default_reasoning_mode.clone(),
             runtime_tools: self.runtime_tools,
+            tool_policy: self.tool_policy.clone(),
             external_skills_dirs: self.external_skills_dirs.clone(),
             external_rule_files: self.external_rule_files.clone(),
         }

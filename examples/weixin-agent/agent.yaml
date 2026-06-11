@@ -1,7 +1,7 @@
 agent_id: weixin-agent
 name: weixin-agent
 description: Weixin single-user assistant example
-policy_mode: allow_all
+policy_mode: full_access
 session_store_dir: sessions
 channel_session_dir: channel_sessions
 external_skills_dirs: []

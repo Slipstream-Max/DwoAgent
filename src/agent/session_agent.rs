@@ -18,6 +18,7 @@ use crate::config::models::{
     AgentState, ContextUsageSnapshot, ModelProfile, PolicyMode, ReasoningMode, SessionMetaPayload,
     StopReason,
 };
+use crate::config::policy::ToolPolicyConfig;
 use crate::context::manager::{
     CancelEvent, CompactionOutcome, ConversationContextManager, SystemMessagesBuilder,
 };
@@ -42,6 +43,7 @@ pub struct SessionAgent {
     cancel_event: CancelEvent,
     tool_manager_cached: Arc<ToolRunManager>,
     tool_schemas_cached: Arc<Vec<Value>>,
+    tool_policy: Arc<ToolPolicyConfig>,
     watcher_runtime: Option<Arc<WatcherRuntime>>,
     prompt_lock: Mutex<()>,
 }
@@ -61,6 +63,7 @@ impl SessionAgent {
         model_profiles: HashMap<String, ModelProfile>,
         runtime_factory_builder: RuntimeFactoryBuilder,
         watcher_runtime: Option<Arc<WatcherRuntime>>,
+        tool_policy: Arc<ToolPolicyConfig>,
     ) -> Arc<Self> {
         let session_id_cached = session.session_id.clone();
         let cwd_cached = session.cwd.clone();
@@ -92,6 +95,7 @@ impl SessionAgent {
             cancel_event: CancelEvent::new(),
             tool_manager_cached: tool_manager.clone(),
             tool_schemas_cached,
+            tool_policy,
             watcher_runtime,
             prompt_lock: Mutex::new(()),
         })
@@ -265,6 +269,7 @@ impl SessionAgent {
                 reasoning_mode: reasoning_for_turn,
                 model_client: &rt_parts.model_client,
                 tool_schemas: request_tool_schemas,
+                tool_policy: self.tool_policy.clone(),
                 tool_manager: &tool_manager_ref,
                 context_manager: &mut rt_parts.context_manager,
                 rebuild_system_messages: rebuild_builder,

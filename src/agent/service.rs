@@ -13,13 +13,14 @@ use super::factory::{CreateSessionArgs, RuntimeFactoryBuilder, SessionAgentFacto
 use super::session::{SESSION_META_FILE, SESSION_MODEL_CONTEXT_FILE};
 use super::session_agent::SessionAgent;
 use crate::config::loader::{
-    read_agent_meta, read_json_model, read_model_registry, resolve_agent_structure_dir,
-    resolve_channel_session_dir, resolve_session_store_dir,
+    read_agent_meta, read_json_model, read_model_registry, read_tool_policy,
+    resolve_agent_structure_dir, resolve_channel_session_dir, resolve_session_store_dir,
 };
 use crate::config::models::{
     AgentMeta, AgentState, AgentTools, ContextUsageSnapshot, ModelProfile, PolicyMode,
     ReasoningMode, SessionMetaPayload, SessionModelContextPayload, StopReason,
 };
+use crate::config::policy::ToolPolicyConfig;
 use crate::tools::{
     subagent_tool_runtime::{PermissionRequester, UpdateEmitter},
     tool_schemas,
@@ -32,6 +33,7 @@ pub struct AgentService {
     agent_meta: AgentMeta,
     default_model_id: String,
     model_profiles: HashMap<String, ModelProfile>,
+    tool_policy: Arc<ToolPolicyConfig>,
     session_store_dir: PathBuf,
     channel_session_dir: PathBuf,
     agents: Mutex<HashMap<String, Arc<SessionAgent>>>,
@@ -41,6 +43,7 @@ impl AgentService {
     pub fn new(agent_folder: &Path) -> Result<Self> {
         let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
         let agent_meta = read_agent_meta(&agent_structure_dir.join("agent.yaml"))?;
+        let tool_policy = Arc::new(read_tool_policy(&agent_structure_dir)?);
         let (default_model_id, model_profiles) =
             read_model_registry(&agent_structure_dir.join("model.yaml"))?;
 
@@ -62,6 +65,7 @@ impl AgentService {
             agent_meta,
             default_model_id,
             model_profiles,
+            tool_policy,
             session_store_dir,
             channel_session_dir,
             agents: Mutex::new(HashMap::new()),
@@ -405,6 +409,7 @@ impl AgentService {
             profile.capabilities,
             profile.default_reasoning_mode.as_str(),
             runtime_tools,
+            self.tool_policy.clone(),
             resolve_config_paths(
                 &self.agent_meta.external_skills_dirs,
                 &self.agent_structure_dir,
@@ -421,6 +426,7 @@ impl AgentService {
             agent_structure_dir: self.agent_structure_dir.clone(),
             agent_id: self.agent_meta.agent_id.clone(),
             runtime_tools,
+            tool_policy: self.tool_policy.clone(),
             external_skills_dirs: resolve_config_paths(
                 &self.agent_meta.external_skills_dirs,
                 &self.agent_structure_dir,
@@ -530,6 +536,7 @@ struct AgentServiceShape {
     agent_structure_dir: PathBuf,
     agent_id: String,
     runtime_tools: AgentTools,
+    tool_policy: Arc<ToolPolicyConfig>,
     external_skills_dirs: Vec<PathBuf>,
     external_rule_files: Vec<PathBuf>,
 }
@@ -550,6 +557,7 @@ impl AgentServiceShape {
             profile.capabilities,
             profile.default_reasoning_mode.as_str(),
             self.runtime_tools,
+            self.tool_policy.clone(),
             self.external_skills_dirs.clone(),
             self.external_rule_files.clone(),
         ))

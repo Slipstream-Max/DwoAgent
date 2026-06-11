@@ -21,6 +21,7 @@ use super::factory::SessionAgentFactory;
 use super::policy::clamp_subagent_policy;
 use super::turn::{PolicyModeGetter, TurnRuntime, run_turn};
 use crate::config::models::{AgentState, AgentTools, ToolSwitch};
+use crate::config::policy::ToolPolicyConfig;
 use crate::context::manager::{CancelEvent, ConversationContextManager};
 use crate::llm::client::BaseLlmClient;
 use crate::tools::session::{Cap, ToolArgs, ToolSession};
@@ -164,6 +165,7 @@ pub struct SubagentExecutor {
     max_running_turn: Option<u32>,
     runtime_factory_shape: SessionAgentFactory,
     subagent_tools: Vec<Value>,
+    tool_policy: Arc<ToolPolicyConfig>,
 }
 
 impl SubagentExecutor {
@@ -173,6 +175,7 @@ impl SubagentExecutor {
         max_running_turn: Option<u32>,
         runtime_factory_shape: SessionAgentFactory,
         tools: AgentTools,
+        tool_policy: Arc<ToolPolicyConfig>,
     ) -> Self {
         Self {
             parent_session_id,
@@ -180,6 +183,7 @@ impl SubagentExecutor {
             max_running_turn,
             runtime_factory_shape,
             subagent_tools: subagent_tool_schemas(&tools),
+            tool_policy,
         }
     }
 }
@@ -207,6 +211,7 @@ impl SubagentExecutorTrait for SubagentExecutor {
             context.cancel_event.clone(),
             context.emit_update.clone(),
             context.request_permission.clone(),
+            self.tool_policy.clone(),
             self.subagent_tools.clone(),
             parts.model_client,
             parts.tool_manager,
@@ -227,6 +232,7 @@ pub struct SubagentSession {
     cancel_event: CancelEvent,
     emit_parent_update: UpdateEmitter,
     parent_request_permission: PermissionRequester,
+    tool_policy: Arc<ToolPolicyConfig>,
     confirm_lock: Arc<Mutex<()>>,
     inner: Arc<SubagentInner>,
 }
@@ -259,6 +265,7 @@ impl SubagentSession {
         cancel_event: CancelEvent,
         emit_parent_update: UpdateEmitter,
         parent_request_permission: PermissionRequester,
+        tool_policy: Arc<ToolPolicyConfig>,
         tool_schemas: Vec<Value>,
         model_client: BaseLlmClient,
         tool_manager: Arc<ToolRunManager>,
@@ -274,6 +281,7 @@ impl SubagentSession {
             cancel_event,
             emit_parent_update,
             parent_request_permission,
+            tool_policy,
             // Per-subagent confirm lock: serialises permission prompts
             // inside this subagent only, so unrelated subagents (and the
             // main agent) never block on each other's permission UI.
@@ -323,6 +331,7 @@ impl SubagentSession {
         let parent_session_id = self.parent_session_id.clone();
         let emit_parent = self.emit_parent_update.clone();
         let parent_perm = self.parent_request_permission.clone();
+        let tool_policy = self.tool_policy.clone();
         let confirm_lock = self.confirm_lock.clone();
         let parent_cancel = self.cancel_event.clone();
         let max_running_turn = self.max_running_turn;
@@ -340,6 +349,7 @@ impl SubagentSession {
                 cancel_token,
                 emit_parent,
                 parent_perm,
+                tool_policy,
                 confirm_lock,
             )
             .await;
@@ -733,6 +743,7 @@ async fn run_subagent_turn(
     own_cancel: CancelEvent,
     emit_parent: UpdateEmitter,
     parent_request_permission: PermissionRequester,
+    tool_policy: Arc<ToolPolicyConfig>,
     confirm_lock: Arc<Mutex<()>>,
 ) -> Result<String> {
     // Build the recording emit/permission wrappers that update the card.
@@ -902,6 +913,7 @@ async fn run_subagent_turn(
         reasoning_mode,
         model_client,
         tool_schemas: inner.tool_schemas.clone(),
+        tool_policy,
         tool_manager: &inner.tool_manager,
         context_manager,
         rebuild_system_messages: None,

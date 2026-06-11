@@ -14,7 +14,7 @@
           "policy": {
             "type": "string",
             "description": "Requested tool policy for this subagent.",
-            "enum": ["allow_all", "confirm", "block_all"]
+            "enum": ["full_access", "confirm", "watch"]
           }
         },
         "required": ["task"],

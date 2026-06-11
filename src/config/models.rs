@@ -73,11 +73,50 @@ macro_rules! str_enum {
     };
 }
 
-str_enum! {
-    pub enum PolicyMode {
-        AllowAll => "allow_all",
-        BlockAll => "block_all",
-        Confirm => "confirm",
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyMode {
+    FullAccess,
+    Confirm,
+    Watch,
+}
+
+impl PolicyMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FullAccess => "full_access",
+            Self::Confirm => "confirm",
+            Self::Watch => "watch",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Result<Self> {
+        match parse_policy_mode(value)?.as_str() {
+            "full_access" => Ok(Self::FullAccess),
+            "confirm" => Ok(Self::Confirm),
+            "watch" => Ok(Self::Watch),
+            other => bail!("invalid PolicyMode: {other}"),
+        }
+    }
+
+    pub const ALL: &'static [Self] = &[Self::FullAccess, Self::Confirm, Self::Watch];
+}
+
+impl fmt::Display for PolicyMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for PolicyMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = <String as Deserialize>::deserialize(d)?;
+        Self::from_str(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -510,6 +549,27 @@ mod tests {
         assert!(!meta.runtime_tools.file_edit_enabled());
         assert!(meta.runtime_tools.terminal_enabled());
         assert!(!meta.runtime_tools.subagent_enabled());
+    }
+
+    #[test]
+    fn agent_meta_accepts_legacy_policy_mode_aliases() {
+        let meta = deserialize_agent_meta(serde_json::json!({
+            "agent_id": "test-agent",
+            "name": "Test Agent",
+            "description": "test",
+            "policy_mode": "allow_all"
+        }))
+        .unwrap();
+        assert_eq!(meta.policy_mode, PolicyMode::FullAccess);
+
+        let meta = deserialize_agent_meta(serde_json::json!({
+            "agent_id": "test-agent",
+            "name": "Test Agent",
+            "description": "test",
+            "policy_mode": "block_all"
+        }))
+        .unwrap();
+        assert_eq!(meta.policy_mode, PolicyMode::Watch);
     }
 
     #[test]

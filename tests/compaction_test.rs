@@ -149,7 +149,7 @@ agent_id: test-agent
 name: Compaction Test Agent
 description: Test
 max_running_turn: 5
-policy_mode: allow_all
+policy_mode: full_access
 session_store_dir: .sessions
 ",
     )

@@ -48,7 +48,7 @@ fn websocket_initialize_and_new_session_use_acp_jsonrpc() {
         )
         .await;
         assert!(session["sessionId"].as_str().is_some());
-        assert_eq!(session["modes"]["currentModeId"], "allow_all");
+        assert_eq!(session["modes"]["currentModeId"], "full_access");
     });
 }
 
@@ -167,7 +167,7 @@ agent_id: websocket-test-agent
 name: WebSocket Test Agent
 description: Test agent for websocket ACP ingress
 max_running_turn: 5
-policy_mode: allow_all
+policy_mode: full_access
 session_store_dir: sessions
 channel_session_dir: channel_sessions
 ",

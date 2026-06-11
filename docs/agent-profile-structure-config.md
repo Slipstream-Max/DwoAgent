@@ -10,6 +10,7 @@
 <agent-folder>/
   agent.yaml
   model.yaml
+  policy.yaml                  # 可选
   channels.yaml                # 可选
   resources/
     agents/
@@ -27,6 +28,7 @@
   agent-structure/
     agent.yaml
     model.yaml
+    policy.yaml                # 可选
     channels.yaml              # 可选
     resources/
       agents/
@@ -77,7 +79,7 @@ tools:
 - `agent_id`：必填 id，同时用于选择 `resources/agents/` 下的文件。
 - `name`：必填显示名称。
 - `description`：必填简短描述。
-- `policy_mode`：必填权限策略。允许值：`allow_all`、`block_all`、`confirm`。
+- `policy_mode`：必填权限策略。允许值：`full_access`、`confirm`、`watch`。旧值 `allow_all` 会兼容为 `full_access`，`block_all` 会兼容为 `watch`。
 - `session_store_dir`：可选，普通 agent session 存储根目录。默认 `sessions`。相对路径按 agent structure 目录解析。
 - `channel_session_dir`：可选，channel session 存储根目录。默认 `channel_sessions`。相对路径按 agent structure 目录解析。
 - `max_running_turn`：可选正整数。省略时，agent loop 会一直运行，直到模型停止、会话取消或发生错误。
@@ -91,6 +93,40 @@ tools:
 - 修改 `agent.yaml` 会影响新会话；已有会话继续使用持久化的运行时工具快照，除非代码显式迁移它们。
 - `session_store_dir` 只影响 ACP/普通 session 的创建、加载和列表；`channel_session_dir` 只影响 channel 自己维护的持久化 session。
 - 运行时可以通过 session API 修改 policy mode；这是会话状态变更，不是重新读取 `agent.yaml`。
+
+## policy.yaml
+
+`policy.yaml` 是可选文件，用于配置 terminal 命令的黑白名单。它不决定当前 mode；默认 mode 仍由 `agent.yaml` 的 `policy_mode` 决定。
+
+```yaml
+terminal:
+  deny:
+    - regex: '(?i)^\s*git\s+reset\s+--hard\b'
+    - regex: '(?i)\bRemove-Item\b.*\b-Recurse\b'
+  allow:
+    - exact: git status
+    - prefix: git diff
+    - prefix: rg
+    - prefix: cargo check
+  watch_allow:
+    - exact: git status
+    - prefix: git diff
+    - prefix: git show
+    - prefix: git log
+    - prefix: rg
+    - prefix: Get-Content
+    - prefix: Select-String
+    - prefix: Get-ChildItem
+```
+
+规则语义：
+
+- `full_access`：`terminal_exec.command` 命中 `deny` 就拒绝，否则执行。
+- `confirm`：`terminal_exec.command` 命中 `deny` 就拒绝；命中 `allow` 且是单条简单命令时直接执行；其他进入确认流程。
+- `watch`：`terminal_exec.command` 只有命中 `watch_allow` 且是单条简单命令时执行；其他拒绝。
+- `allow` 和 `watch_allow` 不会放行多命令、管道、重定向、命令替换或带 `env` 覆盖的 command；这些在 `confirm` 下会进入确认，在 `watch` 下会拒绝。
+- `file_edit` 不读取 `policy.yaml`：`full_access` 直接执行，`confirm` 一律确认，`watch` 一律拒绝。
+- subagent 固定继承父 session 的 mode，上限不能高于父 session；subagent 内部的 terminal/file tool call 继续使用同一份 `policy.yaml`。
 
 ## model.yaml
 

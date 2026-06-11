@@ -9,10 +9,10 @@ use serde_json::{Map, Value, json};
 
 use super::activity::ActivityTurnHandle;
 use super::constants::{
-    MODE_CONFIRM, PERMISSION_CANCELLED, STOP_CANCELLED, STOP_COMPLETED, STOP_MAX_TURNS,
-    cancelled_tool_output,
+    PERMISSION_CANCELLED, STOP_CANCELLED, STOP_COMPLETED, STOP_MAX_TURNS, cancelled_tool_output,
 };
-use super::policy::resolve_tool_permission;
+use super::policy::{ToolPolicyAction, resolve_permission_decision, resolve_tool_policy};
+use crate::config::policy::ToolPolicyConfig;
 use crate::context::manager::{
     CancelEvent, CompactionOutcome, ConversationContextManager, SystemMessagesBuilder,
 };
@@ -65,6 +65,7 @@ pub struct TurnRuntime<'a> {
     pub reasoning_mode: String,
     pub model_client: &'a BaseLlmClient,
     pub tool_schemas: Arc<Vec<Value>>,
+    pub tool_policy: Arc<ToolPolicyConfig>,
     pub tool_manager: &'a ToolRunManager,
     pub context_manager: &'a mut ConversationContextManager,
     pub rebuild_system_messages: Option<SystemMessagesBuilder>,
@@ -392,12 +393,13 @@ async fn process_tool_calls(
 
         current_mode = (runtime.get_policy_mode)().await;
 
-        let (allowed, next_mode) = check_tool_permission(
+        let (allowed, next_mode, reason) = check_tool_permission(
             &runtime.activity,
             &tool_call_id,
             &tool_name,
             &tool_args,
             &current_mode,
+            runtime.tool_policy.as_ref(),
         )
         .await?;
         current_mode = next_mode;
@@ -406,7 +408,7 @@ async fn process_tool_calls(
             let blocked_output = json!({
                 "status": "blocked_by_policy",
                 "mode": current_mode,
-                "message": "Tool call blocked by session mode policy.",
+                "message": reason.unwrap_or_else(|| "Tool call blocked by session mode policy.".to_string()),
             });
             indexed_outputs[index] = Some(blocked_output.clone());
             runtime
@@ -483,24 +485,25 @@ async fn check_tool_permission(
     tool_name: &str,
     tool_args: &Map<String, Value>,
     mode_id: &str,
-) -> Result<(bool, String)> {
-    if mode_id != MODE_CONFIRM {
-        let outcome = resolve_tool_permission(mode_id, None)?;
-        return Ok((outcome.allowed, outcome.next_mode));
+    policy: &ToolPolicyConfig,
+) -> Result<(bool, String, Option<String>)> {
+    match resolve_tool_policy(mode_id, tool_name, tool_args, policy)? {
+        ToolPolicyAction::Allow => return Ok((true, mode_id.to_string(), None)),
+        ToolPolicyAction::Reject(reason) => {
+            return Ok((false, mode_id.to_string(), Some(reason)));
+        }
+        ToolPolicyAction::Confirm => {}
     }
 
     let decision = activity
         .request_tool_permission(tool_call_id, tool_name, tool_args)
         .await?;
 
-    let outcome = resolve_tool_permission(mode_id, Some(&decision))?;
+    let outcome = resolve_permission_decision(&decision)?;
     if decision == PERMISSION_CANCELLED {
         raise_if_cancelled(activity.cancel_event())?;
     }
-    if outcome.mode_changed {
-        activity.current_mode_update(&outcome.next_mode).await?;
-    }
-    Ok((outcome.allowed, outcome.next_mode))
+    Ok((outcome.allowed, mode_id.to_string(), None))
 }
 
 fn raise_if_cancelled(cancel_event: &CancelEvent) -> Result<()> {

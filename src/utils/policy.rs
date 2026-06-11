@@ -3,19 +3,35 @@
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-const MODE_ALLOW_ALL: &str = "allow_all";
-const MODE_BLOCK_ALL: &str = "block_all";
+const MODE_FULL_ACCESS: &str = "full_access";
+const MODE_ALLOW_ALL_ALIAS: &str = "allow_all";
 const MODE_CONFIRM: &str = "confirm";
+const MODE_WATCH: &str = "watch";
+const MODE_BLOCK_ALL_ALIAS: &str = "block_all";
 
 pub fn parse_policy_mode(value: &str) -> Result<String> {
     let mode = value.trim();
     if mode.is_empty() {
         bail!("policy_mode cannot be empty");
     }
-    if !matches!(mode, MODE_ALLOW_ALL | MODE_BLOCK_ALL | MODE_CONFIRM) {
-        bail!("policy_mode must use one internal name: allow_all, block_all, confirm");
+    let normalized = match mode {
+        MODE_FULL_ACCESS | MODE_ALLOW_ALL_ALIAS => MODE_FULL_ACCESS,
+        MODE_CONFIRM => MODE_CONFIRM,
+        MODE_WATCH | MODE_BLOCK_ALL_ALIAS => MODE_WATCH,
+        _ => {
+            bail!("policy_mode must use one internal name: full_access, confirm, watch");
+        }
+    };
+    Ok(normalized.to_string())
+}
+
+pub fn policy_mode_rank(mode: &str) -> Result<u8> {
+    match parse_policy_mode(mode)?.as_str() {
+        MODE_WATCH => Ok(0),
+        MODE_CONFIRM => Ok(1),
+        MODE_FULL_ACCESS => Ok(2),
+        other => bail!("invalid policy mode: {other}"),
     }
-    Ok(mode.to_string())
 }
 
 pub fn cancelled_tool_output() -> Value {

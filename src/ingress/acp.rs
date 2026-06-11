@@ -36,7 +36,7 @@ use crate::agent::activity::event::{
     EVENT_TOOL_CALL, EVENT_TOOL_CALL_UPDATE, EVENT_USAGE_UPDATE, EVENT_USER_MESSAGE_CHUNK,
 };
 use crate::agent::constants::{
-    MODE_ALLOW_ALL, MODE_BLOCK_ALL, MODE_CONFIRM, STOP_CANCELLED, STOP_COMPLETED, STOP_MAX_TURNS,
+    MODE_CONFIRM, MODE_FULL_ACCESS, MODE_WATCH, STOP_CANCELLED, STOP_COMPLETED, STOP_MAX_TURNS,
 };
 use crate::agent::service::AgentService;
 use crate::agent::session::SESSION_CLIENT_TRANSCRIPT_FILE;
@@ -561,12 +561,17 @@ fn build_mode_state(current_mode_id: &str) -> SessionModeState {
     SessionModeState::new(
         current_mode_id.to_string(),
         vec![
-            SessionMode::new(MODE_ALLOW_ALL, "Allow All")
-                .description("Allow all tool calls without confirmation.".to_string()),
-            SessionMode::new(MODE_BLOCK_ALL, "Block All")
-                .description("Block all tool calls.".to_string()),
-            SessionMode::new(MODE_CONFIRM, "Confirm")
-                .description("Ask for permission before each tool call.".to_string()),
+            SessionMode::new(MODE_FULL_ACCESS, "Full Access").description(
+                "Allow tool calls, except terminal commands denied by policy.".to_string(),
+            ),
+            SessionMode::new(MODE_CONFIRM, "Confirm").description(
+                "Ask for permission unless terminal policy allows or denies the command."
+                    .to_string(),
+            ),
+            SessionMode::new(MODE_WATCH, "Watch").description(
+                "Allow only watch-mode terminal commands and read-only tool inspection."
+                    .to_string(),
+            ),
         ],
     )
 }
@@ -585,12 +590,17 @@ fn build_config_options(
         "Policy",
         current_mode_id.to_string(),
         vec![
-            SessionConfigSelectOption::new(MODE_CONFIRM, "Confirm")
-                .description("Ask for permission before each tool call.".to_string()),
-            SessionConfigSelectOption::new(MODE_ALLOW_ALL, "Allow All")
-                .description("Allow all tool calls without confirmation.".to_string()),
-            SessionConfigSelectOption::new(MODE_BLOCK_ALL, "Block All")
-                .description("Block all tool calls.".to_string()),
+            SessionConfigSelectOption::new(MODE_FULL_ACCESS, "Full Access").description(
+                "Allow tool calls, except terminal commands denied by policy.".to_string(),
+            ),
+            SessionConfigSelectOption::new(MODE_CONFIRM, "Confirm").description(
+                "Ask for permission unless terminal policy allows or denies the command."
+                    .to_string(),
+            ),
+            SessionConfigSelectOption::new(MODE_WATCH, "Watch").description(
+                "Allow only watch-mode terminal commands and read-only tool inspection."
+                    .to_string(),
+            ),
         ],
     )
     .description("Choose how tool calls are handled.".to_string())

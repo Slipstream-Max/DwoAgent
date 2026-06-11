@@ -323,7 +323,7 @@ agent_id: test-agent
 name: Test Agent
 description: Test agent for protocol conformance
 max_running_turn: 5
-policy_mode: allow_all
+policy_mode: full_access
 session_store_dir: .sessions
 ",
     )
@@ -631,16 +631,16 @@ fn test_new_session_returns_config_and_modes() {
 
     let r = c.send_request("session/new", json!({"cwd": ".", "mcpServers": []}));
     assert!(r["sessionId"].as_str().unwrap().len() > 0);
-    assert_eq!(r["modes"]["currentModeId"], "allow_all");
+    assert_eq!(r["modes"]["currentModeId"], "full_access");
     let mode_ids: Vec<&str> = r["modes"]["availableModes"]
         .as_array()
         .unwrap()
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert!(mode_ids.contains(&"allow_all"));
+    assert!(mode_ids.contains(&"full_access"));
     assert!(mode_ids.contains(&"confirm"));
-    assert!(mode_ids.contains(&"block_all"));
+    assert!(mode_ids.contains(&"watch"));
 
     let opts = r["configOptions"].as_array().unwrap();
     let ids: Vec<&str> = opts.iter().map(|o| o["id"].as_str().unwrap()).collect();
@@ -1069,11 +1069,11 @@ fn test_policy_mode_change_applies_to_next_tool_call_in_running_turn() {
 
     let allow_result = c.send_request(
         "session/set_config_option",
-        json!({"sessionId": sid, "configId": "policy_mode", "value": "allow_all"}),
+        json!({"sessionId": sid, "configId": "policy_mode", "value": "full_access"}),
     );
     assert_eq!(
         config_current_value(&allow_result, "policy_mode"),
-        "allow_all"
+        "full_access"
     );
 
     let prompt_resp = c
@@ -1112,16 +1112,13 @@ fn test_live_config_changes_return_immediately_and_apply_to_preempting_prompt() 
 
     let policy_id = c.send_request_no_wait(
         "session/set_config_option",
-        json!({"sessionId": sid, "configId": "policy_mode", "value": "block_all"}),
+        json!({"sessionId": sid, "configId": "policy_mode", "value": "watch"}),
     );
     let policy_resp = c
         .wait_response(policy_id, Duration::from_secs(2))
         .expect("policy change should respond while prompt is running");
     let policy_result = policy_resp.get("result").cloned().unwrap_or(Value::Null);
-    assert_eq!(
-        config_current_value(&policy_result, "policy_mode"),
-        "block_all"
-    );
+    assert_eq!(config_current_value(&policy_result, "policy_mode"), "watch");
 
     let model_id = c.send_request_no_wait(
         "session/set_config_option",
@@ -1316,7 +1313,7 @@ fn test_set_config_option_policy() {
 
     let r = c.send_request(
         "session/set_config_option",
-        json!({"sessionId": sid, "configId": "policy_mode", "value": "block_all"}),
+        json!({"sessionId": sid, "configId": "policy_mode", "value": "watch"}),
     );
     let policy = r["configOptions"]
         .as_array()
@@ -1324,7 +1321,7 @@ fn test_set_config_option_policy() {
         .iter()
         .find(|o| o["id"] == "policy_mode")
         .unwrap();
-    assert_eq!(policy["currentValue"], "block_all");
+    assert_eq!(policy["currentValue"], "watch");
 }
 
 #[test]

@@ -106,7 +106,7 @@ feishu:
 ## Notes
 
 - Agent profile 文件夹结构、`agent.yaml` / `model.yaml`、`channels.yaml`、
-  rules 和 skills 见
+  `policy.yaml`、rules 和 skills 见
   [docs/agent-profile-structure-config.md](docs/agent-profile-structure-config.md)。
 - `acp` 通过 stdio 运行 ACP，client 关闭 stdin 后进程退出。`serve`
   用于 websocket、Feishu、Weixin 等长生命周期 ingress channels。

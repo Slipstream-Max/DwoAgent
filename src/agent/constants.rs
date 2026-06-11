@@ -10,9 +10,9 @@ pub const STOP_COMPLETED: &str = "completed";
 pub const STOP_CANCELLED: &str = "cancelled";
 pub const STOP_MAX_TURNS: &str = "max_turns";
 
-pub const MODE_ALLOW_ALL: &str = "allow_all";
-pub const MODE_BLOCK_ALL: &str = "block_all";
+pub const MODE_FULL_ACCESS: &str = "full_access";
 pub const MODE_CONFIRM: &str = "confirm";
+pub const MODE_WATCH: &str = "watch";
 
 pub const PERMISSION_ALLOW_ONCE: &str = "allow_once";
 pub const PERMISSION_REJECT_ONCE: &str = "reject_once";

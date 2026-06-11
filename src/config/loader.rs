@@ -11,6 +11,7 @@ use super::models::{
     AgentMeta, ModelConfig, ModelProfile, ModelRegistry, deserialize_agent_meta,
     deserialize_model_registry,
 };
+use super::policy::ToolPolicyConfig;
 use crate::llm::provider::load_default_catalog;
 use crate::utils::files::{read_json_utf8, read_yaml_dict};
 
@@ -77,6 +78,16 @@ pub fn read_agent_meta(agent_yaml_path: &Path) -> Result<AgentMeta> {
     let payload = Value::Object(read_yaml_dict(agent_yaml_path)?);
     deserialize_agent_meta(payload)
         .with_context(|| format!("Invalid YAML config in {}", agent_yaml_path.display()))
+}
+
+/// Read optional `policy.yaml` from an agent structure directory.
+pub fn read_tool_policy(agent_structure_dir: &Path) -> Result<ToolPolicyConfig> {
+    let path = agent_structure_dir.join("policy.yaml");
+    if !path.is_file() {
+        return Ok(ToolPolicyConfig::default());
+    }
+    ToolPolicyConfig::from_value(Value::Object(read_yaml_dict(&path)?))
+        .with_context(|| format!("Invalid YAML config in {}", path.display()))
 }
 
 /// Read and merge `model.yaml` with the built-in provider catalog, returning

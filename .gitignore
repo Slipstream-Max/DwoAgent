@@ -4,3 +4,7 @@ Cargo.lock
 **/.simpleagent/sessions/
 .dwoagent/sessions/
 **/.dwoagent/sessions/
+channel_secret/
+**/channel_secret/
+channel_sessions/
+**/channel_sessions/

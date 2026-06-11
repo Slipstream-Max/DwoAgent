@@ -11,6 +11,11 @@ pub mod compact {
 }
 
 pub mod channel {
+    pub mod feishu {
+        pub const MEDIA_TOOL_SCHEMA: &str = include_str!("channel/feishu/media_tool_schema.json");
+        pub const CARD_TOOL_SCHEMA: &str = include_str!("channel/feishu/card_tool_schema.json");
+    }
+
     pub mod weixin {
         pub const TOOL_SCHEMA: &str = include_str!("channel/weixin/tool_schema.json");
     }

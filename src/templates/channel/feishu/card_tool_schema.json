@@ -1,0 +1,20 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "feishu_reply_card",
+      "description": "Reply to the current Feishu conversation with a Feishu interactive message card JSON object.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "card": {
+            "type": "object",
+            "description": "Feishu interactive card JSON object. The tool sends it as an interactive message; do not stringify it."
+          }
+        },
+        "required": ["card"]
+      }
+    }
+  }
+]

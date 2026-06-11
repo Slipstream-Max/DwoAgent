@@ -233,7 +233,7 @@ pub struct SubagentSession {
 
 struct SubagentInner {
     model_client: Mutex<Option<BaseLlmClient>>,
-    tool_schemas: Vec<Value>,
+    tool_schemas: Arc<Vec<Value>>,
     tool_manager: Arc<ToolRunManager>,
     context_manager: Mutex<Option<ConversationContextManager>>,
     status: Mutex<String>,
@@ -280,7 +280,7 @@ impl SubagentSession {
             confirm_lock: Arc::new(Mutex::new(())),
             inner: Arc::new(SubagentInner {
                 model_client: Mutex::new(Some(model_client)),
-                tool_schemas,
+                tool_schemas: Arc::new(tool_schemas),
                 tool_manager,
                 context_manager: Mutex::new(Some(context_manager)),
                 status: Mutex::new("created".to_string()),

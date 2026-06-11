@@ -16,7 +16,17 @@ path = "src/lib.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "process",
+    "signal",
+    "io-std",
+    "io-util",
+] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -27,30 +37,27 @@ serde_yaml = "0.9"
 
 # LLM / Agent ecosystem
 agent-client-protocol = "0.11"
-tiktoken-rs = "0.7"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
+    "multipart",
     "stream",
     "rustls-tls",
 ] }
 eventsource-stream = "0.2"
 weixin-agent = "0.2"
+clawrs-feishu = { git = "https://github.com/AgenticWeb4/ZClaw-Channel-Feishu.git", rev = "5aa32ff" }
 
 # CLI / Logging / Errors
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
 tokio-util = { version = "0.7", features = ["compat"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 regex = "1"
-once_cell = "1"
-bytes = "1"
-dirs = "5"
 base64 = "0.22"
 
 [target.'cfg(unix)'.dependencies]
@@ -58,4 +65,3 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-pretty_assertions = "1"

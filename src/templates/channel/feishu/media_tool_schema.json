@@ -1,0 +1,29 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "feishu_reply_media",
+      "description": "Reply to the current Feishu conversation with a local image or file. The path must be inside the configured workspace or the Feishu channel session directory.",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative or absolute path to the file to send."
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["auto", "image", "file"],
+            "description": "How to send the local file. auto sends common image files as Feishu image messages and everything else as file messages."
+          },
+          "file_type": {
+            "type": "string",
+            "description": "Optional Feishu file_type override for file uploads, such as pdf, doc, xls, ppt, mp4, opus, or stream."
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  }
+]

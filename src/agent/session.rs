@@ -48,8 +48,6 @@ pub struct Session {
     pub reasoning_mode: ReasoningMode,
     #[serde(default)]
     pub pending_reasoning_mode: Option<ReasoningMode>,
-    #[serde(default)]
-    pub transcript_events: Vec<Value>,
 }
 
 fn default_mode() -> PolicyMode {
@@ -72,6 +70,25 @@ impl Session {
         self.pending_model_id =
             normalize_optional_str(self.pending_model_id.as_deref(), "pending_model_id")?;
         Ok(())
+    }
+
+    pub fn to_meta_payload(&self) -> SessionMetaPayload {
+        SessionMetaPayload {
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            title: self.title.clone(),
+            model_id: self.model_id.clone(),
+            mode_id: self.mode_id,
+            state: self.state,
+            stop_reason: self.stop_reason,
+            updated_at: self.updated_at.clone(),
+            max_running_turn: self.max_running_turn,
+            runtime_tools: self.runtime_tools,
+            tool_schemas: self.tool_schemas.clone(),
+            pending_model_id: self.pending_model_id.clone(),
+            reasoning_mode: self.reasoning_mode,
+            pending_reasoning_mode: self.pending_reasoning_mode,
+        }
     }
 }
 
@@ -117,22 +134,7 @@ impl SessionPersistence {
         std::fs::create_dir_all(&self.session_dir)
             .with_context(|| format!("create session dir {}", self.session_dir.display()))?;
 
-        let meta_payload = SessionMetaPayload {
-            session_id: session.session_id.clone(),
-            cwd: session.cwd.clone(),
-            title: session.title.clone(),
-            model_id: session.model_id.clone(),
-            mode_id: session.mode_id,
-            state: session.state,
-            stop_reason: session.stop_reason,
-            updated_at: session.updated_at.clone(),
-            max_running_turn: session.max_running_turn,
-            runtime_tools: session.runtime_tools,
-            tool_schemas: session.tool_schemas.clone(),
-            pending_model_id: session.pending_model_id.clone(),
-            reasoning_mode: session.reasoning_mode,
-            pending_reasoning_mode: session.pending_reasoning_mode,
-        };
+        let meta_payload = session.to_meta_payload();
 
         write_json_utf8(
             &self.session_dir.join(SESSION_META_FILE),

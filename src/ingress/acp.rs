@@ -1,7 +1,9 @@
 //! ACP adapter for the agent runtime.
 
 use std::collections::HashMap;
-use std::io;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -22,7 +24,7 @@ use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification,
     on_receive_request,
 };
-use anyhow::Result;
+use anyhow::{Context as AnyhowContext, Result};
 use futures::io::AsyncRead;
 use serde_json::{Map, Value};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -36,7 +38,8 @@ use crate::agent::constants::{
     MODE_ALLOW_ALL, MODE_BLOCK_ALL, MODE_CONFIRM, STOP_CANCELLED, STOP_COMPLETED, STOP_MAX_TURNS,
 };
 use crate::agent::service::AgentService;
-use crate::config::models::ModelProfile;
+use crate::agent::session::SESSION_CLIENT_TRANSCRIPT_FILE;
+use crate::config::models::{ModelProfile, SessionTranscriptEvent};
 use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 
@@ -93,7 +96,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                 let cwd = req.cwd.to_string_lossy().to_string();
                 match agent_for_new.new_session(&cwd).await {
                     Ok(session) => {
-                        let snapshot = session.session_snapshot().await;
+                        let snapshot = session.session_meta_snapshot().await;
                         let profiles = agent_for_new.model_profiles();
                         let sid = SessionId::new(session.session_id());
                         let response = NewSessionResponse::new(sid)
@@ -170,7 +173,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                         if result.is_ok()
                             && let Some(session) = agent.get_session(&session_id).await
                         {
-                            let snapshot = session.session_snapshot().await;
+                            let snapshot = session.session_meta_snapshot().await;
                             let profiles = agent.model_profiles();
                             emit_mode_and_config_state(
                                 &cx_for_finish,
@@ -239,11 +242,19 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                 let session_id = req.session_id.to_string();
                 match agent_for_load.load_session(&session_id).await {
                     Ok(Some(session)) => {
-                        let snapshot = session.session_snapshot().await;
+                        let snapshot = session.session_meta_snapshot().await;
                         let profiles = agent_for_load.model_profiles();
 
                         // Replay transcript events.
-                        replay_transcript_events(&cx, &session_id, &snapshot.transcript_events);
+                        let transcript_path =
+                            session.session_dir().join(SESSION_CLIENT_TRANSCRIPT_FILE);
+                        if let Err(err) = replay_transcript_file(&cx, &session_id, &transcript_path)
+                        {
+                            return responder.respond_with_error(
+                                agent_client_protocol::schema::Error::internal_error()
+                                    .data(format!("{err:#}")),
+                            );
+                        }
 
                         // Emit session info if title is set.
                         if let Some(title) = &snapshot.title {
@@ -288,7 +299,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                 let mode_id = req.mode_id.to_string();
                 match agent_for_mode.set_session_mode(&session_id, &mode_id).await {
                     Ok(Some(session)) => {
-                        let snapshot = session.session_snapshot().await;
+                        let snapshot = session.session_meta_snapshot().await;
                         let profiles = agent_for_mode.model_profiles();
 
                         // Emit mode update notification.
@@ -341,7 +352,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                     "policy_mode" => {
                         match agent_for_config.set_session_mode(&session_id, &value).await {
                             Ok(Some(session)) => {
-                                let snapshot = session.session_snapshot().await;
+                                let snapshot = session.session_meta_snapshot().await;
                                 // Emit mode update.
                                 let mode_notif = SessionNotification::new(
                                     SessionId::new(session_id.as_str()),
@@ -362,7 +373,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                             .await
                         {
                             Ok(_) => match agent_for_config.get_session(&session_id).await {
-                                Some(session) => Ok(session.session_snapshot().await),
+                                Some(session) => Ok(session.session_meta_snapshot().await),
                                 None => Err(anyhow::anyhow!("session not found")),
                             },
                             Err(e) => Err(e),
@@ -374,7 +385,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                             .await
                         {
                             Ok(_) => match agent_for_config.get_session(&session_id).await {
-                                Some(session) => Ok(session.session_snapshot().await),
+                                Some(session) => Ok(session.session_meta_snapshot().await),
                                 None => Err(anyhow::anyhow!("session not found")),
                             },
                             Err(e) => Err(e),
@@ -666,18 +677,25 @@ async fn request_permission_from_client(
 
 // ── Transcript replay ──────────────────────────────────────────────────────
 
-fn replay_transcript_events(
-    cx: &ConnectionTo<Client>,
-    session_id: &str,
-    transcript_events: &[Value],
-) {
-    for item in transcript_events {
-        let update = match item.get("update").and_then(Value::as_object) {
-            Some(obj) => obj,
-            None => continue,
-        };
-        emit_session_update(cx, session_id, update);
+fn replay_transcript_file(cx: &ConnectionTo<Client>, session_id: &str, path: &Path) -> Result<()> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let event: SessionTranscriptEvent = serde_json::from_str(text)
+            .with_context(|| format!("parse transcript event in {}", path.display()))?;
+        emit_session_update(cx, session_id, &event.update);
     }
+    Ok(())
 }
 
 // ── Prompt normalization ───────────────────────────────────────────────────

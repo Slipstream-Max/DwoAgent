@@ -64,7 +64,7 @@ pub struct TurnRuntime<'a> {
     pub activity: ActivityTurnHandle,
     pub reasoning_mode: String,
     pub model_client: &'a BaseLlmClient,
-    pub tool_schemas: Vec<Value>,
+    pub tool_schemas: Arc<Vec<Value>>,
     pub tool_manager: &'a ToolRunManager,
     pub context_manager: &'a mut ConversationContextManager,
     pub rebuild_system_messages: Option<SystemMessagesBuilder>,
@@ -267,7 +267,7 @@ async fn request_assistant_message_stream(
     let response_result = runtime
         .model_client
         .request_stream_with_usage(
-            &messages_for_model,
+            messages_for_model.as_ref(),
             None,
             request_tools,
             Some(probes.on_text_chunk),

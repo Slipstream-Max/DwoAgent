@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
@@ -11,7 +11,8 @@ use super::errors::SkillError;
 use super::models::SkillProperties;
 use crate::utils::files::read_utf8_text;
 
-static KEBAB_CASE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").unwrap());
+static KEBAB_CASE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").unwrap());
 
 /// Return the SKILL.md path inside a skill directory.
 pub fn find_skill_md(skill_dir: &Path) -> Result<PathBuf, SkillError> {

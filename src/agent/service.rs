@@ -10,9 +10,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::factory::{CreateSessionArgs, RuntimeFactoryBuilder, SessionAgentFactory};
-use super::session::{
-    SESSION_CLIENT_TRANSCRIPT_FILE, SESSION_META_FILE, SESSION_MODEL_CONTEXT_FILE,
-};
+use super::session::{SESSION_META_FILE, SESSION_MODEL_CONTEXT_FILE};
 use super::session_agent::SessionAgent;
 use crate::config::loader::{
     read_agent_meta, read_json_model, read_model_registry, resolve_agent_structure_dir,
@@ -20,7 +18,7 @@ use crate::config::loader::{
 };
 use crate::config::models::{
     AgentMeta, AgentState, AgentTools, ModelProfile, PolicyMode, ReasoningMode, SessionMetaPayload,
-    SessionModelContextPayload, SessionTranscriptEvent, StopReason,
+    SessionModelContextPayload, StopReason,
 };
 use crate::tools::{
     subagent_tool_runtime::{PermissionRequester, UpdateEmitter},
@@ -272,26 +270,8 @@ impl AgentService {
             {
                 continue;
             }
-            let session = agent.session_snapshot().await;
-            merged.insert(
-                session.session_id.clone(),
-                SessionMetaPayload {
-                    session_id: session.session_id,
-                    cwd: session.cwd,
-                    title: session.title,
-                    model_id: session.model_id,
-                    mode_id: session.mode_id,
-                    state: session.state,
-                    stop_reason: session.stop_reason,
-                    updated_at: session.updated_at,
-                    max_running_turn: session.max_running_turn,
-                    runtime_tools: session.runtime_tools,
-                    tool_schemas: session.tool_schemas,
-                    pending_model_id: session.pending_model_id,
-                    reasoning_mode: session.reasoning_mode,
-                    pending_reasoning_mode: session.pending_reasoning_mode,
-                },
-            );
+            let meta = agent.session_meta_snapshot().await;
+            merged.insert(meta.session_id.clone(), meta);
         }
 
         let mut result: Vec<SessionMetaPayload> = merged.into_values().collect();
@@ -355,7 +335,6 @@ impl AgentService {
             session_id,
             title,
             context_messages,
-            transcript_events,
             max_running_turn,
             runtime_tools,
             state,
@@ -400,7 +379,6 @@ impl AgentService {
             stop_reason,
             title,
             context_messages,
-            transcript_events,
             pending_model_id,
             reasoning_mode,
             pending_reasoning_mode,
@@ -463,14 +441,12 @@ impl AgentService {
     ) -> Result<Option<Arc<SessionAgent>>> {
         let meta_path = session_dir.join(SESSION_META_FILE);
         let context_path = session_dir.join(SESSION_MODEL_CONTEXT_FILE);
-        let transcript_path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
-        if !meta_path.exists() || !context_path.exists() || !transcript_path.exists() {
+        if !meta_path.exists() || !context_path.exists() {
             return Ok(None);
         }
 
         let meta: SessionMetaPayload = read_json_model(&meta_path)?;
         let context_payload: SessionModelContextPayload = read_json_model(&context_path)?;
-        let transcript_events = read_transcript_jsonl(&transcript_path)?;
 
         if !self.model_profiles.contains_key(&meta.model_id) {
             bail!("Unknown model_id in persisted session: {}", meta.model_id);
@@ -494,7 +470,6 @@ impl AgentService {
             session_id: Some(meta.session_id.clone()),
             title: meta.title,
             context_messages: Some(context_payload.messages),
-            transcript_events,
             max_running_turn: meta.max_running_turn,
             runtime_tools: meta.runtime_tools,
             tool_schemas: meta.tool_schemas,
@@ -602,7 +577,6 @@ struct CreateAgentArgs {
     session_dir: Option<PathBuf>,
     title: Option<String>,
     context_messages: Option<Vec<Value>>,
-    transcript_events: Vec<Value>,
     max_running_turn: Option<u32>,
     runtime_tools: AgentTools,
     tool_schemas: Vec<Value>,
@@ -623,7 +597,6 @@ impl Default for CreateAgentArgs {
             session_dir: None,
             title: None,
             context_messages: None,
-            transcript_events: Vec::new(),
             max_running_turn: None,
             runtime_tools: AgentTools::default(),
             tool_schemas: Vec::new(),
@@ -634,22 +607,6 @@ impl Default for CreateAgentArgs {
             pending_reasoning_mode: None,
         }
     }
-}
-
-fn read_transcript_jsonl(path: &Path) -> Result<Vec<Value>> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut events: Vec<Value> = Vec::new();
-    for line in raw.lines() {
-        let text = line.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let loaded: Value = serde_json::from_str(text)
-            .with_context(|| format!("parse JSONL line in {}", path.display()))?;
-        let event = deserialize_transcript_event(loaded)?;
-        events.push(event);
-    }
-    Ok(events)
 }
 
 #[cfg(test)]
@@ -776,10 +733,4 @@ models:
                 .is_some_and(|path| path.ends_with("agent-sessions"))
         );
     }
-}
-
-fn deserialize_transcript_event(value: Value) -> Result<Value> {
-    let event: SessionTranscriptEvent =
-        serde_json::from_value(value).context("validate SessionTranscriptEvent")?;
-    serde_json::to_value(&event).context("serialize SessionTranscriptEvent")
 }

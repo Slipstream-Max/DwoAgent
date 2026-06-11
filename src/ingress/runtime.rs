@@ -2,10 +2,13 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, bail};
+use tokio::task::JoinHandle;
 
 use super::config::{ChannelRuntimeConfig, load_channel_runtime_config};
+use super::feishu::FeishuChannel;
 use super::weixin::WeixinChannel;
 use crate::agent::service::AgentService;
 
@@ -47,6 +50,10 @@ impl ChannelRuntime {
     }
 
     async fn run_inner(&self) -> Result<()> {
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<Result<()>>(4);
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        let mut weixin_clients = Vec::new();
+
         if self.config.weixin.enabled {
             let weixin = WeixinChannel::new(
                 self.agent.clone(),
@@ -55,18 +62,57 @@ impl ChannelRuntime {
             )
             .await?;
             let client = weixin.client();
-            let mut task = tokio::spawn(async move { weixin.run().await });
-            tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    signal?;
+            weixin_clients.push(client);
+            let tx = result_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = tx.send(weixin.run().await).await;
+            }));
+        }
+
+        if self.config.feishu.enabled {
+            let feishu = FeishuChannel::new(
+                self.agent.clone(),
+                self.agent.agent_structure_dir(),
+                &self.config.feishu,
+            )
+            .await?;
+            let tx = result_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = tx.send(feishu.run().await).await;
+            }));
+        }
+
+        drop(result_tx);
+
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                for client in weixin_clients {
                     client.shutdown();
-                    task.await?
                 }
-                result = &mut task => result?,
+                let shutdown_wait = tokio::time::sleep(Duration::from_secs(5));
+                tokio::pin!(shutdown_wait);
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_wait => break,
+                        result = result_rx.recv() => {
+                            if result.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                for task in tasks {
+                    task.abort();
+                }
+                Ok(())
             }
-        } else {
-            tokio::signal::ctrl_c().await?;
-            Ok(())
+            result = result_rx.recv() => {
+                for task in tasks {
+                    task.abort();
+                }
+                result.unwrap_or_else(|| Ok(()))
+            }
         }
     }
 
@@ -82,9 +128,6 @@ impl ChannelRuntime {
         let mut enabled_optional: Vec<&str> = Vec::new();
         if self.config.websocket.enabled {
             enabled_optional.push("websocket");
-        }
-        if self.config.feishu.enabled {
-            enabled_optional.push("feishu");
         }
 
         if !enabled_optional.is_empty() {

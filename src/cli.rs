@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::host::{HostMode, run_host_sync};
-use crate::ingress::run_weixin_login_sync;
+use crate::ingress::{run_feishu_login_sync, run_weixin_login_sync};
 
 #[derive(Debug, Parser)]
 #[command(name = "dwo-agent", about = "Dwo Agent (赤铎) CLI")]
@@ -39,6 +39,9 @@ enum ChannelCommand {
 enum ChannelLoginCommand {
     /// Log in to Weixin by scanning a QR code.
     Weixin(AgentFolderArgs),
+
+    /// Save Feishu app credentials for the channel.
+    Feishu(FeishuLoginArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -46,6 +49,21 @@ struct AgentFolderArgs {
     /// Agent folder or workspace root containing `agent-structure/`.
     #[arg(long, default_value = ".")]
     agent_folder: PathBuf,
+}
+
+#[derive(Debug, clap::Args)]
+struct FeishuLoginArgs {
+    /// Agent folder or workspace root containing `agent-structure/`.
+    #[arg(long, default_value = ".")]
+    agent_folder: PathBuf,
+
+    /// Feishu app id. Falls back to FEISHU_APP_ID.
+    #[arg(long)]
+    app_id: Option<String>,
+
+    /// Feishu app secret. Falls back to FEISHU_APP_SECRET.
+    #[arg(long)]
+    app_secret: Option<String>,
 }
 
 /// CLI entry point invoked by `main.rs`.
@@ -56,6 +74,9 @@ pub fn main() -> Result<()> {
         Command::Serve(args) => run_host_sync(args.agent_folder, HostMode::ServiceIngress),
         Command::Channel(ChannelCommand::Login(ChannelLoginCommand::Weixin(args))) => {
             run_weixin_login_sync(args.agent_folder)
+        }
+        Command::Channel(ChannelCommand::Login(ChannelLoginCommand::Feishu(args))) => {
+            run_feishu_login_sync(args.agent_folder, args.app_id, args.app_secret)
         }
     }
 }

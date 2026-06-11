@@ -146,16 +146,11 @@ impl SessionActivity {
     }
 
     async fn record_update(&self, update: Map<String, Value>) -> Result<()> {
-        let (Some(session), Some(persistence)) = (&self.inner.session, &self.inner.persistence)
-        else {
+        let Some(persistence) = &self.inner.persistence else {
             return Ok(());
         };
         let event = SessionTranscriptEvent::new(utc_iso(), update)?;
         let payload = serde_json::to_value(&event)?;
-        {
-            let mut session_guard = session.lock().await;
-            session_guard.transcript_events.push(payload.clone());
-        }
         persistence.append_transcript_event(&payload)?;
         Ok(())
     }

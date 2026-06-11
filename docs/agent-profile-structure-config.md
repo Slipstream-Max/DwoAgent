@@ -42,11 +42,13 @@
 cargo run -- acp --agent-folder examples/dwo-agent
 cargo run -- serve --agent-folder examples/weixin-agent
 cargo run -- channel login weixin --agent-folder examples/weixin-agent
+cargo run -- channel login feishu --agent-folder examples/weixin-agent --app-id cli_xxx --app-secret xxx
 ```
 
 - `acp`：通过 stdio 运行 ACP，并从 ACP `session/new` 创建会话。
 - `serve`：启动由 `channels.yaml` 配置的长生命周期 ingress channel。
 - `channel login weixin`：执行微信扫码登录，并把凭据写入当前 agent profile。
+- `channel login feishu`：保存飞书应用凭据到当前 agent profile。
 
 ## agent.yaml
 
@@ -139,16 +141,28 @@ websocket:
   enabled: false
 
 feishu:
-  enabled: false
+  enabled: true
+  workspace_dir: .
+  domain: feishu
+  dm_policy: allow_all
+  group_policy: white_list
+  allow_from: ["*"]
+  group_allow_from: []
+  group_require_mention: true
+  media_input: true
+  media_output: true
+  card_output: true
+  override_model: deepseek-v4-pro
+  override_reasoning_mode: high
 ```
 
 顶层配置：
 
 - `weixin`：微信单用户 assistant channel。
 - `websocket`：预留，目前尚未实现。
-- `feishu`：预留，目前尚未实现。
+- `feishu`：飞书/Lark assistant channel。
 
-如果 `channels.yaml` 不存在或为空，所有 channel 默认禁用。`serve` host 要求至少启用一个 channel。目前只有 Weixin 已实现；启用 `websocket` 或 `feishu` 会在启动时报错。
+如果 `channels.yaml` 不存在或为空，所有 channel 默认禁用。`serve` host 要求至少启用一个 channel。目前 `websocket` 仍未实现；启用 `websocket` 会在启动时报错。
 
 ### Weixin Channel
 
@@ -188,6 +202,76 @@ Weixin 运行时文件：
 Weixin channel 使用 `<channel_session_dir>/weixin/session/` 下的一个持久化 channel session。`channel_session_dir` 来自 `agent.yaml`，默认是 `<agent-folder>/channel_sessions`，可以改成任意绝对路径或相对路径。Channel secret 仍固定保存在当前 agent profile 的 `channel_secret/weixin/` 下。
 
 一旦该 channel session 已存在，它会保留自己的 model、reasoning mode、runtime tool schemas 和工具快照。之后修改 `override_model`、`override_reasoning_mode` 或 `media_output`，不会自动改写已有 channel session。需要新的 channel 配置快照时，应删除该 channel session 或显式迁移它。
+
+### Feishu Channel
+
+Feishu 字段：
+
+- `enabled`：默认 `false`。
+- `workspace_dir`：Feishu 会话使用的 workspace cwd。相对路径按 agent structure 目录解析。默认 `.`。
+- `domain`：`feishu` 或 `lark`。默认 `feishu`，使用 `https://open.feishu.cn`；`lark` 使用国际版 Lark。
+- `dm_policy`：私聊策略。`allow_all` 接受所有私聊；`white_list` 只接受 `allow_from` 中的 sender open id。默认 `white_list`。
+- `group_policy`：群聊策略。`allow_all` 接受所有群；`white_list` 只接受 `group_allow_from` 中的群 `chat_id`。默认 `white_list`。
+- `allow_from`：私聊 sender open id 白名单。`"*"` 表示全部允许。
+- `group_allow_from`：群聊 `chat_id` 白名单。`"*"` 表示全部允许。
+- `group_require_mention`：群聊是否必须 @机器人 才触发。默认 `true`。
+- `media_input`：是否下载入站图片和文件，并作为附件传给 agent。默认 `false`。
+- `media_output`：是否向 Feishu channel session 的模型暴露 `feishu_reply_media(path)`，用于上传并回复图片或文件。默认 `false`。
+- `card_output`：是否向 Feishu channel session 的模型暴露 `feishu_reply_card(card)`，用于发送飞书交互卡片。默认 `false`。
+- `override_model`：可选模型别名，只在对应 Feishu channel session 首次创建时使用。
+- `override_reasoning_mode`：可选 reasoning mode，只在对应 Feishu channel session 首次创建时使用。
+
+飞书凭据：
+
+```powershell
+cargo run -- channel login feishu --agent-folder examples/weixin-agent --app-id cli_xxx --app-secret xxx
+```
+
+也可以从环境变量读取：
+
+```powershell
+$env:FEISHU_APP_ID="cli_xxx"
+$env:FEISHU_APP_SECRET="xxx"
+cargo run -- channel login feishu --agent-folder examples/weixin-agent
+```
+
+登录会写入：
+
+```text
+<agent-folder>/channel_secret/feishu/auth.yaml
+```
+
+`auth.yaml` 只保存 `app_id` 和 `app_secret`，不应该提交到仓库。
+
+Feishu 运行时文件：
+
+```text
+<agent-folder>/channel_secret/feishu/auth.yaml
+<channel_session_dir>/feishu/dm/<sender>/
+<channel_session_dir>/feishu/group/<chat_id>/
+<channel_session_dir>/feishu/dm/<sender>/attachments/<message_id>/
+<channel_session_dir>/feishu/group/<chat_id>/attachments/<message_id>/
+```
+
+Feishu 私聊和群聊使用独立持久化 channel session。收到私聊消息时使用 sender open id 定位：
+
+```text
+<channel_session_dir>/feishu/dm/<sender>/
+```
+
+收到群聊消息时使用群 `chat_id` 定位：
+
+```text
+<channel_session_dir>/feishu/group/<chat_id>/
+```
+
+如果对应目录里已有 session metadata 和 context，就加载已有 session；否则创建新 session。`channel_session_dir` 来自 `agent.yaml`，默认是 `<agent-folder>/channel_sessions`，可以改成任意绝对路径或相对路径。Channel secret 仍固定保存在当前 agent profile 的 `channel_secret/feishu/` 下。
+
+开启 `media_input` 后，入站图片和文件会下载到对应 session 的 `attachments/<message_id>/` 下，并以 `resource_link` 加入上下文；图片会额外加入 data URL image block，供支持多模态的模型读取。
+
+开启 `media_output` 后，新建 Feishu channel session 会获得 `feishu_reply_media` 工具。工具会把 workspace 或当前 channel session 目录内的本地文件上传到飞书，然后回复当前私聊或群聊。`kind: auto` 会把常见图片扩展名作为图片消息发送，其他文件作为文件消息发送；也可以指定 `kind: image` 或 `kind: file`。
+
+开启 `card_output` 后，新建 Feishu channel session 会获得 `feishu_reply_card` 工具。工具接收飞书 interactive card JSON object，并发送到当前私聊或群聊。当前实现只发送新卡片，不做卡片更新、延迟更新或表单回调处理。
 
 ## Agent Prompt
 

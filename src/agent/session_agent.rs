@@ -14,7 +14,9 @@ use super::factory::RuntimeFactoryBuilder;
 use super::session::{SESSION_TITLE_LENGTH, Session, SessionPersistence};
 use super::turn::{PolicyModeGetter, TurnRuntime, run_turn};
 use crate::config::loader::utc_iso;
-use crate::config::models::{AgentState, ModelProfile, PolicyMode, ReasoningMode, StopReason};
+use crate::config::models::{
+    AgentState, ModelProfile, PolicyMode, ReasoningMode, SessionMetaPayload, StopReason,
+};
 use crate::context::manager::{CancelEvent, ConversationContextManager, SystemMessagesBuilder};
 use crate::llm::client::BaseLlmClient;
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
@@ -36,6 +38,7 @@ pub struct SessionAgent {
     runtime_factory_builder: RuntimeFactoryBuilder,
     cancel_event: CancelEvent,
     tool_manager_cached: Arc<ToolRunManager>,
+    tool_schemas_cached: Arc<Vec<Value>>,
     watcher_runtime: Option<Arc<WatcherRuntime>>,
     prompt_lock: Mutex<()>,
 }
@@ -60,6 +63,7 @@ impl SessionAgent {
         let cwd_cached = session.cwd.clone();
         let max_running_turn_cached = session.max_running_turn;
         let session_dir_cached = session.session_dir.clone();
+        let tool_schemas_cached = Arc::new(session.tool_schemas.clone());
         let persistence = Arc::new(SessionPersistence::new(session.session_dir.clone()));
         let session = Arc::new(Mutex::new(session));
         let activity = SessionActivity::new(
@@ -84,6 +88,7 @@ impl SessionAgent {
             runtime_factory_builder,
             cancel_event: CancelEvent::new(),
             tool_manager_cached: tool_manager.clone(),
+            tool_schemas_cached,
             watcher_runtime,
             prompt_lock: Mutex::new(()),
         })
@@ -97,6 +102,10 @@ impl SessionAgent {
 
     pub async fn session_snapshot(&self) -> Session {
         self.session.lock().await.clone()
+    }
+
+    pub async fn session_meta_snapshot(&self) -> SessionMetaPayload {
+        self.session.lock().await.to_meta_payload()
     }
 
     pub async fn context_manager_snapshot(&self) -> Vec<Value> {
@@ -229,10 +238,7 @@ impl SessionAgent {
         let max_running_turn = self.max_running_turn();
 
         let tool_manager_ref = self.runtime.lock().await.tool_manager.clone();
-        let request_tool_schemas = {
-            let session = self.session.lock().await;
-            session.tool_schemas.clone()
-        };
+        let request_tool_schemas = self.tool_schemas_cached.clone();
         let rebuild_builder: Option<SystemMessagesBuilder> = Some(Arc::new({
             let this = self.clone();
             move || {

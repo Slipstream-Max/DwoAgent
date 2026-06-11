@@ -71,9 +71,18 @@ mod tests {
     #[test]
     fn channel_tool_schema_templates_are_parseable() {
         let names = schema_names(tool_schemas_from_templates(&[
+            templates::channel::feishu::MEDIA_TOOL_SCHEMA,
+            templates::channel::feishu::CARD_TOOL_SCHEMA,
             templates::channel::weixin::TOOL_SCHEMA,
         ]));
 
-        assert_eq!(names, vec!["weixin_reply_media".to_string()]);
+        assert_eq!(
+            names,
+            vec![
+                "feishu_reply_media".to_string(),
+                "feishu_reply_card".to_string(),
+                "weixin_reply_media".to_string()
+            ]
+        );
     }
 }

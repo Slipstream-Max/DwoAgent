@@ -15,6 +15,10 @@ Port in progress. The Rust crate is now laid out as a standalone project.
 cargo build
 ```
 
+Feishu channel 的 WebSocket 依赖需要 `protoc`。如果构建时报
+`Could not find protoc`，请安装 protobuf compiler，或设置 `PROTOC` 指向
+`protoc` 可执行文件。
+
 ## Run
 
 ```bash
@@ -40,6 +44,38 @@ weixin:
   override_reasoning_mode: auto
 ```
 
+保存 Feishu channel 凭据：
+
+```bash
+cargo run -- channel login feishu --agent-folder examples/dwo-agent --app-id cli_xxx --app-secret xxx
+```
+
+也可以使用环境变量：
+
+```bash
+FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx \
+  cargo run -- channel login feishu --agent-folder examples/dwo-agent
+```
+
+然后在 `channels.yaml` 里启用：
+
+```yaml
+feishu:
+  enabled: true
+  workspace_dir: .
+  domain: feishu
+  dm_policy: allow_all
+  group_policy: white_list
+  allow_from: ["*"]
+  group_allow_from: []
+  group_require_mention: true
+  media_input: true
+  media_output: true
+  card_output: true
+  override_model: deepseek-v4-flash
+  override_reasoning_mode: auto
+```
+
 ## Notes
 
 - Agent profile 文件夹结构、`agent.yaml` / `model.yaml`、`channels.yaml`、
@@ -53,6 +89,11 @@ weixin:
   `agent.yaml` 的 `channel_session_dir` 覆盖。它只接受完成扫码登录的用户发来的消息。
   `override_model` 和 `override_reasoning_mode` 只在 channel session 首次创建时使用；已有 session 保留持久化的模型设置。
   `media_input` 控制是否把入站非文本消息下载成附件。`media_output` 控制 channel session 首次创建时是否加入 Weixin 媒体回复工具；已有 session 保留持久化的 channel tool schemas。
+- Feishu 使用 `channel_secret/feishu/auth.yaml` 保存 app 凭据。私聊和群聊使用独立 channel session：
+  `channel_sessions/feishu/dm/<sender>/` 与 `channel_sessions/feishu/group/<chat_id>/`。
+  `media_input` 默认关闭；开启后会把入站图片和文件下载到对应 session 的 `attachments/` 并加入上下文。
+  `media_output` 默认关闭；开启后会向模型暴露 `feishu_reply_media(path)`，用于上传并回复图片或文件。
+  `card_output` 默认关闭；开启后会向模型暴露 `feishu_reply_card(card)`，用于发送飞书交互卡片。
 - `agent.yaml` 里的 `max_running_turn` 是可选项。省略时，agent loop 会一直运行，直到模型停止、会话取消或发生错误。设置为正整数可以保留旧的 max-turn guard。
 - `agent.yaml` 的 `tools` 可以把 `file_edit`、`terminal`、`subagent` 设置为
   `enable` 或 `disable`。这些值会在 session 创建时快照；之后修改

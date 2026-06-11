@@ -1,24 +1,14 @@
 //! Context compaction.
 
-use std::collections::BTreeMap;
-
 use anyhow::{Error, Result, bail};
-use once_cell::sync::OnceCell;
-use serde_json::{Map, Value, json};
-use tiktoken_rs::{CoreBPE, o200k_base};
+use serde_json::{Value, json};
 
 use super::content_block::{image_placeholder, text as text_block};
 use super::manager::CancelEvent;
 use crate::llm::client::{BaseLlmClient, LlmRequestOptions};
 use crate::templates;
 
-const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
-
-static TOKEN_ENCODER: OnceCell<CoreBPE> = OnceCell::new();
-
-fn token_encoder() -> Result<&'static CoreBPE> {
-    TOKEN_ENCODER.get_or_try_init(|| o200k_base().map_err(Error::from))
-}
+const COMPACT_USER_MESSAGE_MAX_CHARS: usize = 80_000;
 
 fn read_template(name: &str) -> &'static str {
     match name {
@@ -62,7 +52,7 @@ pub async fn compact_context(
     let user_messages = collect_user_messages(conversation, summary_prefix)?;
     let compacted_user_messages = match build_compacted_user_messages(
         &user_messages,
-        COMPACT_USER_MESSAGE_MAX_TOKENS,
+        COMPACT_USER_MESSAGE_MAX_CHARS,
         cancel_event,
     ) {
         Ok(messages) => messages,
@@ -162,32 +152,28 @@ fn collect_user_messages(conversation: &[Value], summary_prefix: &str) -> Result
 
 fn build_compacted_user_messages(
     user_messages: &[Value],
-    user_token_budget: usize,
+    user_char_budget: usize,
     cancel_event: Option<&CancelEvent>,
 ) -> Result<Vec<Value>> {
-    let mut remaining_tokens = user_token_budget;
-    let mut token_cache: BTreeMap<String, usize> = BTreeMap::new();
+    let mut remaining_chars = user_char_budget;
     let mut selected_newest_first: Vec<Value> = Vec::new();
 
     for message_content in user_messages.iter().rev() {
-        if remaining_tokens == 0 {
+        if remaining_chars == 0 {
             break;
         }
         raise_if_cancelled(cancel_event)?;
 
-        let tokens = count_content_tokens(message_content, &mut token_cache)?;
-        if tokens <= remaining_tokens {
+        let chars = count_content_chars(message_content)?;
+        if chars <= remaining_chars {
             selected_newest_first.push(message_content.clone());
-            remaining_tokens -= tokens;
+            remaining_chars -= chars;
             continue;
         }
 
-        if let Some(truncated) = truncate_user_content_to_budget(
-            message_content,
-            remaining_tokens,
-            &mut token_cache,
-            cancel_event,
-        )? {
+        if let Some(truncated) =
+            truncate_user_content_to_budget(message_content, remaining_chars, cancel_event)?
+        {
             selected_newest_first.push(truncated);
         }
         break;
@@ -202,12 +188,11 @@ fn build_compacted_user_messages(
 
 fn truncate_user_content_to_budget(
     content: &Value,
-    token_budget: usize,
-    token_cache: &mut BTreeMap<String, usize>,
+    char_budget: usize,
     cancel_event: Option<&CancelEvent>,
 ) -> Result<Option<Value>> {
     if let Value::String(s) = content {
-        let truncated = truncate_text_to_budget(s, token_budget, token_cache, cancel_event)?;
+        let truncated = truncate_text_to_budget(s, char_budget, cancel_event)?;
         if truncated.is_empty() {
             Ok(None)
         } else {
@@ -220,12 +205,11 @@ fn truncate_user_content_to_budget(
 
 fn truncate_text_to_budget(
     text: &str,
-    token_budget: usize,
-    token_cache: &mut BTreeMap<String, usize>,
+    char_budget: usize,
     cancel_event: Option<&CancelEvent>,
 ) -> Result<String> {
     let normalized = text.trim();
-    if token_budget == 0 || normalized.is_empty() {
+    if char_budget == 0 || normalized.is_empty() {
         return Ok(String::new());
     }
 
@@ -246,8 +230,8 @@ fn truncate_text_to_budget(
             continue;
         }
 
-        let token_count = count_content_tokens(&Value::String(candidate.clone()), token_cache)?;
-        if token_count <= token_budget {
+        let char_count = candidate.chars().count();
+        if char_count <= char_budget {
             best = candidate;
             low = mid + 1;
         } else {
@@ -260,25 +244,14 @@ fn truncate_text_to_budget(
     Ok(best)
 }
 
-fn count_content_tokens(
-    content: &Value,
-    token_cache: &mut BTreeMap<String, usize>,
-) -> Result<usize> {
+fn count_content_chars(content: &Value) -> Result<usize> {
     if is_empty_user_content(content)? {
         return Ok(0);
     }
-    let cache_key = token_cache_key(content);
-    if let Some(count) = token_cache.get(&cache_key) {
-        return Ok(*count);
-    }
-    let token_text = content_to_token_text(content)?;
-    let encoder = token_encoder()?;
-    let count = encoder.encode_with_special_tokens(&token_text).len();
-    token_cache.insert(cache_key, count);
-    Ok(count)
+    Ok(content_to_budget_text(content)?.chars().count())
 }
 
-fn content_to_token_text(content: &Value) -> Result<String> {
+fn content_to_budget_text(content: &Value) -> Result<String> {
     match content {
         Value::String(s) => Ok(s.clone()),
         Value::Array(items) => {
@@ -412,34 +385,6 @@ fn is_empty_user_content(content: &Value) -> Result<bool> {
         Value::String(s) => Ok(s.trim().is_empty()),
         Value::Array(items) => Ok(items.is_empty()),
         _ => bail!("User content must be a string or list of content blocks."),
-    }
-}
-
-fn token_cache_key(content: &Value) -> String {
-    if let Value::String(s) = content {
-        return format!("text:{s}");
-    }
-    serde_json::to_string(&sorted_value(content)).unwrap_or_default()
-}
-
-/// Recursively sort object keys so `json.dumps(sort_keys=True)` and our cache
-/// key stay stable across runs.
-fn sorted_value(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut sorted: Vec<(String, Value)> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), sorted_value(v)))
-                .collect();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            let mut out = Map::new();
-            for (k, v) in sorted {
-                out.insert(k, v);
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(sorted_value).collect()),
-        other => other.clone(),
     }
 }
 

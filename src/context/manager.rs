@@ -1,5 +1,6 @@
 //! Conversation context manager.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -140,14 +141,16 @@ impl ConversationContextManager {
         }));
     }
 
-    pub fn messages_for_model(&self, vision: bool) -> Vec<Value> {
+    pub fn messages_for_model(&self, vision: bool) -> Cow<'_, [Value]> {
         if vision {
-            self.messages.clone()
+            Cow::Borrowed(&self.messages)
         } else {
-            self.messages
-                .iter()
-                .map(patch_message_for_text_model)
-                .collect()
+            Cow::Owned(
+                self.messages
+                    .iter()
+                    .map(patch_message_for_text_model)
+                    .collect(),
+            )
         }
     }
 

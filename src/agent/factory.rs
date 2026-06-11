@@ -64,7 +64,6 @@ pub struct CreateSessionArgs {
     pub stop_reason: Option<StopReason>,
     pub title: Option<String>,
     pub context_messages: Option<Vec<Value>>,
-    pub transcript_events: Vec<Value>,
     pub pending_model_id: Option<String>,
     pub reasoning_mode: Option<ReasoningMode>,
     pub pending_reasoning_mode: Option<ReasoningMode>,
@@ -199,7 +198,6 @@ impl SessionAgentFactory {
                 .reasoning_mode
                 .unwrap_or(profile.default_reasoning_mode),
             pending_reasoning_mode: args.pending_reasoning_mode,
-            transcript_events: args.transcript_events,
         };
         let agent = SessionAgent::new(
             session,

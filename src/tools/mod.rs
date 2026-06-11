@@ -1,5 +1,6 @@
 //! Tool runtimes and session management.
 
+pub mod feishu_runtime;
 pub mod file_edit_runtime;
 pub mod schema;
 pub mod session;
@@ -8,6 +9,10 @@ pub mod terminal_runtime;
 pub mod tool_run_manager;
 pub mod weixin_runtime;
 
+pub use feishu_runtime::{
+    FEISHU_REPLY_CARD_TOOL, FEISHU_REPLY_MEDIA_TOOL, FeishuReplyCardResult, FeishuReplyMediaKind,
+    FeishuReplyMediaResult, FeishuToolBridge, FeishuToolExecutor, feishu_tool_schemas,
+};
 pub use file_edit_runtime::{FileEditError, file_edit_text};
 pub use schema::{tool_schemas, tool_schemas_from_templates};
 pub use session::{Cap, ToolArgs, ToolSession};

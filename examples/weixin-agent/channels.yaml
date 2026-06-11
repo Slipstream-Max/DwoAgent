@@ -6,3 +6,8 @@ weixin:
   media_output: true
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
+
+websocket:
+  enabled: false
+  bind_addr: 127.0.0.1:8765
+  auth: true

@@ -22,6 +22,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "fs",
+    "net",
     "process",
     "signal",
     "io-std",
@@ -44,6 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 eventsource-stream = "0.2"
+tokio-tungstenite = { version = "0.23", default-features = false, features = ["handshake"] }
 weixin-agent = "0.2"
 clawrs-feishu = { git = "https://github.com/AgenticWeb4/ZClaw-Channel-Feishu.git", rev = "5aa32ff" }
 

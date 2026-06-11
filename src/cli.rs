@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::host::{HostMode, run_host_sync};
-use crate::ingress::{run_feishu_login_sync, run_weixin_login_sync};
+use crate::ingress::{run_feishu_login_sync, run_websocket_login_sync, run_weixin_login_sync};
 
 #[derive(Debug, Parser)]
 #[command(name = "dwo-agent", about = "Dwo Agent (赤铎) CLI")]
@@ -42,6 +42,9 @@ enum ChannelLoginCommand {
 
     /// Save Feishu app credentials for the channel.
     Feishu(FeishuLoginArgs),
+
+    /// Generate and persist a WebSocket bearer token.
+    Websocket(AgentFolderArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -77,6 +80,9 @@ pub fn main() -> Result<()> {
         }
         Command::Channel(ChannelCommand::Login(ChannelLoginCommand::Feishu(args))) => {
             run_feishu_login_sync(args.agent_folder, args.app_id, args.app_secret)
+        }
+        Command::Channel(ChannelCommand::Login(ChannelLoginCommand::Websocket(args))) => {
+            run_websocket_login_sync(args.agent_folder)
         }
     }
 }

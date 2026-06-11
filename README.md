@@ -25,6 +25,33 @@ Feishu channel 的 WebSocket 依赖需要 `protoc`。如果构建时报
 cargo run -- acp --agent-folder examples/dwo-agent
 ```
 
+启用 ACP WebSocket ingress：
+
+```yaml
+websocket:
+  enabled: true
+  bind_addr: 127.0.0.1:8765
+  auth: true
+```
+
+然后运行：
+
+```bash
+cargo run -- channel login websocket --agent-folder examples/dwo-agent
+```
+
+客户端连接时使用输出的 token：
+
+```http
+Authorization: Bearer dwo_ws_xxx
+```
+
+启动服务：
+
+```bash
+cargo run -- serve --agent-folder examples/dwo-agent
+```
+
 登录 Weixin channel：
 
 ```bash

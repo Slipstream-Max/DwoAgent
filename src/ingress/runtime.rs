@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use super::config::{ChannelRuntimeConfig, load_channel_runtime_config};
 use super::feishu::FeishuChannel;
+use super::websocket::WebSocketChannel;
 use super::weixin::WeixinChannel;
 use crate::agent::service::AgentService;
 
@@ -53,6 +54,18 @@ impl ChannelRuntime {
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<Result<()>>(4);
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         let mut weixin_clients = Vec::new();
+
+        if self.config.websocket.enabled {
+            let websocket = WebSocketChannel::new(
+                self.agent.clone(),
+                self.agent.agent_structure_dir(),
+                &self.config.websocket,
+            )?;
+            let tx = result_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = tx.send(websocket.run().await).await;
+            }));
+        }
 
         if self.config.weixin.enabled {
             let weixin = WeixinChannel::new(
@@ -125,17 +138,6 @@ impl ChannelRuntime {
             bail!("channels.yaml must enable at least one service ingress");
         }
 
-        let mut enabled_optional: Vec<&str> = Vec::new();
-        if self.config.websocket.enabled {
-            enabled_optional.push("websocket");
-        }
-
-        if !enabled_optional.is_empty() {
-            bail!(
-                "Service ingress channels are configured but not implemented yet: {}",
-                enabled_optional.join(", ")
-            );
-        }
         Ok(())
     }
 }

@@ -140,6 +140,8 @@ weixin:
 
 websocket:
   enabled: false
+  bind_addr: 127.0.0.1:8765
+  auth: true
 
 feishu:
   enabled: true
@@ -161,10 +163,38 @@ feishu:
 顶层配置：
 
 - `weixin`：微信单用户 assistant channel。
-- `websocket`：预留，目前尚未实现。
+- `websocket`：ACP-over-WebSocket channel，协议行为与 `acp` stdio 相同。
 - `feishu`：飞书/Lark assistant channel。
 
-如果 `channels.yaml` 不存在或为空，所有 channel 默认禁用。`serve` host 要求至少启用一个 channel。目前 `websocket` 仍未实现；启用 `websocket` 会在启动时报错。
+如果 `channels.yaml` 不存在或为空，所有 channel 默认禁用。`serve` host 要求至少启用一个 channel。
+
+### WebSocket Channel
+
+WebSocket 字段：
+
+- `enabled`：默认 `false`。
+- `bind_addr`：监听地址。默认 `127.0.0.1:8765`。也可以写成别名 `bind`。
+- `auth`：是否启用 bearer token 鉴权。默认 `true`。启用 websocket 时建议保持 `true`。
+
+WebSocket channel 复用 ACP stdio 的 request/response 和 notification 行为：client 通过 websocket 发送一条 JSON-RPC text/binary message，服务端回一条 JSON-RPC text message。每个 websocket connection 是一条独立 ACP transport connection；`initialize`、`session/new`、`session/prompt`、`session/cancel`、`session/list`、`session/load`、`session/set_mode` 和 `session/set_config_option` 的语义与 stdio ACP 保持一致。
+
+生成 WebSocket token：
+
+```powershell
+cargo run -- channel login websocket --agent-folder examples/dwo-agent
+```
+
+该命令要求 `websocket.enabled: true` 且 `websocket.auth: true`，然后写入：
+
+```text
+<agent-folder>/channel_secret/websocket/auth.yaml
+```
+
+客户端连接时在 websocket handshake 携带：
+
+```http
+Authorization: Bearer <token>
+```
 
 ### Weixin Channel
 

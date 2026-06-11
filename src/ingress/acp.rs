@@ -50,6 +50,34 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
     let stdout = tokio::io::stdout().compat_write();
     let transport = ByteStreams::new(stdout, stdin);
 
+    let agent_fut = run_acp_transport(agent, transport);
+
+    tokio::select! {
+        result = agent_fut => {
+            match result {
+                Ok(()) => Ok(()),
+                Err(err) if is_stdio_eof_error(&err) => {
+                    tracing::info!("ACP stdio input closed, shutting down");
+                    Ok(())
+                }
+                Err(err) => Err(anyhow::anyhow!("ACP connection error: {err}")),
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received SIGINT, shutting down gracefully");
+            Ok(())
+        }
+    }
+}
+
+/// Run the ACP agent over any line-delimited JSON-RPC transport.
+pub async fn run_acp_transport<T>(
+    agent: Arc<AgentService>,
+    transport: T,
+) -> std::result::Result<(), agent_client_protocol::Error>
+where
+    T: agent_client_protocol::ConnectTo<Agent> + 'static,
+{
     let agent_for_init = agent.clone();
     let agent_for_new = agent.clone();
     let agent_for_prompt = agent.clone();
@@ -59,7 +87,7 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
     let agent_for_mode = agent.clone();
     let agent_for_config = agent.clone();
 
-    let agent_fut = Agent
+    Agent
         .builder()
         .name(&agent.meta().name)
         // ── initialize ─────────────────────────────────────────────
@@ -335,10 +363,9 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                         );
                         let _ = cx.send_notification_to(Client, config_notif);
 
-                        let usage = session.context_usage_snapshot().await;
-                        emit_context_usage_state(&cx, &session_id, usage);
-
-                        responder.respond(SetSessionModeResponse::new())
+                        let result = responder.respond(SetSessionModeResponse::new());
+                        spawn_context_usage_update(&cx, session_id, session);
+                        result
                     }
                     Ok(None) => responder.respond_with_error(
                         agent_client_protocol::schema::Error::invalid_params()
@@ -423,11 +450,11 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
                             current_reasoning_mode.as_str(),
                             &profiles,
                         );
+                        let session_for_usage = agent_for_config.get_session(&session_id).await;
                         let response = SetSessionConfigOptionResponse::new(options);
                         let result = responder.respond(response);
-                        if let Some(session) = agent_for_config.get_session(&session_id).await {
-                            let usage = session.context_usage_snapshot().await;
-                            emit_context_usage_state(&cx, &session_id, usage);
+                        if let Some(session) = session_for_usage {
+                            spawn_context_usage_update(&cx, session_id, session);
                         }
                         result
                     }
@@ -439,24 +466,8 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
             },
             on_receive_request!(),
         )
-        .connect_to(transport);
-
-    tokio::select! {
-        result = agent_fut => {
-            match result {
-                Ok(()) => Ok(()),
-                Err(err) if is_stdio_eof_error(&err) => {
-                    tracing::info!("ACP stdio input closed, shutting down");
-                    Ok(())
-                }
-                Err(err) => Err(anyhow::anyhow!("ACP connection error: {err}")),
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received SIGINT, shutting down gracefully");
-            Ok(())
-        }
-    }
+        .connect_to(transport)
+        .await
 }
 
 struct EofAsError<R> {
@@ -531,6 +542,19 @@ fn emit_context_usage_state(
         SessionUpdate::UsageUpdate(UsageUpdate::new(usage.used, usage.size)),
     );
     let _ = cx.send_notification_to(Client, notif);
+}
+
+fn spawn_context_usage_update(
+    cx: &ConnectionTo<Client>,
+    session_id: String,
+    session: Arc<crate::agent::session_agent::SessionAgent>,
+) {
+    let cx_for_usage = cx.clone();
+    let _ = cx.spawn(async move {
+        let usage = session.context_usage_snapshot().await;
+        emit_context_usage_state(&cx_for_usage, &session_id, usage);
+        Ok(())
+    });
 }
 
 fn build_mode_state(current_mode_id: &str) -> SessionModeState {

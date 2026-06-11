@@ -195,6 +195,8 @@ impl AcpClient {
         let binary = find_binary();
         let mut child = Command::new(&binary)
             .args(["acp", "--agent-folder", agent_folder.to_str().unwrap()])
+            .env("NO_PROXY", "127.0.0.1,localhost,::1")
+            .env("no_proxy", "127.0.0.1,localhost,::1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -17,11 +17,19 @@ pub const CHANNELS_CONFIG_FILE: &str = "channels.yaml";
 pub struct WebSocketIngressConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_websocket_bind_addr", alias = "bind")]
+    pub bind_addr: String,
+    #[serde(default = "default_true")]
+    pub auth: bool,
 }
 
 impl Default for WebSocketIngressConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            bind_addr: default_websocket_bind_addr(),
+            auth: true,
+        }
     }
 }
 
@@ -174,6 +182,10 @@ fn default_workspace_dir() -> String {
     ".".to_string()
 }
 
+fn default_websocket_bind_addr() -> String {
+    "127.0.0.1:8765".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -239,6 +251,23 @@ weixin:
             config.weixin.override_reasoning_mode,
             Some(ReasoningMode::High)
         );
+    }
+
+    #[test]
+    fn websocket_config_accepts_bind_addr() {
+        let config: ChannelRuntimeConfig = serde_yaml::from_str(
+            r#"
+websocket:
+  enabled: true
+  bind_addr: 127.0.0.1:9001
+  auth: true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.websocket.enabled);
+        assert_eq!(config.websocket.bind_addr, "127.0.0.1:9001");
+        assert!(config.websocket.auth);
     }
 
     #[test]

@@ -79,7 +79,7 @@ tools:
 - `agent_id`：必填 id，同时用于选择 `resources/agents/` 下的文件。
 - `name`：必填显示名称。
 - `description`：必填简短描述。
-- `policy_mode`：必填权限策略。允许值：`full_access`、`confirm`、`watch`。旧值 `allow_all` 会兼容为 `full_access`，`block_all` 会兼容为 `watch`。
+- `policy_mode`：必填权限策略。允许值：`full_access`、`confirm`、`watch`。
 - `session_store_dir`：可选，普通 agent session 存储根目录。默认 `sessions`。相对路径按 agent structure 目录解析。
 - `channel_session_dir`：可选，channel session 存储根目录。默认 `channel_sessions`。相对路径按 agent structure 目录解析。
 - `max_running_turn`：可选正整数。省略时，agent loop 会一直运行，直到模型停止、会话取消或发生错误。

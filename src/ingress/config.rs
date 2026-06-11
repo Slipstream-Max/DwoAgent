@@ -35,6 +35,27 @@ impl Default for WebSocketIngressConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AcpChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub ipc: bool,
+    #[serde(default = "default_true")]
+    pub auth: bool,
+}
+
+impl Default for AcpChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ipc: true,
+            auth: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WeixinChannelConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -155,6 +176,8 @@ impl Default for FeishuChannelConfig {
 #[serde(deny_unknown_fields)]
 pub struct ChannelRuntimeConfig {
     #[serde(default)]
+    pub acp: AcpChannelConfig,
+    #[serde(default)]
     pub websocket: WebSocketIngressConfig,
     #[serde(default)]
     pub weixin: WeixinChannelConfig,
@@ -165,6 +188,7 @@ pub struct ChannelRuntimeConfig {
 impl Default for ChannelRuntimeConfig {
     fn default() -> Self {
         Self {
+            acp: AcpChannelConfig::default(),
             websocket: WebSocketIngressConfig::default(),
             weixin: WeixinChannelConfig::default(),
             feishu: FeishuChannelConfig::default(),
@@ -174,7 +198,7 @@ impl Default for ChannelRuntimeConfig {
 
 impl ChannelRuntimeConfig {
     pub fn has_enabled_channels(&self) -> bool {
-        self.websocket.enabled || self.weixin.enabled || self.feishu.enabled
+        self.acp.enabled || self.websocket.enabled || self.weixin.enabled || self.feishu.enabled
     }
 }
 
@@ -268,6 +292,23 @@ websocket:
         assert!(config.websocket.enabled);
         assert_eq!(config.websocket.bind_addr, "127.0.0.1:9001");
         assert!(config.websocket.auth);
+    }
+
+    #[test]
+    fn acp_config_accepts_ipc_and_auth() {
+        let config: ChannelRuntimeConfig = serde_yaml::from_str(
+            r#"
+acp:
+  enabled: true
+  ipc: true
+  auth: true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.acp.enabled);
+        assert!(config.acp.ipc);
+        assert!(config.acp.auth);
     }
 
     #[test]

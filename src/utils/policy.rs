@@ -4,10 +4,8 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 const MODE_FULL_ACCESS: &str = "full_access";
-const MODE_ALLOW_ALL_ALIAS: &str = "allow_all";
 const MODE_CONFIRM: &str = "confirm";
 const MODE_WATCH: &str = "watch";
-const MODE_BLOCK_ALL_ALIAS: &str = "block_all";
 
 pub fn parse_policy_mode(value: &str) -> Result<String> {
     let mode = value.trim();
@@ -15,9 +13,9 @@ pub fn parse_policy_mode(value: &str) -> Result<String> {
         bail!("policy_mode cannot be empty");
     }
     let normalized = match mode {
-        MODE_FULL_ACCESS | MODE_ALLOW_ALL_ALIAS => MODE_FULL_ACCESS,
+        MODE_FULL_ACCESS => MODE_FULL_ACCESS,
         MODE_CONFIRM => MODE_CONFIRM,
-        MODE_WATCH | MODE_BLOCK_ALL_ALIAS => MODE_WATCH,
+        MODE_WATCH => MODE_WATCH,
         _ => {
             bail!("policy_mode must use one internal name: full_access, confirm, watch");
         }

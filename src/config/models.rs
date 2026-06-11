@@ -552,27 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_meta_accepts_legacy_policy_mode_aliases() {
-        let meta = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
-            "name": "Test Agent",
-            "description": "test",
-            "policy_mode": "allow_all"
-        }))
-        .unwrap();
-        assert_eq!(meta.policy_mode, PolicyMode::FullAccess);
-
-        let meta = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
-            "name": "Test Agent",
-            "description": "test",
-            "policy_mode": "block_all"
-        }))
-        .unwrap();
-        assert_eq!(meta.policy_mode, PolicyMode::Watch);
-    }
-
-    #[test]
     fn agent_meta_reads_external_context_paths() {
         let meta = deserialize_agent_meta(serde_json::json!({
             "agent_id": "test-agent",

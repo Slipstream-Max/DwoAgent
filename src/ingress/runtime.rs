@@ -7,7 +7,6 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use tokio::task::JoinHandle;
 
-use super::automation::{AutomationNotificationSinks, AutomationRuntime};
 use super::bridge::{PendingConfirmationRegistry, SessionLeaseRegistry};
 use super::config::{ChannelRuntimeConfig, load_channel_runtime_config};
 use super::feishu::FeishuChannel;
@@ -15,6 +14,7 @@ use super::stdio::StdioChannel;
 use super::websocket::WebSocketChannel;
 use super::weixin::WeixinChannel;
 use crate::agent::service::AgentService;
+use crate::automation::AutomationNotificationSinks;
 
 /// Start service ingress channels configured for one agent.
 pub struct ChannelRuntime {
@@ -41,6 +41,10 @@ impl ChannelRuntime {
         &self.config
     }
 
+    pub fn lease_registry(&self) -> Arc<SessionLeaseRegistry> {
+        self.lease_registry.clone()
+    }
+
     pub async fn start(&mut self) -> Result<()> {
         if self.started {
             return Ok(());
@@ -52,12 +56,25 @@ impl ChannelRuntime {
 
     pub async fn run(&mut self) -> Result<()> {
         self.start().await?;
-        let result = self.run_inner().await;
+        let result = self.run_inner(None).await;
         self.shutdown().await;
         result
     }
 
-    async fn run_inner(&self) -> Result<()> {
+    pub async fn run_with_notification_sinks(
+        &mut self,
+        sinks_tx: tokio::sync::oneshot::Sender<AutomationNotificationSinks>,
+    ) -> Result<()> {
+        self.start().await?;
+        let result = self.run_inner(Some(sinks_tx)).await;
+        self.shutdown().await;
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        sinks_tx: Option<tokio::sync::oneshot::Sender<AutomationNotificationSinks>>,
+    ) -> Result<()> {
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<Result<()>>(8);
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         let mut weixin_clients = Vec::new();
@@ -123,17 +140,8 @@ impl ChannelRuntime {
             }));
         }
 
-        if self.config.automation.enabled {
-            let automation = AutomationRuntime::new(
-                self.agent.clone(),
-                self.agent.agent_structure_dir(),
-                self.config.automation.jobs.clone(),
-                notification_sinks,
-            );
-            let tx = result_tx.clone();
-            tasks.push(tokio::spawn(async move {
-                let _ = tx.send(automation.run().await).await;
-            }));
+        if let Some(sinks_tx) = sinks_tx {
+            let _ = sinks_tx.send(notification_sinks);
         }
 
         drop(result_tx);

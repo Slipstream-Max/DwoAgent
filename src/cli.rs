@@ -10,6 +10,7 @@ use crate::ingress::{
     run_feishu_login_sync, run_stdio_connect_sync, run_stdio_login_sync, run_websocket_login_sync,
     run_weixin_login_sync,
 };
+use crate::tui::run_tui;
 
 #[derive(Debug, Parser)]
 #[command(name = "dwo-agent", about = "Dwo Agent (赤铎) CLI")]
@@ -23,8 +24,11 @@ enum Command {
     /// Run or connect ACP stdio.
     Acp(AcpArgs),
 
-    /// Run long-lived service ingress channels.
+    /// Run long-lived service ingress channels and automation scheduler.
     Serve(AgentFolderArgs),
+
+    /// Open a local terminal dashboard for an agent folder.
+    Tui(AgentFolderArgs),
 
     /// Manage external channels.
     #[command(subcommand)]
@@ -115,6 +119,7 @@ pub fn main() -> Result<()> {
             }
         },
         Command::Serve(args) => run_host_sync(args.agent_folder, HostMode::ServiceIngress),
+        Command::Tui(args) => run_tui(args.agent_folder),
         Command::Channel(ChannelCommand::Login(ChannelLoginCommand::Stdio(args))) => {
             run_stdio_login_sync(args.agent_folder)
         }

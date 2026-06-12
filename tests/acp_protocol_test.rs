@@ -29,6 +29,7 @@ struct MockLlmServer {
     _handle: thread::JoinHandle<()>,
     port: u16,
     request_count: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<Value>>>,
 }
 
 impl MockLlmServer {
@@ -43,10 +44,13 @@ impl MockLlmServer {
         let port = listener.local_addr().unwrap().port();
         let request_count = Arc::new(AtomicUsize::new(0));
         let rc = request_count.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = requests.clone();
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let rc = rc.clone();
+                let requests = requests_for_thread.clone();
                 thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut content_length: usize = 0;
@@ -69,8 +73,10 @@ impl MockLlmServer {
                         .get("stream")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let is_title_request = is_title_generation_request(&request);
 
                     rc.fetch_add(1, Ordering::SeqCst);
+                    requests.lock().unwrap().push(request);
 
                     if !delay.is_zero() {
                         thread::sleep(delay);
@@ -95,7 +101,12 @@ impl MockLlmServer {
                         );
                         stream.write_all(resp.as_bytes()).ok();
                     } else {
-                        let body = json!({"id":"m1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello from mock LLM."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}});
+                        let content = if is_title_request {
+                            "Refined session title"
+                        } else {
+                            "Hello from mock LLM."
+                        };
+                        let body = json!({"id":"m1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}});
                         let payload = serde_json::to_string(&body).unwrap();
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
@@ -112,8 +123,37 @@ impl MockLlmServer {
             _handle: handle,
             port,
             request_count,
+            requests,
         }
     }
+
+    fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn is_title_generation_request(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("concise conversation titles")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn is_streaming_request(request: &Value) -> bool {
+    request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 // ── Mock LLM Server (slow streaming, for cancel tests) ─────────────────────
@@ -157,11 +197,6 @@ impl ToolCallingLlm {
                         .get("stream")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    let request_index = rc.fetch_add(1, Ordering::SeqCst);
-
-                    if request_index == 0 {
-                        thread::sleep(delay);
-                    }
 
                     if !is_stream {
                         let body = json!({"id":"m1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}});
@@ -173,6 +208,12 @@ impl ToolCallingLlm {
                         stream.write_all(resp.as_bytes()).ok();
                         stream.flush().ok();
                         return;
+                    }
+
+                    let request_index = rc.fetch_add(1, Ordering::SeqCst);
+
+                    if request_index == 0 {
+                        thread::sleep(delay);
                     }
 
                     let chunks = if request_index == 0 {
@@ -256,7 +297,23 @@ impl SlowStreamingLlm {
                     let mut body = vec![0u8; content_length];
                     std::io::Read::read_exact(&mut reader, &mut body).ok();
                     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let is_stream = request
+                        .get("stream")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     requests_inner.lock().unwrap().push(request);
+
+                    if !is_stream {
+                        let body = json!({"id":"m1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Refined session title"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}});
+                        let payload = serde_json::to_string(&body).unwrap();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        stream.write_all(resp.as_bytes()).ok();
+                        stream.flush().ok();
+                        return;
+                    }
 
                     // Send headers for SSE.
                     let header_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
@@ -877,6 +934,45 @@ fn test_prompt_sets_session_title() {
 }
 
 #[test]
+fn test_prompt_refines_session_title_with_model() {
+    let mock = MockLlmServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = create_mock_agent_folder(tmp.path(), mock.port);
+    let mut c = AcpClient::spawn(&folder);
+    c.send_request("initialize", json!({"protocolVersion": 1}));
+    let s = c.send_request("session/new", json!({"cwd": ".", "mcpServers": []}));
+    let sid = s["sessionId"].as_str().unwrap().to_string();
+
+    c.send_request(
+        "session/prompt",
+        json!({"sessionId": sid.clone(), "prompt": [{"type": "text", "text": "Please investigate flaky websocket tests"}]}),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut refined_title = None;
+    while std::time::Instant::now() < deadline {
+        let list = c.send_request("session/list", json!({}));
+        refined_title = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["sessionId"].as_str() == Some(sid.as_str()))
+            .and_then(|session| session["title"].as_str())
+            .map(str::to_string);
+        if refined_title.as_deref() == Some("Refined session title") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(refined_title.as_deref(), Some("Refined session title"));
+    assert!(
+        mock.requests().iter().any(is_title_generation_request),
+        "expected a separate title generation request"
+    );
+}
+
+#[test]
 fn test_prompt_multiple_turns_same_session() {
     let mock = MockLlmServer::start();
     let tmp = tempfile::tempdir().unwrap();
@@ -1159,16 +1255,27 @@ fn test_live_config_changes_return_immediately_and_apply_to_preempting_prompt() 
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    while mock.requests().len() < 2 && std::time::Instant::now() < deadline {
+    while mock
+        .requests()
+        .iter()
+        .filter(|request| is_streaming_request(request))
+        .count()
+        < 2
+        && std::time::Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(100));
     }
     let requests = mock.requests();
+    let streaming_requests: Vec<&Value> = requests
+        .iter()
+        .filter(|request| is_streaming_request(request))
+        .collect();
     assert!(
-        requests.len() >= 2,
+        streaming_requests.len() >= 2,
         "second prompt should start after preempting the first"
     );
-    assert_eq!(requests[1]["model"], "deepseek-v4-flash");
-    assert_eq!(requests[1]["reasoning_effort"], "max");
+    assert_eq!(streaming_requests[1]["model"], "deepseek-v4-flash");
+    assert_eq!(streaming_requests[1]["reasoning_effort"], "max");
 
     let first_resp = c.wait_response(first_id, Duration::from_secs(8));
     assert!(first_resp.is_some(), "first prompt should be cancelled");

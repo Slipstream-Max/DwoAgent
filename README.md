@@ -124,31 +124,42 @@ feishu:
   override_reasoning_mode: auto
 ```
 
-启用 automation/job：
+在平级 `automation.yaml` 启用 automation/job：
 
 ```yaml
-automation:
-  enabled: true
-  jobs:
-    - id: daily_digest
-      enabled: true
-      workspace_dir: .
-      schedule:
-        type: interval
-        every_seconds: 3600
-      prompt: "总结当前项目状态。"
-      notify:
-        - channel: weixin
+enabled: true
+jobs:
+  - id: daily_digest
+    enabled: true
+    workspace_dir: .
+    session:
+      mode: new
+    schedule:
+      type: interval
+      every_seconds: 3600
+    prompt: "总结当前项目状态。"
+    notify:
+      - channel: weixin
 ```
+
+打开本地 TUI dashboard：
+
+```bash
+cargo run -- tui --agent-folder examples/dwo-agent
+```
+
+TUI 第一版直接读取 agent profile 文件和本地运行记录，不要求 `serve` 正在运行。主导航为
+`Overview`、`Agent`、`Sessions`、`Channels`、`Automation`、`Logs`；Service 状态放在
+`Overview`，通过 `channel_secret/stdio/daemon.yaml` 检测。
 
 ## Notes
 
-- Agent profile 文件夹结构、`agent.yaml` / `model.yaml`、`channels.yaml`、
-  `policy.yaml`、rules 和 skills 见
+- Agent profile 文件夹结构、`agent.yaml` / `model.yaml`、`policy.yaml`、
+  `channels.yaml`、`automation.yaml`、rules 和 skills 见
   [docs/agent-profile-structure-config.md](docs/agent-profile-structure-config.md)。
 - `acp embedded` 通过 stdio 在当前进程内运行 ACP，client 关闭 stdin 后进程退出。
   `acp connect` 是 stdio bridge，会连接已经启动的 `serve`，bridge 退出不会关闭 agent runtime。
-  `serve` 用于 stdio、websocket、Feishu、Weixin、automation 等长生命周期 ingress channels。
+  `serve` 用于 stdio、websocket、Feishu、Weixin 等长生命周期 ingress channels，也会启动 `automation.yaml` 配置的 scheduler。
 - Stdio bridge 使用 `channel_secret/stdio/auth.yaml` 保存 token，`serve` 启动时写入
   `channel_secret/stdio/daemon.yaml` 供 `acp connect` 定位本机 IPC endpoint。
 - Weixin 使用 `channel_secret/weixin/auth.yaml` 和
@@ -164,9 +175,9 @@ automation:
   `card_output` 默认关闭；开启后会向模型暴露 `feishu_reply_card(card)`，用于发送飞书交互卡片。
 - Weixin/Feishu 支持 `/list`、`/switch <session_id>`、`/back`、`/where`。切换到非默认 session 时会占用该 session；其他 channel、ACP IPC 或 WebSocket 连接不能同时占用。
 - 飞书工具确认会通过 `/approve <confirmation_id>`、`/deny <confirmation_id>` 透传，确认审计写入 `channel_secret/audit/confirm_audit.jsonl`。
-- Automation 由 `serve` 激活。每次 job 触发都会新建普通 agent session，并把 run 状态写入
-  `channel_sessions/automation/<job_id>/runs/<run_id>/run.yaml`。配置 `notify` 后，run 结束会投递包含
-  `session_id` 和 `/switch <session_id>` 的通知；投递结果也会写回 `run.yaml`。
+- Automation 由 `serve` 激活，但不是 ingress channel。Job 可配置 `new`、`fixed` 或 `sticky` session 模式；目标 session 被占用时本次 run 会记为 `skipped`。
+  Run 状态写入 `<session_store_dir>/<year>/<month>/<day>/<session_id>/automation/<job_id>/runs/<run_id>/run.yaml`。
+  配置 `notify` 后，run 结束会投递包含 `session_id` 和 `/switch <session_id>` 的通知；投递结果也会写回 `run.yaml`。
 - `agent.yaml` 里的 `max_running_turn` 是可选项。省略时，agent loop 会一直运行，直到模型停止、会话取消或发生错误。设置为正整数可以保留旧的 max-turn guard。
 - `agent.yaml` 的 `tools` 可以把 `file_edit`、`terminal`、`subagent` 设置为
   `enable` 或 `disable`。这些值会在 session 创建时快照；之后修改

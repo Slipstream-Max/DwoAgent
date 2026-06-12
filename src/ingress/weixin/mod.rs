@@ -16,13 +16,13 @@ use weixin_agent::{
     WeixinClient, WeixinConfig,
 };
 
-use super::automation::AutomationNotificationSink;
 use super::bridge::{ChannelBridge, PendingConfirmationRegistry, SessionLeaseRegistry};
 use super::config::WeixinChannelConfig;
 use super::response::{ChannelResponseDetail, ChannelUpdateCollector};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::agent::session_agent::SessionAgent;
+use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
 use crate::config::loader::resolve_agent_structure_dir;
 use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::PermissionRequester;
@@ -424,11 +424,7 @@ impl WeixinToolBridge for WeixinReplyMediaBridge {
 
 #[async_trait::async_trait]
 impl AutomationNotificationSink for WeixinAutomationNotifier {
-    async fn send(
-        &self,
-        _notify: &super::config::AutomationNotifyConfig,
-        text: &str,
-    ) -> Result<String> {
+    async fn send(&self, _notify: &AutomationNotifyConfig, text: &str) -> Result<String> {
         let result = self.client.send_text(&self.to, text, None).await?;
         Ok(result.message_id)
     }

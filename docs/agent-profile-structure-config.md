@@ -12,6 +12,8 @@
   model.yaml
   policy.yaml                  # 可选
   channels.yaml                # 可选
+  automation.yaml              # 可选
+  automation_state/            # 运行时生成
   resources/
     agents/
       <agent_id>.agent.md
@@ -30,11 +32,13 @@
     model.yaml
     policy.yaml                # 可选
     channels.yaml              # 可选
+    automation.yaml            # 可选
+    automation_state/          # 运行时生成
     resources/
       agents/
 ```
 
-运行时启动时会解析 agent structure 目录，并把它作为 `session_store_dir`、`channel_session_dir` 等相对路径的基准目录。
+运行时启动时会解析 agent structure 目录，并把它作为 `session_store_dir`、`channel_session_dir` 等相对路径的基准目录。Automation sticky 模式的状态固定写入当前 agent structure 下的 `automation_state/`。
 
 ## 运行模式
 
@@ -44,6 +48,7 @@
 cargo run -- acp embedded --agent-folder examples/dwo-agent
 cargo run -- acp connect --agent-folder examples/dwo-agent
 cargo run -- serve --agent-folder examples/weixin-agent
+cargo run -- tui --agent-folder examples/weixin-agent
 cargo run -- channel login stdio --agent-folder examples/weixin-agent
 cargo run -- channel login weixin --agent-folder examples/weixin-agent
 cargo run -- channel login feishu --agent-folder examples/weixin-agent --app-id cli_xxx --app-secret xxx
@@ -51,10 +56,43 @@ cargo run -- channel login feishu --agent-folder examples/weixin-agent --app-id 
 
 - `acp embedded`：通过 stdio 在当前进程内运行 ACP，并从 ACP `session/new` 创建会话。
 - `acp connect`：短生命周期 stdio bridge，连接已经启动的 `serve`。
-- `serve`：启动由 `channels.yaml` 配置的长生命周期 ingress channel。
+- `serve`：启动由 `channels.yaml` 配置的长生命周期 ingress channel，以及由 `automation.yaml` 配置的 automation scheduler。
+- `tui`：打开本地终端 dashboard，直接读取 agent profile、session、automation run 和 channel 运行态文件。
 - `channel login stdio`：生成本机 stdio bridge token。
 - `channel login weixin`：执行微信扫码登录，并把凭据写入当前 agent profile。
 - `channel login feishu`：保存飞书应用凭据到当前 agent profile。
+
+## TUI Dashboard
+
+`dwo-agent tui` 是本地文件型 dashboard：
+
+```powershell
+cargo run -- tui --agent-folder examples/weixin-agent
+```
+
+第一版不需要连接 `serve`，也不会启动 agent runtime。它读取当前 agent structure 下的配置、session metadata、context usage、automation run records 和 stdio daemon manifest。若 `serve` 正在运行，`Overview` 会通过 `channel_secret/stdio/daemon.yaml` 显示 pid 和启动时间；若没有 manifest，则显示 local files only。
+
+主导航顺序：
+
+```text
+Overview
+Agent
+Sessions
+Channels
+Automation
+Logs
+```
+
+页面职责：
+
+- `Overview`：展示 agent 名称、默认模型、policy mode、service manifest 状态、session 数量、channel 数量、automation 概览和 recent activity。
+- `Agent`：展示 agent profile 自己的上下文资源。`Skills` 来自 `<agent-folder>/resources/skills` 和 `agent.yaml external_skills_dirs`；`Prompt` 是 `<agent_id>.agent.md`；`Rules` 是 `<agent_id>.rule.md` 和 `agent.yaml external_rule_files`。
+- `Sessions`：按 `<session_store_dir>/<year>/<month>/<day>/<session_id>/` 扫描普通 session，展示当前模型、thinking/reasoning mode、policy mode、启用工具、context window 占用和 session 路径。
+- `Channels`：展示 `channels.yaml` 中 stdio、websocket、weixin、feishu 的启用状态和关键配置。
+- `Automation`：展示 `automation.yaml` jobs；runs 挂在对应 job 下，来源是普通 session 目录内的 `automation/<job_id>/runs/<run_id>/run.yaml`。
+- `Logs`：聚合 automation run records 和 session transcript tail，作为第一版本地观察入口。
+
+TUI 只认新的普通 session 日期层级，不扫描旧的 flat session 目录。
 
 ## agent.yaml
 
@@ -95,6 +133,7 @@ tools:
 
 - `tools`、`max_running_turn`、policy mode、model id、reasoning mode、tool schemas 会在会话创建时快照。
 - 修改 `agent.yaml` 会影响新会话；已有会话继续使用持久化的运行时工具快照，除非代码显式迁移它们。
+- 普通 session 会按本地日期写入 `<session_store_dir>/<year>/<month>/<day>/<session_id>/`。
 - `session_store_dir` 只影响 ACP/普通 session 的创建、加载和列表；`channel_session_dir` 只影响 channel 自己维护的持久化 session。
 - 运行时可以通过 session API 修改 policy mode；这是会话状态变更，不是重新读取 `agent.yaml`。
 
@@ -202,24 +241,6 @@ feishu:
   response_detail: response_only
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
-
-automation:
-  enabled: false
-  jobs:
-    - id: daily_digest
-      enabled: true
-      workspace_dir: .
-      schedule:
-        type: interval
-        every_seconds: 3600
-      prompt: "总结当前项目状态。"
-      response_detail: response_only
-      notify:
-        - channel: weixin
-        - channel: feishu
-          recipient:
-            type: chat
-            id: oc_xxx
 ```
 
 顶层配置：
@@ -228,9 +249,8 @@ automation:
 - `weixin`：微信单用户 assistant channel。
 - `websocket`：ACP-over-WebSocket channel，协议行为与 stdio ACP 相同。
 - `feishu`：飞书/Lark assistant channel。
-- `automation`：定时 job ingress。
 
-如果 `channels.yaml` 不存在或为空，所有 channel 默认禁用。`serve` host 要求至少启用一个 channel。
+如果 `channels.yaml` 不存在或为空，所有 channel 默认禁用。Automation 不属于 channel，单独由 `automation.yaml` 配置。`serve` host 要求至少启用一个 channel 或一个 automation job。
 
 ### Stdio Channel
 
@@ -454,9 +474,32 @@ args: ...
 <agent-folder>/channel_secret/audit/confirm_audit.jsonl
 ```
 
-### Automation Channel
+## automation.yaml
 
-Automation 字段：
+`automation.yaml` 是可选文件，用于配置 `dwo-agent serve` 启动的 scheduler。Automation 不是 ingress channel；它只是按计划触发普通 agent session 的第一条或下一条 prompt。
+
+```yaml
+enabled: true
+jobs:
+  - id: daily_digest
+    enabled: true
+    workspace_dir: .
+    session:
+      mode: new
+    schedule:
+      type: interval
+      every_seconds: 3600
+    prompt: "总结当前项目状态。"
+    response_detail: response_only
+    notify:
+      - channel: weixin
+      - channel: feishu
+        recipient:
+          type: chat
+          id: oc_xxx
+```
+
+顶层字段：
 
 - `enabled`：默认 `false`。
 - `jobs`：定时 job 列表。
@@ -465,11 +508,42 @@ Job 字段：
 
 - `id`：必填 job id。
 - `enabled`：默认 `true`。
-- `workspace_dir`：该 job 新建 session 使用的 cwd。默认 `.`。
+- `workspace_dir`：该 job 使用的 cwd。相对路径按 agent structure 目录解析。默认 `.`。
+- `session`：该 job 如何选择普通 session。默认 `mode: new`。
 - `schedule`：触发计划。第一版支持 `interval` 和 `daily`。
-- `prompt`：每次触发时注入新 session 的用户输入。
+- `prompt`：每次触发时注入普通 session 的用户输入。
 - `response_detail`：收集结果时是否包含 thinking/tool call 摘要。默认 `response_only`。
 - `notify`：结果投递配置。Weixin 可省略 recipient，默认发送给当前登录绑定用户；Feishu 必须配置 recipient。
+
+Session 模式：
+
+```yaml
+session:
+  mode: new
+```
+
+`new` 每次触发都新建普通 session，适合日报、一次性任务和需要干净上下文的 job。
+
+```yaml
+session:
+  mode: fixed
+  session_id: 40092adf-9ffa-4345-8a04-375d47b3f16a
+```
+
+`fixed` 每次触发都加载指定普通 session。目标 session 正在运行或被 channel 占用时，本次 run 跳过，不抢占。
+
+```yaml
+session:
+  mode: sticky
+```
+
+`sticky` 第一次触发时自动新建一个普通 session，并把绑定关系写入：
+
+```text
+<agent-folder>/automation_state/<job_id>/state.yaml
+```
+
+之后同一个 job 复用该 session。目标 session 正在运行或被 channel 占用时，本次 run 跳过，不抢占。
 
 Schedule 示例：
 
@@ -496,13 +570,13 @@ notify:
       id: oc_xxx
 ```
 
-`serve` 启动 automation 后，每次 job 触发都会新建普通 agent session，不复用长期 session。运行状态写入：
+`serve` 启动 automation 后，每次 job 触发都会选择一个普通 agent session，并把运行状态写入该普通 session 目录：
 
 ```text
-<channel_session_dir>/automation/<job_id>/runs/<run_id>/run.yaml
+<session_store_dir>/<year>/<month>/<day>/<session_id>/automation/<job_id>/runs/<run_id>/run.yaml
 ```
 
-`run.yaml` 包含 `job_id`、`run_id`、`session_id`、状态、开始/结束时间、stop reason、错误、最终 response 和 notify 配置。用户可以通过微信/飞书 `/switch <session_id>` 继续和某次 automation run 的 session 对话。
+`run.yaml` 包含 `job_id`、`run_id`、`session_id`、状态、开始/结束时间、stop reason、错误、最终 response 和 notify 配置。状态包括 `running`、`completed`、`failed` 和 `skipped`。用户可以通过微信/飞书 `/switch <session_id>` 继续和某次 automation run 的 session 对话。
 
 如果配置了 `notify`，automation 会在 run 结束后投递一条包含 job 状态、`session_id`、`/switch <session_id>` 和最终回复的消息。投递结果会记录到 `run.yaml` 的 `notifications` 字段。
 
@@ -687,7 +761,32 @@ system context 由这些 blocks 构成：
 my-agent/
   agent.yaml
   model.yaml
+  policy.yaml
   channels.yaml
+  automation.yaml
+  automation_state/
+    daily_digest/
+      state.yaml
+  sessions/
+    2026/
+      06/
+        12/
+          <session_id>/
+            session.json
+            model_context.json
+            client_transcript.jsonl
+            automation/
+              daily_digest/
+                runs/
+                  <run_id>/
+                    run.yaml
+  channel_sessions/
+    weixin/
+      session/
+    feishu/
+      dm/
+      group/
+  channel_secret/
   shared/
     rules/
       common.md

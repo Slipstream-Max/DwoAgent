@@ -1,0 +1,359 @@
+{
+  "cwd": "\\\\?\\C:\\Users\\11307\\Documents\\GitHub\\dwoagent",
+  "mode_id": "confirm",
+  "model_id": "deepseek-v4-pro",
+  "pending_model_id": null,
+  "pending_reasoning_mode": null,
+  "reasoning_mode": "high",
+  "runtime_tools": {
+    "file_edit": "enable",
+    "subagent": "enable",
+    "terminal": "enable"
+  },
+  "session_id": "5f2bc08f-9606-4c44-adc8-ceb26d72cf69",
+  "state": "idle",
+  "stop_reason": null,
+  "title": null,
+  "tool_schemas": [
+    {
+      "function": {
+        "description": "Edit files by applying a small patch. Relative paths are resolved against the current workspace. Use this for creating, updating, deleting, or moving files. The patch string must start with '*** Begin Patch' and its last non-empty line must be exactly '*** End Patch'.",
+        "name": "file_edit",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "patch": {
+              "description": "Raw patch text only. Before calling, verify the first line is exactly '*** Begin Patch' and the last non-empty line is exactly '*** End Patch'. Do not omit the closing line.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "patch"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Start a terminal command. Wait up to timeout; if it finishes, return final tail output; otherwise return running snapshot and run_id.",
+        "name": "terminal_exec",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "description": "Command line to run.",
+              "type": "string"
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Optional environment variables.",
+              "type": "object"
+            },
+            "lines": {
+              "default": 200,
+              "description": "Maximum output lines to return.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "mode": {
+              "default": "tail",
+              "description": "Slice mode when still running.",
+              "enum": [
+                "head",
+                "tail",
+                "startwith"
+              ],
+              "type": "string"
+            },
+            "startwith": {
+              "default": 1,
+              "description": "When mode=startwith, start from this line number (1-based).",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "timeout": {
+              "default": 30,
+              "description": "How many seconds to wait before returning.",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List running terminal commands by id and status.",
+        "name": "list_terminals",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Wait for a running terminal command by run_id. If it finishes, return final tail output; otherwise return a running snapshot.",
+        "name": "terminal_wait",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "lines": {
+              "default": 200,
+              "description": "Maximum output lines to return.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "mode": {
+              "default": "tail",
+              "description": "Slice mode when still running.",
+              "enum": [
+                "head",
+                "tail",
+                "startwith"
+              ],
+              "type": "string"
+            },
+            "run_id": {
+              "description": "ID returned by terminal_exec.",
+              "type": "string"
+            },
+            "startwith": {
+              "default": 1,
+              "description": "When mode=startwith, start from this line number (1-based).",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "timeout": {
+              "default": 30,
+              "description": "How many seconds to wait before returning.",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Peek current output and status by run_id without waiting.",
+        "name": "terminal_checkout",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "lines": {
+              "default": 200,
+              "description": "Maximum output lines to return.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "mode": {
+              "default": "tail",
+              "description": "Slice mode when still running.",
+              "enum": [
+                "head",
+                "tail",
+                "startwith"
+              ],
+              "type": "string"
+            },
+            "run_id": {
+              "description": "ID returned by terminal_exec.",
+              "type": "string"
+            },
+            "startwith": {
+              "default": 1,
+              "description": "When mode=startwith, start from this line number (1-based).",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Kill a running terminal command by run_id and return final tail output.",
+        "name": "terminal_kill",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "lines": {
+              "default": 200,
+              "description": "Maximum output lines to return.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "run_id": {
+              "description": "ID returned by terminal_exec.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Start one native subagent thread. Returns a subagent_run_id immediately while progress remains visible through ACP updates.",
+        "name": "spawn_subagent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "policy": {
+              "description": "Requested tool policy for this subagent.",
+              "enum": [
+                "full_access",
+                "confirm",
+                "watch"
+              ],
+              "type": "string"
+            },
+            "task": {
+              "description": "The task this subagent should work on.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List active or waiting subagent threads by id and status.",
+        "name": "list_subagents",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Return a non-blocking snapshot of a subagent thread's status, progress, flow, and latest result.",
+        "name": "checkout_subagent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "subagent_run_id": {
+              "description": "The subagent id returned by spawn_subagent.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "subagent_run_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Wait for the subagent's current turn to finish. If it is already waiting for input, returns immediately.",
+        "name": "wait_subagent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "subagent_run_id": {
+              "description": "The subagent id returned by spawn_subagent.",
+              "type": "string"
+            },
+            "timeout": {
+              "default": 30,
+              "description": "Maximum seconds to wait.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "subagent_run_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Send another message to a waiting or failed subagent thread. Can interrupt a running turn if interrupt is true.",
+        "name": "send_subagent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "interrupt": {
+              "default": false,
+              "description": "Whether to cancel the current running turn before sending this message.",
+              "type": "boolean"
+            },
+            "message": {
+              "description": "The next instruction or message for the subagent.",
+              "type": "string"
+            },
+            "subagent_run_id": {
+              "description": "The subagent id returned by spawn_subagent.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "subagent_run_id",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Close a subagent thread and cancel any running turn.",
+        "name": "close_subagent",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "subagent_run_id": {
+              "description": "The subagent id returned by spawn_subagent.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "subagent_run_id"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ],
+  "updated_at": "2026-06-12T08:22:44.021709+00:00"
+}

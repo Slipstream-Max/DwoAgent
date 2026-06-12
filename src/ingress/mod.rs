@@ -1,5 +1,4 @@
 pub mod acp;
-pub mod automation;
 pub mod bridge;
 pub mod config;
 pub mod feishu;

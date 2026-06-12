@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use super::activity::SessionActivity;
+use super::activity::{ActivityTurnHandle, SessionActivity};
 use super::constants::parse_policy_mode;
 use super::factory::RuntimeFactoryBuilder;
 use super::session::{SESSION_TITLE_LENGTH, Session, SessionPersistence};
@@ -25,6 +25,7 @@ use crate::context::manager::{
 use crate::llm::client::{BaseLlmClient, LlmRequestOptions};
 use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 use crate::tools::tool_run_manager::ToolRunManager;
+use crate::utils::prompt::extract_first_text;
 use crate::watchers::runtime::WatcherRuntime;
 
 pub struct SessionAgent {
@@ -198,13 +199,15 @@ impl SessionAgent {
             self.cancel_event.clone(),
         );
 
-        // Derive session title on first prompt.
+        // Set a cheap fallback immediately, then refine it with a background
+        // model request so title generation does not block the main turn.
         {
             let mut session = self.session.lock().await;
             if session.title.is_none()
-                && let Some(title) = derive_session_title(&user_input, &user_blocks)
+                && let Some(source_text) = extract_session_title_source(&user_input, &user_blocks)
             {
-                session.title = Some(title.clone());
+                let fallback_title = fallback_session_title(&source_text);
+                session.title = Some(fallback_title.clone());
                 let (messages, usage) = {
                     let runtime = self.runtime.lock().await;
                     (
@@ -216,8 +219,9 @@ impl SessionAgent {
                 let updated_at = session.updated_at.clone();
                 drop(session);
                 let _ = activity
-                    .session_info_update(&title, updated_at.as_deref())
+                    .session_info_update(&fallback_title, updated_at.as_deref())
                     .await;
+                self.spawn_title_refinement(source_text, fallback_title, activity.clone());
             }
         }
 
@@ -595,11 +599,123 @@ impl SessionAgent {
         let session = self.session.lock().await.clone();
         self.persistence.save_session_meta(&session)
     }
+
+    fn spawn_title_refinement(
+        self: &Arc<Self>,
+        source_text: String,
+        fallback_title: String,
+        activity: ActivityTurnHandle,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let Ok(Some(title)) = this.generate_session_title(&source_text).await else {
+                return;
+            };
+            if title == fallback_title {
+                return;
+            }
+
+            let (session_snapshot, updated_at) = {
+                let mut session = this.session.lock().await;
+                if session.title.as_deref() != Some(fallback_title.as_str()) {
+                    return;
+                }
+                session.title = Some(title.clone());
+                session.updated_at = Some(utc_iso());
+                (session.clone(), session.updated_at.clone())
+            };
+
+            if this
+                .persistence
+                .save_session_meta(&session_snapshot)
+                .is_err()
+            {
+                return;
+            }
+            let _ = activity
+                .session_info_update(&title, updated_at.as_deref())
+                .await;
+        });
+    }
+
+    async fn generate_session_title(&self, source_text: &str) -> Result<Option<String>> {
+        let (cwd, model_id) = {
+            let session = self.session.lock().await;
+            (session.cwd.clone(), session.model_id.clone())
+        };
+        let profile = {
+            let profiles = self.model_profiles.lock().await;
+            profiles
+                .get(&model_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Unknown model_id: {model_id}"))?
+        };
+        let client = (self.runtime_factory_builder)(&cwd, &profile)?
+            .create_model_client()
+            .context("create title model client")?;
+        let title_source = title_source_excerpt(source_text);
+        let messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "You generate concise conversation titles. Return only the title, with no quotes or explanation. Use the same language as the user's message. Keep it under 12 Chinese characters or 6 English words."
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("User message:\n{title_source}\n\nTitle:")
+            }),
+        ];
+        let mut options = LlmRequestOptions::default();
+        options.retry.request_max_retries = 0;
+        let response = client
+            .request_with_usage(&messages, None, None, None, options)
+            .await?;
+        let content = response
+            .message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        Ok(clean_generated_session_title(content))
+    }
 }
 
-fn derive_session_title(user_input: &Value, user_blocks: &[Value]) -> Option<String> {
-    use crate::utils::prompt::extract_first_text;
-    let text = extract_first_text(user_input)
-        .or_else(|| extract_first_text(&Value::Array(user_blocks.to_vec())))?;
-    Some(text.chars().take(SESSION_TITLE_LENGTH).collect())
+fn extract_session_title_source(user_input: &Value, user_blocks: &[Value]) -> Option<String> {
+    extract_first_text(user_input)
+        .or_else(|| extract_first_text(&Value::Array(user_blocks.to_vec())))
+}
+
+fn fallback_session_title(text: &str) -> String {
+    text.chars().take(SESSION_TITLE_LENGTH).collect()
+}
+
+fn title_source_excerpt(text: &str) -> String {
+    const TITLE_SOURCE_CHAR_LIMIT: usize = 2000;
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index == TITLE_SOURCE_CHAR_LIMIT {
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn clean_generated_session_title(raw: &str) -> Option<String> {
+    const GENERATED_TITLE_LENGTH: usize = 40;
+
+    let first_line = raw.lines().find(|line| !line.trim().is_empty())?.trim();
+    let title = first_line
+        .strip_prefix("Title:")
+        .or_else(|| first_line.strip_prefix("title:"))
+        .or_else(|| first_line.strip_prefix("标题:"))
+        .or_else(|| first_line.strip_prefix("标题："))
+        .unwrap_or(first_line)
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'))
+        .trim()
+        .trim_end_matches(|ch| matches!(ch, '.' | '。'))
+        .trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.chars().take(GENERATED_TITLE_LENGTH).collect())
 }

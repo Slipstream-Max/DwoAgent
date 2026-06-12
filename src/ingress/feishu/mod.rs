@@ -18,12 +18,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
-use super::automation::AutomationNotificationSink;
 use super::bridge::{ChannelBridge, PendingConfirmationRegistry, SessionLeaseRegistry};
 use super::config::{FeishuAccessPolicy, FeishuChannelConfig, FeishuChannelDomain};
 use super::response::ChannelUpdateCollector;
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
+use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
 use crate::config::loader::resolve_agent_structure_dir;
 use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::PermissionRequester;
@@ -493,11 +493,7 @@ impl FeishuToolBridge for FeishuReplyBridge {
 
 #[async_trait::async_trait]
 impl AutomationNotificationSink for FeishuAutomationNotifier {
-    async fn send(
-        &self,
-        notify: &super::config::AutomationNotifyConfig,
-        text: &str,
-    ) -> Result<String> {
+    async fn send(&self, notify: &AutomationNotifyConfig, text: &str) -> Result<String> {
         let recipient = notify
             .recipient
             .as_ref()

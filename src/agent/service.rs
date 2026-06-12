@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use chrono::Local;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -355,7 +356,7 @@ impl AgentService {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or(cwd);
         let session_uuid = session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        let session_dir = session_dir.unwrap_or_else(|| self.session_store_dir.join(&session_uuid));
+        let session_dir = session_dir.unwrap_or_else(|| self.new_session_dir(&session_uuid));
         let profile = self
             .model_profiles
             .get(&model_id)
@@ -439,7 +440,9 @@ impl AgentService {
     }
 
     async fn load_persisted_session(&self, session_id: &str) -> Result<Option<Arc<SessionAgent>>> {
-        let session_dir = self.session_store_dir.join(session_id);
+        let Some(session_dir) = self.find_persisted_session_dir(session_id) else {
+            return Ok(None);
+        };
         self.load_persisted_session_from_dir(&session_dir).await
     }
 
@@ -494,25 +497,32 @@ impl AgentService {
     }
 
     fn list_persisted_session_meta(&self) -> Vec<SessionMetaPayload> {
-        let Ok(entries) = std::fs::read_dir(&self.session_store_dir) else {
-            return Vec::new();
-        };
         let mut out: Vec<SessionMetaPayload> = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let meta_path = path.join(SESSION_META_FILE);
-            if !meta_path.is_file() {
-                continue;
-            }
-            let Ok(meta) = read_json_model::<SessionMetaPayload>(&meta_path) else {
-                continue;
-            };
-            out.push(meta);
-        }
+        collect_persisted_session_meta(&self.session_store_dir, &mut out);
         out
+    }
+
+    fn new_session_dir(&self, session_id: &str) -> PathBuf {
+        let date = Local::now();
+        self.session_store_dir
+            .join(date.format("%Y").to_string())
+            .join(date.format("%m").to_string())
+            .join(date.format("%d").to_string())
+            .join(session_id)
+    }
+
+    fn find_persisted_session_dir(&self, session_id: &str) -> Option<PathBuf> {
+        for year_dir in date_child_dirs(&self.session_store_dir, 4) {
+            for month_dir in date_child_dirs(&year_dir, 2) {
+                for day_dir in date_child_dirs(&month_dir, 2) {
+                    let session_dir = day_dir.join(session_id);
+                    if persisted_session_dir_matches(&session_dir, session_id) {
+                        return Some(session_dir);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn validate_reasoning_mode(&self, model_id: &str, mode: ReasoningMode) -> Result<()> {
@@ -529,6 +539,57 @@ impl AgentService {
         }
         Ok(())
     }
+}
+
+fn collect_persisted_session_meta(session_store_dir: &Path, out: &mut Vec<SessionMetaPayload>) {
+    for year_dir in date_child_dirs(session_store_dir, 4) {
+        for month_dir in date_child_dirs(&year_dir, 2) {
+            for day_dir in date_child_dirs(&month_dir, 2) {
+                let Ok(entries) = std::fs::read_dir(&day_dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let session_dir = entry.path();
+                    if !session_dir.is_dir() {
+                        continue;
+                    }
+                    let meta_path = session_dir.join(SESSION_META_FILE);
+                    if let Ok(meta) = read_json_model::<SessionMetaPayload>(&meta_path) {
+                        out.push(meta);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn date_child_dirs(parent: &Path, name_len: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.len() == name_len && name.chars().all(|ch| ch.is_ascii_digit())
+                    })
+        })
+        .collect()
+}
+
+fn persisted_session_dir_matches(dir: &Path, session_id: &str) -> bool {
+    let meta_path = dir.join(SESSION_META_FILE);
+    let context_path = dir.join(SESSION_MODEL_CONTEXT_FILE);
+    if !meta_path.is_file() || !context_path.is_file() {
+        return false;
+    }
+    read_json_model::<SessionMetaPayload>(&meta_path)
+        .is_ok_and(|meta| meta.session_id == session_id)
 }
 
 #[derive(Clone)]
@@ -739,11 +800,21 @@ models:
 
         let cwd = tmp.path().to_string_lossy().to_string();
         let session = service.new_session(&cwd).await.unwrap();
+        let session_root = std::fs::canonicalize(agent_dir.join("agent-sessions")).unwrap();
+        let relative = session.session_dir().strip_prefix(session_root).unwrap();
+        let parts = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0].len(), 4);
+        assert_eq!(parts[1].len(), 2);
+        assert_eq!(parts[2].len(), 2);
         assert!(
-            session
-                .session_dir()
-                .parent()
-                .is_some_and(|path| path.ends_with("agent-sessions"))
+            parts[..3]
+                .iter()
+                .all(|part| part.chars().all(|ch| ch.is_ascii_digit()))
         );
+        assert_eq!(parts[3], session.session_id());
     }
 }

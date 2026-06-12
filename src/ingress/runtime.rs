@@ -7,8 +7,11 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use tokio::task::JoinHandle;
 
+use super::automation::{AutomationNotificationSinks, AutomationRuntime};
+use super::bridge::{PendingConfirmationRegistry, SessionLeaseRegistry};
 use super::config::{ChannelRuntimeConfig, load_channel_runtime_config};
 use super::feishu::FeishuChannel;
+use super::stdio::StdioChannel;
 use super::websocket::WebSocketChannel;
 use super::weixin::WeixinChannel;
 use crate::agent::service::AgentService;
@@ -17,6 +20,8 @@ use crate::agent::service::AgentService;
 pub struct ChannelRuntime {
     agent: Arc<AgentService>,
     config: ChannelRuntimeConfig,
+    lease_registry: Arc<SessionLeaseRegistry>,
+    confirmation_registry: Arc<PendingConfirmationRegistry>,
     started: bool,
 }
 
@@ -26,6 +31,8 @@ impl ChannelRuntime {
         Ok(Self {
             agent,
             config,
+            lease_registry: Arc::new(SessionLeaseRegistry::new()),
+            confirmation_registry: Arc::new(PendingConfirmationRegistry::new(agent_structure_dir)),
             started: false,
         })
     }
@@ -51,13 +58,28 @@ impl ChannelRuntime {
     }
 
     async fn run_inner(&self) -> Result<()> {
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<Result<()>>(4);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<Result<()>>(8);
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         let mut weixin_clients = Vec::new();
+        let mut notification_sinks = AutomationNotificationSinks::default();
+
+        if self.config.stdio.enabled {
+            let stdio = StdioChannel::new(
+                self.agent.clone(),
+                self.lease_registry.clone(),
+                self.agent.agent_structure_dir(),
+                &self.config.stdio,
+            )?;
+            let tx = result_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = tx.send(stdio.run().await).await;
+            }));
+        }
 
         if self.config.websocket.enabled {
             let websocket = WebSocketChannel::new(
                 self.agent.clone(),
+                self.lease_registry.clone(),
                 self.agent.agent_structure_dir(),
                 &self.config.websocket,
             )?;
@@ -70,10 +92,13 @@ impl ChannelRuntime {
         if self.config.weixin.enabled {
             let weixin = WeixinChannel::new(
                 self.agent.clone(),
+                self.lease_registry.clone(),
+                self.confirmation_registry.clone(),
                 self.agent.agent_structure_dir(),
                 &self.config.weixin,
             )
             .await?;
+            notification_sinks.weixin = Some(weixin.automation_notifier());
             let client = weixin.client();
             weixin_clients.push(client);
             let tx = result_tx.clone();
@@ -85,13 +110,29 @@ impl ChannelRuntime {
         if self.config.feishu.enabled {
             let feishu = FeishuChannel::new(
                 self.agent.clone(),
+                self.lease_registry.clone(),
+                self.confirmation_registry.clone(),
                 self.agent.agent_structure_dir(),
                 &self.config.feishu,
             )
             .await?;
+            notification_sinks.feishu = Some(feishu.automation_notifier());
             let tx = result_tx.clone();
             tasks.push(tokio::spawn(async move {
                 let _ = tx.send(feishu.run().await).await;
+            }));
+        }
+
+        if self.config.automation.enabled {
+            let automation = AutomationRuntime::new(
+                self.agent.clone(),
+                self.agent.agent_structure_dir(),
+                self.config.automation.jobs.clone(),
+                notification_sinks,
+            );
+            let tx = result_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = tx.send(automation.run().await).await;
             }));
         }
 

@@ -41,14 +41,18 @@
 同一个 agent profile 可以用不同 host 模式启动：
 
 ```powershell
-cargo run -- acp --agent-folder examples/dwo-agent
+cargo run -- acp embedded --agent-folder examples/dwo-agent
+cargo run -- acp connect --agent-folder examples/dwo-agent
 cargo run -- serve --agent-folder examples/weixin-agent
+cargo run -- channel login stdio --agent-folder examples/weixin-agent
 cargo run -- channel login weixin --agent-folder examples/weixin-agent
 cargo run -- channel login feishu --agent-folder examples/weixin-agent --app-id cli_xxx --app-secret xxx
 ```
 
-- `acp`：通过 stdio 运行 ACP，并从 ACP `session/new` 创建会话。
+- `acp embedded`：通过 stdio 在当前进程内运行 ACP，并从 ACP `session/new` 创建会话。
+- `acp connect`：短生命周期 stdio bridge，连接已经启动的 `serve`。
 - `serve`：启动由 `channels.yaml` 配置的长生命周期 ingress channel。
+- `channel login stdio`：生成本机 stdio bridge token。
 - `channel login weixin`：执行微信扫码登录，并把凭据写入当前 agent profile。
 - `channel login feishu`：保存飞书应用凭据到当前 agent profile。
 
@@ -164,6 +168,10 @@ models:
 `channels.yaml` 是可选文件，用于配置 `dwo-agent serve` 启动的长生命周期 service ingress channels。
 
 ```yaml
+stdio:
+  enabled: true
+  auth: true
+
 weixin:
   enabled: true
   workspace_dir: .
@@ -194,15 +202,74 @@ feishu:
   response_detail: response_only
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
+
+automation:
+  enabled: false
+  jobs:
+    - id: daily_digest
+      enabled: true
+      workspace_dir: .
+      schedule:
+        type: interval
+        every_seconds: 3600
+      prompt: "总结当前项目状态。"
+      response_detail: response_only
+      notify:
+        - channel: weixin
+        - channel: feishu
+          recipient:
+            type: chat
+            id: oc_xxx
 ```
 
 顶层配置：
 
+- `stdio`：本机 stdio bridge channel，供 `acp connect` / Zed 等 stdio client 接入长期 runtime。
 - `weixin`：微信单用户 assistant channel。
-- `websocket`：ACP-over-WebSocket channel，协议行为与 `acp` stdio 相同。
+- `websocket`：ACP-over-WebSocket channel，协议行为与 stdio ACP 相同。
 - `feishu`：飞书/Lark assistant channel。
+- `automation`：定时 job ingress。
 
 如果 `channels.yaml` 不存在或为空，所有 channel 默认禁用。`serve` host 要求至少启用一个 channel。
+
+### Stdio Channel
+
+Stdio channel 字段：
+
+- `enabled`：默认 `false`。
+- `auth`：是否启用本机 bridge token。默认 `true`。
+
+生成 stdio bridge token：
+
+```powershell
+cargo run -- channel login stdio --agent-folder examples/dwo-agent
+```
+
+该命令要求 `stdio.enabled: true` 且 `stdio.auth: true`，然后写入：
+
+```text
+<agent-folder>/channel_secret/stdio/auth.yaml
+```
+
+`serve` 启动且 `stdio.enabled: true` 时会监听本机 IPC，并写入：
+
+```text
+<agent-folder>/channel_secret/stdio/daemon.yaml
+```
+
+`daemon.yaml` 记录当前进程 pid、启动时间和 IPC endpoint。它是运行态文件，异常退出时可能残留；`acp connect` 会实际连接 endpoint，不能只信 manifest。
+
+Zed 等 stdio ACP client 推荐调用：
+
+```powershell
+cargo run -- acp connect --agent-folder examples/dwo-agent
+```
+
+兼容旧行为可以使用：
+
+```powershell
+cargo run -- acp embedded --agent-folder examples/dwo-agent
+```
 
 ### WebSocket Channel
 
@@ -213,6 +280,8 @@ WebSocket 字段：
 - `auth`：是否启用 bearer token 鉴权。默认 `true`。启用 websocket 时建议保持 `true`。
 
 WebSocket channel 复用 ACP stdio 的 request/response 和 notification 行为：client 通过 websocket 发送一条 JSON-RPC text/binary message，服务端回一条 JSON-RPC text message。每个 websocket connection 是一条独立 ACP transport connection；`initialize`、`session/new`、`session/prompt`、`session/cancel`、`session/list`、`session/load`、`session/set_mode` 和 `session/set_config_option` 的语义与 stdio ACP 保持一致。
+
+ACP IPC 和 WebSocket connection 在 `session/new` 或 `session/load` 时会占用对应 session，connection 断开后释放。被占用的 session 不能被微信/飞书 `/switch` 抢占。
 
 生成 WebSocket token：
 
@@ -271,6 +340,19 @@ Weixin 运行时文件：
 Weixin channel 使用 `<channel_session_dir>/weixin/session/` 下的一个持久化 channel session。`channel_session_dir` 来自 `agent.yaml`，默认是 `<agent-folder>/channel_sessions`，可以改成任意绝对路径或相对路径。Channel secret 仍固定保存在当前 agent profile 的 `channel_secret/weixin/` 下。
 
 一旦该 channel session 已存在，它会保留自己的 model、reasoning mode、runtime tool schemas 和工具快照。之后修改 `override_model`、`override_reasoning_mode` 或 `media_output`，不会自动改写已有 channel session。需要新的 channel 配置快照时，应删除该 channel session 或显式迁移它。
+
+Weixin 支持 channel bridge 命令：
+
+```text
+/list
+/switch <session_id>
+/back
+/where
+/approve <confirmation_id>
+/deny <confirmation_id>
+```
+
+普通消息默认进入 Weixin 自己的 channel session。`/switch <session_id>` 会把后续消息重定向到指定普通 session，并尝试占用该 session；`/back` 释放占用并返回默认 channel session。附件仍下载到 Weixin channel session 的附件空间，但本轮输入会送到当前 active session。
 
 ### Feishu Channel
 
@@ -342,6 +424,87 @@ Feishu 私聊和群聊使用独立持久化 channel session。收到私聊消息
 开启 `media_output` 后，新建 Feishu channel session 会获得 `feishu_reply_media` 工具。工具会把 workspace 或当前 channel session 目录内的本地文件上传到飞书，然后回复当前私聊或群聊。`kind: auto` 会把常见图片扩展名作为图片消息发送，其他文件作为文件消息发送；也可以指定 `kind: image` 或 `kind: file`。
 
 开启 `card_output` 后，新建 Feishu channel session 会获得 `feishu_reply_card` 工具。工具接收飞书 interactive card JSON object，并发送到当前私聊或群聊。当前实现只发送新卡片，不做卡片更新、延迟更新或表单回调处理。
+
+Feishu 支持与 Weixin 相同的 channel bridge 命令：
+
+```text
+/list
+/switch <session_id>
+/back
+/where
+/approve <confirmation_id>
+/deny <confirmation_id>
+```
+
+Feishu 在 confirm mode 下遇到需要确认的工具调用时，会向当前私聊或群聊发送：
+
+```text
+[confirm required]
+session: ...
+confirm: c_xxx
+tool: terminal_exec
+args: ...
+/approve c_xxx
+/deny c_xxx
+```
+
+确认审计会写入：
+
+```text
+<agent-folder>/channel_secret/audit/confirm_audit.jsonl
+```
+
+### Automation Channel
+
+Automation 字段：
+
+- `enabled`：默认 `false`。
+- `jobs`：定时 job 列表。
+
+Job 字段：
+
+- `id`：必填 job id。
+- `enabled`：默认 `true`。
+- `workspace_dir`：该 job 新建 session 使用的 cwd。默认 `.`。
+- `schedule`：触发计划。第一版支持 `interval` 和 `daily`。
+- `prompt`：每次触发时注入新 session 的用户输入。
+- `response_detail`：收集结果时是否包含 thinking/tool call 摘要。默认 `response_only`。
+- `notify`：结果投递配置。Weixin 可省略 recipient，默认发送给当前登录绑定用户；Feishu 必须配置 recipient。
+
+Schedule 示例：
+
+```yaml
+schedule:
+  type: interval
+  every_seconds: 3600
+```
+
+```yaml
+schedule:
+  type: daily
+  at: "09:00"
+```
+
+Notify 示例：
+
+```yaml
+notify:
+  - channel: weixin
+  - channel: feishu
+    recipient:
+      type: chat
+      id: oc_xxx
+```
+
+`serve` 启动 automation 后，每次 job 触发都会新建普通 agent session，不复用长期 session。运行状态写入：
+
+```text
+<channel_session_dir>/automation/<job_id>/runs/<run_id>/run.yaml
+```
+
+`run.yaml` 包含 `job_id`、`run_id`、`session_id`、状态、开始/结束时间、stop reason、错误、最终 response 和 notify 配置。用户可以通过微信/飞书 `/switch <session_id>` 继续和某次 automation run 的 session 对话。
+
+如果配置了 `notify`，automation 会在 run 结束后投递一条包含 job 状态、`session_id`、`/switch <session_id>` 和最终回复的消息。投递结果会记录到 `run.yaml` 的 `notifications` 字段。
 
 ## Agent Prompt
 

@@ -22,7 +22,28 @@ Feishu channel 的 WebSocket 依赖需要 `protoc`。如果构建时报
 ## Run
 
 ```bash
-cargo run -- acp --agent-folder examples/dwo-agent
+cargo run -- acp embedded --agent-folder examples/dwo-agent
+```
+
+启用长生命周期本机 stdio bridge：
+
+```yaml
+stdio:
+  enabled: true
+  auth: true
+```
+
+然后运行：
+
+```bash
+cargo run -- channel login stdio --agent-folder examples/dwo-agent
+cargo run -- serve --agent-folder examples/dwo-agent
+```
+
+Zed 或其他 stdio ACP client 连接长期 runtime：
+
+```bash
+cargo run -- acp connect --agent-folder examples/dwo-agent
 ```
 
 启用 ACP WebSocket ingress：
@@ -103,13 +124,33 @@ feishu:
   override_reasoning_mode: auto
 ```
 
+启用 automation/job：
+
+```yaml
+automation:
+  enabled: true
+  jobs:
+    - id: daily_digest
+      enabled: true
+      workspace_dir: .
+      schedule:
+        type: interval
+        every_seconds: 3600
+      prompt: "总结当前项目状态。"
+      notify:
+        - channel: weixin
+```
+
 ## Notes
 
 - Agent profile 文件夹结构、`agent.yaml` / `model.yaml`、`channels.yaml`、
   `policy.yaml`、rules 和 skills 见
   [docs/agent-profile-structure-config.md](docs/agent-profile-structure-config.md)。
-- `acp` 通过 stdio 运行 ACP，client 关闭 stdin 后进程退出。`serve`
-  用于 websocket、Feishu、Weixin 等长生命周期 ingress channels。
+- `acp embedded` 通过 stdio 在当前进程内运行 ACP，client 关闭 stdin 后进程退出。
+  `acp connect` 是 stdio bridge，会连接已经启动的 `serve`，bridge 退出不会关闭 agent runtime。
+  `serve` 用于 stdio、websocket、Feishu、Weixin、automation 等长生命周期 ingress channels。
+- Stdio bridge 使用 `channel_secret/stdio/auth.yaml` 保存 token，`serve` 启动时写入
+  `channel_secret/stdio/daemon.yaml` 供 `acp connect` 定位本机 IPC endpoint。
 - Weixin 使用 `channel_secret/weixin/auth.yaml` 和
   `channel_secret/weixin/context_tokens.json` 保存凭据和 token 状态，并把单个
   channel session 存在 `channel_sessions/weixin/session/` 下。这个根目录可通过
@@ -121,6 +162,11 @@ feishu:
   `media_input` 默认关闭；开启后会把入站图片和文件下载到对应 session 的 `attachments/` 并加入上下文。
   `media_output` 默认关闭；开启后会向模型暴露 `feishu_reply_media(path)`，用于上传并回复图片或文件。
   `card_output` 默认关闭；开启后会向模型暴露 `feishu_reply_card(card)`，用于发送飞书交互卡片。
+- Weixin/Feishu 支持 `/list`、`/switch <session_id>`、`/back`、`/where`。切换到非默认 session 时会占用该 session；其他 channel、ACP IPC 或 WebSocket 连接不能同时占用。
+- 飞书工具确认会通过 `/approve <confirmation_id>`、`/deny <confirmation_id>` 透传，确认审计写入 `channel_secret/audit/confirm_audit.jsonl`。
+- Automation 由 `serve` 激活。每次 job 触发都会新建普通 agent session，并把 run 状态写入
+  `channel_sessions/automation/<job_id>/runs/<run_id>/run.yaml`。配置 `notify` 后，run 结束会投递包含
+  `session_id` 和 `/switch <session_id>` 的通知；投递结果也会写回 `run.yaml`。
 - `agent.yaml` 里的 `max_running_turn` 是可选项。省略时，agent loop 会一直运行，直到模型停止、会话取消或发生错误。设置为正整数可以保留旧的 max-turn guard。
 - `agent.yaml` 的 `tools` 可以把 `file_edit`、`terminal`、`subagent` 设置为
   `enable` 或 `disable`。这些值会在 session 创建时快照；之后修改

@@ -1,11 +1,11 @@
 //! ACP adapter for the agent runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use agent_client_protocol::schema::{
@@ -30,6 +30,7 @@ use futures::io::AsyncRead;
 use serde_json::{Map, Value};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use super::bridge::SessionLeaseRegistry;
 use crate::agent::activity::event::{
     EVENT_ACTIVITY_BOX, EVENT_ACTIVITY_BOX_UPDATE, EVENT_AGENT_MESSAGE_CHUNK,
     EVENT_AGENT_THOUGHT_CHUNK, EVENT_CONFIG_OPTION, EVENT_CURRENT_MODE, EVENT_SESSION_INFO,
@@ -70,10 +71,67 @@ pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {
     }
 }
 
+#[derive(Clone)]
+pub struct AcpSessionLeaseBridge {
+    holder: String,
+    registry: Arc<SessionLeaseRegistry>,
+    held_sessions: Arc<Mutex<HashSet<String>>>,
+}
+
+impl AcpSessionLeaseBridge {
+    pub fn new(holder: impl Into<String>, registry: Arc<SessionLeaseRegistry>) -> Self {
+        Self {
+            holder: holder.into(),
+            registry,
+            held_sessions: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    pub async fn acquire(&self, session_id: &str) -> Result<()> {
+        self.registry.acquire(session_id, &self.holder).await?;
+        self.held_sessions
+            .lock()
+            .expect("ACP held session mutex poisoned")
+            .insert(session_id.to_string());
+        Ok(())
+    }
+}
+
+impl Drop for AcpSessionLeaseBridge {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.held_sessions) != 1 {
+            return;
+        }
+        let held = self
+            .held_sessions
+            .lock()
+            .expect("ACP held session mutex poisoned")
+            .drain()
+            .collect::<Vec<_>>();
+        for session_id in held {
+            self.registry
+                .release_if_holder_sync(&session_id, &self.holder);
+        }
+    }
+}
+
 /// Run the ACP agent over any line-delimited JSON-RPC transport.
 pub async fn run_acp_transport<T>(
     agent: Arc<AgentService>,
     transport: T,
+) -> std::result::Result<(), agent_client_protocol::Error>
+where
+    T: agent_client_protocol::ConnectTo<Agent> + 'static,
+{
+    run_acp_transport_with_leases(agent, transport, None).await
+}
+
+/// Run the ACP agent over any line-delimited JSON-RPC transport and bind
+/// loaded/new sessions to a remote connection lease.
+pub async fn run_acp_transport_with_leases<T>(
+    agent: Arc<AgentService>,
+    transport: T,
+    session_leases: Option<AcpSessionLeaseBridge>,
 ) -> std::result::Result<(), agent_client_protocol::Error>
 where
     T: agent_client_protocol::ConnectTo<Agent> + 'static,
@@ -86,6 +144,9 @@ where
     let agent_for_load = agent.clone();
     let agent_for_mode = agent.clone();
     let agent_for_config = agent.clone();
+    let leases_for_new = session_leases.clone();
+    let leases_for_prompt = session_leases.clone();
+    let leases_for_load = session_leases.clone();
 
     Agent
         .builder()
@@ -129,6 +190,14 @@ where
                         let usage = session.context_usage_snapshot().await;
                         let profiles = agent_for_new.model_profiles();
                         let session_id = session.session_id().to_string();
+                        if let Some(leases) = leases_for_new.as_ref()
+                            && let Err(err) = leases.acquire(&session_id).await
+                        {
+                            return responder.respond_with_error(
+                                agent_client_protocol::schema::Error::invalid_params()
+                                    .data(format!("{err:#}")),
+                            );
+                        }
                         let sid = SessionId::new(session_id.as_str());
                         let response = NewSessionResponse::new(sid)
                             .modes(build_mode_state(snapshot.mode_id.as_str()))
@@ -156,6 +225,14 @@ where
                         responder: Responder<PromptResponse>,
                         cx: ConnectionTo<Client>| {
                 let session_id = req.session_id.to_string();
+                if let Some(leases) = leases_for_prompt.as_ref()
+                    && let Err(err) = leases.acquire(&session_id).await
+                {
+                    return responder.respond_with_error(
+                        agent_client_protocol::schema::Error::invalid_params()
+                            .data(format!("{err:#}")),
+                    );
+                }
                 let (user_input, user_blocks) = match normalize_prompt_blocks(&req.prompt) {
                     Ok(normalized) => normalized,
                     Err(err) => {
@@ -277,6 +354,14 @@ where
                 let session_id = req.session_id.to_string();
                 match agent_for_load.load_session(&session_id).await {
                     Ok(Some(session)) => {
+                        if let Some(leases) = leases_for_load.as_ref()
+                            && let Err(err) = leases.acquire(&session_id).await
+                        {
+                            return responder.respond_with_error(
+                                agent_client_protocol::schema::Error::invalid_params()
+                                    .data(format!("{err:#}")),
+                            );
+                        }
                         let snapshot = session.session_meta_snapshot().await;
                         let usage = session.context_usage_snapshot().await;
                         let profiles = agent_for_load.model_profiles();

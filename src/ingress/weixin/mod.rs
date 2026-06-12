@@ -16,8 +16,10 @@ use weixin_agent::{
     WeixinClient, WeixinConfig,
 };
 
-use super::channel_events::{ChannelResponseDetail, ChannelUpdateCollector};
+use super::automation::AutomationNotificationSink;
+use super::bridge::{ChannelBridge, PendingConfirmationRegistry, SessionLeaseRegistry};
 use super::config::WeixinChannelConfig;
+use super::response::{ChannelResponseDetail, ChannelUpdateCollector};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::agent::session_agent::SessionAgent;
@@ -48,6 +50,7 @@ struct WeixinAuth {
 
 pub struct WeixinChannel {
     client: Arc<WeixinClient>,
+    notify_to: String,
     initial_sync_buf: Option<String>,
     context_tokens_path: PathBuf,
 }
@@ -55,6 +58,8 @@ pub struct WeixinChannel {
 #[derive(Clone)]
 struct WeixinHandler {
     session: Arc<SessionAgent>,
+    bridge: ChannelBridge,
+    confirmations: Arc<PendingConfirmationRegistry>,
     auth: WeixinAuth,
     workspace_dir: PathBuf,
     session_dir: PathBuf,
@@ -71,6 +76,11 @@ struct WeixinReplyMediaBridge {
     client: Arc<WeixinClient>,
     to: String,
     context_token: Option<String>,
+}
+
+struct WeixinAutomationNotifier {
+    client: Arc<WeixinClient>,
+    to: String,
 }
 
 pub fn run_weixin_login_sync(agent_folder: PathBuf) -> Result<()> {
@@ -155,6 +165,8 @@ pub async fn run_weixin_login(agent_folder: &Path) -> Result<()> {
 impl WeixinChannel {
     pub async fn new(
         agent: Arc<AgentService>,
+        leases: Arc<SessionLeaseRegistry>,
+        confirmations: Arc<PendingConfirmationRegistry>,
         agent_structure_dir: &Path,
         config: &WeixinChannelConfig,
     ) -> Result<Self> {
@@ -181,8 +193,18 @@ impl WeixinChannel {
                 config.override_reasoning_mode,
             )
             .await?;
+        let bridge = ChannelBridge::new(
+            agent.clone(),
+            leases,
+            confirmations.clone(),
+            format!("weixin:user:{}", auth.bound_user_id),
+            &session_dir,
+            session.session_id().to_string(),
+        );
         let handler = WeixinHandler {
             session,
+            bridge,
+            confirmations,
             auth: auth.clone(),
             workspace_dir: workspace_dir.clone(),
             session_dir: session_dir.clone(),
@@ -213,6 +235,7 @@ impl WeixinChannel {
 
         Ok(Self {
             client,
+            notify_to: auth.bound_user_id,
             initial_sync_buf: read_sync_buf(&sync_buf_path)?,
             context_tokens_path,
         })
@@ -220,6 +243,13 @@ impl WeixinChannel {
 
     pub fn client(&self) -> Arc<WeixinClient> {
         self.client.clone()
+    }
+
+    pub fn automation_notifier(&self) -> Arc<dyn AutomationNotificationSink> {
+        Arc::new(WeixinAutomationNotifier {
+            client: self.client.clone(),
+            to: self.notify_to.clone(),
+        })
     }
 
     pub async fn run(self) -> Result<()> {
@@ -267,10 +297,16 @@ impl MessageHandler for WeixinHandler {
 
 impl WeixinHandler {
     async fn handle_message(&self, ctx: &MessageContext) -> Result<()> {
+        if let Some(text) = ctx.body.as_deref()
+            && let Some(reply) = self.bridge.handle_command(text).await?
+        {
+            ctx.reply_text(&reply).await?;
+            return Ok(());
+        }
         let Some((user_input, user_blocks)) = self.build_user_input(ctx).await? else {
             return Ok(());
         };
-        let agent = self.session.clone();
+        let agent = self.bridge.active_session(self.session.clone()).await?;
 
         let tool_manager = agent.tool_manager().await;
         if self.media_output {
@@ -295,7 +331,18 @@ impl WeixinHandler {
 
         let update_collector = ChannelUpdateCollector::new(self.response_detail);
         let emit_update = update_collector.emitter();
-        let request_permission = rejecting_permission_requester();
+        let client = self
+            .client
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Weixin client is not initialized."))?;
+        let request_permission = confirming_permission_requester(
+            self.confirmations.clone(),
+            client,
+            ctx.from.clone(),
+            ctx.context_token.clone(),
+            format!("weixin:user:{}", self.auth.bound_user_id),
+        );
         let run_result = agent
             .clone()
             .run_prompt(user_input, user_blocks, emit_update, request_permission)
@@ -375,9 +422,42 @@ impl WeixinToolBridge for WeixinReplyMediaBridge {
     }
 }
 
-fn rejecting_permission_requester() -> PermissionRequester {
-    Arc::new(move |_target: String, _payload: Map<String, Value>| {
-        Box::pin(async move { Ok(PERMISSION_REJECT_ONCE.to_string()) })
+#[async_trait::async_trait]
+impl AutomationNotificationSink for WeixinAutomationNotifier {
+    async fn send(
+        &self,
+        _notify: &super::config::AutomationNotifyConfig,
+        text: &str,
+    ) -> Result<String> {
+        let result = self.client.send_text(&self.to, text, None).await?;
+        Ok(result.message_id)
+    }
+}
+
+fn confirming_permission_requester(
+    confirmations: Arc<PendingConfirmationRegistry>,
+    client: Arc<WeixinClient>,
+    to: String,
+    context_token: Option<String>,
+    holder: String,
+) -> PermissionRequester {
+    Arc::new(move |session_id: String, payload: Map<String, Value>| {
+        let confirmations = confirmations.clone();
+        let client = client.clone();
+        let to = to.clone();
+        let context_token = context_token.clone();
+        let holder = holder.clone();
+        Box::pin(async move {
+            let (snapshot, rx) = confirmations.create(session_id, payload, holder)?;
+            let message = ChannelBridge::confirmation_message(&snapshot);
+            client
+                .send_text(&to, &message, context_token.as_deref())
+                .await?;
+            match rx.await {
+                Ok(decision) => Ok(decision),
+                Err(_) => Ok(PERMISSION_REJECT_ONCE.to_string()),
+            }
+        })
     })
 }
 

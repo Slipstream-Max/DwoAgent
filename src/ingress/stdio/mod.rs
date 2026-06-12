@@ -1,4 +1,4 @@
-//! Long-lived ACP local channel and short-lived stdio bridge.
+//! Long-lived local stdio bridge for ACP clients.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,22 +6,21 @@ use std::sync::Arc;
 use agent_client_protocol::ByteStreams;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use super::acp::run_acp_transport;
-use super::config::{AcpChannelConfig, load_channel_runtime_config};
+use super::acp::{AcpSessionLeaseBridge, run_acp_transport_with_leases};
+use super::bridge::SessionLeaseRegistry;
+use super::config::{StdioChannelConfig, load_channel_runtime_config};
 use crate::agent::service::AgentService;
 use crate::config::loader::{resolve_agent_structure_dir, utc_iso};
 use crate::utils::files::read_utf8_text;
 
-const ACP_SECRET_DIR: &str = "channel_secret/acp";
+const STDIO_SECRET_DIR: &str = "channel_secret/stdio";
 const ACP_AUTH_FILE: &str = "auth.yaml";
 const ACP_DAEMON_FILE: &str = "daemon.yaml";
-const TOKEN_PREFIX: &str = "dwo_acp_";
+const TOKEN_PREFIX: &str = "dwo_stdio_";
 const MIN_TOKEN_LEN: usize = TOKEN_PREFIX.len() + 64;
 const AUTH_LINE_PREFIX: &str = "DWO_AUTH ";
 
@@ -54,23 +53,21 @@ pub struct AcpDaemonManifest {
     pub ipc: AcpIpcEndpoint,
 }
 
-pub struct AcpChannel {
+pub struct StdioChannel {
     agent: Arc<AgentService>,
+    leases: Arc<SessionLeaseRegistry>,
     agent_structure_dir: PathBuf,
-    config: AcpChannelConfig,
     auth_token: Option<String>,
     endpoint: AcpIpcEndpoint,
 }
 
-impl AcpChannel {
+impl StdioChannel {
     pub fn new(
         agent: Arc<AgentService>,
+        leases: Arc<SessionLeaseRegistry>,
         agent_structure_dir: &Path,
-        config: &AcpChannelConfig,
+        config: &StdioChannelConfig,
     ) -> Result<Self> {
-        if !config.ipc {
-            bail!("acp channel is enabled but `acp.ipc` is false; no transport is configured.");
-        }
         let auth_token = if config.auth {
             Some(read_auth(&auth_path(agent_structure_dir))?.token)
         } else {
@@ -79,19 +76,17 @@ impl AcpChannel {
         let endpoint = default_ipc_endpoint(agent_structure_dir)?;
         Ok(Self {
             agent,
+            leases,
             agent_structure_dir: agent_structure_dir.to_path_buf(),
-            config: config.clone(),
             auth_token,
             endpoint,
         })
     }
 
     pub async fn run(self) -> Result<()> {
-        if !self.config.ipc {
-            bail!("acp channel is enabled but `acp.ipc` is false; no transport is configured.");
-        }
         run_ipc_listener(
             self.agent,
+            self.leases,
             self.agent_structure_dir,
             self.endpoint,
             self.auth_token,
@@ -100,18 +95,18 @@ impl AcpChannel {
     }
 }
 
-pub fn run_acp_login_sync(agent_folder: PathBuf) -> Result<()> {
-    run_acp_login(&agent_folder)
+pub fn run_stdio_login_sync(agent_folder: PathBuf) -> Result<()> {
+    run_stdio_login(&agent_folder)
 }
 
-pub fn run_acp_login(agent_folder: &Path) -> Result<()> {
+pub fn run_stdio_login(agent_folder: &Path) -> Result<()> {
     let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
     let config = load_channel_runtime_config(&agent_structure_dir)?;
-    if !config.acp.enabled {
-        bail!("acp channel is not enabled in channels.yaml.");
+    if !config.stdio.enabled {
+        bail!("stdio channel is not enabled in channels.yaml.");
     }
-    if !config.acp.auth {
-        bail!("acp auth is disabled in channels.yaml; set `acp.auth: true` first.");
+    if !config.stdio.auth {
+        bail!("stdio auth is disabled in channels.yaml; set `stdio.auth: true` first.");
     }
 
     let auth = AcpAuth {
@@ -120,27 +115,24 @@ pub fn run_acp_login(agent_folder: &Path) -> Result<()> {
     let path = auth_path(&agent_structure_dir);
     write_auth(&path, &auth)?;
 
-    println!("ACP token:");
+    println!("ACP stdio token:");
     println!("{}", auth.token);
-    println!("ACP credentials saved to {}", path.display());
+    println!("ACP stdio credentials saved to {}", path.display());
     Ok(())
 }
 
-pub fn run_acp_connect_sync(agent_folder: PathBuf, ipc: Option<String>) -> Result<()> {
+pub fn run_stdio_connect_sync(agent_folder: PathBuf, ipc: Option<String>) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_acp_connect(&agent_folder, ipc))
+    rt.block_on(run_stdio_connect(&agent_folder, ipc))
 }
 
-pub async fn run_acp_connect(agent_folder: &Path, ipc: Option<String>) -> Result<()> {
+pub async fn run_stdio_connect(agent_folder: &Path, ipc: Option<String>) -> Result<()> {
     let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
     let config = load_channel_runtime_config(&agent_structure_dir)?;
-    if !config.acp.enabled {
-        bail!("acp channel is not enabled in channels.yaml.");
-    }
-    if !config.acp.ipc {
-        bail!("acp channel has no IPC transport configured; set `acp.ipc: true`.");
+    if !config.stdio.enabled {
+        bail!("stdio channel is not enabled in channels.yaml.");
     }
 
     let endpoint = match ipc {
@@ -155,7 +147,7 @@ pub async fn run_acp_connect(agent_folder: &Path, ipc: Option<String>) -> Result
             })?
             .ipc,
     };
-    let auth_token = if config.acp.auth {
+    let auth_token = if config.stdio.auth {
         Some(read_auth(&auth_path(&agent_structure_dir))?.token)
     } else {
         None
@@ -184,7 +176,10 @@ where
             .write_all(format!("{AUTH_LINE_PREFIX}{token}\n").as_bytes())
             .await
             .context("write ACP IPC auth line")?;
-        write_half.flush().await.context("flush ACP IPC auth line")?;
+        write_half
+            .flush()
+            .await
+            .context("flush ACP IPC auth line")?;
     }
 
     let mut stdin = tokio::io::stdin();
@@ -210,6 +205,7 @@ where
 
 async fn serve_ipc_connection<S>(
     agent: Arc<AgentService>,
+    leases: Arc<SessionLeaseRegistry>,
     stream: S,
     auth_token: Option<String>,
 ) -> Result<()>
@@ -225,7 +221,9 @@ where
     }
 
     let transport = ByteStreams::new(write_half.compat_write(), reader.compat());
-    run_acp_transport(agent, transport)
+    let holder = format!("stdio:ipc:{}", Uuid::new_v4().simple());
+    let bridge = AcpSessionLeaseBridge::new(holder, leases);
+    run_acp_transport_with_leases(agent, transport, Some(bridge))
         .await
         .map_err(|err| anyhow::anyhow!("ACP IPC connection error: {err}"))
 }
@@ -254,19 +252,21 @@ where
 }
 
 fn auth_path(agent_structure_dir: &Path) -> PathBuf {
-    agent_structure_dir.join(ACP_SECRET_DIR).join(ACP_AUTH_FILE)
+    agent_structure_dir
+        .join(STDIO_SECRET_DIR)
+        .join(ACP_AUTH_FILE)
 }
 
 fn daemon_path(agent_structure_dir: &Path) -> PathBuf {
     agent_structure_dir
-        .join(ACP_SECRET_DIR)
+        .join(STDIO_SECRET_DIR)
         .join(ACP_DAEMON_FILE)
 }
 
 fn read_auth(path: &Path) -> Result<AcpAuth> {
     if !path.is_file() {
         bail!(
-            "ACP auth file not found: {}. Run `dwo-agent channel login acp --agent-folder <agent-folder>` first.",
+            "ACP stdio auth file not found: {}. Run `dwo-agent channel login stdio --agent-folder <agent-folder>` first.",
             path.display()
         );
     }
@@ -290,7 +290,9 @@ fn write_auth(path: &Path, auth: &AcpAuth) -> Result<()> {
 fn validate_auth(auth: &AcpAuth) -> Result<()> {
     let token = auth.token.trim();
     if token.len() < MIN_TOKEN_LEN || !token.starts_with(TOKEN_PREFIX) {
-        bail!("ACP token is invalid; run `dwo-agent channel login acp` to generate a new token.");
+        bail!(
+            "ACP stdio token is invalid; run `dwo-agent channel login stdio` to generate a new token."
+        );
     }
     Ok(())
 }
@@ -365,7 +367,7 @@ fn default_ipc_endpoint(_agent_structure_dir: &Path) -> Result<AcpIpcEndpoint> {
 
 #[cfg(unix)]
 fn default_ipc_endpoint(agent_structure_dir: &Path) -> Result<AcpIpcEndpoint> {
-    let dir = agent_structure_dir.join(ACP_SECRET_DIR);
+    let dir = agent_structure_dir.join(STDIO_SECRET_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(AcpIpcEndpoint {
         kind: AcpIpcKind::UnixSocket,
@@ -395,6 +397,7 @@ fn override_ipc_endpoint(name: String) -> AcpIpcEndpoint {
 #[cfg(windows)]
 async fn run_ipc_listener(
     agent: Arc<AgentService>,
+    leases: Arc<SessionLeaseRegistry>,
     agent_structure_dir: PathBuf,
     endpoint: AcpIpcEndpoint,
     auth_token: Option<String>,
@@ -424,9 +427,10 @@ async fn run_ipc_listener(
             .await
             .with_context(|| format!("accept ACP named pipe {}", endpoint.name))?;
         let agent = agent.clone();
+        let leases = leases.clone();
         let auth_token = auth_token.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_ipc_connection(agent, server, auth_token).await {
+            if let Err(err) = serve_ipc_connection(agent, leases, server, auth_token).await {
                 tracing::warn!(error = %format!("{err:#}"), "ACP IPC connection ended with error");
             }
         });
@@ -437,6 +441,7 @@ async fn run_ipc_listener(
 #[cfg(unix)]
 async fn run_ipc_listener(
     agent: Arc<AgentService>,
+    leases: Arc<SessionLeaseRegistry>,
     agent_structure_dir: PathBuf,
     endpoint: AcpIpcEndpoint,
     auth_token: Option<String>,
@@ -457,9 +462,10 @@ async fn run_ipc_listener(
     loop {
         let (stream, _addr) = listener.accept().await.context("accept ACP unix socket")?;
         let agent = agent.clone();
+        let leases = leases.clone();
         let auth_token = auth_token.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_ipc_connection(agent, stream, auth_token).await {
+            if let Err(err) = serve_ipc_connection(agent, leases, stream, auth_token).await {
                 tracing::warn!(error = %format!("{err:#}"), "ACP IPC connection ended with error");
             }
         });
@@ -497,11 +503,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acp_login_writes_valid_token() {
+    fn stdio_login_writes_valid_token() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = write_agent_structure(tmp.path(), true, true);
 
-        run_acp_login(&agent_dir).unwrap();
+        run_stdio_login(&agent_dir).unwrap();
 
         let auth = read_auth(&auth_path(&agent_dir)).unwrap();
         assert!(auth.token.starts_with(TOKEN_PREFIX));
@@ -509,15 +515,15 @@ mod tests {
     }
 
     #[test]
-    fn acp_login_requires_enabled_auth_channel() {
+    fn stdio_login_requires_enabled_auth_channel() {
         let tmp = tempfile::tempdir().unwrap();
         let disabled_dir = write_agent_structure(tmp.path(), false, true);
-        let disabled_err = run_acp_login(&disabled_dir).unwrap_err();
+        let disabled_err = run_stdio_login(&disabled_dir).unwrap_err();
         assert!(disabled_err.to_string().contains("not enabled"));
 
         let no_auth_dir = tmp.path().join("no-auth-agent");
         write_agent_structure_at(&no_auth_dir, true, false);
-        let no_auth_err = run_acp_login(&no_auth_dir).unwrap_err();
+        let no_auth_err = run_stdio_login(&no_auth_dir).unwrap_err();
         assert!(no_auth_err.to_string().contains("auth is disabled"));
     }
 
@@ -545,13 +551,13 @@ mod tests {
         assert!(!constant_time_eq(b"same", b"same-longer"));
     }
 
-    fn write_agent_structure(root: &Path, acp_enabled: bool, acp_auth: bool) -> PathBuf {
+    fn write_agent_structure(root: &Path, stdio_enabled: bool, stdio_auth: bool) -> PathBuf {
         let agent_dir = root.join("agent");
-        write_agent_structure_at(&agent_dir, acp_enabled, acp_auth);
+        write_agent_structure_at(&agent_dir, stdio_enabled, stdio_auth);
         agent_dir
     }
 
-    fn write_agent_structure_at(agent_dir: &Path, acp_enabled: bool, acp_auth: bool) {
+    fn write_agent_structure_at(agent_dir: &Path, stdio_enabled: bool, stdio_auth: bool) {
         std::fs::create_dir_all(agent_dir.join("resources").join("agents")).unwrap();
         std::fs::write(
             agent_dir.join("agent.yaml"),
@@ -579,10 +585,9 @@ models:
             agent_dir.join("channels.yaml"),
             format!(
                 "\
-acp:
-  enabled: {acp_enabled}
-  ipc: true
-  auth: {acp_auth}
+stdio:
+  enabled: {stdio_enabled}
+  auth: {stdio_auth}
 "
             ),
         )

@@ -384,7 +384,12 @@ impl AcpClient {
     fn spawn(agent_folder: &Path) -> Self {
         let binary = find_agent_binary();
         let mut child = Command::new(&binary)
-            .args(["acp", "--agent-folder", agent_folder.to_str().unwrap()])
+            .args([
+                "acp",
+                "embedded",
+                "--agent-folder",
+                agent_folder.to_str().unwrap(),
+            ])
             .env("NO_PROXY", "127.0.0.1,localhost,::1")
             .env("no_proxy", "127.0.0.1,localhost,::1")
             .stdin(Stdio::piped())
@@ -593,7 +598,12 @@ fn test_stdio_eof_exits_process() {
     let folder = create_mock_agent_folder(tmp.path(), mock.port);
     let binary = find_agent_binary();
     let mut child = Command::new(&binary)
-        .args(["acp", "--agent-folder", folder.to_str().unwrap()])
+        .args([
+            "acp",
+            "embedded",
+            "--agent-folder",
+            folder.to_str().unwrap(),
+        ])
         .env("NO_PROXY", "127.0.0.1,localhost,::1")
         .env("no_proxy", "127.0.0.1,localhost,::1")
         .stdin(Stdio::piped())

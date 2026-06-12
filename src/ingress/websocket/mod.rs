@@ -17,7 +17,8 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use super::acp::run_acp_transport;
+use super::acp::{AcpSessionLeaseBridge, run_acp_transport_with_leases};
+use super::bridge::SessionLeaseRegistry;
 use super::config::{WebSocketIngressConfig, load_channel_runtime_config};
 use crate::agent::service::AgentService;
 use crate::config::loader::resolve_agent_structure_dir;
@@ -37,6 +38,7 @@ struct WebSocketAuth {
 
 pub struct WebSocketChannel {
     agent: Arc<AgentService>,
+    leases: Arc<SessionLeaseRegistry>,
     bind_addr: String,
     auth_token: Option<String>,
 }
@@ -44,6 +46,7 @@ pub struct WebSocketChannel {
 impl WebSocketChannel {
     pub fn new(
         agent: Arc<AgentService>,
+        leases: Arc<SessionLeaseRegistry>,
         agent_structure_dir: &Path,
         config: &WebSocketIngressConfig,
     ) -> Result<Self> {
@@ -55,6 +58,7 @@ impl WebSocketChannel {
         };
         Ok(Self {
             agent,
+            leases,
             bind_addr: config.bind_addr.clone(),
             auth_token,
         })
@@ -69,9 +73,10 @@ impl WebSocketChannel {
         loop {
             let (stream, peer_addr) = listener.accept().await.context("accept websocket tcp")?;
             let agent = self.agent.clone();
+            let leases = self.leases.clone();
             let auth_token = self.auth_token.clone();
             tokio::spawn(async move {
-                if let Err(err) = serve_connection(agent, stream, auth_token).await {
+                if let Err(err) = serve_connection(agent, leases, stream, auth_token).await {
                     tracing::warn!(%peer_addr, error = %format!("{err:#}"), "ACP websocket connection ended with error");
                 }
             });
@@ -107,6 +112,7 @@ pub fn run_websocket_login(agent_folder: &Path) -> Result<()> {
 
 async fn serve_connection(
     agent: Arc<AgentService>,
+    leases: Arc<SessionLeaseRegistry>,
     stream: TcpStream,
     auth_token: Option<String>,
 ) -> Result<()> {
@@ -128,7 +134,13 @@ async fn serve_connection(
     let mut incoming_task = tokio::spawn(websocket_to_acp_lines(ws_reader, incoming_writer));
     let mut outgoing_task = tokio::spawn(acp_lines_to_websocket(outgoing_reader, ws_writer));
     let transport = ByteStreams::new(outgoing_writer.compat_write(), incoming_reader.compat());
-    let mut acp_task = tokio::spawn(run_acp_transport(agent, transport));
+    let holder = format!("websocket:{}", Uuid::new_v4().simple());
+    let bridge = AcpSessionLeaseBridge::new(holder, leases);
+    let mut acp_task = tokio::spawn(run_acp_transport_with_leases(
+        agent,
+        transport,
+        Some(bridge),
+    ));
 
     let result = tokio::select! {
         result = &mut acp_task => join_acp_result(result).context("run ACP websocket transport"),

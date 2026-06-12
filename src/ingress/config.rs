@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::channel_events::ChannelResponseDetail;
+use super::response::ChannelResponseDetail;
 use crate::config::models::ReasoningMode;
 use crate::utils::files::read_utf8_text;
 
@@ -35,20 +35,17 @@ impl Default for WebSocketIngressConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AcpChannelConfig {
+pub struct StdioChannelConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub ipc: bool,
     #[serde(default = "default_true")]
     pub auth: bool,
 }
 
-impl Default for AcpChannelConfig {
+impl Default for StdioChannelConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            ipc: true,
             auth: true,
         }
     }
@@ -171,34 +168,105 @@ impl Default for FeishuChannelConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub jobs: Vec<AutomationJobConfig>,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            jobs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationJobConfig {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_workspace_dir")]
+    pub workspace_dir: String,
+    pub schedule: AutomationSchedule,
+    pub prompt: String,
+    #[serde(default)]
+    pub response_detail: ChannelResponseDetail,
+    #[serde(default)]
+    pub notify: Vec<AutomationNotifyConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AutomationSchedule {
+    Interval { every_seconds: u64 },
+    Daily { at: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationNotifyConfig {
+    pub channel: AutomationNotifyChannel,
+    #[serde(default)]
+    pub recipient: Option<AutomationNotifyRecipient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationNotifyChannel {
+    Weixin,
+    Feishu,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationNotifyRecipient {
+    #[serde(rename = "type")]
+    pub recipient_type: String,
+    pub id: String,
+}
+
 /// Optional ingress configuration loaded from an agent's channels.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelRuntimeConfig {
-    #[serde(default)]
-    pub acp: AcpChannelConfig,
+    #[serde(default, alias = "acp")]
+    pub stdio: StdioChannelConfig,
     #[serde(default)]
     pub websocket: WebSocketIngressConfig,
     #[serde(default)]
     pub weixin: WeixinChannelConfig,
     #[serde(default)]
     pub feishu: FeishuChannelConfig,
+    #[serde(default)]
+    pub automation: AutomationConfig,
 }
 
 impl Default for ChannelRuntimeConfig {
     fn default() -> Self {
         Self {
-            acp: AcpChannelConfig::default(),
+            stdio: StdioChannelConfig::default(),
             websocket: WebSocketIngressConfig::default(),
             weixin: WeixinChannelConfig::default(),
             feishu: FeishuChannelConfig::default(),
+            automation: AutomationConfig::default(),
         }
     }
 }
 
 impl ChannelRuntimeConfig {
     pub fn has_enabled_channels(&self) -> bool {
-        self.acp.enabled || self.websocket.enabled || self.weixin.enabled || self.feishu.enabled
+        self.stdio.enabled
+            || self.websocket.enabled
+            || self.weixin.enabled
+            || self.feishu.enabled
+            || self.automation.enabled
     }
 }
 
@@ -295,20 +363,18 @@ websocket:
     }
 
     #[test]
-    fn acp_config_accepts_ipc_and_auth() {
+    fn stdio_config_accepts_auth() {
         let config: ChannelRuntimeConfig = serde_yaml::from_str(
             r#"
-acp:
+stdio:
   enabled: true
-  ipc: true
   auth: true
 "#,
         )
         .unwrap();
 
-        assert!(config.acp.enabled);
-        assert!(config.acp.ipc);
-        assert!(config.acp.auth);
+        assert!(config.stdio.enabled);
+        assert!(config.stdio.auth);
     }
 
     #[test]
@@ -356,5 +422,40 @@ feishu:
             config.feishu.override_reasoning_mode,
             Some(ReasoningMode::High)
         );
+    }
+
+    #[test]
+    fn automation_config_accepts_jobs_and_notify() {
+        let config: ChannelRuntimeConfig = serde_yaml::from_str(
+            r#"
+automation:
+  enabled: true
+  jobs:
+    - id: daily_digest
+      enabled: true
+      workspace_dir: .
+      schedule:
+        type: daily
+        at: "09:00"
+      prompt: "总结今天"
+      response_detail: detailed
+      notify:
+        - channel: weixin
+        - channel: feishu
+          recipient:
+            type: chat
+            id: oc_xxx
+"#,
+        )
+        .unwrap();
+
+        assert!(config.automation.enabled);
+        assert_eq!(config.automation.jobs.len(), 1);
+        assert_eq!(config.automation.jobs[0].id, "daily_digest");
+        assert_eq!(
+            config.automation.jobs[0].response_detail,
+            ChannelResponseDetail::Detailed
+        );
+        assert_eq!(config.automation.jobs[0].notify.len(), 2);
     }
 }

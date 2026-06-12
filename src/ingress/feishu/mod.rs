@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
-use super::channel_events::ChannelUpdateCollector;
+use super::automation::AutomationNotificationSink;
+use super::bridge::{ChannelBridge, PendingConfirmationRegistry, SessionLeaseRegistry};
 use super::config::{FeishuAccessPolicy, FeishuChannelConfig, FeishuChannelDomain};
+use super::response::ChannelUpdateCollector;
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::config::loader::resolve_agent_structure_dir;
@@ -44,6 +46,8 @@ struct FeishuAuth {
 
 pub struct FeishuChannel {
     agent: Arc<AgentService>,
+    leases: Arc<SessionLeaseRegistry>,
+    confirmations: Arc<PendingConfirmationRegistry>,
     channel: Arc<clawrs_feishu::FeishuChannelService>,
     rest: Arc<FeishuRestClient>,
     config: FeishuChannelConfig,
@@ -91,6 +95,10 @@ struct FeishuRestClient {
 struct FeishuReplyBridge {
     rest: Arc<FeishuRestClient>,
     to: String,
+}
+
+struct FeishuAutomationNotifier {
+    rest: Arc<FeishuRestClient>,
 }
 
 pub fn run_feishu_login_sync(
@@ -141,6 +149,8 @@ pub fn run_feishu_login(
 impl FeishuChannel {
     pub async fn new(
         agent: Arc<AgentService>,
+        leases: Arc<SessionLeaseRegistry>,
+        confirmations: Arc<PendingConfirmationRegistry>,
         agent_structure_dir: &Path,
         config: &FeishuChannelConfig,
     ) -> Result<Self> {
@@ -169,6 +179,8 @@ impl FeishuChannel {
 
         Ok(Self {
             agent,
+            leases,
+            confirmations,
             channel: Arc::new(create_channel(claw_config)),
             rest: Arc::new(FeishuRestClient::new(auth, base_url)),
             config: config.clone(),
@@ -199,6 +211,12 @@ impl FeishuChannel {
         }
     }
 
+    pub fn automation_notifier(&self) -> Arc<dyn AutomationNotificationSink> {
+        Arc::new(FeishuAutomationNotifier {
+            rest: self.rest.clone(),
+        })
+    }
+
     async fn handle_message(&self, msg: ChannelMessage) -> Result<()> {
         let kind = chat_kind(&msg);
         let peer_id = peer_id(&msg, kind);
@@ -217,22 +235,40 @@ impl FeishuChannel {
             .join(chat_kind_name(kind))
             .join(sanitize_filename(peer_id));
         let channel_tools = feishu_tool_schemas(self.config.media_output, self.config.card_output);
+
+        let default_session = self
+            .agent
+            .load_or_create_channel_session(
+                &self.workspace_dir.to_string_lossy(),
+                session_dir.clone(),
+                channel_tools.clone(),
+                self.config.override_model.as_deref(),
+                self.config.override_reasoning_mode,
+            )
+            .await?;
+        let holder = format!("feishu:{}:{peer_id}", chat_kind_name(kind));
+        let bridge = ChannelBridge::new(
+            self.agent.clone(),
+            self.leases.clone(),
+            self.confirmations.clone(),
+            holder.clone(),
+            &session_dir,
+            default_session.session_id().to_string(),
+        );
+        if let Some(command_text) = command_text(&msg.content)
+            && let Some(reply) = bridge.handle_command(&command_text).await?
+        {
+            self.channel.send(&reply, reply_target(&msg, kind)).await?;
+            return Ok(());
+        }
+
         let Some((user_input, user_blocks)) =
             self.build_user_input(&msg, kind, &session_dir).await?
         else {
             return Ok(());
         };
 
-        let session = self
-            .agent
-            .load_or_create_channel_session(
-                &self.workspace_dir.to_string_lossy(),
-                session_dir.clone(),
-                channel_tools,
-                self.config.override_model.as_deref(),
-                self.config.override_reasoning_mode,
-            )
-            .await?;
+        let session = bridge.active_session(default_session).await?;
 
         let expose_output_tools = self.config.media_output || self.config.card_output;
         let tool_manager = session.tool_manager().await;
@@ -252,7 +288,12 @@ impl FeishuChannel {
 
         let update_collector = ChannelUpdateCollector::new(self.config.response_detail);
         let emit_update = update_collector.emitter();
-        let request_permission = rejecting_permission_requester();
+        let request_permission = confirming_permission_requester(
+            self.confirmations.clone(),
+            self.channel.clone(),
+            reply_target(&msg, kind).to_string(),
+            holder,
+        );
         let run_result = session
             .run_prompt(user_input, user_blocks, emit_update, request_permission)
             .await;
@@ -447,6 +488,23 @@ impl FeishuToolBridge for FeishuReplyBridge {
             .send_message(&self.to, "interactive", card)
             .await?;
         Ok(FeishuReplyCardResult { message_id })
+    }
+}
+
+#[async_trait::async_trait]
+impl AutomationNotificationSink for FeishuAutomationNotifier {
+    async fn send(
+        &self,
+        notify: &super::config::AutomationNotifyConfig,
+        text: &str,
+    ) -> Result<String> {
+        let recipient = notify
+            .recipient
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("feishu automation notify requires recipient"))?;
+        self.rest
+            .send_message(&recipient.id, "text", json!({ "text": text }))
+            .await
     }
 }
 
@@ -646,9 +704,26 @@ impl FeishuRestClient {
     }
 }
 
-fn rejecting_permission_requester() -> PermissionRequester {
-    Arc::new(move |_target: String, _payload: Map<String, Value>| {
-        Box::pin(async move { Ok(PERMISSION_REJECT_ONCE.to_string()) })
+fn confirming_permission_requester(
+    confirmations: Arc<PendingConfirmationRegistry>,
+    channel: Arc<clawrs_feishu::FeishuChannelService>,
+    target: String,
+    holder: String,
+) -> PermissionRequester {
+    Arc::new(move |session_id: String, payload: Map<String, Value>| {
+        let confirmations = confirmations.clone();
+        let channel = channel.clone();
+        let target = target.clone();
+        let holder = holder.clone();
+        Box::pin(async move {
+            let (snapshot, rx) = confirmations.create(session_id, payload, holder)?;
+            let message = ChannelBridge::confirmation_message(&snapshot);
+            channel.send(&message, &target).await?;
+            match rx.await {
+                Ok(decision) => Ok(decision),
+                Err(_) => Ok(PERMISSION_REJECT_ONCE.to_string()),
+            }
+        })
     })
 }
 
@@ -715,6 +790,16 @@ fn peer_id(msg: &ChannelMessage, kind: FeishuChatKind) -> &str {
 
 fn reply_target(msg: &ChannelMessage, kind: FeishuChatKind) -> &str {
     peer_id(msg, kind)
+}
+
+fn command_text(content: &str) -> Option<String> {
+    let has_media = parse_media(content).is_some();
+    let text = message_text(content, has_media)?;
+    let trimmed = text.trim();
+    trimmed
+        .starts_with('/')
+        .then(|| trimmed.to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn allow_list_contains(list: &[String], value: &str) -> bool {

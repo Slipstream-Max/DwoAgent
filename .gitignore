@@ -1,9 +1,7 @@
 /target
 Cargo.lock
-.simpleagent/sessions/
-**/.simpleagent/sessions/
-.dwoagent/sessions/
-**/.dwoagent/sessions/
+sessions/
+**/sessions/
 channel_secret/
 **/channel_secret/
 channel_sessions/

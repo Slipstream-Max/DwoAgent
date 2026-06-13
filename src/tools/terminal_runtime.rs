@@ -1,4 +1,4 @@
-//! Terminal executor and session implementation.
+﻿//! Terminal executor and session implementation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -137,8 +137,8 @@ impl TerminalExecutor {
 
     fn build_command(&self, command: &str) -> Command {
         if cfg!(windows) {
-            let mut cmd = Command::new(windows_shell_program());
-            let ps_script = format!("$ProgressPreference='SilentlyContinue';{command}");
+            let mut cmd = Command::new("powershell.exe");
+            let ps_script = format!("chcp 65001 >$null;$ProgressPreference='SilentlyContinue';{command}");
             cmd.args([
                 "-NoLogo",
                 "-NoProfile",
@@ -429,20 +429,6 @@ fn positive_float(value: f64, default: f64) -> f64 {
 
 fn lock_state(state: &Mutex<HandleState>) -> MutexGuard<'_, HandleState> {
     state.lock().expect("terminal state lock poisoned")
-}
-
-fn windows_shell_program() -> &'static str {
-    if cfg!(windows) && command_exists_on_path("pwsh.exe") {
-        "pwsh.exe"
-    } else {
-        "powershell.exe"
-    }
-}
-
-fn command_exists_on_path(exe_name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(exe_name).is_file()))
-        .unwrap_or(false)
 }
 
 // ── Kill process tree ──────────────────────────────────────────────────────

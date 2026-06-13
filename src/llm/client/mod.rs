@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 pub use base::{
     BaseLlmClient, LlmCancelToken, LlmRequestCancelled, LlmRequestOptions, LlmResponse,
     LlmRetryCallback, LlmRetryEvent, LlmRetryKind, LlmRetryPolicy, PassthroughReasoning,
-    ReasoningShaper, StreamChunkCallback, Usage,
+    ReasoningShaper, StreamChunkCallback, TOOL_ARG_PARSE_ERROR_FIELD, Usage,
 };
 pub use deepseek::new_deepseek_client;
 

@@ -4,7 +4,7 @@ providers:
     models:
       deepseek-v4-pro:
         context_window: 1024000
-        max_output_tokens: 4096
+        max_output_tokens: 384000
         capabilities:
           tool_use: true
           vision: false
@@ -16,7 +16,7 @@ providers:
         default_reasoning_mode: auto
       deepseek-v4-flash:
         context_window: 1024000
-        max_output_tokens: 4096
+        max_output_tokens: 384000
         capabilities:
           tool_use: true
           vision: false

@@ -1,11 +1,12 @@
 //! Local terminal dashboard for agent profile files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -312,6 +313,7 @@ struct TuiSnapshot {
     runs: Vec<RunView>,
     service: ServiceView,
     logs: Vec<LogEvent>,
+    daily_usage: Vec<DailyModelUsage>,
 }
 
 impl TuiSnapshot {
@@ -331,6 +333,7 @@ impl TuiSnapshot {
         let runs = load_runs(&sessions);
         let service = load_service(&agent_structure_dir);
         let logs = load_logs(&sessions, &runs);
+        let daily_usage = load_daily_model_usage(&sessions);
 
         Ok(Self {
             agent_structure_dir,
@@ -346,6 +349,7 @@ impl TuiSnapshot {
             runs,
             service,
             logs,
+            daily_usage,
         })
     }
 }
@@ -357,6 +361,7 @@ struct SessionView {
     usage: ContextUsageSnapshot,
     context_window: u64,
     tool_names: Vec<String>,
+    model_call_count: usize,
 }
 
 #[derive(Clone)]
@@ -405,6 +410,13 @@ struct LogEvent {
     path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DailyModelUsage {
+    date: NaiveDate,
+    calls: u32,
+    tokens: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct DaemonManifest {
     pid: u32,
@@ -422,10 +434,15 @@ fn load_sessions(
             continue;
         };
         let context_path = session_dir.join(SESSION_MODEL_CONTEXT_FILE);
-        let usage = read_json_model::<SessionModelContextPayload>(&context_path)
-            .ok()
+        let context_payload = read_json_model::<SessionModelContextPayload>(&context_path).ok();
+        let usage = context_payload
+            .as_ref()
             .and_then(|payload| payload.usage)
             .unwrap_or_default();
+        let model_call_count = context_payload
+            .as_ref()
+            .map(|payload| assistant_message_count(&payload.messages))
+            .unwrap_or(0);
         let profile_window = model_profiles
             .get(&meta.model_id)
             .map(|profile| profile.context_window as u64)
@@ -442,6 +459,7 @@ fn load_sessions(
             usage,
             context_window,
             tool_names,
+            model_call_count,
         });
     }
     sessions.sort_by(|a, b| updated_at(&b.meta).cmp(updated_at(&a.meta)));
@@ -698,6 +716,138 @@ fn load_logs(sessions: &[SessionView], runs: &[RunView]) -> Vec<LogEvent> {
     logs
 }
 
+fn load_daily_model_usage(sessions: &[SessionView]) -> Vec<DailyModelUsage> {
+    let mut days = BTreeMap::new();
+    for session in sessions {
+        let transcript_path = session.dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        let (call_days, token_days) = match read_utf8_text(&transcript_path) {
+            Ok(text) => (
+                model_call_days_from_transcript(&text),
+                token_days_from_transcript(&text),
+            ),
+            Err(_) => (BTreeMap::new(), BTreeMap::new()),
+        };
+
+        if call_days.is_empty() {
+            if let Some(date) = session_date(session) {
+                add_daily_calls(
+                    &mut days,
+                    date,
+                    session.model_call_count.min(u32::MAX as usize) as u32,
+                );
+            }
+        } else {
+            for (date, calls) in call_days {
+                add_daily_calls(&mut days, date, calls);
+            }
+        }
+
+        if token_days.is_empty() {
+            if let Some(date) = session_date(session) {
+                add_daily_tokens(&mut days, date, session.usage.used);
+            }
+        } else {
+            for (date, tokens) in token_days {
+                add_daily_tokens(&mut days, date, tokens);
+            }
+        }
+    }
+    days.into_values().collect()
+}
+
+fn add_daily_calls(days: &mut BTreeMap<NaiveDate, DailyModelUsage>, date: NaiveDate, calls: u32) {
+    let entry = days.entry(date).or_insert(DailyModelUsage {
+        date,
+        calls: 0,
+        tokens: 0,
+    });
+    entry.calls = entry.calls.saturating_add(calls);
+}
+
+fn add_daily_tokens(days: &mut BTreeMap<NaiveDate, DailyModelUsage>, date: NaiveDate, tokens: u64) {
+    let entry = days.entry(date).or_insert(DailyModelUsage {
+        date,
+        calls: 0,
+        tokens: 0,
+    });
+    entry.tokens = entry.tokens.saturating_add(tokens);
+}
+
+fn model_call_days_from_transcript(text: &str) -> BTreeMap<NaiveDate, u32> {
+    let mut days = BTreeMap::new();
+    let mut in_model_call = false;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let update_type = transcript_update_type(&value);
+        if is_model_call_event(update_type) {
+            if !in_model_call && let Some(date) = transcript_date(&value) {
+                *days.entry(date).or_insert(0) += 1;
+            }
+            in_model_call = true;
+        } else {
+            in_model_call = false;
+        }
+    }
+    days
+}
+
+fn token_days_from_transcript(text: &str) -> BTreeMap<NaiveDate, u64> {
+    let mut days = BTreeMap::new();
+    let mut previous_used = 0;
+    let mut saw_usage = false;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if transcript_update_type(&value) != "usage_update" {
+            continue;
+        }
+        let Some(date) = transcript_date(&value) else {
+            continue;
+        };
+        let Some(used) = value
+            .get("update")
+            .and_then(|update| update.get("used"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        let delta = if !saw_usage || used < previous_used {
+            used
+        } else {
+            used - previous_used
+        };
+        saw_usage = true;
+        previous_used = used;
+        *days.entry(date).or_insert(0) += delta;
+    }
+    days
+}
+
+fn is_model_call_event(update_type: &str) -> bool {
+    matches!(
+        update_type,
+        "agent_thought_chunk" | "agent_message_chunk" | "tool_call"
+    )
+}
+
+fn transcript_update_type(value: &Value) -> &str {
+    value
+        .get("update")
+        .and_then(|update| update.get("session_update"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn transcript_date(value: &Value) -> Option<NaiveDate> {
+    value
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .and_then(parse_date_prefix)
+}
+
 fn draw(app: &App, frame: &mut Frame) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::default().bg(color_bg())), area);
@@ -834,32 +984,12 @@ fn render_page(app: &App, frame: &mut Frame, area: Rect) {
 
 fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
     let snapshot = &app.snapshot;
-    let active_sessions = snapshot
-        .sessions
-        .iter()
-        .filter(|session| session.meta.state == AgentState::Running)
-        .count();
-    let enabled_channels = channel_rows(&snapshot.channels)
-        .into_iter()
-        .filter(|row| row.enabled)
-        .count();
-    let enabled_jobs = snapshot
-        .automation
-        .jobs
-        .iter()
-        .filter(|job| job.enabled)
-        .count();
-    let last_run = snapshot
-        .runs
-        .first()
-        .map(|run| format!("{} {}", run.record.job_id, run_status(run.record.status)))
-        .unwrap_or_else(|| "-".to_string());
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
-            Constraint::Length(5),
+            Constraint::Length(12),
             Constraint::Min(7),
         ])
         .split(area);
@@ -878,46 +1008,7 @@ fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
         chunks[0],
     );
 
-    let summary = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(chunks[1]);
-    render_metric(
-        frame,
-        summary[0],
-        "Sessions",
-        &format!(
-            "{} total / {} active",
-            snapshot.sessions.len(),
-            active_sessions
-        ),
-        average_context_percent(&snapshot.sessions).unwrap_or(0.0) / 100.0,
-        "avg context",
-    );
-    render_metric(
-        frame,
-        summary[1],
-        "Channels",
-        &format!("{enabled_channels} enabled"),
-        enabled_channels as f64 / 4.0,
-        "configured",
-    );
-    render_metric(
-        frame,
-        summary[2],
-        "Automation",
-        &format!("{enabled_jobs} enabled / last {last_run}"),
-        if snapshot.automation.jobs.is_empty() {
-            0.0
-        } else {
-            enabled_jobs as f64 / snapshot.automation.jobs.len() as f64
-        },
-        "jobs",
-    );
+    render_model_usage_heatmap(app, frame, chunks[1]);
 
     render_log_list(app, frame, chunks[2], "Recent Activity", 10);
 }
@@ -1301,31 +1392,137 @@ fn render_log_list(app: &App, frame: &mut Frame, area: Rect, title: &'static str
     );
 }
 
-fn render_metric(
-    frame: &mut Frame,
-    area: Rect,
-    title: &'static str,
-    label: &str,
-    ratio: f64,
-    gauge_label: &'static str,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
-        .split(area);
+fn render_model_usage_heatmap(app: &App, frame: &mut Frame, area: Rect) {
+    let today = Local::now().date_naive();
+    let data = app
+        .snapshot
+        .daily_usage
+        .iter()
+        .map(|usage| (usage.date, *usage))
+        .collect::<BTreeMap<_, _>>();
+    let total_calls: u32 = app
+        .snapshot
+        .daily_usage
+        .iter()
+        .map(|usage| usage.calls)
+        .sum();
+    let peak_calls = app
+        .snapshot
+        .daily_usage
+        .iter()
+        .map(|usage| usage.calls)
+        .max()
+        .unwrap_or(0);
+    let today_usage = data.get(&today).copied();
+    let today_calls = today_usage.map(|usage| usage.calls).unwrap_or(0);
+    let today_tokens = today_usage.map(|usage| usage.tokens).unwrap_or(0);
+    let week_count = heatmap_week_count(area);
+    let start = heatmap_start_date(today, week_count);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("today ", muted_style()),
+            Span::styled(format!("{today_calls} calls"), green_style()),
+            Span::styled(" / ", muted_style()),
+            Span::styled(
+                format!("{} tokens", format_token_count(today_tokens)),
+                blue_style(),
+            ),
+            Span::styled("   total ", muted_style()),
+            Span::styled(format!("{total_calls} calls"), text_style()),
+            Span::styled("   peak ", muted_style()),
+            Span::styled(format!("{peak_calls}/day"), text_style()),
+        ]),
+        heatmap_month_header(start, week_count),
+    ];
+
+    for row in 0..7 {
+        lines.push(heatmap_day_line(
+            row, start, today, week_count, peak_calls, &data,
+        ));
+    }
+    lines.push(heatmap_legend_line(peak_calls));
+
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(label, text_style())))
-            .block(panel_block(title, false)),
-        chunks[0],
+        Paragraph::new(Text::from(lines)).block(panel_block("Model Calls", false)),
+        area,
     );
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::new().style(Style::default().bg(color_bg())))
-            .gauge_style(Style::default().fg(color_blue()).bg(color_surface()))
-            .label(gauge_label)
-            .ratio(ratio.clamp(0.0, 1.0)),
-        chunks[1],
-    );
+}
+
+fn heatmap_week_count(area: Rect) -> usize {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let grid_width = inner_width.saturating_sub(4);
+    (grid_width / 2).clamp(4, 53)
+}
+
+fn heatmap_start_date(today: NaiveDate, week_count: usize) -> NaiveDate {
+    let days_since_monday = today.weekday().num_days_from_monday() as i64;
+    let current_week_start = today - ChronoDuration::days(days_since_monday);
+    current_week_start - ChronoDuration::weeks(week_count.saturating_sub(1) as i64)
+}
+
+fn heatmap_month_header(start: NaiveDate, week_count: usize) -> Line<'static> {
+    let width = 4 + week_count * 2;
+    let mut chars = vec![' '; width];
+    let mut previous_month = None;
+    for col in 0..week_count {
+        let date = start + ChronoDuration::weeks(col as i64);
+        let month = date.month();
+        if col == 0 || previous_month != Some(month) {
+            let label = month_label(month);
+            let offset = 4 + col * 2;
+            for (index, ch) in label.chars().enumerate() {
+                if offset + index < chars.len() {
+                    chars[offset + index] = ch;
+                }
+            }
+        }
+        previous_month = Some(month);
+    }
+    Line::from(Span::styled(
+        chars.into_iter().collect::<String>(),
+        muted_style(),
+    ))
+}
+
+fn heatmap_day_line(
+    row: usize,
+    start: NaiveDate,
+    today: NaiveDate,
+    week_count: usize,
+    peak_calls: u32,
+    data: &BTreeMap<NaiveDate, DailyModelUsage>,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{:<3} ", weekday_label(row)),
+        muted_style(),
+    )];
+    for col in 0..week_count {
+        let date = start + ChronoDuration::days((col * 7 + row) as i64);
+        if date > today {
+            spans.push(Span::styled("  ", dim_style()));
+            continue;
+        }
+        let calls = data.get(&date).map(|usage| usage.calls).unwrap_or(0);
+        let marker = if calls == 0 { "· " } else { "● " };
+        spans.push(Span::styled(
+            marker,
+            model_call_dot_style(calls, peak_calls),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn heatmap_legend_line(peak_calls: u32) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("less ", muted_style()),
+        Span::styled("· ", model_call_dot_style(0, peak_calls)),
+        Span::styled("● ", model_call_dot_style(1, 4)),
+        Span::styled("● ", model_call_dot_style(2, 4)),
+        Span::styled("● ", model_call_dot_style(3, 4)),
+        Span::styled("● ", model_call_dot_style(4, 4)),
+        Span::styled("more", muted_style()),
+    ])
 }
 
 fn render_text_panel(
@@ -1490,25 +1687,25 @@ fn context_ratio(session: &SessionView) -> f64 {
 }
 
 fn color_bg() -> Color {
-    Color::Rgb(27, 26, 40)
+    Color::Rgb(18, 18, 20)
 }
 fn color_surface() -> Color {
-    Color::Rgb(43, 42, 58)
+    Color::Rgb(31, 31, 35)
 }
 fn color_selected() -> Color {
-    Color::Rgb(52, 49, 70)
+    Color::Rgb(43, 43, 48)
 }
 fn color_border() -> Color {
-    Color::Rgb(132, 137, 166)
+    Color::Rgb(116, 116, 124)
 }
 fn color_text() -> Color {
-    Color::Rgb(213, 216, 238)
+    Color::Rgb(224, 224, 230)
 }
 fn color_muted() -> Color {
-    Color::Rgb(124, 128, 153)
+    Color::Rgb(145, 145, 153)
 }
 fn color_dim() -> Color {
-    Color::Rgb(87, 90, 112)
+    Color::Rgb(88, 88, 96)
 }
 fn color_green() -> Color {
     Color::Rgb(175, 239, 174)
@@ -1546,6 +1743,22 @@ fn green_style() -> Style {
 }
 fn blue_style() -> Style {
     Style::default().fg(color_blue()).bg(color_bg())
+}
+fn model_call_dot_style(calls: u32, peak_calls: u32) -> Style {
+    if calls == 0 || peak_calls == 0 {
+        return dim_style();
+    }
+    let ratio = calls as f64 / peak_calls as f64;
+    let color = if ratio <= 0.25 {
+        Color::Rgb(72, 126, 92)
+    } else if ratio <= 0.5 {
+        Color::Rgb(93, 170, 111)
+    } else if ratio <= 0.75 {
+        color_green()
+    } else {
+        color_yellow()
+    };
+    Style::default().fg(color).bg(color_bg())
 }
 fn selected_style() -> Style {
     Style::default()
@@ -1725,16 +1938,77 @@ fn context_percent_label(session: &SessionView) -> String {
     )
 }
 
-fn average_context_percent(sessions: &[SessionView]) -> Option<f64> {
-    let values: Vec<f64> = sessions
+fn assistant_message_count(messages: &[Value]) -> usize {
+    messages
         .iter()
-        .filter(|session| session.context_window > 0)
-        .map(|session| (session.usage.used as f64 / session.context_window as f64) * 100.0)
-        .collect();
-    if values.is_empty() {
-        None
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .count()
+}
+
+fn session_date(session: &SessionView) -> Option<NaiveDate> {
+    session
+        .meta
+        .updated_at
+        .as_deref()
+        .and_then(parse_date_prefix)
+        .or_else(|| session_dir_date(&session.dir))
+}
+
+fn session_dir_date(session_dir: &Path) -> Option<NaiveDate> {
+    let day = session_dir.parent()?.file_name()?.to_str()?;
+    let month = session_dir.parent()?.parent()?.file_name()?.to_str()?;
+    let year = session_dir
+        .parent()?
+        .parent()?
+        .parent()?
+        .file_name()?
+        .to_str()?;
+    NaiveDate::parse_from_str(&format!("{year}-{month}-{day}"), "%Y-%m-%d").ok()
+}
+
+fn parse_date_prefix(value: &str) -> Option<NaiveDate> {
+    if value.len() < 10 {
+        return None;
+    }
+    NaiveDate::parse_from_str(&value[..10], "%Y-%m-%d").ok()
+}
+
+fn weekday_label(row: usize) -> &'static str {
+    match row {
+        0 => "Mon",
+        1 => "Tue",
+        2 => "Wed",
+        3 => "Thu",
+        4 => "Fri",
+        5 => "Sat",
+        _ => "Sun",
+    }
+}
+
+fn month_label(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        _ => "Dec",
+    }
+}
+
+fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
     } else {
-        Some(values.iter().sum::<f64>() / values.len() as f64)
+        value.to_string()
     }
 }
 
@@ -1830,4 +2104,68 @@ fn join_limited(values: &[String], max_chars: usize) -> String {
         out.push_str(&next);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_call_days_collapse_stream_chunks() {
+        let text = [
+            transcript_line("2026-06-13T10:00:00Z", "user_message_chunk", json!({})),
+            transcript_line("2026-06-13T10:00:01Z", "agent_thought_chunk", json!({})),
+            transcript_line("2026-06-13T10:00:02Z", "agent_thought_chunk", json!({})),
+            transcript_line("2026-06-13T10:00:03Z", "tool_call", json!({})),
+            transcript_line("2026-06-13T10:00:04Z", "tool_call_update", json!({})),
+            transcript_line("2026-06-13T10:00:05Z", "agent_message_chunk", json!({})),
+        ]
+        .join("\n");
+
+        let days = model_call_days_from_transcript(&text);
+        let date = NaiveDate::from_ymd_opt(2026, 6, 13).unwrap();
+        assert_eq!(days.get(&date), Some(&2));
+    }
+
+    #[test]
+    fn token_days_use_usage_deltas() {
+        let text = [
+            transcript_line(
+                "2026-06-13T10:00:00Z",
+                "usage_update",
+                json!({"used": 100, "size": 1000}),
+            ),
+            transcript_line(
+                "2026-06-13T10:10:00Z",
+                "usage_update",
+                json!({"used": 160, "size": 1000}),
+            ),
+            transcript_line(
+                "2026-06-14T09:00:00Z",
+                "usage_update",
+                json!({"used": 40, "size": 1000}),
+            ),
+        ]
+        .join("\n");
+
+        let days = token_days_from_transcript(&text);
+        let first = NaiveDate::from_ymd_opt(2026, 6, 13).unwrap();
+        let second = NaiveDate::from_ymd_opt(2026, 6, 14).unwrap();
+        assert_eq!(days.get(&first), Some(&160));
+        assert_eq!(days.get(&second), Some(&40));
+    }
+
+    fn transcript_line(updated_at: &str, update_type: &str, mut update: Value) -> String {
+        let update_obj = update.as_object_mut().unwrap();
+        update_obj.insert(
+            "session_update".to_string(),
+            Value::String(update_type.to_string()),
+        );
+        serde_json::to_string(&json!({
+            "updated_at": updated_at,
+            "update": update,
+        }))
+        .unwrap()
+    }
 }

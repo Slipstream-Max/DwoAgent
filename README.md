@@ -1,31 +1,70 @@
 # Dwo Agent (赤铎)
 
-Native Rust implementation of a modular agent runtime.
+Native Rust implementation of a modular, multi-turn AI agent runtime with
+native tool execution, subagent delegation, and streaming ACP transport.
 
-A modular, multi-turn AI agent runtime with native tool execution, subagent delegation,
-and streaming ACP transport.
+## What is Dwo Agent?
 
-## Status
+Dwo Agent runs a persistent AI agent that can:
 
-Port in progress. The Rust crate is now laid out as a standalone project.
+- Execute tools natively — file editing, terminal commands, subagent delegation
+- Serve across multiple channels simultaneously — stdio (ACP), WebSocket, WeChat, Feishu
+- Schedule automated jobs with configurable session policies
+- Enforce tool-use policies (confirm / full_access / watch)
+- Present a local TUI dashboard for monitoring and session inspection
 
-## Build
+Everything is configured through a single agent profile folder (`agent.yaml`,
+`model.yaml`, `policy.yaml`, `channels.yaml`, `automation.yaml`).
+
+## Quick Start
 
 ```bash
+# Build
 cargo build
+
+# Run an embedded agent over stdio (closes when stdin ends)
+cargo run -- acp embedded --agent-folder examples/dwo-agent
 ```
 
-Feishu channel 的 WebSocket 依赖需要 `protoc`。如果构建时报
-`Could not find protoc`，请安装 protobuf compiler，或设置 `PROTOC` 指向
-`protoc` 可执行文件。
+> **Prerequisite for Feishu:** The Feishu channel depends on a WebSocket library
+> that requires `protoc`. If you see `Could not find protoc`, install the
+> protobuf compiler or set the `PROTOC` environment variable.
 
-## Run
+## Configuration
+
+Agent behaviour is driven by YAML files under the agent folder. See
+[docs/agent-profile-structure-config.md](docs/agent-profile-structure-config.md)
+for the full specification.
+
+| File | Purpose |
+|---|---|
+| `agent.yaml` | Agent identity, policy mode, session directories, tool toggles, external rules/skills |
+| `model.yaml` | LLM provider and model settings |
+| `policy.yaml` | Tool-use policy rules (confirm, watch, allow, deny) |
+| `channels.yaml` | Ingress channel configuration (stdio, websocket, weixin, feishu) |
+| `automation.yaml` | Scheduled job definitions |
+
+Tool toggles in `agent.yaml` (`file_edit`, `terminal`, `subagent`) accept
+`enable` or `disable`. These values are **snapshotted at session creation**;
+later changes to `agent.yaml` only affect new sessions.
+
+`max_running_turn` is optional. When omitted the agent loop runs until the model
+stops, the session is cancelled, or an error occurs. Set a positive integer to
+cap turns.
+
+## Channels
+
+### Embedded ACP (stdio)
+
+Runs an ACP session in-process. The process exits when the client closes stdin.
 
 ```bash
 cargo run -- acp embedded --agent-folder examples/dwo-agent
 ```
 
-启用长生命周期本机 stdio bridge：
+### Stdio Bridge (long-lived)
+
+Enable in `channels.yaml`:
 
 ```yaml
 stdio:
@@ -33,55 +72,50 @@ stdio:
   auth: true
 ```
 
-然后运行：
-
 ```bash
+# First-time login (stores token in channel_secret/stdio/auth.yaml)
 cargo run -- channel login stdio --agent-folder examples/dwo-agent
+
+# Start the service
 cargo run -- serve --agent-folder examples/dwo-agent
-```
 
-Zed 或其他 stdio ACP client 连接长期 runtime：
-
-```bash
+# Connect from Zed or any ACP stdio client
 cargo run -- acp connect --agent-folder examples/dwo-agent
 ```
 
-启用 ACP WebSocket ingress：
+`acp connect` talks to the already-running service via a local IPC endpoint
+(written by `serve` to `channel_secret/stdio/daemon.yaml`). Disconnecting the
+bridge does **not** stop the agent runtime.
+
+### WebSocket
 
 ```yaml
+# channels.yaml
 websocket:
   enabled: true
   bind_addr: 127.0.0.1:8765
   auth: true
 ```
 
-然后运行：
-
 ```bash
 cargo run -- channel login websocket --agent-folder examples/dwo-agent
+cargo run -- serve --agent-folder examples/dwo-agent
 ```
 
-客户端连接时使用输出的 token：
+Connect with the printed token:
 
 ```http
 Authorization: Bearer dwo_ws_xxx
 ```
 
-启动服务：
-
-```bash
-cargo run -- serve --agent-folder examples/dwo-agent
-```
-
-登录 Weixin channel：
+### WeChat (Weixin)
 
 ```bash
 cargo run -- channel login weixin --agent-folder examples/dwo-agent
 ```
 
-然后在 `channels.yaml` 里启用：
-
 ```yaml
+# channels.yaml
 weixin:
   enabled: true
   workspace_dir: .
@@ -92,22 +126,29 @@ weixin:
   override_reasoning_mode: auto
 ```
 
-保存 Feishu channel 凭据：
+- Auth files live under `channel_secret/weixin/` (auth token and context state).
+- Each channel gets a single session under `channel_sessions/weixin/session/`
+  (root overridable via `agent.yaml` → `channel_session_dir`).
+- `override_model` and `override_reasoning_mode` only apply on **first session
+  creation**; an existing session keeps its persisted settings.
+- `media_input`: when enabled, inbound non-text messages are downloaded as
+  attachments.
+- `media_output`: when enabled, the WeChat media reply tool is exposed to the
+  model on session creation. Existing sessions preserve their tool schemas.
+
+### Feishu (Lark)
 
 ```bash
-cargo run -- channel login feishu --agent-folder examples/dwo-agent --app-id cli_xxx --app-secret xxx
-```
+cargo run -- channel login feishu --agent-folder examples/dwo-agent \
+  --app-id cli_xxx --app-secret xxx
 
-也可以使用环境变量：
-
-```bash
+# Or via environment variables:
 FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx \
   cargo run -- channel login feishu --agent-folder examples/dwo-agent
 ```
 
-然后在 `channels.yaml` 里启用：
-
 ```yaml
+# channels.yaml
 feishu:
   enabled: true
   workspace_dir: .
@@ -124,16 +165,45 @@ feishu:
   override_reasoning_mode: auto
 ```
 
-在平级 `automation.yaml` 启用 automation/job：
+- Auth stored in `channel_secret/feishu/auth.yaml`.
+- Separate sessions for DMs and groups:
+  `channel_sessions/feishu/dm/<sender>/` and `channel_sessions/feishu/group/<chat_id>/`.
+- `media_input` (default off): downloads inbound images/files to
+  `attachments/` under the session and includes them in context.
+- `media_output` (default off): exposes `feishu_reply_media(path)` for
+  uploading and replying with images/files.
+- `card_output` (default off): exposes `feishu_reply_card(card)` for sending
+  interactive Feishu cards.
+- Tool confirmations are relayed via `/approve <id>` and `/deny <id>`. Audit
+  records go to `channel_secret/audit/confirm_audit.jsonl`.
+
+### Channel Commands
+
+WeChat and Feishu channels support these built-in commands:
+
+| Command | Description |
+|---|---|
+| `/list` | List available sessions |
+| `/switch <session_id>` | Switch to and claim a session |
+| `/back` | Return to the default session |
+| `/where` | Show current session |
+
+Switching to a non-default session claims it exclusively; no other channel,
+ACP IPC, or WebSocket connection can occupy the same session simultaneously.
+
+## Automation
+
+Enable automation alongside or independently of channels:
 
 ```yaml
+# automation.yaml
 enabled: true
 jobs:
   - id: daily_digest
     enabled: true
     workspace_dir: .
     session:
-      mode: new
+      mode: new          # new | fixed | sticky
     schedule:
       type: interval
       every_seconds: 3600
@@ -142,44 +212,68 @@ jobs:
       - channel: weixin
 ```
 
-打开本地 TUI dashboard：
+- Automation is activated by `serve` but is **not** an ingress channel itself.
+- **Session modes:**
+  - `new` — create a fresh session each run.
+  - `fixed` — reuse a named session.
+  - `sticky` — reuse the same session across runs if available.
+- If the target session is occupied, the run is recorded as `skipped`.
+- Run state is persisted to:
+  ```
+  <session_store_dir>/<year>/<month>/<day>/<session_id>/automation/<job_id>/runs/<run_id>/run.yaml
+  ```
+- When `notify` is configured, the run result (including `session_id` and a
+  `/switch` command) is delivered to the specified channel(s). Delivery status
+  is written back to `run.yaml`.
+
+## TUI Dashboard
 
 ```bash
 cargo run -- tui --agent-folder examples/dwo-agent
 ```
 
-TUI 第一版直接读取 agent profile 文件和本地运行记录，不要求 `serve` 正在运行。主导航为
-`Overview`、`Agent`、`Sessions`、`Channels`、`Automation`、`Logs`；Service 状态放在
-`Overview`，通过 `channel_secret/stdio/daemon.yaml` 检测。
+The TUI reads agent profile files and local run records directly — it does
+**not** require `serve` to be running.
 
-## Notes
+| Tab | Content |
+|---|---|
+| Overview | Service status (detects `serve` via `channel_secret/stdio/daemon.yaml`) |
+| Agent | Agent profile summary |
+| Sessions | Session list and details |
+| Channels | Channel configuration and state |
+| Automation | Job definitions and run history |
+| Logs | Recent activity log |
 
-- Agent profile 文件夹结构、`agent.yaml` / `model.yaml`、`policy.yaml`、
-  `channels.yaml`、`automation.yaml`、rules 和 skills 见
-  [docs/agent-profile-structure-config.md](docs/agent-profile-structure-config.md)。
-- `acp embedded` 通过 stdio 在当前进程内运行 ACP，client 关闭 stdin 后进程退出。
-  `acp connect` 是 stdio bridge，会连接已经启动的 `serve`，bridge 退出不会关闭 agent runtime。
-  `serve` 用于 stdio、websocket、Feishu、Weixin 等长生命周期 ingress channels，也会启动 `automation.yaml` 配置的 scheduler。
-- Stdio bridge 使用 `channel_secret/stdio/auth.yaml` 保存 token，`serve` 启动时写入
-  `channel_secret/stdio/daemon.yaml` 供 `acp connect` 定位本机 IPC endpoint。
-- Weixin 使用 `channel_secret/weixin/auth.yaml` 和
-  `channel_secret/weixin/context_tokens.json` 保存凭据和 token 状态，并把单个
-  channel session 存在 `channel_sessions/weixin/session/` 下。这个根目录可通过
-  `agent.yaml` 的 `channel_session_dir` 覆盖。它只接受完成扫码登录的用户发来的消息。
-  `override_model` 和 `override_reasoning_mode` 只在 channel session 首次创建时使用；已有 session 保留持久化的模型设置。
-  `media_input` 控制是否把入站非文本消息下载成附件。`media_output` 控制 channel session 首次创建时是否加入 Weixin 媒体回复工具；已有 session 保留持久化的 channel tool schemas。
-- Feishu 使用 `channel_secret/feishu/auth.yaml` 保存 app 凭据。私聊和群聊使用独立 channel session：
-  `channel_sessions/feishu/dm/<sender>/` 与 `channel_sessions/feishu/group/<chat_id>/`。
-  `media_input` 默认关闭；开启后会把入站图片和文件下载到对应 session 的 `attachments/` 并加入上下文。
-  `media_output` 默认关闭；开启后会向模型暴露 `feishu_reply_media(path)`，用于上传并回复图片或文件。
-  `card_output` 默认关闭；开启后会向模型暴露 `feishu_reply_card(card)`，用于发送飞书交互卡片。
-- Weixin/Feishu 支持 `/list`、`/switch <session_id>`、`/back`、`/where`。切换到非默认 session 时会占用该 session；其他 channel、ACP IPC 或 WebSocket 连接不能同时占用。
-- 飞书工具确认会通过 `/approve <confirmation_id>`、`/deny <confirmation_id>` 透传，确认审计写入 `channel_secret/audit/confirm_audit.jsonl`。
-- Automation 由 `serve` 激活，但不是 ingress channel。Job 可配置 `new`、`fixed` 或 `sticky` session 模式；目标 session 被占用时本次 run 会记为 `skipped`。
-  Run 状态写入 `<session_store_dir>/<year>/<month>/<day>/<session_id>/automation/<job_id>/runs/<run_id>/run.yaml`。
-  配置 `notify` 后，run 结束会投递包含 `session_id` 和 `/switch <session_id>` 的通知；投递结果也会写回 `run.yaml`。
-- `agent.yaml` 里的 `max_running_turn` 是可选项。省略时，agent loop 会一直运行，直到模型停止、会话取消或发生错误。设置为正整数可以保留旧的 max-turn guard。
-- `agent.yaml` 的 `tools` 可以把 `file_edit`、`terminal`、`subagent` 设置为
-  `enable` 或 `disable`。这些值会在 session 创建时快照；之后修改
-  `agent.yaml` 只影响新 session。
-- ACP sessions 的 workspace 来自 `session/new.cwd`；解析后的路径会随 session 保存，并在加载时复用。
+## ACP Sessions
+
+ACP sessions inherit their workspace from `session/new.cwd`. The resolved path
+is persisted with the session and reused on subsequent loads.
+
+## License
+
+<!-- TODO -->
+
+## Project Structure
+
+```
+src/
+├── agent/         Agent lifecycle, sessions, turns, subagents, policy
+├── automation/    Scheduled job runtime
+├── config/        YAML config loading and models
+├── context/       Context window management and compaction
+├── ingress/       Channel runtimes: acp, stdio, websocket, weixin, feishu
+├── llm/           LLM client and provider abstraction
+├── templates/     Prompt templates and tool descriptions
+├── tools/         Native tool runtimes (file_edit, terminal, subagent)
+├── tui/           Terminal dashboard
+├── utils/         Shared utilities
+├── watchers/      Environment block watchers
+├── cli.rs         CLI definition (clap)
+├── host.rs        Host process wiring
+├── lib.rs         Library root
+└── main.rs        Binary entry point
+tests/
+examples/
+├── dwo-agent/     Default agent profile
+└── weixin-agent/  WeChat single-user assistant example
+```

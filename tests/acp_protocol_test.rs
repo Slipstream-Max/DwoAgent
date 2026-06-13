@@ -164,8 +164,34 @@ struct ToolCallingLlm {
     request_count: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+enum ToolCallingFirstResponse {
+    ValidPatch {
+        delay: Duration,
+        patch: String,
+    },
+    MalformedArguments {
+        raw_arguments: String,
+        finish_reason: Option<String>,
+    },
+}
+
 impl ToolCallingLlm {
     fn start_with_first_response_delay(delay: Duration, patch: String) -> Self {
+        Self::start(ToolCallingFirstResponse::ValidPatch { delay, patch })
+    }
+
+    fn start_with_malformed_tool_args(
+        raw_arguments: String,
+        finish_reason: Option<String>,
+    ) -> Self {
+        Self::start(ToolCallingFirstResponse::MalformedArguments {
+            raw_arguments,
+            finish_reason,
+        })
+    }
+
+    fn start(first_response: ToolCallingFirstResponse) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind tool-calling LLM");
         let port = listener.local_addr().unwrap().port();
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -174,7 +200,7 @@ impl ToolCallingLlm {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let rc = rc.clone();
-                let patch = patch.clone();
+                let first_response = first_response.clone();
                 thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut content_length: usize = 0;
@@ -212,17 +238,28 @@ impl ToolCallingLlm {
 
                     let request_index = rc.fetch_add(1, Ordering::SeqCst);
 
-                    if request_index == 0 {
-                        thread::sleep(delay);
-                    }
-
                     let chunks = if request_index == 0 {
-                        let args = serde_json::to_string(&json!({"patch": patch})).unwrap();
-                        vec![
-                            json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}),
-                            json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_file_edit","type":"function","function":{"name":"file_edit","arguments":args}}]}}]}),
-                            json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}),
-                        ]
+                        match first_response {
+                            ToolCallingFirstResponse::ValidPatch { delay, patch } => {
+                                thread::sleep(delay);
+                                let args = serde_json::to_string(&json!({"patch": patch})).unwrap();
+                                vec![
+                                    json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}),
+                                    json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_file_edit","type":"function","function":{"name":"file_edit","arguments":args}}]}}]}),
+                                    json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}),
+                                ]
+                            }
+                            ToolCallingFirstResponse::MalformedArguments {
+                                raw_arguments,
+                                finish_reason,
+                            } => {
+                                vec![
+                                    json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}),
+                                    json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_file_edit","type":"function","function":{"name":"file_edit","arguments":raw_arguments}}]}}]}),
+                                    json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":finish_reason}],"usage":{"prompt_tokens":10,"completion_tokens":4096,"total_tokens":4106}}),
+                                ]
+                            }
+                        }
                     } else {
                         vec![
                             json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}),
@@ -1197,6 +1234,48 @@ fn test_policy_mode_change_applies_to_next_tool_call_in_running_turn() {
     assert!(
         mock.request_count() >= 2,
         "tool result should be sent back to the model for a follow-up turn"
+    );
+}
+
+#[test]
+fn test_malformed_tool_arguments_are_returned_as_recoverable_tool_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = ToolCallingLlm::start_with_malformed_tool_args(
+        "{\"patch\":\"*** Begin Patch".to_string(),
+        Some("length".to_string()),
+    );
+    let folder = create_mock_agent_folder(tmp.path(), mock.port);
+    let mut c = AcpClient::spawn(&folder);
+    c.send_request("initialize", json!({"protocolVersion": 1}));
+    let s = c.send_request("session/new", json!({"cwd": ".", "mcpServers": []}));
+    let sid = s["sessionId"].as_str().unwrap().to_string();
+
+    let prompt_result = c.send_request(
+        "session/prompt",
+        json!({"sessionId": sid, "prompt": [{"type": "text", "text": "Try a large edit"}]}),
+    );
+
+    assert_eq!(
+        prompt_result["stopReason"], "end_turn",
+        "malformed tool args should not abort the turn: {prompt_result}"
+    );
+    assert!(
+        mock.request_count() >= 2,
+        "the recoverable tool error should be sent back to the model"
+    );
+    let notifications = c.drain_notifications();
+    let saw_failed_tool = notifications.iter().any(|notification| {
+        notification["method"] == "session/update"
+            && notification["params"]["update"]["sessionUpdate"] == "tool_call_update"
+            && notification["params"]["update"]["status"] == "failed"
+            && notification["params"]["update"]["rawOutput"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tool arguments were incomplete")
+    });
+    assert!(
+        saw_failed_tool,
+        "expected a concise failed tool update, got: {notifications:?}"
     );
 }
 

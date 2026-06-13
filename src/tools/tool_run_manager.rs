@@ -16,7 +16,9 @@ use super::session::{Cap, ToolSession};
 use super::subagent_tool_runtime::{
     SpawnSubagentPayload, ToolExecutionContext, subagent_not_found,
 };
-use super::terminal_runtime::{TerminalExecutor, TerminalSession, terminal_not_found};
+use super::terminal_runtime::{
+    TerminalExecutor, TerminalSession, terminal_not_found, terminal_wait,
+};
 use crate::agent::activity::event::{ActivityEvent, ToolCallUpdateEvent};
 use crate::config::models::AgentTools;
 use crate::utils::perf::perf_log;
@@ -218,6 +220,13 @@ impl ToolRunManager {
             return self.list_sessions(tool_name).await;
         }
 
+        if tool_name == "terminal_wait" {
+            let time = tool_args.get("time").and_then(Value::as_f64).unwrap_or(0.0);
+            return terminal_wait(time)
+                .await
+                .unwrap_or_else(|err| tool_error(tool_name, &format!("{err:#}")));
+        }
+
         if IMMEDIATE_TOOLS.contains(&tool_name) {
             let patch = tool_args
                 .get("patch")
@@ -241,7 +250,7 @@ impl ToolRunManager {
         }
 
         // OPERATE tools.
-        let session = self.resolve_operate_session(&tool_args).await;
+        let session = self.resolve_operate_session(tool_name, &tool_args).await;
         let Some(session) = session else {
             return session_not_found(tool_name, &tool_args);
         };
@@ -481,22 +490,12 @@ impl ToolRunManager {
                         .collect::<HashMap<_, _>>()
                 });
                 let timeout = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
-                let lines = args.get("lines").and_then(Value::as_i64).unwrap_or(200);
-                let mode = args
-                    .get("mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tail")
-                    .to_string();
-                let startwith = args.get("startwith").and_then(Value::as_i64).unwrap_or(1);
                 let terminal = TerminalSession::new(
                     tool_call_id.to_string(),
                     self.terminal_executor.clone(),
                     command,
                     env,
                     timeout,
-                    lines,
-                    mode,
-                    startwith,
                 );
                 Arc::new(Mutex::new(terminal))
             }
@@ -549,15 +548,18 @@ impl ToolRunManager {
 
     async fn resolve_operate_session(
         &self,
+        tool_name: &str,
         args: &Map<String, Value>,
     ) -> Option<Arc<Mutex<dyn ToolSession>>> {
-        let key = args
-            .get("run_id")
-            .or_else(|| args.get("subagent_run_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
+        let key = if tool_name.starts_with("terminal_") {
+            args.get("id")
+        } else {
+            args.get("subagent_run_id")
+        }
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
         if key.is_empty() {
             return None;
         }
@@ -573,28 +575,32 @@ impl ToolRunManager {
     ) -> Result<Value> {
         let mut guard = session.lock().await;
         match name {
-            "terminal_wait" | "wait_subagent" => {
+            "wait_subagent" => {
                 if !guard.capabilities().contains(&Cap::Wait) {
                     return Ok(tool_error(name, "session does not support wait"));
                 }
                 let timeout = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
-                let op_args = operate_args(args);
-                guard.wait(timeout, &op_args).await
+                guard.wait(timeout, &Map::new()).await
             }
-            "terminal_checkout" | "checkout_subagent" => {
+            "terminal_checkout" => {
                 if !guard.capabilities().contains(&Cap::Checkout) {
                     return Ok(tool_error(name, "session does not support checkout"));
                 }
-                let op_args = operate_args(args);
+                let mut op_args = Map::new();
+                if let Some(v) = args.get("tail_line_num").cloned() {
+                    op_args.insert("tail_line_num".to_string(), v);
+                }
                 guard.checkout(&op_args).await
+            }
+            "checkout_subagent" => {
+                if !guard.capabilities().contains(&Cap::Checkout) {
+                    return Ok(tool_error(name, "session does not support checkout"));
+                }
+                guard.checkout(&Map::new()).await
             }
             "terminal_kill" | "close_subagent" => {
                 guard.cancel().await?;
-                let mut op_args = Map::new();
-                if let Some(v) = args.get("lines").cloned() {
-                    op_args.insert("lines".to_string(), v);
-                }
-                guard.checkout(&op_args).await
+                guard.checkout(&Map::new()).await
             }
             "send_subagent" => {
                 if !guard.capabilities().contains(&Cap::Send) {
@@ -747,16 +753,6 @@ fn normalize_arguments(arguments: Option<&Value>) -> Result<Map<String, Value>> 
     }
 }
 
-fn operate_args(args: &Map<String, Value>) -> Map<String, Value> {
-    let mut op_args = Map::new();
-    for key in ["lines", "mode", "startwith"] {
-        if let Some(v) = args.get(key).cloned() {
-            op_args.insert(key.to_string(), v);
-        }
-    }
-    op_args
-}
-
 fn tool_error(tool_name: &str, message: &str) -> Value {
     json!({
         "status": "error",
@@ -895,13 +891,13 @@ fn tool_status_to_update_status(output: &Value) -> &'static str {
 }
 
 fn session_not_found(tool_name: &str, args: &Map<String, Value>) -> Value {
-    let run_id = args
-        .get("run_id")
+    let id = args
+        .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    if tool_name.starts_with("terminal_") && !run_id.is_empty() {
-        return terminal_not_found(run_id);
+    if tool_name.starts_with("terminal_") && !id.is_empty() {
+        return terminal_not_found(id);
     }
     let sub_id = args
         .get("subagent_run_id")
@@ -989,6 +985,59 @@ mod tests {
         assert_eq!(
             output.get("error").and_then(Value::as_str),
             Some("Tool is disabled: file_edit")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_wait_uses_time_without_session_id() {
+        let manager = ToolRunManager::new(None, 30, AgentTools::default())
+            .await
+            .unwrap();
+
+        let output = manager
+            .execute_tool_call("wait-1", "terminal_wait", Some(&json!({"time": 0.1})), None)
+            .await;
+
+        assert_eq!(output["status"], "ok");
+        assert_eq!(output["done"], true);
+        assert_eq!(output["waited_seconds"], 0.1);
+    }
+
+    #[tokio::test]
+    async fn terminal_checkout_uses_id_and_tail_line_num() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = ToolRunManager::new(Some(tmp.path()), 30, AgentTools::default())
+            .await
+            .unwrap();
+        let command = if cfg!(windows) {
+            "1..5 | ForEach-Object { Write-Output \"line$_\" }"
+        } else {
+            "for i in 1 2 3 4 5; do echo line$i; done"
+        };
+
+        let started = manager
+            .execute_tool_call(
+                "term-1",
+                "terminal_exec",
+                Some(&json!({"command": command, "timeout": 5})),
+                None,
+            )
+            .await;
+        assert_eq!(started["id"], "term-1");
+
+        let checked = manager
+            .execute_tool_call(
+                "check-1",
+                "terminal_checkout",
+                Some(&json!({"id": "term-1", "tail_line_num": 2})),
+                None,
+            )
+            .await;
+
+        assert_eq!(checked["returned_lines"], 2);
+        assert_eq!(
+            checked["output"].as_str().unwrap().replace("\r\n", "\n"),
+            "line4\nline5\n"
         );
     }
 

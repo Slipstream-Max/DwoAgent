@@ -3,64 +3,43 @@
 ### Rules
 
 - Keep commands focused and outputs concise.
-- Use the returned `run_id` to inspect or stop long-running commands.
+- Use the returned `id` to inspect or stop long-running commands.
 - Use `list_terminals` when you need to recall running terminal ids.
-- Use `terminal_wait` when you want to keep waiting for completion.
+- Use `terminal_wait` when you want to wait before checking terminal state again.
 - Use `terminal_checkout` when you only want the current snapshot.
 
 ### Workflow
 
-1. Start with `terminal_exec(command, env, timeout, lines, mode, startwith)`.
+1. Start with `terminal_exec(command, env, timeout)`.
 - Required:
   - `command`: command line to run.
 - Optional:
   - `env`: object of environment variables.
   - `timeout`: seconds to wait before returning, default `30`.
-  - `lines`: maximum output lines to return, default `200`.
-  - `mode`: output slice mode while still running, one of `head`, `tail`, `startwith`; default `tail`.
-  - `startwith`: 1-based line number used when `mode=startwith`, default `1`.
 - It waits up to `timeout` seconds.
-- If command finishes in time, it returns final output immediately.
-- If still running, it returns `run_id` and a snapshot.
+- If command finishes in time, it returns output immediately.
+- If still running, it returns `id` and a snapshot.
 
 2. List running processes with `list_terminals()`.
 
-3. Wait for a running process with `terminal_wait(run_id, timeout, lines, mode, startwith)`.
+3. Wait before checking again with `terminal_wait(time)`.
 - Required:
-  - `run_id`: ID returned by `terminal_exec`.
-- Optional:
-  - `timeout`: seconds to wait before returning, default `30`.
-  - `lines`: maximum output lines to return, default `200`.
-  - `mode`: output slice mode while still running, one of `head`, `tail`, `startwith`; default `tail`.
-  - `startwith`: 1-based line number used when `mode=startwith`, default `1`.
-- It waits up to `timeout` seconds.
-- If command finishes during wait, it returns final output.
-- If still running, it returns the latest snapshot.
+  - `time`: seconds to wait.
+- It returns after the requested duration.
 
-4. Check a running process with `terminal_checkout(run_id, lines, mode, startwith)`.
+4. Check a running process with `terminal_checkout(id, tail_line_num)`.
 - Required:
-  - `run_id`: ID returned by `terminal_exec`.
+  - `id`: ID returned by `terminal_exec`.
 - Optional:
-  - `lines`: maximum output lines to return, default `200`.
-  - `mode`: output slice mode while still running, one of `head`, `tail`, `startwith`; default `tail`.
-  - `startwith`: 1-based line number used when `mode=startwith`, default `1`.
+  - `tail_line_num`: number of latest output lines to return, default `200`.
 - This is a peek call.
 - It returns the latest snapshot without waiting.
-- If the command has finished, it returns final output.
+- If the command has finished, it returns output.
 
-5. Stop process with `terminal_kill(run_id, lines)`.
+5. Stop process with `terminal_kill(id)`.
 - Required:
-  - `run_id`: ID returned by `terminal_exec`.
-- Optional:
-  - `lines`: maximum output lines to return, default `200`.
-- Returns final tail output after kill.
-
-### Output Slicing
-
-- `head`: earliest lines.
-- `tail`: latest lines.
-- `startwith`: from line N for `lines` rows.
-- For finished states (`completed_success`, `completed_error`, `killed`), output is always returned by `tail(lines)`.
+  - `id`: ID returned by `terminal_exec`.
+- Returns final output after kill.
 
 ### Lifecycle
 

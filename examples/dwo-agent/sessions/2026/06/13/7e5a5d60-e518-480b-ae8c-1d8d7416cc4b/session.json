@@ -1,6 +1,6 @@
 {
-  "cwd": "\\\\?\\D:\\Creation\\Code\\my_cv",
-  "mode_id": "allow_all",
+  "cwd": "\\\\?\\C:\\Users\\11307\\Documents\\GitHub\\dwoagent",
+  "mode_id": "full_access",
   "model_id": "deepseek-v4-pro",
   "pending_model_id": null,
   "pending_reasoning_mode": null,
@@ -10,10 +10,10 @@
     "subagent": "enable",
     "terminal": "enable"
   },
-  "session_id": "40092adf-9ffa-4345-8a04-375d47b3f16a",
+  "session_id": "7e5a5d60-e518-480b-ae8c-1d8d7416cc4b",
   "state": "stop",
   "stop_reason": "completed",
-  "title": "这里应该写共一第二",
+  "title": "查看README",
   "tool_schemas": [
     {
       "function": {
@@ -37,7 +37,7 @@
     },
     {
       "function": {
-        "description": "Start a terminal command. Wait up to timeout; if it finishes, return final tail output; otherwise return running snapshot and run_id.",
+        "description": "Start a terminal command. Wait up to timeout; if it finishes, return the requested output slice; otherwise return running snapshot and run_id.",
         "name": "terminal_exec",
         "parameters": {
           "additionalProperties": false,
@@ -104,7 +104,7 @@
     },
     {
       "function": {
-        "description": "Wait for a running terminal command by run_id. If it finishes, return final tail output; otherwise return a running snapshot.",
+        "description": "Wait for a running terminal command by run_id. If it finishes, return the requested output slice; otherwise return a running snapshot.",
         "name": "terminal_wait",
         "parameters": {
           "additionalProperties": false,
@@ -228,9 +228,9 @@
             "policy": {
               "description": "Requested tool policy for this subagent.",
               "enum": [
-                "allow_all",
+                "full_access",
                 "confirm",
-                "block_all"
+                "watch"
               ],
               "type": "string"
             },
@@ -355,5 +355,5 @@
       "type": "function"
     }
   ],
-  "updated_at": "2026-06-11T07:54:11.744022+00:00"
+  "updated_at": "2026-06-13T11:20:28.832427+00:00"
 }

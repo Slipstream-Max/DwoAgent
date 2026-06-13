@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "terminal_exec",
-      "description": "Start a terminal command. Wait up to timeout; if it finishes, return final tail output; otherwise return running snapshot and run_id.",
+      "description": "Spawn a terminal command. Wait up to timeout; if it finishes, return output; otherwise return a running snapshot and id.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -22,28 +22,6 @@
             "type": "integer",
             "description": "How many seconds to wait before returning.",
             "default": 30,
-            "minimum": 1
-          },
-          "lines": {
-            "type": "integer",
-            "description": "Maximum output lines to return.",
-            "default": 200,
-            "minimum": 1
-          },
-          "mode": {
-            "type": "string",
-            "description": "Slice mode when still running.",
-            "enum": [
-              "head",
-              "tail",
-              "startwith"
-            ],
-            "default": "tail"
-          },
-          "startwith": {
-            "type": "integer",
-            "description": "When mode=startwith, start from this line number (1-based).",
-            "default": 1,
             "minimum": 1
           }
         },
@@ -70,45 +48,18 @@
     "type": "function",
     "function": {
       "name": "terminal_wait",
-      "description": "Wait for a running terminal command by run_id. If it finishes, return final tail output; otherwise return a running snapshot.",
+      "description": "Wait for a duration before checking terminal state again.",
       "parameters": {
         "type": "object",
         "properties": {
-          "run_id": {
-            "type": "string",
-            "description": "ID returned by terminal_exec."
-          },
-          "timeout": {
-            "type": "integer",
-            "description": "How many seconds to wait before returning.",
-            "default": 30,
-            "minimum": 1
-          },
-          "lines": {
-            "type": "integer",
-            "description": "Maximum output lines to return.",
-            "default": 200,
-            "minimum": 1
-          },
-          "mode": {
-            "type": "string",
-            "description": "Slice mode when still running.",
-            "enum": [
-              "head",
-              "tail",
-              "startwith"
-            ],
-            "default": "tail"
-          },
-          "startwith": {
-            "type": "integer",
-            "description": "When mode=startwith, start from this line number (1-based).",
-            "default": 1,
-            "minimum": 1
+          "time": {
+            "type": "number",
+            "description": "Seconds to wait.",
+            "minimum": 0.1
           }
         },
         "required": [
-          "run_id"
+          "time"
         ],
         "additionalProperties": false
       }
@@ -118,39 +69,23 @@
     "type": "function",
     "function": {
       "name": "terminal_checkout",
-      "description": "Peek current output and status by run_id without waiting.",
+      "description": "Check current terminal output and status by id without waiting.",
       "parameters": {
         "type": "object",
         "properties": {
-          "run_id": {
+          "id": {
             "type": "string",
             "description": "ID returned by terminal_exec."
           },
-          "lines": {
+          "tail_line_num": {
             "type": "integer",
-            "description": "Maximum output lines to return.",
+            "description": "Number of latest output lines to return.",
             "default": 200,
-            "minimum": 1
-          },
-          "mode": {
-            "type": "string",
-            "description": "Slice mode when still running.",
-            "enum": [
-              "head",
-              "tail",
-              "startwith"
-            ],
-            "default": "tail"
-          },
-          "startwith": {
-            "type": "integer",
-            "description": "When mode=startwith, start from this line number (1-based).",
-            "default": 1,
             "minimum": 1
           }
         },
         "required": [
-          "run_id"
+          "id"
         ],
         "additionalProperties": false
       }
@@ -160,23 +95,17 @@
     "type": "function",
     "function": {
       "name": "terminal_kill",
-      "description": "Kill a running terminal command by run_id and return final tail output.",
+      "description": "Kill a running terminal command by id and return final output.",
       "parameters": {
         "type": "object",
         "properties": {
-          "run_id": {
+          "id": {
             "type": "string",
             "description": "ID returned by terminal_exec."
-          },
-          "lines": {
-            "type": "integer",
-            "description": "Maximum output lines to return.",
-            "default": 200,
-            "minimum": 1
           }
         },
         "required": [
-          "run_id"
+          "id"
         ],
         "additionalProperties": false
       }

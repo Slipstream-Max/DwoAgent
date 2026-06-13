@@ -1,6 +1,6 @@
 {
-  "cwd": "\\\\?\\D:\\Creation\\Code\\dwoagent",
-  "mode_id": "allow_all",
+  "cwd": "\\\\?\\C:\\Users\\11307\\Documents\\GitHub\\dwoagent",
+  "mode_id": "full_access",
   "model_id": "deepseek-v4-pro",
   "pending_model_id": null,
   "pending_reasoning_mode": null,
@@ -10,10 +10,10 @@
     "subagent": "enable",
     "terminal": "enable"
   },
-  "session_id": "4c2fa8f7-6a77-4117-929c-46480dd98619",
-  "state": "idle",
+  "session_id": "5093a74b-07c8-4a2e-948e-c599529e77f5",
+  "state": "stop",
   "stop_reason": "completed",
-  "title": "你好",
+  "title": "README文档质量观察",
   "tool_schemas": [
     {
       "function": {
@@ -228,9 +228,9 @@
             "policy": {
               "description": "Requested tool policy for this subagent.",
               "enum": [
-                "allow_all",
+                "full_access",
                 "confirm",
-                "block_all"
+                "watch"
               ],
               "type": "string"
             },
@@ -355,5 +355,5 @@
       "type": "function"
     }
   ],
-  "updated_at": "2026-06-12T04:00:41.370134+00:00"
+  "updated_at": "2026-06-13T07:49:37.353801+00:00"
 }

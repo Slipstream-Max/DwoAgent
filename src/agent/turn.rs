@@ -16,7 +16,7 @@ use crate::config::policy::ToolPolicyConfig;
 use crate::context::manager::{
     CancelEvent, CompactionOutcome, ConversationContextManager, SystemMessagesBuilder,
 };
-use crate::llm::client::{BaseLlmClient, LlmRequestCancelled};
+use crate::llm::client::{BaseLlmClient, LlmRequestCancelled, TOOL_ARG_PARSE_ERROR_FIELD};
 use crate::tools::tool_run_manager::ToolRunManager;
 use crate::watchers::runtime::WatcherRuntime;
 
@@ -139,13 +139,24 @@ enum TurnStepOutcome {
     Continue,
 }
 
+struct AssistantStreamResult {
+    message: Map<String, Value>,
+    finish_reason: Option<String>,
+}
+
 async fn run_turn_step(
     runtime: &mut TurnRuntime<'_>,
     parsed_tool_calls: &mut Vec<Value>,
     _stable_message_count: usize,
 ) -> Result<TurnStepOutcome> {
-    let assistant_message = request_assistant_message_stream(runtime).await?;
-    let calls = runtime.model_client.parse_tool_calls(&assistant_message)?;
+    let assistant = request_assistant_message_stream(runtime).await?;
+    emit_finish_reason_notice(runtime, assistant.finish_reason.as_deref()).await?;
+    let mut calls = runtime.model_client.parse_tool_calls(&assistant.message)?;
+    annotate_tool_arg_parse_errors(
+        &mut calls,
+        assistant.finish_reason.as_deref(),
+        runtime.model_client.config.max_tokens,
+    );
     *parsed_tool_calls = calls;
 
     if parsed_tool_calls.is_empty() {
@@ -257,7 +268,7 @@ async fn maybe_compact_with_activity(runtime: &mut TurnRuntime<'_>) -> Result<()
 
 async fn request_assistant_message_stream(
     runtime: &mut TurnRuntime<'_>,
-) -> Result<Map<String, Value>> {
+) -> Result<AssistantStreamResult> {
     inject_pending_watcher_content(runtime).await;
     let messages_for_model = runtime
         .context_manager
@@ -314,7 +325,25 @@ async fn request_assistant_message_stream(
     runtime
         .context_manager
         .add_assistant(Value::Object(assistant_message.clone()));
-    Ok(assistant_message)
+    Ok(AssistantStreamResult {
+        message: assistant_message,
+        finish_reason: response.finish_reason,
+    })
+}
+
+async fn emit_finish_reason_notice(
+    runtime: &TurnRuntime<'_>,
+    finish_reason: Option<&str>,
+) -> Result<()> {
+    if !finish_reason_is_output_limit(finish_reason) {
+        return Ok(());
+    }
+    let notice = output_limit_notice(runtime.model_client.config.max_tokens);
+    runtime
+        .activity
+        .activity_box("Model output limit")
+        .start_or_update("failed", &notice)
+        .await
 }
 
 async fn inject_pending_watcher_content(runtime: &mut TurnRuntime<'_>) {
@@ -385,11 +414,33 @@ async fn process_tool_calls(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        let arg_parse_error = call
+            .get(TOOL_ARG_PARSE_ERROR_FIELD)
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         runtime
             .activity
             .tool_call_pending(&tool_call_id, &tool_name, Value::Object(tool_args.clone()))
             .await?;
+
+        if let Some(error) = arg_parse_error {
+            let output = tool_arg_parse_error_output(&tool_name, &error);
+            indexed_outputs[index] = Some(output.clone());
+            runtime
+                .activity
+                .tool_call_update(
+                    &tool_call_id,
+                    "failed",
+                    None,
+                    None,
+                    None,
+                    Some(output),
+                    None,
+                )
+                .await?;
+            continue;
+        }
 
         current_mode = (runtime.get_policy_mode)().await;
 
@@ -477,6 +528,59 @@ async fn process_tool_calls(
         })
         .collect();
     Ok(finalized)
+}
+
+fn annotate_tool_arg_parse_errors(
+    calls: &mut [Value],
+    finish_reason: Option<&str>,
+    max_tokens: Option<u32>,
+) {
+    if !finish_reason_is_output_limit(finish_reason) {
+        return;
+    }
+    let notice = output_limit_notice(max_tokens);
+    for call in calls {
+        let Some(obj) = call.as_object_mut() else {
+            continue;
+        };
+        let Some(_error) = obj
+            .get(TOOL_ARG_PARSE_ERROR_FIELD)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        obj.insert(
+            TOOL_ARG_PARSE_ERROR_FIELD.to_string(),
+            Value::String(notice.clone()),
+        );
+    }
+}
+
+fn tool_arg_parse_error_output(_tool_name: &str, error: &str) -> Value {
+    json!({
+        "status": "completed_error",
+        "error": error,
+    })
+}
+
+fn finish_reason_is_output_limit(finish_reason: Option<&str>) -> bool {
+    let Some(reason) = finish_reason else {
+        return false;
+    };
+    matches!(
+        reason.trim().to_ascii_lowercase().as_str(),
+        "length" | "max_tokens" | "max_output_tokens"
+    )
+}
+
+fn output_limit_notice(max_tokens: Option<u32>) -> String {
+    match max_tokens {
+        Some(limit) => format!(
+            "Model output hit max_tokens={limit}; tool arguments were incomplete and likely truncated."
+        ),
+        None => "Model output hit its length limit; tool arguments were incomplete and likely truncated.".to_string(),
+    }
 }
 
 async fn check_tool_permission(

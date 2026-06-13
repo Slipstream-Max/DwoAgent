@@ -16,6 +16,8 @@ use tokio::time::{sleep, timeout};
 use crate::config::models::{ModelCapabilities, ModelConfig};
 use crate::utils::perf::{messages_size, perf_log};
 
+pub const TOOL_ARG_PARSE_ERROR_FIELD: &str = "_dwo_tool_arg_parse_error";
+
 /// Async callback invoked for each streaming chunk.
 pub type StreamChunkCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
@@ -160,6 +162,7 @@ pub struct LlmResponse {
     pub message: Map<String, Value>,
     pub usage: Usage,
     pub total_tokens: u64,
+    pub finish_reason: Option<String>,
 }
 
 /// OpenAI-compatible base client. Equivalent to Python's `BaseLLMClient`.
@@ -196,6 +199,7 @@ struct StreamAttemptResponse {
     usage: Usage,
     content_chars: usize,
     reasoning_chars: usize,
+    finish_reason: Option<String>,
 }
 
 enum StreamAttemptError {
@@ -295,6 +299,10 @@ impl BaseLlmClient {
             .get("message")
             .cloned()
             .ok_or_else(|| anyhow!("Missing message in non-stream response"))?;
+        let finish_reason = first
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let message_map = match raw_message {
             Value::Object(map) => prune_nulls(map),
             _ => bail!("choices[0].message must be object"),
@@ -314,6 +322,7 @@ impl BaseLlmClient {
                 "model": effective_model,
                 "elapsed_ms": started.elapsed().as_millis() as u64,
                 "total_tokens": total_tokens,
+                "finish_reason": finish_reason.clone(),
             }),
         );
 
@@ -321,6 +330,7 @@ impl BaseLlmClient {
             message: message_map,
             usage,
             total_tokens,
+            finish_reason,
         })
     }
 
@@ -431,6 +441,7 @@ impl BaseLlmClient {
                 "reasoning_chars": reasoning_chars,
                 "tool_calls": tool_count,
                 "stream_retries": stream_retry_count,
+                "finish_reason": response.finish_reason.clone(),
             }),
         );
 
@@ -438,6 +449,7 @@ impl BaseLlmClient {
             message: response.message,
             usage: response.usage,
             total_tokens: response.usage.total_tokens,
+            finish_reason: response.finish_reason,
         })
     }
 
@@ -461,6 +473,7 @@ impl BaseLlmClient {
         let mut reasoning_parts: Vec<String> = Vec::new();
         let mut tool_call_map: BTreeMap<u64, Map<String, Value>> = BTreeMap::new();
         let mut usage: Option<Usage> = None;
+        let mut finish_reason: Option<String> = None;
 
         loop {
             raise_if_llm_cancelled(options.cancel.as_ref()).map_err(StreamAttemptError::Fatal)?;
@@ -496,6 +509,11 @@ impl BaseLlmClient {
             let Some(first) = choices.first() else {
                 continue;
             };
+            if let Some(reason) = first.get("finish_reason").and_then(Value::as_str)
+                && !reason.is_empty()
+            {
+                finish_reason = Some(reason.to_string());
+            }
             let Some(delta) = first.get("delta") else {
                 continue;
             };
@@ -578,6 +596,7 @@ impl BaseLlmClient {
             usage,
             content_chars,
             reasoning_chars,
+            finish_reason,
         })
     }
 
@@ -614,6 +633,7 @@ impl BaseLlmClient {
                 bail!("Invalid tool_call at index {index}: missing function.name");
             }
 
+            let mut arg_parse_error: Option<String> = None;
             let parsed_args = match function.get("arguments") {
                 Some(Value::Object(map)) => Value::Object(map.clone()),
                 Some(Value::String(raw)) => {
@@ -621,19 +641,34 @@ impl BaseLlmClient {
                     if trimmed.is_empty() {
                         Value::Object(Map::new())
                     } else {
-                        serde_json::from_str::<Value>(trimmed).with_context(|| {
-                            format!("Invalid tool_call args for {name}: JSON parse")
-                        })?
+                        match serde_json::from_str::<Value>(trimmed) {
+                            Ok(value) => value,
+                            Err(_err) => {
+                                arg_parse_error = Some(
+                                    "Tool arguments were invalid JSON and could not be parsed."
+                                        .to_string(),
+                                );
+                                Value::Object(Map::new())
+                            }
+                        }
                     }
                 }
                 Some(Value::Null) | None => Value::Object(Map::new()),
                 Some(_) => {
-                    bail!("Invalid tool_call args for {name}: arguments must be JSON object");
+                    arg_parse_error = Some(
+                        "Tool arguments must be a JSON object and could not be parsed.".to_string(),
+                    );
+                    Value::Object(Map::new())
                 }
             };
-            if !parsed_args.is_object() {
-                bail!("Invalid tool_call args for {name}: arguments must be JSON object");
-            }
+            let parsed_args = if parsed_args.is_object() {
+                parsed_args
+            } else {
+                arg_parse_error = Some(
+                    "Tool arguments must be a JSON object and could not be parsed.".to_string(),
+                );
+                Value::Object(Map::new())
+            };
 
             let id = obj
                 .get("id")
@@ -641,11 +676,17 @@ impl BaseLlmClient {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("tool_call_{index}"));
 
-            parsed.push(json!({
+            let mut parsed_call = json!({
                 "id": id,
                 "name": name,
                 "arguments": parsed_args,
-            }));
+            });
+            if let Some(error) = arg_parse_error
+                && let Value::Object(map) = &mut parsed_call
+            {
+                map.insert(TOOL_ARG_PARSE_ERROR_FIELD.to_string(), Value::String(error));
+            }
+            parsed.push(parsed_call);
         }
         Ok(parsed)
     }
@@ -1196,10 +1237,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_tool_calls_rejects_non_object_arguments() {
+    fn parse_tool_calls_marks_non_object_arguments_as_recoverable_error() {
         let client = test_client(true);
         let assistant = serde_json::json!({
             "tool_calls": [{
+                "id": "call_bad",
                 "function": {
                     "name": "terminal_exec",
                     "arguments": "[1,2,3]"
@@ -1210,9 +1252,45 @@ mod tests {
             panic!("assistant payload must be object");
         };
 
-        let error = client.parse_tool_calls(&message).unwrap_err().to_string();
+        let calls = client.parse_tool_calls(&message).unwrap();
 
-        assert!(error.contains("arguments must be JSON object"));
+        assert_eq!(calls[0]["id"], "call_bad");
+        assert_eq!(calls[0]["name"], "terminal_exec");
+        assert_eq!(calls[0]["arguments"], serde_json::json!({}));
+        assert!(
+            calls[0][TOOL_ARG_PARSE_ERROR_FIELD]
+                .as_str()
+                .unwrap()
+                .contains("must be a JSON object")
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_marks_malformed_json_arguments_as_recoverable_error() {
+        let client = test_client(true);
+        let assistant = serde_json::json!({
+            "tool_calls": [{
+                "id": "call_file",
+                "function": {
+                    "name": "file_edit",
+                    "arguments": "{\"patch\":\"*** Begin Patch"
+                }
+            }]
+        });
+        let Value::Object(message) = assistant else {
+            panic!("assistant payload must be object");
+        };
+
+        let calls = client.parse_tool_calls(&message).unwrap();
+
+        assert_eq!(calls[0]["id"], "call_file");
+        assert_eq!(calls[0]["name"], "file_edit");
+        assert_eq!(calls[0]["arguments"], serde_json::json!({}));
+        let error = calls[0][TOOL_ARG_PARSE_ERROR_FIELD].as_str().unwrap();
+        assert_eq!(
+            error,
+            "Tool arguments were invalid JSON and could not be parsed."
+        );
     }
 
     #[test]
@@ -1325,6 +1403,60 @@ mod tests {
         assert!(matches!(events[0].kind, LlmRetryKind::Stream));
         assert_eq!(events[0].attempt, 1);
         assert_eq!(events[0].max_retries, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_response_records_finish_reason() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            let final_chunk = json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": "partial"},
+                    "finish_reason": "length"
+                }]
+            });
+            let usage = json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 4096,
+                    "total_tokens": 4097
+                }
+            });
+            let body = format!("data: {final_chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+            write_sse_response(stream, &body);
+        });
+
+        let client = test_client_with_base(false, &format!("http://{addr}/v1"));
+        let response = client
+            .request_stream_with_usage(
+                &[json!({"role": "user", "content": "hi"})],
+                None,
+                Some(&[]),
+                None,
+                None,
+                None,
+                LlmRequestOptions {
+                    retry: LlmRetryPolicy {
+                        request_max_retries: 0,
+                        stream_max_retries: 0,
+                        stream_idle_timeout: Duration::from_secs(5),
+                        base_delay: Duration::from_millis(1),
+                    },
+                    cancel: None,
+                    on_retry: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.message["content"], "partial");
+        assert_eq!(response.finish_reason.as_deref(), Some("length"));
+        assert_eq!(response.usage.completion_tokens, 4096);
     }
 
     #[test]

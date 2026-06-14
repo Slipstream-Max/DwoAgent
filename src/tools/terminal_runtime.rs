@@ -1,4 +1,4 @@
-﻿//! Terminal executor and session implementation.
+//! Terminal executor and session implementation.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use super::session::{Cap, ToolArgs, ToolSession};
 
-const DEFAULT_TAIL_LINE_NUM: usize = 200;
+const DEFAULT_CHECKOUT_LINES: usize = 200;
 
 pub struct TerminalHandle {
     state: Arc<Mutex<HandleState>>,
@@ -43,11 +43,11 @@ impl HandleState {
 
     fn status_label(&self) -> &'static str {
         if self.killed {
-            "killed"
+            "cancelled"
         } else if self.exit_code == Some(0) {
-            "completed_success"
+            "completed"
         } else {
-            "completed_error"
+            "error"
         }
     }
 }
@@ -138,7 +138,8 @@ impl TerminalExecutor {
     fn build_command(&self, command: &str) -> Command {
         if cfg!(windows) {
             let mut cmd = Command::new("powershell.exe");
-            let ps_script = format!("chcp 65001 >$null;$ProgressPreference='SilentlyContinue';{command}");
+            let ps_script =
+                format!("chcp 65001 >$null;$ProgressPreference='SilentlyContinue';{command}");
             cmd.args([
                 "-NoLogo",
                 "-NoProfile",
@@ -221,6 +222,7 @@ impl TerminalExecutor {
 /// One terminal command run.
 pub struct TerminalSession {
     session_id: String,
+    name: String,
     executor: TerminalExecutor,
     command: String,
     env: Option<HashMap<String, String>>,
@@ -231,6 +233,7 @@ pub struct TerminalSession {
 impl TerminalSession {
     pub fn new(
         session_id: impl Into<String>,
+        name: impl Into<String>,
         executor: TerminalExecutor,
         command: impl Into<String>,
         env: Option<HashMap<String, String>>,
@@ -239,6 +242,7 @@ impl TerminalSession {
         let command_text = command.into().trim().to_string();
         Self {
             session_id: session_id.into(),
+            name: name.into(),
             executor,
             command: command_text,
             env,
@@ -249,47 +253,39 @@ impl TerminalSession {
 
     fn render_snapshot(
         &self,
+        tool: &str,
         handle: &TerminalHandle,
-        tail_line_num: usize,
+        line_limit: Option<usize>,
+        status_override: Option<&str>,
         message: Option<&str>,
     ) -> Value {
         let state = lock_state(&handle.state);
-        let (status, done, exit_code) = if state.finished {
-            (state.status_label(), true, state.exit_code)
+        let (status, exit_code) = if state.finished {
+            (state.status_label(), state.exit_code)
         } else {
-            ("running", false, None)
+            ("running", None)
         };
+        let status = status_override.unwrap_or(status);
         let mut payload = Map::new();
+        payload.insert("tool".to_string(), Value::String(tool.to_string()));
+        payload.insert("kind".to_string(), Value::String("terminal".to_string()));
+        payload.insert("name".to_string(), Value::String(self.name.clone()));
         payload.insert("id".to_string(), Value::String(self.session_id.clone()));
-        payload.insert(
-            "runtime".to_string(),
-            json!({
-                "kind": "terminal",
-                "id": self.session_id,
-                "status": status,
-            }),
-        );
         payload.insert("status".to_string(), Value::String(status.to_string()));
-        payload.insert("done".to_string(), Value::Bool(done));
-        if done {
-            payload.insert(
-                "exit_code".to_string(),
-                exit_code
-                    .map(|v| Value::Number(v.into()))
-                    .unwrap_or(Value::Null),
-            );
-        }
+        payload.insert(
+            "exit_code".to_string(),
+            exit_code
+                .map(|v| Value::Number(v.into()))
+                .unwrap_or(Value::Null),
+        );
         let total_lines = state.output_lines.len();
-        let start = total_lines.saturating_sub(tail_line_num.max(1));
+        let start = line_limit
+            .map(|n| total_lines.saturating_sub(n.max(1)))
+            .unwrap_or(0);
         payload.insert(
             "output".to_string(),
             Value::String(state.output_lines[start..].concat()),
         );
-        payload.insert(
-            "returned_lines".to_string(),
-            Value::Number((total_lines - start).into()),
-        );
-        payload.insert("total_lines".to_string(), Value::Number(total_lines.into()));
         if let Some(msg) = message {
             payload.insert("message".to_string(), Value::String(msg.to_string()));
         }
@@ -305,6 +301,7 @@ impl ToolSession for TerminalSession {
 
     fn capabilities(&self) -> HashSet<Cap> {
         let mut caps = HashSet::new();
+        caps.insert(Cap::Wait);
         caps.insert(Cap::Checkout);
         caps
     }
@@ -319,14 +316,11 @@ impl ToolSession for TerminalSession {
             }
             Err(exc) => {
                 return Ok(json!({
+                    "tool": "terminal_exec",
+                    "kind": "terminal",
+                    "name": self.name,
                     "id": self.session_id.clone(),
-                    "runtime": {
-                        "kind": "terminal",
-                        "id": self.session_id.clone(),
-                        "status": "completed_error",
-                    },
-                    "status": "completed_error",
-                    "done": true,
+                    "status": "error",
                     "error": exc.to_string(),
                 }));
             }
@@ -337,21 +331,49 @@ impl ToolSession for TerminalSession {
             .ok_or_else(|| anyhow!("terminal session has not started"))?;
         let finished = self.executor.wait_for_exit(handle, self.timeout).await;
         let message = (!finished).then_some("command still running after timeout");
-        Ok(self.render_snapshot(handle, DEFAULT_TAIL_LINE_NUM, message))
+        let status_override = (!finished).then_some("timeout");
+        Ok(self.render_snapshot("terminal_exec", handle, None, status_override, message))
     }
 
-    async fn checkout(&mut self, args: &ToolArgs) -> Result<Value> {
-        let tail_line_num = args
-            .get("tail_line_num")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_TAIL_LINE_NUM);
+    async fn wait(&mut self, timeout_secs: f64, args: &ToolArgs) -> Result<Value> {
         let handle = self
             .handle
             .as_ref()
             .ok_or_else(|| anyhow!("terminal session has not started"))?;
-        Ok(self.render_snapshot(handle, tail_line_num, None))
+        let finished = self.executor.wait_for_exit(handle, timeout_secs).await;
+        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("wait");
+        let state = lock_state(&handle.state);
+        let status = if finished {
+            state.status_label()
+        } else {
+            "timeout"
+        };
+        Ok(json!({
+            "tool": tool,
+            "kind": "terminal",
+            "name": self.name,
+            "id": self.session_id,
+            "status": status,
+            "exit_code": state.exit_code,
+        }))
+    }
+
+    async fn checkout(&mut self, args: &ToolArgs) -> Result<Value> {
+        let line_limit = args
+            .get("lines")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_CHECKOUT_LINES);
+        let tool = args
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("terminal_checkout");
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| anyhow!("terminal session has not started"))?;
+        Ok(self.render_snapshot(tool, handle, Some(line_limit), None, None))
     }
 
     async fn cancel(&mut self) -> Result<()> {
@@ -385,38 +407,24 @@ impl ToolSession for TerminalSession {
             .unwrap_or("created");
         json!({
             "id": self.session_id,
+            "name": self.name,
             "kind": "terminal",
             "status": status,
-            "done": self.is_done(),
+            "command": self.command,
         })
     }
 }
 
 // ── Free helpers ───────────────────────────────────────────────────────────
 
-pub fn terminal_not_found(id: &str) -> Value {
+pub fn terminal_not_found(tool: &str, name: &str) -> Value {
     json!({
-        "id": id,
-        "runtime": {
-            "kind": "terminal",
-            "id": id,
-            "status": "not_found",
-        },
-        "status": "not_found",
-        "done": true,
+        "tool": tool,
+        "kind": "terminal",
+        "name": name,
+        "status": "error",
+        "error": "terminal session not found",
     })
-}
-
-pub async fn terminal_wait(time_secs: f64) -> Result<Value> {
-    if !time_secs.is_finite() || time_secs <= 0.0 {
-        bail!("time must be a positive number.");
-    }
-    tokio::time::sleep(Duration::from_secs_f64(time_secs)).await;
-    Ok(json!({
-        "status": "ok",
-        "done": true,
-        "waited_seconds": time_secs,
-    }))
 }
 
 fn positive_float(value: f64, default: f64) -> f64 {
@@ -498,14 +506,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_session_start_returns_completed_success() {
+    async fn terminal_session_start_returns_completed() {
         let executor = TerminalExecutor::new(None);
-        let mut session =
-            TerminalSession::new("terminal-test", executor, quick_command(), None, 5.0);
+        let mut session = TerminalSession::new(
+            "terminal-test",
+            "powershell-1",
+            executor,
+            quick_command(),
+            None,
+            5.0,
+        );
 
         let output = session.start(&Map::new()).await.unwrap();
-        assert_eq!(output["status"], "completed_success");
-        assert_eq!(output["done"], true);
+        assert_eq!(output["tool"], "terminal_exec");
+        assert_eq!(output["kind"], "terminal");
+        assert_eq!(output["name"], "powershell-1");
+        assert_eq!(output["status"], "completed");
         assert_eq!(output["output"].as_str().unwrap().trim_end(), "done");
     }
 
@@ -514,6 +530,7 @@ mod tests {
         let executor = TerminalExecutor::new(None);
         let mut session = TerminalSession::new(
             "terminal-non-ascii",
+            "powershell-1",
             executor,
             non_ascii_command(),
             None,
@@ -522,9 +539,7 @@ mod tests {
 
         let output = session.start(&Map::new()).await.unwrap();
 
-        assert_eq!(output["status"], "completed_success");
-        assert_eq!(output["done"], true);
-        assert_eq!(output["total_lines"], 1);
+        assert_eq!(output["status"], "completed");
         assert_eq!(output["output"].as_str().unwrap().trim_end(), "赤铎 — ok");
     }
 
@@ -555,20 +570,25 @@ mod tests {
             "head -20 sample.txt"
         };
         let executor = TerminalExecutor::new(Some(tmp.path().to_path_buf()));
-        let mut session = TerminalSession::new("terminal-drain", executor, command, None, 5.0);
+        let mut session = TerminalSession::new(
+            "terminal-drain",
+            "powershell-1",
+            executor,
+            command,
+            None,
+            5.0,
+        );
 
         let output = session.start(&Map::new()).await.unwrap();
 
-        assert_eq!(output["status"], "completed_success");
-        assert_eq!(output["done"], true);
-        assert_eq!(output["total_lines"], 20);
+        assert_eq!(output["status"], "completed");
         let text = output["output"].as_str().unwrap();
         assert!(text.contains("line1"));
         assert!(text.contains("line20"));
     }
 
     #[tokio::test]
-    async fn terminal_session_checkout_respects_tail_line_num() {
+    async fn terminal_session_checkout_respects_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let file_text = (1..=10).map(|i| format!("line{i}\n")).collect::<String>();
         std::fs::write(tmp.path().join("sample.txt"), file_text).unwrap();
@@ -578,40 +598,31 @@ mod tests {
             "cat sample.txt"
         };
         let executor = TerminalExecutor::new(Some(tmp.path().to_path_buf()));
-        let mut session = TerminalSession::new("terminal-tail", executor, command, None, 5.0);
+        let mut session = TerminalSession::new(
+            "terminal-tail",
+            "powershell-1",
+            executor,
+            command,
+            None,
+            5.0,
+        );
 
         let first = session.start(&Map::new()).await.unwrap();
 
-        assert_eq!(first["status"], "completed_success");
-        assert_eq!(first["total_lines"], 10);
-        assert_eq!(first["returned_lines"], 10);
+        assert_eq!(first["status"], "completed");
         assert_eq!(
             first["output"].as_str().unwrap().replace("\r\n", "\n"),
             "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
         );
 
         let checkout = session
-            .checkout(&Map::from_iter([("tail_line_num".to_string(), json!(3))]))
+            .checkout(&Map::from_iter([("lines".to_string(), json!(3))]))
             .await
             .unwrap();
 
-        assert_eq!(checkout["total_lines"], 10);
-        assert_eq!(checkout["returned_lines"], 3);
         assert_eq!(
             checkout["output"].as_str().unwrap().replace("\r\n", "\n"),
             "line8\nline9\nline10\n"
         );
-    }
-
-    #[tokio::test]
-    async fn terminal_wait_sleeps_for_requested_time() {
-        let started = Instant::now();
-
-        let output = terminal_wait(0.1).await.unwrap();
-
-        assert_eq!(output["status"], "ok");
-        assert_eq!(output["done"], true);
-        assert_eq!(output["waited_seconds"], 0.1);
-        assert!(started.elapsed() >= Duration::from_millis(90));
     }
 }

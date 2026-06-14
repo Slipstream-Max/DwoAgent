@@ -9,15 +9,13 @@ use crate::utils::files::read_utf8_text;
 
 pub fn build_rule(
     resources_dir: &Path,
-    agent_id: &str,
+    _agent_id: &str,
     cwd: &str,
     external_rule_files: &[PathBuf],
 ) -> Result<String> {
     let mut chunks: Vec<String> = Vec::new();
 
-    let agent_rule_path = resources_dir
-        .join("agents")
-        .join(format!("{agent_id}.rule.md"));
+    let agent_rule_path = resources_dir.join("prompt").join("AGENTS.md");
     if let Some(text) = read_optional_trimmed(&agent_rule_path)? {
         chunks.push(rule_source_block("agent_rule", &agent_rule_path, &text));
     }

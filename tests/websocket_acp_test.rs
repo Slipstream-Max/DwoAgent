@@ -157,52 +157,41 @@ fn reserve_loopback_port() -> u16 {
 
 fn create_websocket_agent_folder(tmp_dir: &Path, port: u16) -> PathBuf {
     let agent_dir = tmp_dir.join("agent");
-    let agents_dir = agent_dir.join("resources").join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
+    let prompt_dir = agent_dir.join("resources").join("prompt");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
 
     std::fs::write(
         agent_dir.join("agent.yaml"),
-        "\
+        format!(
+            "\
 agent_id: websocket-test-agent
 name: WebSocket Test Agent
 description: Test agent for websocket ACP ingress
 max_running_turn: 5
 policy_mode: full_access
-session_store_dir: sessions
-channel_session_dir: channel_sessions
-",
-    )
-    .unwrap();
-
-    std::fs::write(
-        agent_dir.join("model.yaml"),
-        "\
-default_model_id: mock-model
-models:
-  - model_name: mock-model
-    provider: deepseek
-    model_id: deepseek-v4-pro
-    api_key: test-key-not-real
-    api_base: http://127.0.0.1:9/v1
-    default_reasoning_mode: auto
-    compact_threshold: 0.8
-",
-    )
-    .unwrap();
-
-    std::fs::write(
-        agent_dir.join("channels.yaml"),
-        format!(
-            "\
-websocket:
-  enabled: true
-  bind_addr: 127.0.0.1:{port}
-  auth: true
+model:
+  default_model_id: mock-model
+  models:
+    - model_name: mock-model
+      provider: deepseek
+      model_id: deepseek-v4-pro
+      api_key: test-key-not-real
+      api_base: http://127.0.0.1:9/v1
+      default_reasoning_mode: auto
+      compact_threshold: 0.8
+channels:
+  websocket:
+    enabled: true
+    bind_addr: 127.0.0.1:{port}
+    auth: true
 "
         ),
     )
     .unwrap();
-    let secret_dir = agent_dir.join("channel_secret").join("websocket");
+    let secret_dir = agent_dir
+        .join("runtime")
+        .join("channel_secret")
+        .join("websocket");
     std::fs::create_dir_all(&secret_dir).unwrap();
     std::fs::write(
         secret_dir.join("auth.yaml"),
@@ -211,7 +200,7 @@ websocket:
     .unwrap();
 
     std::fs::write(
-        agents_dir.join("websocket-test-agent.agent.md"),
+        prompt_dir.join("system.md"),
         "You are a websocket test agent.\n",
     )
     .unwrap();

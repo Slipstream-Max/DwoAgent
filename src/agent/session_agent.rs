@@ -1,6 +1,6 @@
 //! Single-session agent runtime behavior.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -176,6 +176,7 @@ impl SessionAgent {
         user_blocks: Vec<Value>,
         emit_update: UpdateEmitter,
         request_permission: PermissionRequester,
+        extra_tool_schemas: Vec<Value>,
     ) -> Result<String> {
         if self.is_active().await {
             self.cancel().await;
@@ -253,7 +254,8 @@ impl SessionAgent {
         let max_running_turn = self.max_running_turn();
 
         let tool_manager_ref = self.runtime.lock().await.tool_manager.clone();
-        let request_tool_schemas = self.tool_schemas_cached.clone();
+        let request_tool_schemas =
+            effective_tool_schemas(self.tool_schemas_cached.clone(), extra_tool_schemas);
         let rebuild_builder: Option<SystemMessagesBuilder> = Some(Arc::new({
             let this = self.clone();
             move || {
@@ -676,6 +678,40 @@ impl SessionAgent {
             .unwrap_or("");
         Ok(clean_generated_session_title(content))
     }
+}
+
+fn effective_tool_schemas(base: Arc<Vec<Value>>, extra: Vec<Value>) -> Arc<Vec<Value>> {
+    if extra.is_empty() {
+        return base;
+    }
+
+    let mut seen = HashSet::new();
+    let mut merged = Vec::with_capacity(base.len() + extra.len());
+    for schema in base.iter().cloned() {
+        if let Some(name) = tool_schema_name(&schema) {
+            seen.insert(name);
+        }
+        merged.push(schema);
+    }
+    for schema in extra {
+        match tool_schema_name(&schema) {
+            Some(name) => {
+                if seen.insert(name) {
+                    merged.push(schema);
+                }
+            }
+            None => merged.push(schema),
+        }
+    }
+    Arc::new(merged)
+}
+
+fn tool_schema_name(schema: &Value) -> Option<String> {
+    schema
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn extract_session_title_source(user_input: &Value, user_blocks: &[Value]) -> Option<String> {

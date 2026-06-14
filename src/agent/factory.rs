@@ -114,6 +114,10 @@ impl SessionAgentFactory {
         &self.cwd
     }
 
+    pub fn model_id(&self) -> &str {
+        &self.model_config.model_id
+    }
+
     pub fn create_model_client(&self) -> Result<BaseLlmClient> {
         create_model_client(
             self.model_config.clone(),

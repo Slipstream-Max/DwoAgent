@@ -1,12 +1,49 @@
-agent_id: dwo-agent
+﻿agent_id: dwo-agent
 name: dwo-agent
 description: Dwo Agent runtime
 policy_mode: confirm
-session_store_dir: sessions
-channel_session_dir: channel_sessions
 external_skills_dirs: []
 external_rule_files: []
 tools:
   file_edit: enable
   terminal: enable
   subagent: enable
+model:
+  default_model_id: deepseek-v4-pro
+  models:
+    - model_name: deepseek-v4-pro
+      provider: deepseek
+      model_id: deepseek-v4-pro
+      api_key_env: DEEPSEEK_API_KEY
+      default_reasoning_mode: high
+      compact_threshold: 0.8
+    - model_name: deepseek-v4-flash
+      provider: deepseek
+      model_id: deepseek-v4-flash
+      api_key_env: DEEPSEEK_API_KEY
+      default_reasoning_mode: max
+      compact_threshold: 0.8
+policy:
+  terminal:
+    deny:
+      - regex: '(?i)^\s*git\s+reset\s+--hard\b'
+      - regex: '(?i)^\s*git\s+clean\s+-[^\s]*[fd]\b'
+      - regex: '(?i)\bRemove-Item\b.*\b-Recurse\b'
+      - regex: '(?i)\brm\b.*\s-rf\b'
+    allow:
+      - exact: git status
+      - prefix: git diff
+      - prefix: git show
+      - prefix: git log
+      - prefix: rg
+      - prefix: cargo check
+      - prefix: cargo test
+    watch_allow:
+      - exact: git status
+      - prefix: git diff
+      - prefix: git show
+      - prefix: git log
+      - prefix: rg
+      - prefix: Get-Content
+      - prefix: Select-String
+      - prefix: Get-ChildItem

@@ -34,7 +34,9 @@ pub fn policy_mode_rank(mode: &str) -> Result<u8> {
 
 pub fn cancelled_tool_output() -> Value {
     json!({
-        "status": "cancelled_by_user_interrupt",
-        "message": "Tool call cancelled because user interrupt.",
+        "tool": "unknown",
+        "kind": "unknown",
+        "status": "cancelled",
+        "error": "Tool call cancelled because user interrupt.",
     })
 }

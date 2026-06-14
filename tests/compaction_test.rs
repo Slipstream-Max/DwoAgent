@@ -137,47 +137,37 @@ fn handle_http_request(mut stream: std::net::TcpStream, compaction_count: Arc<At
 fn create_agent_folder(tmp_dir: &Path, llm_port: u16) -> PathBuf {
     let agent_dir = tmp_dir.join("agent");
     let resources_dir = agent_dir.join("resources");
-    let agents_dir = resources_dir.join("agents");
+    let prompt_dir = resources_dir.join("prompt");
     let skills_dir = resources_dir.join("skills");
-    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::create_dir_all(&prompt_dir).unwrap();
     std::fs::create_dir_all(&skills_dir).unwrap();
 
     std::fs::write(
         agent_dir.join("agent.yaml"),
-        "\
+        format!(
+            "\
 agent_id: test-agent
 name: Compaction Test Agent
 description: Test
 max_running_turn: 5
 policy_mode: full_access
 session_store_dir: .sessions
-",
-    )
-    .unwrap();
-
-    std::fs::write(
-        agent_dir.join("model.yaml"),
-        format!(
-            "\
-default_model_id: mock-model
-models:
-  - model_name: mock-model
-    provider: deepseek
-    model_id: deepseek-v4-pro
-    api_key: test-key
-    api_base: http://127.0.0.1:{llm_port}/v1
-    default_reasoning_mode: auto
-    compact_threshold: 0.0001
+model:
+  default_model_id: mock-model
+  models:
+    - model_name: mock-model
+      provider: deepseek
+      model_id: deepseek-v4-pro
+      api_key: test-key
+      api_base: http://127.0.0.1:{llm_port}/v1
+      default_reasoning_mode: auto
+      compact_threshold: 0.0001
 "
         ),
     )
     .unwrap();
 
-    std::fs::write(
-        agents_dir.join("test-agent.agent.md"),
-        "You are a test agent.\n",
-    )
-    .unwrap();
+    std::fs::write(prompt_dir.join("system.md"), "You are a test agent.\n").unwrap();
     agent_dir
 }
 

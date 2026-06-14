@@ -79,7 +79,7 @@ struct AcpConnectArgs {
     #[arg(long, default_value = ".")]
     agent_folder: PathBuf,
 
-    /// Explicit IPC endpoint. Defaults to channel_secret/stdio/daemon.yaml.
+    /// Explicit IPC endpoint. Defaults to runtime/channel_secret/stdio/daemon.yaml.
     #[arg(long)]
     ipc: Option<String>,
 }

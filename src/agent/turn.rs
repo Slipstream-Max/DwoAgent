@@ -17,7 +17,7 @@ use crate::context::manager::{
     CancelEvent, CompactionOutcome, ConversationContextManager, SystemMessagesBuilder,
 };
 use crate::llm::client::{BaseLlmClient, LlmRequestCancelled, TOOL_ARG_PARSE_ERROR_FIELD};
-use crate::tools::tool_run_manager::ToolRunManager;
+use crate::tools::tool_run_manager::{ToolRunManager, tool_kind};
 use crate::watchers::runtime::WatcherRuntime;
 
 /// Signal raised by the turn runner when the `CancelEvent` fires mid-loop.
@@ -521,7 +521,9 @@ async fn process_tool_calls(
         .map(|slot| {
             slot.unwrap_or_else(|| {
                 json!({
-                    "status": "completed_error",
+                    "tool": "unknown",
+                    "kind": "unknown",
+                    "status": "error",
                     "error": "Tool output missing due to interrupted execution.",
                 })
             })
@@ -557,9 +559,11 @@ fn annotate_tool_arg_parse_errors(
     }
 }
 
-fn tool_arg_parse_error_output(_tool_name: &str, error: &str) -> Value {
+fn tool_arg_parse_error_output(tool_name: &str, error: &str) -> Value {
     json!({
-        "status": "completed_error",
+        "tool": tool_name,
+        "kind": tool_kind(tool_name),
+        "status": "error",
         "error": error,
     })
 }

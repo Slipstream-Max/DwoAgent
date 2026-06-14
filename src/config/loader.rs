@@ -18,6 +18,9 @@ use crate::utils::files::{read_json_utf8, read_yaml_dict};
 // Re-exports so callers can match the Python `from ..config.loader import …`.
 pub use crate::utils::files::{utc_iso, write_json_utf8};
 
+pub const AGENT_CONFIG_FILE: &str = "agent.yaml";
+pub const CHANNEL_SECRET_DIR: &str = "runtime/channel_secret";
+
 /// Resolve the agent structure directory for *agent_folder*, checking both
 /// the folder itself and a nested `agent-structure/` layout.
 pub fn resolve_agent_structure_dir(agent_folder: &Path) -> Result<PathBuf> {
@@ -32,8 +35,8 @@ pub fn resolve_agent_structure_dir(agent_folder: &Path) -> Result<PathBuf> {
     }
     bail!(
         "Cannot find agent structure directory. \
-         Expected `<agent_folder>/agent.yaml` + `<agent_folder>/model.yaml` + \
-         `<agent_folder>/resources/agents`, or the same under \
+         Expected `<agent_folder>/agent.yaml` + \
+         `<agent_folder>/resources/prompt/system.md`, or the same under \
          `<agent_folder>/agent-structure`."
     );
 }
@@ -44,13 +47,10 @@ pub fn resolve_session_store_dir(store_dir: &str, agent_structure_dir: &Path) ->
     resolve_agent_profile_dir(store_dir, agent_structure_dir)
 }
 
-/// Resolve the channel session directory, defaulting to a path relative to the
+/// Resolve the channel state directory, defaulting to a path relative to the
 /// agent structure directory.
-pub fn resolve_channel_session_dir(
-    session_dir: &str,
-    agent_structure_dir: &Path,
-) -> Result<PathBuf> {
-    resolve_agent_profile_dir(session_dir, agent_structure_dir)
+pub fn resolve_channel_state_dir(state_dir: &str, agent_structure_dir: &Path) -> Result<PathBuf> {
+    resolve_agent_profile_dir(state_dir, agent_structure_dir)
 }
 
 fn resolve_agent_profile_dir(store_dir: &str, agent_structure_dir: &Path) -> Result<PathBuf> {
@@ -67,38 +67,60 @@ fn resolve_agent_profile_dir(store_dir: &str, agent_structure_dir: &Path) -> Res
 
 fn looks_like_agent_structure_dir(path: &Path) -> bool {
     path.is_dir()
-        && path.join("agent.yaml").is_file()
-        && path.join("model.yaml").is_file()
+        && path.join(AGENT_CONFIG_FILE).is_file()
         && path.join("resources").is_dir()
-        && path.join("resources").join("agents").is_dir()
+        && path
+            .join("resources")
+            .join("prompt")
+            .join("system.md")
+            .is_file()
 }
 
 /// Read and validate the agent metadata YAML.
 pub fn read_agent_meta(agent_yaml_path: &Path) -> Result<AgentMeta> {
-    let payload = Value::Object(read_yaml_dict(agent_yaml_path)?);
-    deserialize_agent_meta(payload)
+    let mut payload = read_yaml_dict(agent_yaml_path)?;
+    remove_runtime_sections(&mut payload);
+    deserialize_agent_meta(Value::Object(payload))
         .with_context(|| format!("Invalid YAML config in {}", agent_yaml_path.display()))
 }
 
-/// Read optional `policy.yaml` from an agent structure directory.
+/// Read optional `policy` section from `agent.yaml`.
 pub fn read_tool_policy(agent_structure_dir: &Path) -> Result<ToolPolicyConfig> {
-    let path = agent_structure_dir.join("policy.yaml");
-    if !path.is_file() {
-        return Ok(ToolPolicyConfig::default());
+    match read_agent_config_section(agent_structure_dir, "policy")? {
+        Some(Value::Null) | None => Ok(ToolPolicyConfig::default()),
+        Some(value @ Value::Object(_)) => ToolPolicyConfig::from_value(value).with_context(|| {
+            format!(
+                "Invalid `policy` section in {}",
+                agent_yaml_path(agent_structure_dir).display()
+            )
+        }),
+        Some(_) => bail!(
+            "Invalid `policy` section in {}: expected a mapping",
+            agent_yaml_path(agent_structure_dir).display()
+        ),
     }
-    ToolPolicyConfig::from_value(Value::Object(read_yaml_dict(&path)?))
-        .with_context(|| format!("Invalid YAML config in {}", path.display()))
 }
 
-/// Read and merge `model.yaml` with the built-in provider catalog, returning
+/// Read and merge the `model` section in `agent.yaml` with the built-in provider catalog, returning
 /// the default model id and a name → profile lookup map.
 pub fn read_model_registry(
-    model_yaml_path: &Path,
+    agent_yaml_path: &Path,
 ) -> Result<(String, HashMap<String, ModelProfile>)> {
-    let raw = read_yaml_dict(model_yaml_path)?;
+    let mut config = read_yaml_dict(agent_yaml_path)?;
+    let raw = match config.remove("model") {
+        Some(Value::Object(map)) => map,
+        Some(_) => bail!(
+            "Invalid `model` section in {}: expected a mapping",
+            agent_yaml_path.display()
+        ),
+        None => bail!(
+            "Missing required `model` section in {}",
+            agent_yaml_path.display()
+        ),
+    };
     let payload = build_model_registry_payload(raw)?;
     let registry: ModelRegistry = deserialize_model_registry(Value::Object(payload))
-        .with_context(|| format!("Invalid YAML config in {}", model_yaml_path.display()))?;
+        .with_context(|| format!("Invalid `model` section in {}", agent_yaml_path.display()))?;
     let default_id = registry.default_model_id.clone();
     let profiles: HashMap<String, ModelProfile> = registry
         .models
@@ -106,6 +128,22 @@ pub fn read_model_registry(
         .map(|p| (p.model_name.clone(), p))
         .collect();
     Ok((default_id, profiles))
+}
+
+pub fn read_agent_config_section(
+    agent_structure_dir: &Path,
+    section: &str,
+) -> Result<Option<Value>> {
+    let mut payload = read_yaml_dict(&agent_yaml_path(agent_structure_dir))?;
+    Ok(payload.remove(section))
+}
+
+pub fn agent_yaml_path(agent_structure_dir: &Path) -> PathBuf {
+    agent_structure_dir.join(AGENT_CONFIG_FILE)
+}
+
+pub fn channel_secret_dir(agent_structure_dir: &Path) -> PathBuf {
+    agent_structure_dir.join(CHANNEL_SECRET_DIR)
 }
 
 /// Validate arbitrary JSON payload against type `T`.
@@ -159,15 +197,17 @@ struct ConfiguredModelRegistry {
 
 fn build_model_registry_payload(raw: Map<String, Value>) -> Result<Map<String, Value>> {
     let configured: ConfiguredModelRegistry =
-        serde_json::from_value(Value::Object(raw)).context("parse model.yaml shape")?;
+        serde_json::from_value(Value::Object(raw)).context("parse agent.yaml model section")?;
     let catalog = load_default_catalog()?;
 
     let mut models_out: Vec<Value> = Vec::with_capacity(configured.models.len());
     for item in configured.models {
-        let provider = catalog
-            .providers
-            .get(&item.provider)
-            .ok_or_else(|| anyhow::anyhow!("Unknown provider in model.yaml: {}", item.provider))?;
+        let provider = catalog.providers.get(&item.provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown provider in agent.yaml model section: {}",
+                item.provider
+            )
+        })?;
         let model_spec = provider.models.get(&item.model_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "Unknown model `{}` for provider `{}`",
@@ -226,4 +266,11 @@ fn build_model_registry_payload(raw: Map<String, Value>) -> Result<Map<String, V
     );
     out.insert("models".to_string(), Value::Array(models_out));
     Ok(out)
+}
+
+fn remove_runtime_sections(payload: &mut Map<String, Value>) {
+    payload.remove("model");
+    payload.remove("policy");
+    payload.remove("channels");
+    payload.remove("automation");
 }

@@ -1,4 +1,4 @@
-//! Agent tool policy configuration loaded from `policy.yaml`.
+//! Agent tool policy configuration loaded from the `policy` section in `agent.yaml`.
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -56,7 +56,7 @@ struct RawCommandRuleObject {
 impl ToolPolicyConfig {
     pub fn from_value(value: Value) -> Result<Self> {
         let raw: RawToolPolicyConfig =
-            serde_json::from_value(value).context("parse policy.yaml")?;
+            serde_json::from_value(value).context("parse agent.yaml policy section")?;
         Ok(Self {
             terminal: TerminalPolicyConfig {
                 deny: compile_rules(raw.terminal.deny, "terminal.deny")?,

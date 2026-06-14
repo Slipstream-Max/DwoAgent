@@ -1,0 +1,29 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "wait",
+      "description": "Wait for a duration. Optionally wait on one terminal or subagent session by name and return its status.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "seconds": {
+            "type": "number",
+            "description": "Seconds to wait.",
+            "minimum": 0.1
+          },
+          "terminal_name": {
+            "type": "string",
+            "description": "Optional terminal name to wait on."
+          },
+          "subagent_name": {
+            "type": "string",
+            "description": "Optional subagent name to wait on."
+          }
+        },
+        "required": ["seconds"],
+        "additionalProperties": false
+      }
+    }
+  }
+]

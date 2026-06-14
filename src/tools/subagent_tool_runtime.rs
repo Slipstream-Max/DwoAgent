@@ -15,6 +15,8 @@ use crate::config::models::AgentState;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnSubagentPayload {
+    #[serde(default)]
+    pub subagent_name: Option<String>,
     pub task: String,
     #[serde(default)]
     pub policy: Option<String>,
@@ -23,6 +25,14 @@ pub struct SpawnSubagentPayload {
 impl SpawnSubagentPayload {
     pub fn from_json(value: Value) -> Result<Self> {
         let mut payload: Self = serde_json::from_value(value)?;
+        if let Some(name) = payload.subagent_name.as_ref() {
+            let trimmed = name.trim();
+            payload.subagent_name = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
         payload.task = payload.task.trim().to_string();
         if payload.task.is_empty() {
             bail!("subagent task cannot be empty");
@@ -42,41 +52,15 @@ impl SpawnSubagentPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentIdPayload {
-    pub subagent_run_id: String,
+    pub subagent_name: String,
 }
 
 impl SubagentIdPayload {
     pub fn from_json(value: Value) -> Result<Self> {
         let mut payload: Self = serde_json::from_value(value)?;
-        payload.subagent_run_id = payload.subagent_run_id.trim().to_string();
-        if payload.subagent_run_id.is_empty() {
-            bail!("subagent_run_id cannot be empty");
-        }
-        Ok(payload)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WaitSubagentPayload {
-    pub subagent_run_id: String,
-    #[serde(default = "default_wait_timeout")]
-    pub timeout: f64,
-}
-
-fn default_wait_timeout() -> f64 {
-    30.0
-}
-
-impl WaitSubagentPayload {
-    pub fn from_json(value: Value) -> Result<Self> {
-        let mut payload: Self = serde_json::from_value(value)?;
-        payload.subagent_run_id = payload.subagent_run_id.trim().to_string();
-        if payload.subagent_run_id.is_empty() {
-            bail!("subagent_run_id cannot be empty");
-        }
-        if !(payload.timeout > 0.0) {
-            bail!("timeout must be > 0");
+        payload.subagent_name = payload.subagent_name.trim().to_string();
+        if payload.subagent_name.is_empty() {
+            bail!("subagent_name cannot be empty");
         }
         Ok(payload)
     }
@@ -85,7 +69,7 @@ impl WaitSubagentPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendSubagentPayload {
-    pub subagent_run_id: String,
+    pub subagent_name: String,
     pub message: String,
     #[serde(default)]
     pub interrupt: bool,
@@ -94,10 +78,10 @@ pub struct SendSubagentPayload {
 impl SendSubagentPayload {
     pub fn from_json(value: Value) -> Result<Self> {
         let mut payload: Self = serde_json::from_value(value)?;
-        payload.subagent_run_id = payload.subagent_run_id.trim().to_string();
+        payload.subagent_name = payload.subagent_name.trim().to_string();
         payload.message = payload.message.trim().to_string();
-        if payload.subagent_run_id.is_empty() {
-            bail!("subagent_run_id cannot be empty");
+        if payload.subagent_name.is_empty() {
+            bail!("subagent_name cannot be empty");
         }
         if payload.message.is_empty() {
             bail!("message cannot be empty");
@@ -106,16 +90,12 @@ impl SendSubagentPayload {
     }
 }
 
-pub fn subagent_not_found(subagent_run_id: &str) -> Value {
+pub fn subagent_not_found(tool: &str, subagent_name: &str) -> Value {
     json!({
-        "subagent_run_id": subagent_run_id,
-        "runtime": {
-            "kind": "subagent",
-            "id": subagent_run_id,
-            "status": "not_found",
-        },
-        "status": "not_found",
-        "done": true,
+        "tool": tool,
+        "kind": "subagent",
+        "name": subagent_name,
+        "status": "error",
         "error": "subagent not found",
     })
 }

@@ -80,12 +80,11 @@ impl ChannelToolExecutor for WeixinToolExecutor {
         }
 
         let path = resolve_allowed_file_path(raw_path, &self.allowed_roots)?;
-        let result = self.bridge.reply_media(&path).await?;
+        self.bridge.reply_media(&path).await?;
         Ok(json!({
-            "status": "ok",
-            "done": true,
-            "message_id": result.message_id,
-            "path": path.to_string_lossy(),
+            "tool": WEIXIN_REPLY_MEDIA_TOOL,
+            "kind": "channel",
+            "status": "completed",
         }))
     }
 }

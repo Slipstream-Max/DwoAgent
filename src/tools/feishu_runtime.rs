@@ -128,14 +128,11 @@ impl ChannelToolExecutor for FeishuToolExecutor {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let result = self.bridge.reply_media(&path, call.kind, file_type).await?;
+                self.bridge.reply_media(&path, call.kind, file_type).await?;
                 Ok(json!({
-                    "status": "ok",
-                    "done": true,
-                    "message_id": result.message_id,
-                    "resource_key": result.resource_key,
-                    "msg_type": result.msg_type,
-                    "path": path.to_string_lossy(),
+                    "tool": FEISHU_REPLY_MEDIA_TOOL,
+                    "kind": "channel",
+                    "status": "completed",
                 }))
             }
             FEISHU_REPLY_CARD_TOOL => {
@@ -144,12 +141,11 @@ impl ChannelToolExecutor for FeishuToolExecutor {
                 if !call.card.is_object() {
                     bail!("card must be a JSON object");
                 }
-                let result = self.bridge.reply_card(call.card).await?;
+                self.bridge.reply_card(call.card).await?;
                 Ok(json!({
-                    "status": "ok",
-                    "done": true,
-                    "message_id": result.message_id,
-                    "msg_type": "interactive",
+                    "tool": FEISHU_REPLY_CARD_TOOL,
+                    "kind": "channel",
+                    "status": "completed",
                 }))
             }
             other => bail!("Unknown Feishu tool: {other}"),

@@ -3,10 +3,14 @@
     "type": "function",
     "function": {
       "name": "spawn_subagent",
-      "description": "Start one native subagent thread. Returns a subagent_run_id immediately while progress remains visible through ACP updates.",
+      "description": "Start one native subagent thread. Returns a human-readable subagent name immediately while progress remains visible through ACP updates.",
       "parameters": {
         "type": "object",
         "properties": {
+          "subagent_name": {
+            "type": "string",
+            "description": "Optional human-readable subagent name. If omitted, a name such as alice or bob is assigned."
+          },
           "task": {
             "type": "string",
             "description": "The task this subagent should work on."
@@ -26,7 +30,7 @@
     "type": "function",
     "function": {
       "name": "list_subagents",
-      "description": "List active or waiting subagent threads by id and status.",
+      "description": "List known subagent sessions by name, id, and status.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -38,39 +42,22 @@
     "type": "function",
     "function": {
       "name": "checkout_subagent",
-      "description": "Return a non-blocking snapshot of a subagent thread's status, progress, flow, and latest result.",
+      "description": "Return a non-blocking snapshot of a subagent thread's session slice or final result.",
       "parameters": {
         "type": "object",
         "properties": {
-          "subagent_run_id": {
+          "subagent_name": {
             "type": "string",
-            "description": "The subagent id returned by spawn_subagent."
-          }
-        },
-        "required": ["subagent_run_id"],
-        "additionalProperties": false
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "wait_subagent",
-      "description": "Wait for the subagent's current turn to finish. If it is already waiting for input, returns immediately.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "subagent_run_id": {
-            "type": "string",
-            "description": "The subagent id returned by spawn_subagent."
+            "description": "Subagent name returned by spawn_subagent or list_subagents."
           },
-          "timeout": {
-            "type": "number",
-            "description": "Maximum seconds to wait.",
-            "default": 30
+          "message_num": {
+            "type": "integer",
+            "description": "Number of recent structured session items to return when the subagent is still running.",
+            "default": 20,
+            "minimum": 1
           }
         },
-        "required": ["subagent_run_id"],
+        "required": ["subagent_name"],
         "additionalProperties": false
       }
     }
@@ -79,13 +66,13 @@
     "type": "function",
     "function": {
       "name": "send_subagent",
-      "description": "Send another message to a waiting or failed subagent thread. Can interrupt a running turn if interrupt is true.",
+      "description": "Send another message to a waiting or failed subagent thread. Returns ok when the message is accepted.",
       "parameters": {
         "type": "object",
         "properties": {
-          "subagent_run_id": {
+          "subagent_name": {
             "type": "string",
-            "description": "The subagent id returned by spawn_subagent."
+            "description": "Subagent name returned by spawn_subagent or list_subagents."
           },
           "message": {
             "type": "string",
@@ -97,7 +84,7 @@
             "default": false
           }
         },
-        "required": ["subagent_run_id", "message"],
+        "required": ["subagent_name", "message"],
         "additionalProperties": false
       }
     }
@@ -110,12 +97,12 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "subagent_run_id": {
+          "subagent_name": {
             "type": "string",
-            "description": "The subagent id returned by spawn_subagent."
+            "description": "Subagent name returned by spawn_subagent or list_subagents."
           }
         },
-        "required": ["subagent_run_id"],
+        "required": ["subagent_name"],
         "additionalProperties": false
       }
     }

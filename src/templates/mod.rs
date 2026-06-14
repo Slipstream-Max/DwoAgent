@@ -11,6 +11,8 @@ pub mod compact {
 }
 
 pub mod channel {
+    pub const TOOLS_PROMPT: &str = include_str!("channel/tools_prompt.md");
+
     pub mod feishu {
         pub const MEDIA_TOOL_SCHEMA: &str = include_str!("channel/feishu/media_tool_schema.json");
         pub const CARD_TOOL_SCHEMA: &str = include_str!("channel/feishu/card_tool_schema.json");
@@ -34,4 +36,9 @@ pub mod subagent {
 pub mod terminal {
     pub const TOOLS_PROMPT: &str = include_str!("terminal/tools_prompt.md");
     pub const TOOL_SCHEMA: &str = include_str!("terminal/tool_schema.json");
+}
+
+pub mod wait {
+    pub const TOOLS_PROMPT: &str = include_str!("wait/tools_prompt.md");
+    pub const TOOL_SCHEMA: &str = include_str!("wait/tool_schema.json");
 }

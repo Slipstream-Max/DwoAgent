@@ -121,7 +121,9 @@ mod tests {
         let agent_dir = temp.path().join("agent");
         let skills_dir = agent_dir.join("resources").join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
-        std::fs::create_dir_all(agent_dir.join("resources").join("agents")).unwrap();
+        let prompt_dir = agent_dir.join("resources").join("prompt");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+        std::fs::write(prompt_dir.join("system.md"), "test").unwrap();
 
         let watcher = EnvBlockWatcher::new(
             agent_dir.clone(),
@@ -140,6 +142,7 @@ mod tests {
             "---\nname: new-skill\ndescription: Newly added skill\n---\n",
         )
         .unwrap();
+        std::fs::write(agent_dir.join("resources").join("mcp.json"), "{}").unwrap();
 
         tokio::time::sleep(Duration::from_millis(125)).await;
         let messages = runtime.drain_pending_messages().await;
@@ -153,5 +156,8 @@ mod tests {
         assert!(content.contains("<watcher_content>"));
         assert!(content.contains("<env_block>"));
         assert!(content.contains("<name>\nnew-skill\n</name>"));
+        assert!(content.contains("<mcp>"));
+        assert!(content.contains("mcporter --version"));
+        assert!(content.contains("mcporter --config"));
     }
 }

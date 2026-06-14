@@ -16,8 +16,10 @@ use crate::agent::constants::{PERMISSION_ALLOW_ONCE, PERMISSION_REJECT_ONCE};
 use crate::agent::service::AgentService;
 use crate::agent::session::SESSION_CLIENT_TRANSCRIPT_FILE;
 use crate::agent::session_agent::SessionAgent;
-use crate::config::loader::utc_iso;
-use crate::config::models::{AgentState, SessionMetaPayload, SessionTranscriptEvent};
+use crate::config::loader::{channel_secret_dir, utc_iso};
+use crate::config::models::{
+    AgentState, ReasoningMode, SessionMetaPayload, SessionTranscriptEvent,
+};
 use crate::utils::files::read_utf8_text;
 
 const BRIDGE_STATE_FILE: &str = "bridge_state.yaml";
@@ -27,7 +29,8 @@ const RECENT_CONTEXT_ENTRY_LIMIT: usize = 800;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelBridgeState {
-    pub default_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_session_id: Option<String>,
     #[serde(default)]
@@ -137,8 +140,7 @@ impl PendingConfirmationRegistry {
     pub fn new(agent_structure_dir: &Path) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
-            audit_path: agent_structure_dir
-                .join("channel_secret")
+            audit_path: channel_secret_dir(agent_structure_dir)
                 .join("audit")
                 .join(CONFIRM_AUDIT_FILE),
         }
@@ -246,7 +248,10 @@ pub struct ChannelBridge {
     confirmations: Arc<PendingConfirmationRegistry>,
     holder: String,
     state_path: PathBuf,
-    default_session_id: String,
+    cwd: String,
+    configured_default_session_id: Option<String>,
+    override_model: Option<String>,
+    override_reasoning_mode: Option<ReasoningMode>,
 }
 
 impl ChannelBridge {
@@ -255,16 +260,28 @@ impl ChannelBridge {
         leases: Arc<SessionLeaseRegistry>,
         confirmations: Arc<PendingConfirmationRegistry>,
         holder: impl Into<String>,
-        session_dir: &Path,
-        default_session_id: impl Into<String>,
+        state_dir: &Path,
+        cwd: impl Into<String>,
+        default_session_id: Option<&str>,
+        override_model: Option<&str>,
+        override_reasoning_mode: Option<ReasoningMode>,
     ) -> Self {
         Self {
             agent,
             leases,
             confirmations,
             holder: holder.into(),
-            state_path: session_dir.join(BRIDGE_STATE_FILE),
-            default_session_id: default_session_id.into(),
+            state_path: state_dir.join(BRIDGE_STATE_FILE),
+            cwd: cwd.into(),
+            configured_default_session_id: default_session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            override_model: override_model
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string),
+            override_reasoning_mode,
         }
     }
 
@@ -302,15 +319,16 @@ impl ChannelBridge {
         Ok(Some(reply))
     }
 
-    pub async fn active_session(
-        &self,
-        default_session: Arc<SessionAgent>,
-    ) -> Result<Arc<SessionAgent>> {
-        let state = self.read_or_init_state()?;
+    pub async fn active_session(&self) -> Result<Arc<SessionAgent>> {
+        let mut state = self.read_or_init_state()?;
+        let default_session = self.ensure_default_session(&mut state).await?;
+        let default_session_id = default_session.session_id().to_string();
+        self.write_state(&mut state)?;
+
         let Some(active_session_id) = state.active_session_id else {
             return Ok(default_session);
         };
-        if active_session_id == self.default_session_id {
+        if active_session_id == default_session_id {
             return Ok(default_session);
         }
         self.leases
@@ -323,23 +341,59 @@ impl ChannelBridge {
             .ok_or_else(|| anyhow::anyhow!("active session not found: {active_session_id}"))
     }
 
+    async fn ensure_default_session(
+        &self,
+        state: &mut ChannelBridgeState,
+    ) -> Result<Arc<SessionAgent>> {
+        if let Some(configured) = self.configured_default_session_id.as_deref() {
+            let session = self.agent.load_session(configured).await?.ok_or_else(|| {
+                anyhow::anyhow!("configured default session not found: {configured}")
+            })?;
+            state.default_session_id = Some(session.session_id().to_string());
+            return Ok(session);
+        }
+
+        if let Some(default_session_id) = state.default_session_id.as_deref() {
+            if let Some(session) = self.agent.load_session(default_session_id).await? {
+                return Ok(session);
+            }
+            tracing::warn!(
+                session_id = default_session_id,
+                "channel default session was not found; creating a replacement"
+            );
+        }
+
+        let session = self
+            .agent
+            .new_session_with_options(
+                &self.cwd,
+                self.override_model.as_deref(),
+                self.override_reasoning_mode,
+            )
+            .await?;
+        state.default_session_id = Some(session.session_id().to_string());
+        Ok(session)
+    }
+
     async fn switch_to(&self, requested_session_id: &str) -> Result<String> {
         let session_id = requested_session_id.trim();
         if session_id.is_empty() {
             bail!("session_id is required");
         }
         let mut state = self.read_or_init_state()?;
+        let default_session = self.ensure_default_session(&mut state).await?;
+        let default_session_id = default_session.session_id().to_string();
         if let Some(previous) = state.active_session_id.as_deref()
             && previous != session_id
-            && previous != self.default_session_id
+            && previous != default_session_id
         {
             self.leases.release_if_holder(previous, &self.holder).await;
         }
 
-        if session_id == "default" || session_id == self.default_session_id {
+        if session_id == "default" || session_id == default_session_id {
             state.active_session_id = None;
             self.write_state(&mut state)?;
-            return Ok(format!("已切回默认会话：{}", self.default_session_id));
+            return Ok(format!("已切回默认会话：{default_session_id}"));
         }
 
         let session = self
@@ -372,21 +426,26 @@ impl ChannelBridge {
 
     async fn switch_back(&self) -> Result<String> {
         let mut state = self.read_or_init_state()?;
+        let default_session = self.ensure_default_session(&mut state).await?;
+        let default_session_id = default_session.session_id().to_string();
         if let Some(active) = state.active_session_id.take()
-            && active != self.default_session_id
+            && active != default_session_id
         {
             self.leases.release_if_holder(&active, &self.holder).await;
         }
         self.write_state(&mut state)?;
-        Ok(format!("已返回默认会话：{}", self.default_session_id))
+        Ok(format!("已返回默认会话：{default_session_id}"))
     }
 
     async fn render_where(&self) -> Result<String> {
-        let state = self.read_or_init_state()?;
+        let mut state = self.read_or_init_state()?;
+        let default_session = self.ensure_default_session(&mut state).await?;
+        let default_session_id = default_session.session_id().to_string();
+        self.write_state(&mut state)?;
         let active = state
             .active_session_id
             .as_deref()
-            .unwrap_or(&self.default_session_id);
+            .unwrap_or(&default_session_id);
         let holder = self
             .leases
             .holder(active)
@@ -394,7 +453,7 @@ impl ChannelBridge {
             .unwrap_or_else(|| "none".to_string());
         Ok(format!(
             "当前会话：{active}\n默认会话：{}\n占用者：{holder}",
-            self.default_session_id
+            default_session_id
         ))
     }
 
@@ -433,23 +492,22 @@ impl ChannelBridge {
     }
 
     async fn render_session_list(&self) -> Result<String> {
+        let mut state = self.read_or_init_state()?;
+        let default_session = self.ensure_default_session(&mut state).await?;
+        let default_session_id = default_session.session_id().to_string();
+        self.write_state(&mut state)?;
         let sessions = self.agent.list_sessions(None).await;
         if sessions.is_empty() {
             return Ok("暂无 session。".to_string());
         }
-        let state = self.read_or_init_state()?;
         let active = state
             .active_session_id
             .as_deref()
-            .unwrap_or(&self.default_session_id);
+            .unwrap_or(&default_session_id);
 
         let mut lines = vec!["sessions:".to_string()];
         for session in sessions.iter().take(30) {
-            lines.push(render_session_line(
-                session,
-                active,
-                &self.default_session_id,
-            ));
+            lines.push(render_session_line(session, active, &default_session_id));
         }
         if sessions.len() > 30 {
             lines.push(format!("... 还有 {} 个 session", sessions.len() - 30));
@@ -473,15 +531,12 @@ impl ChannelBridge {
     fn read_or_init_state(&self) -> Result<ChannelBridgeState> {
         if self.state_path.is_file() {
             let text = read_utf8_text(&self.state_path)?;
-            let mut state: ChannelBridgeState = serde_yaml::from_str(&text)
+            let state: ChannelBridgeState = serde_yaml::from_str(&text)
                 .with_context(|| format!("parse {}", self.state_path.display()))?;
-            if state.default_session_id != self.default_session_id {
-                state.default_session_id = self.default_session_id.clone();
-            }
             return Ok(state);
         }
         Ok(ChannelBridgeState {
-            default_session_id: self.default_session_id.clone(),
+            default_session_id: None,
             active_session_id: None,
             updated_at: None,
         })
@@ -778,7 +833,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let state_path = tmp.path().join(BRIDGE_STATE_FILE);
         let mut state = ChannelBridgeState {
-            default_session_id: "default".to_string(),
+            default_session_id: Some("default".to_string()),
             active_session_id: Some("other".to_string()),
             updated_at: None,
         };

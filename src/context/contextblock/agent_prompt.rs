@@ -7,10 +7,8 @@ use anyhow::{Result, bail};
 use super::xml::text_block;
 use crate::utils::files::read_utf8_text;
 
-pub fn build_agent_prompt(resources_dir: &Path, agent_id: &str) -> Result<String> {
-    let prompt_path = resources_dir
-        .join("agents")
-        .join(format!("{agent_id}.agent.md"));
+pub fn build_agent_prompt(resources_dir: &Path, _agent_id: &str) -> Result<String> {
+    let prompt_path = resources_dir.join("prompt").join("system.md");
     let system_prompt = read_required_text(&prompt_path)?;
     let trimmed = system_prompt.trim();
     if trimmed.is_empty() {

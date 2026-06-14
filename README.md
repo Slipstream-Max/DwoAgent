@@ -13,8 +13,7 @@ Dwo Agent runs a persistent AI agent that can:
 - Enforce tool-use policies (confirm / full_access / watch)
 - Present a local TUI dashboard for monitoring and session inspection
 
-Everything is configured through a single agent profile folder (`agent.yaml`,
-`model.yaml`, `policy.yaml`, `channels.yaml`, `automation.yaml`).
+Everything is configured through one `agent.yaml` plus `resources/` prompt files.
 
 ## Quick Start
 
@@ -36,13 +35,16 @@ Agent behaviour is driven by YAML files under the agent folder. See
 [docs/agent-profile-structure-config.md](docs/agent-profile-structure-config.md)
 for the full specification.
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `agent.yaml` | Agent identity, policy mode, session directories, tool toggles, external rules/skills |
-| `model.yaml` | LLM provider and model settings |
-| `policy.yaml` | Tool-use policy rules (confirm, watch, allow, deny) |
-| `channels.yaml` | Ingress channel configuration (stdio, websocket, weixin, feishu) |
-| `automation.yaml` | Scheduled job definitions |
+| `agent.yaml` | Agent identity, model, policy, channels, automation, tool toggles |
+| `runtime/sessions/` | Runtime ordinary sessions: conversations, context, attachments, artifacts |
+| `runtime/channel_state/` | Runtime channel routing state: bridge binding, cursors, context tokens |
+| `runtime/channel_secret/` | Runtime local channel credentials, daemon manifests, confirmation audit |
+| `resources/prompt/system.md` | Required system prompt |
+| `resources/prompt/AGENTS.md` | Optional profile-level rule prompt |
+| `resources/skills/` | Optional agent-profile skills exposed through `<available_skills>` |
+| `resources/mcp.json` | Optional MCP config marker; adds an `<mcp>` context block with mcporter install/use guidance |
 
 Tool toggles in `agent.yaml` (`file_edit`, `terminal`, `subagent`) accept
 `enable` or `disable`. These values are **snapshotted at session creation**;
@@ -64,16 +66,17 @@ cargo run -- acp embedded --agent-folder examples/dwo-agent
 
 ### Stdio Bridge (long-lived)
 
-Enable in `channels.yaml`:
+Enable under `channels.stdio` in `agent.yaml`:
 
 ```yaml
-stdio:
-  enabled: true
-  auth: true
+channels:
+  stdio:
+    enabled: true
+    auth: true
 ```
 
 ```bash
-# First-time login (stores token in channel_secret/stdio/auth.yaml)
+# First-time login (stores token in runtime/channel_secret/stdio/auth.yaml)
 cargo run -- channel login stdio --agent-folder examples/dwo-agent
 
 # Start the service
@@ -84,17 +87,18 @@ cargo run -- acp connect --agent-folder examples/dwo-agent
 ```
 
 `acp connect` talks to the already-running service via a local IPC endpoint
-(written by `serve` to `channel_secret/stdio/daemon.yaml`). Disconnecting the
+(written by `serve` to `runtime/channel_secret/stdio/daemon.yaml`). Disconnecting the
 bridge does **not** stop the agent runtime.
 
 ### WebSocket
 
 ```yaml
-# channels.yaml
-websocket:
-  enabled: true
-  bind_addr: 127.0.0.1:8765
-  auth: true
+# agent.yaml
+channels:
+  websocket:
+    enabled: true
+    bind_addr: 127.0.0.1:8765
+    auth: true
 ```
 
 ```bash
@@ -115,26 +119,28 @@ cargo run -- channel login weixin --agent-folder examples/dwo-agent
 ```
 
 ```yaml
-# channels.yaml
-weixin:
-  enabled: true
-  workspace_dir: .
-  markdown_filter: true
-  media_input: true
-  media_output: true
-  override_model: deepseek-v4-flash
-  override_reasoning_mode: auto
+# agent.yaml
+channels:
+  weixin:
+    enabled: true
+    workspace_dir: .
+    markdown_filter: true
+    media_input: true
+    media_output: true
+    override_model: deepseek-v4-flash
+    override_reasoning_mode: auto
 ```
 
-- Auth files live under `channel_secret/weixin/` (auth token and context state).
-- Each channel gets a single session under `channel_sessions/weixin/session/`
-  (root overridable via `agent.yaml` → `channel_session_dir`).
-- `override_model` and `override_reasoning_mode` only apply on **first session
-  creation**; an existing session keeps its persisted settings.
+- Auth files live under `runtime/channel_secret/weixin/`; runtime channel state
+  such as sync cursors lives under `runtime/channel_state/weixin/`.
+- Weixin messages route to ordinary sessions. The first message creates a
+  normal session unless `default_session_id` is configured.
+- `override_model` and `override_reasoning_mode` only apply when the channel
+  creates a new default ordinary session.
 - `media_input`: when enabled, inbound non-text messages are downloaded as
-  attachments.
-- `media_output`: when enabled, the WeChat media reply tool is exposed to the
-  model on session creation. Existing sessions preserve their tool schemas.
+  attachments under the active ordinary session.
+- `media_output`: when enabled, the WeChat media reply tool is exposed only for
+  the current Weixin-triggered turn.
 
 ### Feishu (Lark)
 
@@ -148,34 +154,35 @@ FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx \
 ```
 
 ```yaml
-# channels.yaml
-feishu:
-  enabled: true
-  workspace_dir: .
-  domain: feishu
-  dm_policy: allow_all
-  group_policy: white_list
-  allow_from: ["*"]
-  group_allow_from: []
-  group_require_mention: true
-  media_input: true
-  media_output: true
-  card_output: true
-  override_model: deepseek-v4-flash
-  override_reasoning_mode: auto
+# agent.yaml
+channels:
+  feishu:
+    enabled: true
+    workspace_dir: .
+    domain: feishu
+    dm_policy: allow_all
+    group_policy: white_list
+    allow_from: ["*"]
+    group_allow_from: []
+    group_require_mention: true
+    media_input: true
+    media_output: true
+    card_output: true
+    override_model: deepseek-v4-flash
+    override_reasoning_mode: auto
 ```
 
-- Auth stored in `channel_secret/feishu/auth.yaml`.
-- Separate sessions for DMs and groups:
-  `channel_sessions/feishu/dm/<sender>/` and `channel_sessions/feishu/group/<chat_id>/`.
+- Auth stored in `runtime/channel_secret/feishu/auth.yaml`.
+- DM/group routing state lives under `runtime/channel_state/feishu/...`; real
+  conversations are ordinary sessions.
 - `media_input` (default off): downloads inbound images/files to
-  `attachments/` under the session and includes them in context.
+  `attachments/` under the active ordinary session and includes them in context.
 - `media_output` (default off): exposes `feishu_reply_media(path)` for
-  uploading and replying with images/files.
+  uploading and replying with images/files on the current Feishu-triggered turn.
 - `card_output` (default off): exposes `feishu_reply_card(card)` for sending
-  interactive Feishu cards.
+  interactive Feishu cards on the current Feishu-triggered turn.
 - Tool confirmations are relayed via `/approve <id>` and `/deny <id>`. Audit
-  records go to `channel_secret/audit/confirm_audit.jsonl`.
+  records go to `runtime/channel_secret/audit/confirm_audit.jsonl`.
 
 ### Channel Commands
 
@@ -196,20 +203,21 @@ ACP IPC, or WebSocket connection can occupy the same session simultaneously.
 Enable automation alongside or independently of channels:
 
 ```yaml
-# automation.yaml
-enabled: true
-jobs:
-  - id: daily_digest
-    enabled: true
-    workspace_dir: .
-    session:
-      mode: new          # new | fixed | sticky
-    schedule:
-      type: interval
-      every_seconds: 3600
-    prompt: "总结当前项目状态。"
-    notify:
-      - channel: weixin
+# agent.yaml
+automation:
+  enabled: true
+  jobs:
+    - id: daily_digest
+      enabled: true
+      workspace_dir: .
+      session:
+        mode: new          # new | fixed | sticky
+      schedule:
+        type: interval
+        every_seconds: 3600
+      prompt: "总结当前项目状态。"
+      notify:
+        - channel: weixin
 ```
 
 - Automation is activated by `serve` but is **not** an ingress channel itself.
@@ -220,7 +228,7 @@ jobs:
 - If the target session is occupied, the run is recorded as `skipped`.
 - Run state is persisted to:
   ```
-  <session_store_dir>/<year>/<month>/<day>/<session_id>/automation/<job_id>/runs/<run_id>/run.yaml
+  runtime/sessions/<year>/<month>/<day>/<session_id>/automation/<job_id>/runs/<run_id>/run.yaml
   ```
 - When `notify` is configured, the run result (including `session_id` and a
   `/switch` command) is delivered to the specified channel(s). Delivery status
@@ -237,7 +245,7 @@ The TUI reads agent profile files and local run records directly — it does
 
 | Tab | Content |
 |---|---|
-| Overview | Service status (detects `serve` via `channel_secret/stdio/daemon.yaml`) |
+| Overview | Service status (detects `serve` via `runtime/channel_secret/stdio/daemon.yaml`) |
 | Agent | Agent profile summary |
 | Sessions | Session list and details |
 | Channels | Channel configuration and state |

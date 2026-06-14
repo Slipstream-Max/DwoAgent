@@ -10,8 +10,8 @@ use serde_json::{Map, Value};
 use crate::utils::policy::parse_policy_mode;
 use crate::utils::strings::{normalize_optional_str, normalize_required_str};
 
-pub const DEFAULT_SESSION_STORE_DIR: &str = "sessions";
-pub const DEFAULT_CHANNEL_SESSION_DIR: &str = "channel_sessions";
+pub const DEFAULT_SESSION_STORE_DIR: &str = "runtime/sessions";
+pub const DEFAULT_CHANNEL_STATE_DIR: &str = "runtime/channel_state";
 
 // ── Literal-style enums ────────────────────────────────────────────────────
 
@@ -168,8 +168,8 @@ fn default_session_store_dir() -> String {
     DEFAULT_SESSION_STORE_DIR.to_string()
 }
 
-fn default_channel_session_dir() -> String {
-    DEFAULT_CHANNEL_SESSION_DIR.to_string()
+fn default_channel_state_dir() -> String {
+    DEFAULT_CHANNEL_STATE_DIR.to_string()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,7 +300,7 @@ impl ModelProfile {
     }
 }
 
-/// Top-level registry loaded from `model.yaml`.
+/// Top-level registry loaded from the `model` section in `agent.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRegistry {
@@ -320,12 +320,12 @@ impl ModelRegistry {
         let mut seen: HashSet<&str> = HashSet::new();
         for profile in &self.models {
             if !seen.insert(profile.model_name.as_str()) {
-                bail!("Duplicate model_name found in model.yaml");
+                bail!("Duplicate model_name found in agent.yaml model section");
             }
         }
         if !seen.contains(self.default_model_id.as_str()) {
             bail!(
-                "default_model_id `{}` not found in model.yaml",
+                "default_model_id `{}` not found in agent.yaml model section",
                 self.default_model_id
             );
         }
@@ -347,13 +347,13 @@ pub struct AgentMeta {
     pub external_skills_dirs: Vec<String>,
     #[serde(default)]
     pub external_rule_files: Vec<String>,
-    #[serde(default, alias = "tools")]
-    pub runtime_tools: AgentTools,
+    #[serde(default)]
+    pub tools: AgentTools,
     pub policy_mode: PolicyMode,
     #[serde(default = "default_session_store_dir")]
     pub session_store_dir: String,
-    #[serde(default = "default_channel_session_dir")]
-    pub channel_session_dir: String,
+    #[serde(default = "default_channel_state_dir")]
+    pub channel_state_dir: String,
 }
 
 impl AgentMeta {
@@ -363,8 +363,8 @@ impl AgentMeta {
         self.description = normalize_required_str(&self.description, "description")?;
         self.session_store_dir =
             normalize_required_str(&self.session_store_dir, "session_store_dir")?;
-        self.channel_session_dir =
-            normalize_required_str(&self.channel_session_dir, "channel_session_dir")?;
+        self.channel_state_dir =
+            normalize_required_str(&self.channel_state_dir, "channel_state_dir")?;
         self.external_skills_dirs =
             normalize_string_list(&self.external_skills_dirs, "external_skills_dirs")?;
         self.external_rule_files =
@@ -498,7 +498,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(meta.max_running_turn, None);
-        assert!(meta.runtime_tools.file_edit_enabled());
+        assert!(meta.tools.file_edit_enabled());
     }
 
     #[test]
@@ -511,23 +511,23 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(meta.session_store_dir, "sessions");
-        assert_eq!(meta.channel_session_dir, "channel_sessions");
+        assert_eq!(meta.session_store_dir, "runtime/sessions");
+        assert_eq!(meta.channel_state_dir, "runtime/channel_state");
     }
 
     #[test]
-    fn agent_meta_reads_channel_session_dir() {
+    fn agent_meta_reads_channel_state_dir() {
         let meta = deserialize_agent_meta(serde_json::json!({
             "agent_id": "test-agent",
             "name": "Test Agent",
             "description": "test",
             "policy_mode": "confirm",
             "session_store_dir": ".sessions",
-            "channel_session_dir": " channel-state "
+            "channel_state_dir": " channel-state "
         }))
         .unwrap();
 
-        assert_eq!(meta.channel_session_dir, "channel-state");
+        assert_eq!(meta.channel_state_dir, "channel-state");
     }
 
     #[test]
@@ -546,9 +546,9 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(!meta.runtime_tools.file_edit_enabled());
-        assert!(meta.runtime_tools.terminal_enabled());
-        assert!(!meta.runtime_tools.subagent_enabled());
+        assert!(!meta.tools.file_edit_enabled());
+        assert!(meta.tools.terminal_enabled());
+        assert!(!meta.tools.subagent_enabled());
     }
 
     #[test]

@@ -184,7 +184,7 @@ impl ChannelRuntime {
 
     fn validate_ready(&self) -> Result<()> {
         if !self.config.has_enabled_channels() {
-            bail!("channels.yaml must enable at least one service ingress");
+            bail!("agent.yaml `channels` must enable at least one service ingress");
         }
 
         Ok(())

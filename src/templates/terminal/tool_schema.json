@@ -3,10 +3,14 @@
     "type": "function",
     "function": {
       "name": "terminal_exec",
-      "description": "Spawn a terminal command. Wait up to timeout; if it finishes, return output; otherwise return a running snapshot and id.",
+      "description": "Spawn a terminal command. Returns output if the command finishes before timeout; otherwise returns the terminal name and timeout status.",
       "parameters": {
         "type": "object",
         "properties": {
+          "terminal_name": {
+            "type": "string",
+            "description": "Optional human-readable terminal name. If omitted, a name such as powershell-1 or sh-1 is assigned."
+          },
           "command": {
             "type": "string",
             "description": "Command line to run."
@@ -36,7 +40,7 @@
     "type": "function",
     "function": {
       "name": "list_terminals",
-      "description": "List running terminal commands by id and status.",
+      "description": "List known terminal sessions by name, id, and status.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -47,37 +51,16 @@
   {
     "type": "function",
     "function": {
-      "name": "terminal_wait",
-      "description": "Wait for a duration before checking terminal state again.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "time": {
-            "type": "number",
-            "description": "Seconds to wait.",
-            "minimum": 0.1
-          }
-        },
-        "required": [
-          "time"
-        ],
-        "additionalProperties": false
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "terminal_checkout",
-      "description": "Check current terminal output and status by id without waiting.",
+      "description": "Check current terminal output and status by terminal name without waiting.",
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
+          "terminal_name": {
             "type": "string",
-            "description": "ID returned by terminal_exec."
+            "description": "Terminal name returned by terminal_exec or list_terminals."
           },
-          "tail_line_num": {
+          "lines": {
             "type": "integer",
             "description": "Number of latest output lines to return.",
             "default": 200,
@@ -85,7 +68,7 @@
           }
         },
         "required": [
-          "id"
+          "terminal_name"
         ],
         "additionalProperties": false
       }
@@ -95,17 +78,23 @@
     "type": "function",
     "function": {
       "name": "terminal_kill",
-      "description": "Kill a running terminal command by id and return final output.",
+      "description": "Kill a running terminal command by terminal name and return final output.",
       "parameters": {
         "type": "object",
         "properties": {
-          "id": {
+          "terminal_name": {
             "type": "string",
-            "description": "ID returned by terminal_exec."
+            "description": "Terminal name returned by terminal_exec or list_terminals."
+          },
+          "lines": {
+            "type": "integer",
+            "description": "Number of latest output lines to return after killing.",
+            "default": 200,
+            "minimum": 1
           }
         },
         "required": [
-          "id"
+          "terminal_name"
         ],
         "additionalProperties": false
       }

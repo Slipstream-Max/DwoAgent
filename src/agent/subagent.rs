@@ -32,8 +32,6 @@ use crate::tools::tool_run_manager::{SubagentExecutor as SubagentExecutorTrait, 
 use crate::tools::tool_schemas;
 use crate::utils::perf::{messages_size, perf_log};
 
-const SNAPSHOT_FLOW_LIMIT: usize = 3;
-
 /// Collect the subagent tool schemas that match the parent agent's allowed
 /// non-delegating execution tools.
 fn subagent_tool_schemas(tools: &AgentTools) -> Vec<Value> {
@@ -50,22 +48,43 @@ fn subagent_tool_schemas(tools: &AgentTools) -> Vec<Value> {
 #[derive(Clone)]
 struct FlowItem {
     kind: String,
+    title: String,
     text: String,
 }
 
 /// Progress card state mirroring Python's `SubagentCardState`.
 pub struct SubagentCardState {
-    task: String,
+    session_name: String,
     policy: String,
+    status: String,
     flow: Vec<FlowItem>,
 }
 
 impl SubagentCardState {
-    pub fn new(task: impl Into<String>, policy: impl Into<String>) -> Self {
+    pub fn new(session_name: impl Into<String>, policy: impl Into<String>) -> Self {
         Self {
-            task: task.into(),
+            session_name: session_name.into(),
             policy: policy.into(),
+            status: "created".to_string(),
             flow: Vec::new(),
+        }
+    }
+
+    pub fn set_status(&mut self, status: &str) {
+        let trimmed = status.trim();
+        if !trimmed.is_empty() {
+            self.status = trimmed.to_string();
+        }
+    }
+
+    pub fn append_user(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            self.flow.push(FlowItem {
+                kind: "user".to_string(),
+                title: String::new(),
+                text: trimmed.to_string(),
+            });
         }
     }
 
@@ -73,12 +92,13 @@ impl SubagentCardState {
         self.append_flow_text("thinking", text);
     }
 
-    pub fn append_execution(&mut self, title: &str) {
+    pub fn append_tool_call(&mut self, title: &str, raw_input: Option<&Value>) {
         let trimmed = title.trim();
         if !trimmed.is_empty() {
             self.flow.push(FlowItem {
-                kind: "execution".to_string(),
-                text: trimmed.to_string(),
+                kind: "tool_call".to_string(),
+                title: trimmed.to_string(),
+                text: raw_input.map(format_card_value).unwrap_or_default(),
             });
         }
     }
@@ -99,61 +119,60 @@ impl SubagentCardState {
         }
         self.flow.push(FlowItem {
             kind: kind.to_string(),
+            title: String::new(),
             text: text.to_string(),
         });
     }
 
     pub fn render(&self) -> String {
-        render_card(&self.task, &self.policy, &self.flow, false)
+        render_card(&self.session_name, &self.policy, &self.status, &self.flow)
     }
 }
 
-fn render_card(task: &str, policy: &str, flow: &[FlowItem], is_window: bool) -> String {
-    let mut flow_lines: Vec<String> = Vec::new();
+fn render_card(session_name: &str, policy: &str, status: &str, flow: &[FlowItem]) -> String {
+    let mut sections = vec![
+        format!("**subagent_name:** `{session_name}`"),
+        format!("**policy:** `{policy}`"),
+        format!("**status:** `{status}`"),
+        String::new(),
+    ];
+
     for item in flow {
         match item.kind.as_str() {
-            "thinking" => {
-                flow_lines.push("[thinking]".to_string());
-                flow_lines.push(String::new());
-                flow_lines.push(item.text.clone());
-                flow_lines.push(String::new());
+            "user" => {
+                sections.push("### User".to_string());
+                sections.push(String::new());
+                sections.push(item.text.clone());
+                sections.push(String::new());
             }
-            "execution" => {
-                flow_lines.push(format!("[tool] {}", item.text));
-                flow_lines.push(String::new());
+            "thinking" => {
+                sections.push("### Thinking".to_string());
+                sections.push(String::new());
+                sections.push(item.text.clone());
+                sections.push(String::new());
+            }
+            "tool_call" => {
+                sections.push(format!("### Tool Call: {}", item.title));
+                if !item.text.trim().is_empty() {
+                    sections.push(String::new());
+                    sections.push(format!("```json\n{}\n```", item.text));
+                }
+                sections.push(String::new());
             }
             "response" => {
-                flow_lines.push("[response]".to_string());
-                flow_lines.push(String::new());
-                flow_lines.push(item.text.clone());
-                flow_lines.push(String::new());
+                sections.push("### Response".to_string());
+                sections.push(String::new());
+                sections.push(item.text.clone());
+                sections.push(String::new());
             }
             _ => {}
         }
     }
-    if flow_lines.is_empty() {
-        flow_lines.push(String::new());
-    }
-
-    let header = if is_window {
-        "Recent Agent Flow:"
-    } else {
-        "Agent Flow:"
-    };
-    let mut sections = vec![
-        "Task:".to_string(),
-        String::new(),
-        task.to_string(),
-        String::new(),
-        "Policy:".to_string(),
-        String::new(),
-        policy.to_string(),
-        String::new(),
-        header.to_string(),
-        String::new(),
-    ];
-    sections.extend(flow_lines);
     sections.join("\n").trim_end().to_string()
+}
+
+fn format_card_value(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 // ── Executor (trait impl) ──────────────────────────────────────────────────
@@ -193,6 +212,7 @@ impl SubagentExecutorTrait for SubagentExecutor {
     async fn create_session(
         &self,
         tool_call_id: &str,
+        session_name: &str,
         task: &str,
         policy: Option<&str>,
         context: &ToolExecutionContext,
@@ -204,11 +224,11 @@ impl SubagentExecutorTrait for SubagentExecutor {
             .await?;
         let session = SubagentSession::new(
             tool_call_id.to_string(),
+            session_name.to_string(),
             self.parent_session_id.clone(),
             task.to_string(),
             effective_policy,
             self.max_running_turn,
-            context.cancel_event.clone(),
             context.emit_update.clone(),
             context.request_permission.clone(),
             self.tool_policy.clone(),
@@ -225,11 +245,11 @@ impl SubagentExecutorTrait for SubagentExecutor {
 
 pub struct SubagentSession {
     session_id: String,
+    session_name: String,
     parent_session_id: String,
     task: String,
     policy: String,
     max_running_turn: Option<u32>,
-    cancel_event: CancelEvent,
     emit_parent_update: UpdateEmitter,
     parent_request_permission: PermissionRequester,
     tool_policy: Arc<ToolPolicyConfig>,
@@ -258,11 +278,11 @@ impl SubagentSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: String,
+        session_name: String,
         parent_session_id: String,
         task: String,
         policy: String,
         max_running_turn: Option<u32>,
-        cancel_event: CancelEvent,
         emit_parent_update: UpdateEmitter,
         parent_request_permission: PermissionRequester,
         tool_policy: Arc<ToolPolicyConfig>,
@@ -271,14 +291,14 @@ impl SubagentSession {
         tool_manager: Arc<ToolRunManager>,
         context_manager: ConversationContextManager,
     ) -> Self {
-        let card = SubagentCardState::new(task.clone(), policy.clone());
+        let card = SubagentCardState::new(session_name.clone(), policy.clone());
         Self {
             session_id,
+            session_name,
             parent_session_id,
             task,
             policy,
             max_running_turn,
-            cancel_event,
             emit_parent_update,
             parent_request_permission,
             tool_policy,
@@ -328,12 +348,12 @@ impl SubagentSession {
 
         let inner = self.inner.clone();
         let session_id = self.session_id.clone();
+        let session_name = self.session_name.clone();
         let parent_session_id = self.parent_session_id.clone();
         let emit_parent = self.emit_parent_update.clone();
         let parent_perm = self.parent_request_permission.clone();
         let tool_policy = self.tool_policy.clone();
         let confirm_lock = self.confirm_lock.clone();
-        let parent_cancel = self.cancel_event.clone();
         let max_running_turn = self.max_running_turn;
         let policy = self.policy.clone();
 
@@ -341,13 +361,13 @@ impl SubagentSession {
             let outcome = run_subagent_turn(
                 &inner,
                 session_id.clone(),
-                parent_session_id,
+                session_name.clone(),
+                parent_session_id.clone(),
                 message,
                 policy,
                 max_running_turn,
-                parent_cancel,
                 cancel_token,
-                emit_parent,
+                emit_parent.clone(),
                 parent_perm,
                 tool_policy,
                 confirm_lock,
@@ -377,11 +397,14 @@ impl SubagentSession {
                 let mut status = inner.status.lock().await;
                 *status = status_text.clone();
             }
+            let public_status = subagent_public_status(&status_text, &error_text);
             if !error_text.is_empty() {
-                let mut card = inner.card.lock().await;
-                card.append_response(&error_text);
+                {
+                    let mut card = inner.card.lock().await;
+                    card.append_response(&error_text);
+                }
                 let mut err_slot = inner.error.lock().await;
-                *err_slot = error_text;
+                *err_slot = error_text.clone();
             } else {
                 // Capture final response from context messages for completed runs.
                 let guard = inner.context_manager.lock().await;
@@ -399,8 +422,28 @@ impl SubagentSession {
                 let mut running = inner.turn_running.lock().await;
                 *running = false;
             }
+            let rendered = {
+                let mut card = inner.card.lock().await;
+                card.set_status(public_status);
+                card.render()
+            };
+            let _ = emit_record_update(
+                &emit_parent,
+                &parent_session_id,
+                &session_id,
+                &session_name,
+                card_tool_status(public_status),
+                &rendered,
+            )
+            .await;
             inner.turn_done.notify_waiters();
         });
+    }
+
+    async fn prepare_turn_card(&self, message: &str) {
+        let mut card = self.inner.card.lock().await;
+        card.set_status("running");
+        card.append_user(message);
     }
 
     async fn cancel_turn(&self, target_status: &str) {
@@ -424,17 +467,19 @@ impl SubagentSession {
             let mut updated_at = self.inner.updated_at.lock().await;
             *updated_at = Some(Instant::now());
         }
-        let status_for_update = if target_status == "closed" {
-            "completed".to_string()
-        } else {
-            "cancelled".to_string()
+        let rendered = {
+            let mut card = self.inner.card.lock().await;
+            card.set_status(target_status);
+            card.render()
         };
+        let status_for_update = card_tool_status(target_status);
         let _ = emit_record_update(
             &self.emit_parent_update,
             &self.parent_session_id,
             &self.session_id,
+            &self.session_name,
             &status_for_update,
-            &self.render_card().await,
+            &rendered,
         )
         .await;
     }
@@ -443,55 +488,72 @@ impl SubagentSession {
         self.inner.card.lock().await.render()
     }
 
-    async fn snapshot(&self, done: bool, message: Option<&str>, error: Option<&str>) -> Value {
+    async fn spawn_output(&self) -> Value {
+        let status = self.inner.status.lock().await.clone();
+        json!({
+            "tool": "spawn_subagent",
+            "kind": "subagent",
+            "name": self.session_name,
+            "id": self.session_id,
+            "status": subagent_public_status(&status, ""),
+            "task": self.task,
+            "policy": self.policy,
+        })
+    }
+
+    async fn status_output(&self, tool: &str, status_override: Option<&str>) -> Value {
+        let status = self.inner.status.lock().await.clone();
+        let error_slot = self.inner.error.lock().await.clone();
+        let status = status_override
+            .map(str::to_string)
+            .unwrap_or_else(|| subagent_public_status(&status, &error_slot).to_string());
+        let mut payload = json!({
+            "tool": tool,
+            "kind": "subagent",
+            "name": self.session_name,
+            "id": self.session_id,
+            "status": status,
+        });
+        if !error_slot.is_empty()
+            && let Value::Object(obj) = &mut payload
+        {
+            obj.insert("error".to_string(), Value::String(error_slot));
+        }
+        payload
+    }
+
+    async fn checkout_output(&self, tool: &str, message_num: usize, error: Option<&str>) -> Value {
         let status = self.inner.status.lock().await.clone();
         let error_slot = self.inner.error.lock().await.clone();
         let last_result = self.inner.last_result.lock().await.clone();
-        let card = self.inner.card.lock().await;
-        let total_flow = card.flow.len();
-        let recent_flow: Vec<FlowItem> = card
-            .flow
-            .iter()
-            .rev()
-            .take(SNAPSHOT_FLOW_LIMIT)
-            .cloned()
-            .collect();
-        let recent_flow: Vec<FlowItem> = recent_flow.into_iter().rev().collect();
-        let progress = render_card(&self.task, &self.policy, &recent_flow, true);
-        let flow_values: Vec<Value> = recent_flow
-            .iter()
-            .map(|item| json!({ "kind": item.kind, "text": item.text }))
-            .collect();
-
-        let mut payload = json!({
-            "subagent_run_id": self.session_id,
-            "runtime": {
-                "kind": "subagent",
-                "id": self.session_id,
-                "status": status,
-            },
-            "status": status,
-            "done": done,
-            "task": self.task,
-            "policy": self.policy,
-            "progress": progress,
-            "flow": flow_values,
-            "flow_items": total_flow,
-            "flow_window": format!("last_{SNAPSHOT_FLOW_LIMIT}"),
-            "flow_truncated": total_flow > SNAPSHOT_FLOW_LIMIT,
-            "result": last_result,
-            "model_result": self.model_result_payload(&status, &last_result, &error_slot),
-        });
-        if let Some(msg) = message
-            && let Value::Object(obj) = &mut payload
-        {
-            obj.insert("message".to_string(), Value::String(msg.to_string()));
-        }
         let final_error = match error {
             Some(e) if !e.is_empty() => Some(e.to_string()),
             _ if !error_slot.is_empty() => Some(error_slot.clone()),
             _ => None,
         };
+
+        let mut payload = json!({
+            "tool": tool,
+            "kind": "subagent",
+            "name": self.session_name,
+            "id": self.session_id,
+            "status": subagent_public_status(&status, final_error.as_deref().unwrap_or("")),
+            "task": self.task,
+            "policy": self.policy,
+        });
+
+        if subagent_public_status(&status, final_error.as_deref().unwrap_or("")) == "completed"
+            && !last_result.trim().is_empty()
+            && let Value::Object(obj) = &mut payload
+        {
+            obj.insert("result".to_string(), Value::String(last_result));
+        } else {
+            let session_slice = self.session_slice(message_num).await;
+            if let Value::Object(obj) = &mut payload {
+                obj.insert("session_slice".to_string(), session_slice);
+            }
+        }
+
         if let Some(err) = final_error
             && let Value::Object(obj) = &mut payload
         {
@@ -500,29 +562,149 @@ impl SubagentSession {
         payload
     }
 
-    fn model_result_payload(&self, status: &str, last_result: &str, error: &str) -> Value {
-        let done = !matches!(status, "created" | "running");
-        let mut payload = json!({
-            "subagent_run_id": self.session_id,
-            "runtime": {
-                "kind": "subagent",
-                "id": self.session_id,
-                "status": status,
-            },
-            "status": status,
-            "done": done,
-        });
-        if !last_result.is_empty()
-            && let Value::Object(obj) = &mut payload
-        {
-            obj.insert("result".to_string(), Value::String(last_result.to_string()));
+    async fn session_slice(&self, message_num: usize) -> Value {
+        let messages = {
+            let guard = self.inner.context_manager.lock().await;
+            guard
+                .as_ref()
+                .map(|cm| cm.messages().to_vec())
+                .unwrap_or_default()
+        };
+        let all_items = session_slice_items(&messages);
+        let count = message_num.max(1);
+        let start = all_items.len().saturating_sub(count);
+        let items: Vec<Value> = all_items[start..].to_vec();
+        json!({
+            "items": items,
+            "total": all_items.len(),
+            "returned": all_items.len() - start,
+        })
+    }
+
+    async fn error_output(&self, tool: &str, error: &str) -> Value {
+        json!({
+            "tool": tool,
+            "kind": "subagent",
+            "name": self.session_name,
+            "id": self.session_id,
+            "status": "error",
+            "error": error,
+        })
+    }
+
+    async fn ok_output(&self, tool: &str) -> Value {
+        json!({
+            "tool": tool,
+            "kind": "subagent",
+            "name": self.session_name,
+            "id": self.session_id,
+            "status": "ok",
+        })
+    }
+}
+
+fn subagent_public_status(status: &str, error: &str) -> &'static str {
+    if !error.is_empty() {
+        return "error";
+    }
+    match status {
+        "created" | "running" => "running",
+        "waiting_input" => "completed",
+        "failed" => "error",
+        "cancelled" | "closed" => "cancelled",
+        _ => "error",
+    }
+}
+
+fn card_tool_status(status: &str) -> &'static str {
+    match status {
+        "running" | "created" | "waiting_user_confirm" => "in_progress",
+        "completed" | "waiting_input" | "closed" => "completed",
+        _ => "failed",
+    }
+}
+
+fn session_slice_items(messages: &[Value]) -> Vec<Value> {
+    let mut items = Vec::new();
+    for message in messages {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        match role {
+            "system" => {}
+            "user" => items.push(json!({
+                "kind": "user",
+                "content": message.get("content").cloned().unwrap_or(Value::Null),
+            })),
+            "assistant" => {
+                if let Some(thought) = message
+                    .get("reasoning_content")
+                    .or_else(|| message.get("reasoning"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    items.push(json!({
+                        "kind": "assistant_thought",
+                        "content": thought,
+                    }));
+                }
+                if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for call in tool_calls {
+                        let function = call.get("function").unwrap_or(&Value::Null);
+                        let arguments = function
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .unwrap_or_else(|| {
+                                function
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({}))
+                            });
+                        items.push(json!({
+                            "kind": "tool_call",
+                            "id": call.get("id").cloned().unwrap_or(Value::Null),
+                            "tool": function.get("name").cloned().unwrap_or(Value::Null),
+                            "input": arguments,
+                        }));
+                    }
+                }
+                if let Some(content) = message.get("content")
+                    && !is_empty_content(content)
+                {
+                    items.push(json!({
+                        "kind": "assistant_response",
+                        "content": content,
+                    }));
+                }
+            }
+            "tool" => {
+                let output = message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .unwrap_or_else(|| message.get("content").cloned().unwrap_or(Value::Null));
+                items.push(json!({
+                    "kind": "tool_result",
+                    "id": message.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                    "tool": message.get("name").cloned().unwrap_or(Value::Null),
+                    "output": output,
+                }));
+            }
+            _ => items.push(json!({
+                "kind": role,
+                "message": message,
+            })),
         }
-        if !error.is_empty()
-            && let Value::Object(obj) = &mut payload
-        {
-            obj.insert("error".to_string(), Value::String(error.to_string()));
-        }
-        payload
+    }
+    items
+}
+
+fn is_empty_content(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
     }
 }
 
@@ -543,7 +725,7 @@ impl ToolSession for SubagentSession {
     async fn start(&mut self, _args: &ToolArgs) -> Result<Value> {
         let current_status = self.inner.status.lock().await.clone();
         if current_status != "created" {
-            return Ok(self.snapshot(self.is_done(), None, None).await);
+            return Ok(self.spawn_output().await);
         }
         let context_size = {
             let guard = self.inner.context_manager.lock().await;
@@ -555,65 +737,80 @@ impl ToolSession for SubagentSession {
         perf_log(
             "subagent_start",
             &json!({
-                "subagent_run_id": self.session_id,
+                "id": self.session_id,
+                "name": self.session_name,
                 "policy": self.policy,
                 "context_messages": context_size.0,
                 "context_chars": context_size.1,
                 "task_chars": self.task.chars().count(),
             }),
         );
+        self.prepare_turn_card(&self.task).await;
         let card_text = self.render_card().await;
         let _ = emit_start_card(
             &self.emit_parent_update,
             &self.parent_session_id,
             &self.session_id,
+            &self.session_name,
             &card_text,
         )
         .await;
 
         self.start_turn(self.task.clone()).await;
-        Ok(self.snapshot(false, Some("subagent started"), None).await)
+        Ok(self.spawn_output().await)
     }
 
-    async fn wait(&mut self, timeout_secs: f64, _args: &ToolArgs) -> Result<Value> {
+    async fn wait(&mut self, timeout_secs: f64, args: &ToolArgs) -> Result<Value> {
         let running = *self.inner.turn_running.lock().await;
         if running {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs_f64(timeout_secs.max(0.1))) => {
                     let running_now = *self.inner.turn_running.lock().await;
                     if running_now {
-                        return Ok(self.snapshot(false, Some("subagent still running after timeout"), None).await);
+                        return Ok(self.status_output("wait", Some("timeout")).await);
                     }
                 }
                 _ = self.inner.turn_done.notified() => {}
             }
         }
-        Ok(self.snapshot(self.is_done(), None, None).await)
+        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("wait");
+        Ok(self.status_output(tool, None).await)
     }
 
-    async fn checkout(&mut self, _args: &ToolArgs) -> Result<Value> {
-        Ok(self.snapshot(self.is_done(), None, None).await)
+    async fn checkout(&mut self, args: &ToolArgs) -> Result<Value> {
+        let tool = args
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("checkout_subagent");
+        let message_num = args
+            .get("message_num")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .filter(|v| *v > 0)
+            .unwrap_or(20);
+        Ok(self.checkout_output(tool, message_num, None).await)
     }
 
     async fn send(&mut self, message: &str, interrupt: bool) -> Result<Value> {
         let text = message.trim().to_string();
         if text.is_empty() {
             return Ok(self
-                .snapshot(self.is_done(), None, Some("message cannot be empty"))
+                .error_output("send_subagent", "message cannot be empty")
                 .await);
         }
         let status = self.inner.status.lock().await.clone();
         if status == "closed" {
-            return Ok(self.snapshot(true, None, Some("subagent is closed")).await);
+            return Ok(self
+                .error_output("send_subagent", "subagent is closed")
+                .await);
         }
         let running = *self.inner.turn_running.lock().await;
         if status == "running" || running {
             if !interrupt {
                 return Ok(self
-                    .snapshot(
-                        false,
-                        None,
-                        Some("subagent is already running; set interrupt=true to replace the current turn"),
+                    .error_output(
+                        "send_subagent",
+                        "subagent is already running; set interrupt=true to replace the current turn",
                     )
                     .await);
             }
@@ -632,18 +829,18 @@ impl ToolSession for SubagentSession {
             let mut updated_at = self.inner.updated_at.lock().await;
             *updated_at = Some(Instant::now());
         }
-        self.start_turn(text).await;
+        self.prepare_turn_card(&text).await;
         let _ = emit_record_update(
             &self.emit_parent_update,
             &self.parent_session_id,
             &self.session_id,
+            &self.session_name,
             "in_progress",
             &self.render_card().await,
         )
         .await;
-        Ok(self
-            .snapshot(false, Some("subagent message sent"), None)
-            .await)
+        self.start_turn(text).await;
+        Ok(self.ok_output("send_subagent").await)
     }
 
     async fn cancel(&mut self) -> Result<()> {
@@ -672,9 +869,11 @@ impl ToolSession for SubagentSession {
             .unwrap_or_else(|_| "running".to_string());
         json!({
             "id": self.session_id,
+            "name": self.session_name,
             "kind": "subagent",
-            "status": status,
-            "done": self.is_done(),
+            "status": subagent_public_status(&status, ""),
+            "task": self.task,
+            "policy": self.policy,
         })
     }
 }
@@ -685,9 +884,10 @@ async fn emit_start_card(
     emit: &UpdateEmitter,
     parent_session_id: &str,
     session_id: &str,
+    session_name: &str,
     rendered: &str,
 ) -> Result<()> {
-    let title = format!("subagent:{session_id}");
+    let title = format!("subagent:{session_name}");
     let mut event = ToolCallEvent::new(session_id, &title);
     event.status = "in_progress".to_string();
     event.content =
@@ -700,10 +900,11 @@ async fn emit_record_update(
     emit: &UpdateEmitter,
     parent_session_id: &str,
     session_id: &str,
+    session_name: &str,
     status: &str,
     rendered: &str,
 ) -> Result<()> {
-    let title = format!("subagent:{session_id}");
+    let title = format!("subagent:{session_name}");
     let mut event = ToolCallUpdateEvent::new(session_id, status);
     event.title = Some(title);
     event.content =
@@ -735,11 +936,11 @@ fn extract_last_assistant_response(messages: &[Value]) -> String {
 async fn run_subagent_turn(
     inner: &Arc<SubagentInner>,
     session_id: String,
+    session_name: String,
     parent_session_id: String,
     message: String,
     policy: String,
     max_running_turn: Option<u32>,
-    parent_cancel: CancelEvent,
     own_cancel: CancelEvent,
     emit_parent: UpdateEmitter,
     parent_request_permission: PermissionRequester,
@@ -750,12 +951,14 @@ async fn run_subagent_turn(
     let card_for_emit = inner.clone();
     let parent_session_id_for_emit = parent_session_id.clone();
     let session_id_for_emit = session_id.clone();
+    let session_name_for_emit = session_name.clone();
     let emit_for_wrapper = emit_parent.clone();
     let recording_emit: UpdateEmitter =
         Arc::new(move |_target: String, update: Map<String, Value>| {
             let inner = card_for_emit.clone();
             let parent_session_id = parent_session_id_for_emit.clone();
             let session_id = session_id_for_emit.clone();
+            let session_name = session_name_for_emit.clone();
             let emit = emit_for_wrapper.clone();
             Box::pin(async move {
                 let session_update = update
@@ -770,6 +973,7 @@ async fn run_subagent_turn(
                         s if s == EVENT_AGENT_THOUGHT_CHUNK => {
                             let text = extract_update_text(&update);
                             if !text.is_empty() {
+                                card.set_status("running");
                                 card.append_thinking(&text);
                                 should_emit_card = true;
                                 bump_count(&inner.update_counts, "thought_chunk").await;
@@ -778,6 +982,7 @@ async fn run_subagent_turn(
                         s if s == EVENT_AGENT_MESSAGE_CHUNK => {
                             let text = extract_update_text(&update);
                             if !text.is_empty() {
+                                card.set_status("running");
                                 card.append_response(&text);
                                 should_emit_card = true;
                                 bump_count(&inner.update_counts, "message_chunk").await;
@@ -789,7 +994,8 @@ async fn run_subagent_turn(
                                 .and_then(Value::as_str)
                                 .unwrap_or("tool")
                                 .to_string();
-                            card.append_execution(&title);
+                            card.set_status("running");
+                            card.append_tool_call(&title, update.get("raw_input"));
                             should_emit_card = true;
                             bump_count(&inner.update_counts, "tool_call").await;
                         }
@@ -802,6 +1008,7 @@ async fn run_subagent_turn(
                         &emit,
                         &parent_session_id,
                         &session_id,
+                        &session_name,
                         "in_progress",
                         &rendered,
                     )
@@ -815,22 +1022,29 @@ async fn run_subagent_turn(
     let inner_for_permission = inner.clone();
     let parent_session_id_for_permission = parent_session_id.clone();
     let session_id_for_permission = session_id.clone();
+    let session_name_for_permission = session_name.clone();
     let parent_request = parent_request_permission.clone();
     let recording_permission: PermissionRequester =
         Arc::new(move |_target: String, mut payload: Map<String, Value>| {
             let inner = inner_for_permission.clone();
             let parent_session_id = parent_session_id_for_permission.clone();
             let session_id = session_id_for_permission.clone();
+            let session_name = session_name_for_permission.clone();
             let emit = emit_for_permission.clone();
             let confirm_lock = confirm_lock.clone();
             let parent_request = parent_request.clone();
             Box::pin(async move {
                 let _lock = confirm_lock.lock().await;
-                let rendered = inner.card.lock().await.render();
+                let rendered = {
+                    let mut card = inner.card.lock().await;
+                    card.set_status("waiting_user_confirm");
+                    card.render()
+                };
                 let _ = emit_record_update(
                     &emit,
                     &parent_session_id,
                     &session_id,
+                    &session_name,
                     "pending",
                     &rendered,
                 )
@@ -842,7 +1056,7 @@ async fn run_subagent_turn(
                     .to_string();
                 payload.insert(
                     "title".to_string(),
-                    Value::String(format!("[subagent:{session_id}] {original_title}")),
+                    Value::String(format!("[subagent:{session_name}] {original_title}")),
                 );
                 parent_request(parent_session_id, payload).await
             })
@@ -853,32 +1067,35 @@ async fn run_subagent_turn(
         let emit = emit_parent.clone();
         let parent_session_id = parent_session_id.clone();
         let session_id = session_id.clone();
+        let session_name = session_name.clone();
         move |state: AgentState| {
             let inner = inner.clone();
             let emit = emit.clone();
             let parent_session_id = parent_session_id.clone();
             let session_id = session_id.clone();
+            let session_name = session_name.clone();
             tokio::spawn(async move {
-                let status = if state == AgentState::WaitingUserConfirm {
-                    "pending"
+                let (card_status, tool_status) = if state == AgentState::WaitingUserConfirm {
+                    ("waiting_user_confirm", "pending")
                 } else {
-                    "in_progress"
+                    ("running", "in_progress")
                 };
-                let rendered = inner.card.lock().await.render();
-                let _ =
-                    emit_record_update(&emit, &parent_session_id, &session_id, status, &rendered)
-                        .await;
+                let rendered = {
+                    let mut card = inner.card.lock().await;
+                    card.set_status(card_status);
+                    card.render()
+                };
+                let _ = emit_record_update(
+                    &emit,
+                    &parent_session_id,
+                    &session_id,
+                    &session_name,
+                    tool_status,
+                    &rendered,
+                )
+                .await;
             });
         }
-    });
-
-    // Choose which cancel event governs the turn — listen to parent + own.
-    // We model this by spawning a relay: parent cancel → own cancel.
-    let parent_cancel_clone = parent_cancel.clone();
-    let own_cancel_for_relay = own_cancel.clone();
-    tokio::spawn(async move {
-        parent_cancel_clone.wait_cancelled().await;
-        own_cancel_for_relay.set();
     });
 
     let mut ctx_guard = inner.context_manager.lock().await;

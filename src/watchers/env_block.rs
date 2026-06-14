@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::context::contextblock::{
-    env_context::build_env_context, rule::build_rule, skills::prompt::build_available_skills,
-    xml::block,
+    env_context::build_env_context, mcp::build_mcp, rule::build_rule,
+    skills::prompt::build_available_skills, xml::block,
 };
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,7 @@ impl EnvBlockWatcher {
                 &self.cwd,
                 &self.external_rule_files,
             )?,
+            build_mcp(&resources_dir),
             build_available_skills(&resources_dir, &self.cwd, &self.external_skills_dirs)?,
             build_env_context(&self.cwd),
         ];

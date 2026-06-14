@@ -13,16 +13,15 @@ use serde_json::{Map, Value};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::agent::session_agent::SessionAgent;
-use crate::config::loader::utc_iso;
+use crate::config::loader::{agent_yaml_path, read_agent_config_section, utc_iso};
 use crate::context::content_block;
 use crate::ingress::bridge::SessionLeaseRegistry;
 use crate::ingress::response::{ChannelResponseDetail, ChannelUpdateCollector};
 use crate::tools::subagent_tool_runtime::PermissionRequester;
 use crate::utils::files::read_utf8_text;
 
-pub const AUTOMATION_CONFIG_FILE: &str = "automation.yaml";
 const AUTOMATION_SESSION_SUBDIR: &str = "automation";
-const AUTOMATION_STATE_DIR: &str = "automation_state";
+const AUTOMATION_STATE_DIR: &str = "runtime/automation_state";
 const AUTOMATION_STATE_FILE: &str = "state.yaml";
 const RUN_FILE: &str = "run.yaml";
 
@@ -121,29 +120,16 @@ struct AutomationStickyState {
 }
 
 pub fn load_automation_config(agent_structure_dir: &Path) -> Result<AutomationConfig> {
-    let path = agent_structure_dir.join(AUTOMATION_CONFIG_FILE);
-    if !path.is_file() {
-        return Ok(AutomationConfig::default());
-    }
-
-    let text = read_utf8_text(&path)?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(AutomationConfig::default());
-    }
-
-    let loaded: Value = serde_yaml::from_str(trimmed)
-        .with_context(|| format!("parse YAML in {}", path.display()))?;
-
-    match loaded {
-        Value::Null => Ok(AutomationConfig::default()),
-        Value::Object(map) => {
+    let path = agent_yaml_path(agent_structure_dir);
+    match read_agent_config_section(agent_structure_dir, "automation")? {
+        None | Some(Value::Null) => Ok(AutomationConfig::default()),
+        Some(Value::Object(map)) => {
             let config: AutomationConfig = serde_json::from_value(Value::Object(map))
-                .with_context(|| format!("Invalid YAML config in {}", path.display()))?;
+                .with_context(|| format!("Invalid `automation` section in {}", path.display()))?;
             Ok(config)
         }
-        _ => bail!(
-            "Invalid YAML config in {}: expected a mapping",
+        Some(_) => bail!(
+            "Invalid `automation` section in {}: expected a mapping",
             path.display()
         ),
     }
@@ -373,6 +359,7 @@ impl AutomationRuntime {
                 blocks,
                 collector.emitter(),
                 rejecting_permission_requester(),
+                Vec::new(),
             )
             .await;
         let collected = collector.finish().await;
@@ -700,30 +687,38 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn automation_config_loads_from_automation_yaml() {
+    fn automation_config_loads_from_agent_yaml_section() {
         let tmp = tempdir().unwrap();
         std::fs::write(
-            tmp.path().join(AUTOMATION_CONFIG_FILE),
+            tmp.path().join("agent.yaml"),
             r#"
-enabled: true
-jobs:
-  - id: daily_digest
-    enabled: true
-    workspace_dir: .
-    session:
-      mode: fixed
-      session_id: abc-123
-    schedule:
-      type: daily
-      at: "09:00"
-    prompt: "总结今天"
-    response_detail: detailed
-    notify:
-      - channel: weixin
-      - channel: feishu
-        recipient:
-          type: chat
-          id: oc_xxx
+agent_id: test-agent
+name: Test Agent
+description: test
+policy_mode: confirm
+model:
+  default_model_id: test
+  models: []
+automation:
+  enabled: true
+  jobs:
+    - id: daily_digest
+      enabled: true
+      workspace_dir: .
+      session:
+        mode: fixed
+        session_id: abc-123
+      schedule:
+        type: daily
+        at: "09:00"
+      prompt: "总结今天"
+      response_detail: detailed
+      notify:
+        - channel: weixin
+        - channel: feishu
+          recipient:
+            type: chat
+            id: oc_xxx
 "#,
         )
         .unwrap();
@@ -824,7 +819,8 @@ prompt: run
         let root = PathBuf::from("agent");
         assert_eq!(
             sticky_state_path(&root, "daily:digest/one"),
-            root.join("automation_state")
+            root.join("runtime")
+                .join("automation_state")
                 .join("daily-digest-one")
                 .join("state.yaml")
         );

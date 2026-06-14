@@ -43,8 +43,7 @@ pub trait ToolSession: Send + Sync {
         json!({
             "id": self.session_id(),
             "kind": "tool",
-            "status": if done { "done" } else { "running" },
-            "done": done,
+            "status": if done { "completed" } else { "running" },
         })
     }
 

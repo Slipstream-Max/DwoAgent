@@ -28,8 +28,8 @@ use crate::automation::{
     AutomationSessionConfig, load_automation_config,
 };
 use crate::config::loader::{
-    read_agent_meta, read_json_model, read_model_registry, resolve_agent_structure_dir,
-    resolve_session_store_dir,
+    agent_yaml_path, channel_secret_dir, read_agent_meta, read_json_model, read_model_registry,
+    resolve_agent_structure_dir, resolve_session_store_dir,
 };
 use crate::config::models::{
     AgentMeta, AgentState, ContextUsageSnapshot, ModelProfile, SessionMetaPayload,
@@ -319,9 +319,9 @@ struct TuiSnapshot {
 impl TuiSnapshot {
     fn load(agent_folder: &Path) -> Result<Self> {
         let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
-        let meta = read_agent_meta(&agent_structure_dir.join("agent.yaml"))?;
-        let (default_model_id, model_profiles) =
-            read_model_registry(&agent_structure_dir.join("model.yaml"))?;
+        let agent_yaml = agent_yaml_path(&agent_structure_dir);
+        let meta = read_agent_meta(&agent_yaml)?;
+        let (default_model_id, model_profiles) = read_model_registry(&agent_yaml)?;
         let session_store_dir =
             resolve_session_store_dir(&meta.session_store_dir, &agent_structure_dir)?;
         let channels = load_channel_runtime_config(&agent_structure_dir)?;
@@ -547,11 +547,11 @@ fn load_skills(agent_structure_dir: &Path, meta: &AgentMeta) -> Vec<SkillView> {
     skills
 }
 
-fn load_prompt(agent_structure_dir: &Path, meta: &AgentMeta) -> PromptView {
+fn load_prompt(agent_structure_dir: &Path, _meta: &AgentMeta) -> PromptView {
     let path = agent_structure_dir
         .join("resources")
-        .join("agents")
-        .join(format!("{}.agent.md", meta.agent_id));
+        .join("prompt")
+        .join("system.md");
     match read_preview_lines(&path) {
         Ok(lines) if lines.is_empty() => PromptView {
             path,
@@ -575,8 +575,8 @@ fn load_rules(agent_structure_dir: &Path, meta: &AgentMeta) -> Vec<RuleView> {
     let mut rules = Vec::new();
     let agent_rule = agent_structure_dir
         .join("resources")
-        .join("agents")
-        .join(format!("{}.rule.md", meta.agent_id));
+        .join("prompt")
+        .join("AGENTS.md");
     rules.push(load_rule_view("agent rule", agent_rule));
     for configured in &meta.external_rule_files {
         let path = resolve_config_path(agent_structure_dir, configured);
@@ -650,8 +650,7 @@ fn load_runs(sessions: &[SessionView]) -> Vec<RunView> {
 }
 
 fn load_service(agent_structure_dir: &Path) -> ServiceView {
-    let manifest_path = agent_structure_dir
-        .join("channel_secret")
+    let manifest_path = channel_secret_dir(agent_structure_dir)
         .join("stdio")
         .join("daemon.yaml");
     if let Ok(text) = read_utf8_text(&manifest_path)
@@ -1168,7 +1167,7 @@ fn render_sessions(app: &App, frame: &mut Frame, area: Rect) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        list_or_empty(items, "no sessions under sessions/YYYY/MM/DD")
+        list_or_empty(items, "no sessions under runtime/sessions/YYYY/MM/DD")
             .block(panel_block("Sessions", app.focus == FocusPane::Content)),
         chunks[0],
     );

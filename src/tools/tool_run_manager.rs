@@ -1,6 +1,6 @@
 //! Unified tool dispatcher and session registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,13 +16,11 @@ use super::session::{Cap, ToolSession};
 use super::subagent_tool_runtime::{
     SpawnSubagentPayload, ToolExecutionContext, subagent_not_found,
 };
-use super::terminal_runtime::{
-    TerminalExecutor, TerminalSession, terminal_not_found, terminal_wait,
-};
+use super::terminal_runtime::{TerminalExecutor, TerminalSession, terminal_not_found};
+use super::wait_runtime::{WaitTarget, parse_wait_target, wait_seconds, wait_session};
 use crate::agent::activity::event::{ActivityEvent, ToolCallUpdateEvent};
 use crate::config::models::AgentTools;
 use crate::utils::perf::perf_log;
-use crate::utils::policy::cancelled_tool_output;
 
 /// Builder hook for spawning subagent sessions. The concrete impl lives in
 /// `agent::subagent` (round 4); the tool runtime only needs the trait surface
@@ -32,6 +30,7 @@ pub trait SubagentExecutor: Send + Sync {
     async fn create_session(
         &self,
         tool_call_id: &str,
+        session_name: &str,
         task: &str,
         policy: Option<&str>,
         context: &ToolExecutionContext,
@@ -54,13 +53,15 @@ const IMMEDIATE_TOOLS: &[&str] = &["file_edit"];
 const CREATE_TOOLS: &[&str] = &["terminal_exec", "spawn_subagent"];
 const LIST_TOOLS: &[&str] = &["list_terminals", "list_subagents"];
 const OPERATE_TOOLS: &[&str] = &[
-    "terminal_wait",
+    "wait",
     "terminal_checkout",
     "terminal_kill",
-    "wait_subagent",
     "checkout_subagent",
     "send_subagent",
     "close_subagent",
+];
+const SUBAGENT_NAMES: &[&str] = &[
+    "alice", "bob", "claire", "david", "emma", "frank", "grace", "henry",
 ];
 
 /// Dispatches tool calls to concrete runtimes and runs batches in parallel.
@@ -77,6 +78,9 @@ pub struct ToolRunManager {
 struct ToolManagerState {
     sessions: HashMap<String, Arc<Mutex<dyn ToolSession>>>,
     updated_at: HashMap<String, Instant>,
+    reserved_session_keys: HashSet<String>,
+    terminal_counter: u64,
+    subagent_counter: u64,
     closing: bool,
 }
 
@@ -100,6 +104,9 @@ impl ToolRunManager {
             state: Mutex::new(ToolManagerState {
                 sessions: HashMap::new(),
                 updated_at: HashMap::new(),
+                reserved_session_keys: HashSet::new(),
+                terminal_counter: 0,
+                subagent_counter: 0,
                 closing: false,
             }),
             finished_ttl_seconds: finished_ttl_seconds.max(30),
@@ -122,6 +129,7 @@ impl ToolRunManager {
         let sessions: Vec<Arc<Mutex<dyn ToolSession>>> = state.sessions.values().cloned().collect();
         state.sessions.clear();
         state.updated_at.clear();
+        state.reserved_session_keys.clear();
         drop(state);
         for session in sessions {
             let mut guard = session.lock().await;
@@ -130,13 +138,45 @@ impl ToolRunManager {
     }
 
     pub async fn cancel_running_tools(&self) {
-        let mut state = self.state.lock().await;
-        let sessions: Vec<Arc<Mutex<dyn ToolSession>>> = state.sessions.values().cloned().collect();
-        state.sessions.clear();
-        state.updated_at.clear();
-        drop(state);
+        let sessions: Vec<Arc<Mutex<dyn ToolSession>>> = {
+            let mut state = self.state.lock().await;
+            let mut unique: Vec<Arc<Mutex<dyn ToolSession>>> = Vec::new();
+            for session in state.sessions.values() {
+                if !unique.iter().any(|existing| Arc::ptr_eq(existing, session)) {
+                    unique.push(session.clone());
+                }
+            }
+            state.reserved_session_keys.clear();
+            unique
+        };
 
         for session in sessions {
+            let kind = {
+                let guard = session.lock().await;
+                guard
+                    .list_item()
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if kind == "subagent" {
+                self.touch_session(&session).await;
+                continue;
+            }
+            {
+                let mut state = self.state.lock().await;
+                let keys: Vec<String> = state
+                    .sessions
+                    .iter()
+                    .filter(|(_, existing)| Arc::ptr_eq(existing, &session))
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in keys {
+                    state.sessions.remove(&key);
+                    state.updated_at.remove(&key);
+                }
+            }
             let mut guard = session.lock().await;
             let _ = guard.cancel().await;
         }
@@ -220,11 +260,8 @@ impl ToolRunManager {
             return self.list_sessions(tool_name).await;
         }
 
-        if tool_name == "terminal_wait" {
-            let time = tool_args.get("time").and_then(Value::as_f64).unwrap_or(0.0);
-            return terminal_wait(time)
-                .await
-                .unwrap_or_else(|err| tool_error(tool_name, &format!("{err:#}")));
+        if tool_name == "wait" {
+            return self.handle_wait(&tool_args).await;
         }
 
         if IMMEDIATE_TOOLS.contains(&tool_name) {
@@ -302,7 +339,7 @@ impl ToolRunManager {
             > 1;
 
         // Save per-call metadata so the cancel path can emit updates.
-        let mut call_metadata: Vec<(String, Option<Value>)> = Vec::with_capacity(total);
+        let mut call_metadata: Vec<(String, String, Option<Value>)> = Vec::with_capacity(total);
 
         // Emit the `in_progress` update up front (Python emits this before
         // the batch's `asyncio.wait` loop begins) so UIs see every call enter
@@ -320,7 +357,7 @@ impl ToolRunManager {
                 .unwrap_or("")
                 .to_string();
             let tool_args = call.get("arguments").cloned();
-            call_metadata.push((tool_call_id.clone(), tool_args.clone()));
+            call_metadata.push((tool_call_id.clone(), tool_name.clone(), tool_args.clone()));
             self.emit_tool_update(
                 context,
                 &tool_call_id,
@@ -412,11 +449,11 @@ impl ToolRunManager {
                 if slot.is_some() {
                     continue;
                 }
-                let output = cancelled_tool_output();
+                let output = tool_cancelled(&call_metadata[index].1);
                 *slot = Some(output.clone());
                 // Emit a "failed" tool_call_update so the client UI sees the
                 // transition from in_progress → failed for each cancelled slot.
-                let (ref tool_call_id, ref tool_args) = call_metadata[index];
+                let (ref tool_call_id, _, ref tool_args) = call_metadata[index];
                 self.emit_tool_update(
                     context,
                     tool_call_id,
@@ -434,7 +471,9 @@ impl ToolRunManager {
             .map(|slot| {
                 slot.unwrap_or_else(|| {
                     json!({
-                        "status": "completed_error",
+                        "tool": "unknown",
+                        "kind": "unknown",
+                        "status": "error",
                         "error": "Tool output missing due to interrupted execution.",
                     })
                 })
@@ -462,10 +501,14 @@ impl ToolRunManager {
     fn is_tool_enabled(&self, tool_name: &str) -> bool {
         match tool_name {
             "file_edit" => self.runtime_tools.file_edit_enabled(),
-            "terminal_exec" | "list_terminals" | "terminal_wait" | "terminal_checkout"
-            | "terminal_kill" => self.runtime_tools.terminal_enabled(),
-            "spawn_subagent" | "list_subagents" | "wait_subagent" | "checkout_subagent"
-            | "send_subagent" | "close_subagent" => self.runtime_tools.subagent_enabled(),
+            "terminal_exec" | "list_terminals" | "terminal_checkout" | "terminal_kill" => {
+                self.runtime_tools.terminal_enabled()
+            }
+            "wait" => {
+                self.runtime_tools.terminal_enabled() || self.runtime_tools.subagent_enabled()
+            }
+            "spawn_subagent" | "list_subagents" | "checkout_subagent" | "send_subagent"
+            | "close_subagent" => self.runtime_tools.subagent_enabled(),
             _ => true,
         }
     }
@@ -479,6 +522,12 @@ impl ToolRunManager {
     ) -> Result<Value> {
         let session: Arc<Mutex<dyn ToolSession>> = match name {
             "terminal_exec" => {
+                let session_name = self
+                    .allocate_session_name(
+                        "terminal",
+                        args.get("terminal_name").and_then(Value::as_str),
+                    )
+                    .await?;
                 let command = args
                     .get("command")
                     .and_then(Value::as_str)
@@ -492,6 +541,7 @@ impl ToolRunManager {
                 let timeout = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
                 let terminal = TerminalSession::new(
                     tool_call_id.to_string(),
+                    session_name,
                     self.terminal_executor.clone(),
                     command,
                     env,
@@ -504,6 +554,9 @@ impl ToolRunManager {
                     anyhow::anyhow!("spawn_subagent requires tool execution context.")
                 })?;
                 let payload = SpawnSubagentPayload::from_json(Value::Object(args.clone()))?;
+                let session_name = self
+                    .allocate_session_name("subagent", payload.subagent_name.as_deref())
+                    .await?;
                 let subagent_guard = self.subagent_executor.lock().await;
                 let subagent = subagent_guard
                     .as_ref()
@@ -513,6 +566,7 @@ impl ToolRunManager {
                 subagent
                     .create_session(
                         tool_call_id,
+                        &session_name,
                         &payload.task,
                         payload.policy.as_deref(),
                         context,
@@ -522,7 +576,7 @@ impl ToolRunManager {
             other => anyhow::bail!("Unknown tool: {other}"),
         };
 
-        self.save_session(tool_call_id, session.clone()).await;
+        self.save_session_aliases(tool_call_id, &session).await;
         let output = {
             let mut guard = session.lock().await;
             guard
@@ -531,18 +585,6 @@ impl ToolRunManager {
                 .unwrap_or_else(|err| tool_error(name, &format!("{err:#}")))
         };
         self.touch_session(&session).await;
-
-        if let Some(runtime_id) = output
-            .get("runtime")
-            .and_then(Value::as_object)
-            .and_then(|obj| obj.get("id"))
-            .and_then(Value::as_str)
-        {
-            let trimmed = runtime_id.trim().to_string();
-            if !trimmed.is_empty() && trimmed != tool_call_id {
-                self.save_session(&trimmed, session.clone()).await;
-            }
-        }
         Ok(output)
     }
 
@@ -552,17 +594,17 @@ impl ToolRunManager {
         args: &Map<String, Value>,
     ) -> Option<Arc<Mutex<dyn ToolSession>>> {
         let key = if tool_name.starts_with("terminal_") {
-            args.get("id")
+            args.get("terminal_name")
+                .and_then(Value::as_str)
+                .map(|name| session_key("terminal", name))
         } else {
-            args.get("subagent_run_id")
-        }
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-        if key.is_empty() {
+            args.get("subagent_name")
+                .and_then(Value::as_str)
+                .map(|name| session_key("subagent", name))
+        };
+        let Some(key) = key else {
             return None;
-        }
+        };
         let state = self.state.lock().await;
         state.sessions.get(&key).cloned()
     }
@@ -575,20 +617,14 @@ impl ToolRunManager {
     ) -> Result<Value> {
         let mut guard = session.lock().await;
         match name {
-            "wait_subagent" => {
-                if !guard.capabilities().contains(&Cap::Wait) {
-                    return Ok(tool_error(name, "session does not support wait"));
-                }
-                let timeout = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
-                guard.wait(timeout, &Map::new()).await
-            }
             "terminal_checkout" => {
                 if !guard.capabilities().contains(&Cap::Checkout) {
                     return Ok(tool_error(name, "session does not support checkout"));
                 }
                 let mut op_args = Map::new();
-                if let Some(v) = args.get("tail_line_num").cloned() {
-                    op_args.insert("tail_line_num".to_string(), v);
+                op_args.insert("tool".to_string(), Value::String(name.to_string()));
+                if let Some(v) = args.get("lines").cloned() {
+                    op_args.insert("lines".to_string(), v);
                 }
                 guard.checkout(&op_args).await
             }
@@ -596,11 +632,32 @@ impl ToolRunManager {
                 if !guard.capabilities().contains(&Cap::Checkout) {
                     return Ok(tool_error(name, "session does not support checkout"));
                 }
-                guard.checkout(&Map::new()).await
+                let mut op_args = Map::new();
+                op_args.insert("tool".to_string(), Value::String(name.to_string()));
+                if let Some(v) = args.get("message_num").cloned() {
+                    op_args.insert("message_num".to_string(), v);
+                }
+                guard.checkout(&op_args).await
             }
-            "terminal_kill" | "close_subagent" => {
+            "terminal_kill" => {
                 guard.cancel().await?;
-                guard.checkout(&Map::new()).await
+                let mut op_args = Map::new();
+                op_args.insert("tool".to_string(), Value::String(name.to_string()));
+                if let Some(v) = args.get("lines").cloned() {
+                    op_args.insert("lines".to_string(), v);
+                }
+                guard.checkout(&op_args).await
+            }
+            "close_subagent" => {
+                guard.cancel().await?;
+                let item = guard.list_item();
+                Ok(json!({
+                    "tool": "close_subagent",
+                    "kind": "subagent",
+                    "name": item.get("name").cloned().unwrap_or(Value::Null),
+                    "id": item.get("id").cloned().unwrap_or(Value::Null),
+                    "status": "ok",
+                }))
             }
             "send_subagent" => {
                 if !guard.capabilities().contains(&Cap::Send) {
@@ -621,6 +678,91 @@ impl ToolRunManager {
         }
     }
 
+    async fn handle_wait(&self, args: &Map<String, Value>) -> Value {
+        let (seconds, target) = match parse_wait_target(args) {
+            Ok(parsed) => parsed,
+            Err(err) => return tool_error("wait", &format!("{err:#}")),
+        };
+        let (kind, name) = match target {
+            WaitTarget::Sleep => {
+                return wait_seconds(seconds)
+                    .await
+                    .unwrap_or_else(|err| tool_error("wait", &format!("{err:#}")));
+            }
+            WaitTarget::Terminal(name) => ("terminal", name),
+            WaitTarget::Subagent(name) => ("subagent", name),
+        };
+
+        let key = session_key(kind, &name);
+        let session = {
+            let state = self.state.lock().await;
+            state.sessions.get(&key).cloned()
+        };
+        let Some(session) = session else {
+            return match kind {
+                "terminal" => terminal_not_found("wait", &name),
+                "subagent" => subagent_not_found("wait", &name),
+                _ => tool_error("wait", "session not found"),
+            };
+        };
+
+        let output = wait_session(&session, seconds)
+            .await
+            .unwrap_or_else(|err| tool_error("wait", &format!("{err:#}")));
+        self.touch_session(&session).await;
+        output
+    }
+
+    async fn allocate_session_name(&self, kind: &str, requested: Option<&str>) -> Result<String> {
+        let mut state = self.state.lock().await;
+        if let Some(name) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+            let key = session_key(kind, name);
+            if state.sessions.contains_key(&key) || state.reserved_session_keys.contains(&key) {
+                anyhow::bail!("{kind} name already exists: {name}");
+            }
+            state.reserved_session_keys.insert(key);
+            return Ok(name.to_string());
+        }
+
+        loop {
+            let candidate = match kind {
+                "terminal" => {
+                    state.terminal_counter += 1;
+                    format!("{}-{}", default_terminal_prefix(), state.terminal_counter)
+                }
+                "subagent" => {
+                    let index = state.subagent_counter as usize;
+                    state.subagent_counter += 1;
+                    if index < SUBAGENT_NAMES.len() {
+                        SUBAGENT_NAMES[index].to_string()
+                    } else {
+                        format!("subagent-{}", index + 1)
+                    }
+                }
+                _ => anyhow::bail!("unknown session kind: {kind}"),
+            };
+            let key = session_key(kind, &candidate);
+            if !state.sessions.contains_key(&key) && !state.reserved_session_keys.contains(&key) {
+                state.reserved_session_keys.insert(key);
+                return Ok(candidate);
+            }
+        }
+    }
+
+    async fn save_session_aliases(&self, id: &str, session: &Arc<Mutex<dyn ToolSession>>) {
+        let item = {
+            let guard = session.lock().await;
+            guard.list_item()
+        };
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        self.save_session(id, session.clone()).await;
+        if !kind.is_empty() && !name.is_empty() {
+            self.save_session(&session_key(kind, name), session.clone())
+                .await;
+        }
+    }
+
     async fn save_session(&self, key: &str, session: Arc<Mutex<dyn ToolSession>>) {
         let key = key.trim().to_string();
         if key.is_empty() {
@@ -628,6 +770,7 @@ impl ToolRunManager {
         }
         let mut state = self.state.lock().await;
         state.updated_at.insert(key.clone(), Instant::now());
+        state.reserved_session_keys.remove(&key);
         state.sessions.insert(key, session);
     }
 
@@ -670,15 +813,12 @@ impl ToolRunManager {
             if kind != target_kind {
                 continue;
             }
-            let done = item.get("done").and_then(Value::as_bool).unwrap_or(false);
-            if done {
-                continue;
-            }
             items.push(item);
         }
         json!({
-            "status": "ok",
+            "tool": tool_name,
             "kind": target_kind,
+            "status": "completed",
             "items": items,
         })
     }
@@ -723,22 +863,11 @@ impl ToolRunManager {
         let Some(ctx) = context else {
             return;
         };
-        // Keep subagent's structured payload for the model result path, but render
-        // the ACP tool card as readable flow markdown instead of raw JSON.
-        let (card_raw_output, card_content) = match &raw_output {
-            Some(output) if is_subagent_output(output) => {
-                let raw = output.get("model_result").cloned();
-                let content = render_subagent_as_content(output);
-                (raw, content)
-            }
-            _ => (raw_output, None),
-        };
         let mut event = ToolCallUpdateEvent::new(tool_call_id, status);
         event.title = title.map(str::to_string);
         event.kind = title.map(|_| "other".to_string());
         event.raw_input = raw_input;
-        event.raw_output = card_raw_output;
-        event.content = card_content;
+        event.raw_output = raw_output;
         let obj = ActivityEvent::ToolCallUpdate(event).into_update();
         let emitter = ctx.emit_update.clone();
         let _ = emitter(ctx.session_id.clone(), obj).await;
@@ -755,10 +884,19 @@ fn normalize_arguments(arguments: Option<&Value>) -> Result<Map<String, Value>> 
 
 fn tool_error(tool_name: &str, message: &str) -> Value {
     json!({
-        "status": "error",
-        "done": true,
-        "error": message,
         "tool": tool_name,
+        "kind": tool_kind(tool_name),
+        "status": "error",
+        "error": message,
+    })
+}
+
+fn tool_cancelled(tool_name: &str) -> Value {
+    json!({
+        "tool": tool_name,
+        "kind": tool_kind(tool_name),
+        "status": "cancelled",
+        "error": "Tool call cancelled because user interrupt.",
     })
 }
 
@@ -769,114 +907,6 @@ fn multiple_file_edit_error() -> Value {
     )
 }
 
-fn is_subagent_output(output: &Value) -> bool {
-    output
-        .get("runtime")
-        .and_then(Value::as_object)
-        .and_then(|runtime| runtime.get("kind"))
-        .and_then(Value::as_str)
-        == Some("subagent")
-}
-
-/// Render subagent tool output as markdown content suitable for the Zed tool
-/// card. The structured JSON remains the value returned to the model.
-fn render_subagent_as_content(output: &Value) -> Option<Value> {
-    if let Some(progress) = output.get("progress").and_then(Value::as_str)
-        && !progress.trim().is_empty()
-    {
-        return markdown_tool_content(progress);
-    }
-
-    let flow = output.get("flow").and_then(Value::as_array);
-    if let Some(flow) = flow
-        && !flow.is_empty()
-    {
-        let rendered = render_flow_items(flow);
-        if !rendered.trim().is_empty() {
-            return markdown_tool_content(&rendered);
-        }
-    }
-
-    let subagent_id = output
-        .get("subagent_run_id")
-        .and_then(Value::as_str)
-        .unwrap_or("subagent");
-    let status = output
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("running");
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("Subagent `{subagent_id}`"));
-    lines.push(String::new());
-    lines.push(format!("Status: `{status}`"));
-    if let Some(task) = output.get("task").and_then(Value::as_str)
-        && !task.trim().is_empty()
-    {
-        lines.push(String::new());
-        lines.push("Task:".to_string());
-        lines.push(String::new());
-        lines.push(task.to_string());
-    }
-    if let Some(message) = output.get("message").and_then(Value::as_str)
-        && !message.trim().is_empty()
-    {
-        lines.push(String::new());
-        lines.push(message.to_string());
-    }
-    if let Some(error) = output.get("error").and_then(Value::as_str)
-        && !error.trim().is_empty()
-    {
-        lines.push(String::new());
-        lines.push(format!("Error: {error}"));
-    }
-    markdown_tool_content(&lines.join("\n"))
-}
-
-fn render_flow_items(flow: &[Value]) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for item in flow {
-        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
-        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-        if text.is_empty() && kind != "execution" {
-            continue;
-        }
-        match kind {
-            "thinking" => {
-                lines.push("**[Thinking]**".to_string());
-                lines.push(String::new());
-                lines.push(text.to_string());
-                lines.push(String::new());
-            }
-            "execution" => {
-                lines.push(format!("**[Tool]** {text}"));
-                lines.push(String::new());
-            }
-            "response" => {
-                lines.push("**[Response]**".to_string());
-                lines.push(String::new());
-                lines.push(text.to_string());
-                lines.push(String::new());
-            }
-            _ => {
-                if !text.is_empty() {
-                    lines.push(text.to_string());
-                    lines.push(String::new());
-                }
-            }
-        }
-    }
-    lines.join("\n").trim_end().to_string()
-}
-
-fn markdown_tool_content(markdown: &str) -> Option<Value> {
-    let text = markdown.trim_end();
-    if text.is_empty() {
-        return None;
-    }
-    Some(json!([{"type": "content", "content": {"type": "text", "text": text}}]))
-}
-
 fn tool_status_to_update_status(output: &Value) -> &'static str {
     let raw = output
         .get("status")
@@ -884,73 +914,55 @@ fn tool_status_to_update_status(output: &Value) -> &'static str {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     match raw.as_str() {
-        "running" | "in_progress" => "in_progress",
-        "completed_error" | "failed" | "error" => "failed",
+        "running" | "in_progress" | "timeout" => "in_progress",
+        "failed" | "error" | "cancelled" => "failed",
         _ => "completed",
     }
 }
 
 fn session_not_found(tool_name: &str, args: &Map<String, Value>) -> Value {
-    let id = args
-        .get("id")
+    let terminal_name = args
+        .get("terminal_name")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    if tool_name.starts_with("terminal_") && !id.is_empty() {
-        return terminal_not_found(id);
+    if tool_name.starts_with("terminal_") && !terminal_name.is_empty() {
+        return terminal_not_found(tool_name, terminal_name);
     }
-    let sub_id = args
-        .get("subagent_run_id")
+    let subagent_name = args
+        .get("subagent_name")
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    if !sub_id.is_empty() {
-        return subagent_not_found(sub_id);
+    if !subagent_name.is_empty() {
+        return subagent_not_found(tool_name, subagent_name);
     }
     tool_error(tool_name, "session not found")
+}
+
+pub(crate) fn tool_kind(tool_name: &str) -> &'static str {
+    match tool_name {
+        "terminal_exec" | "terminal_checkout" | "terminal_kill" => "terminal",
+        "spawn_subagent" | "list_subagents" | "checkout_subagent" | "send_subagent"
+        | "close_subagent" => "subagent",
+        "file_edit" => "file_edit",
+        "feishu_reply_media" | "feishu_reply_card" | "weixin_reply_media" => "channel",
+        "wait" => "wait",
+        _ => "unknown",
+    }
+}
+
+fn session_key(kind: &str, name: &str) -> String {
+    format!("{kind}:{}", name.trim())
+}
+
+fn default_terminal_prefix() -> &'static str {
+    if cfg!(windows) { "powershell" } else { "sh" }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn subagent_running_output_renders_markdown_card_content() {
-        let output = json!({
-            "done": false,
-            "runtime": {
-                "id": "call_00",
-                "kind": "subagent",
-                "status": "running"
-            },
-            "status": "running",
-            "subagent_run_id": "call_00",
-            "message": "subagent started"
-        });
-
-        let content = render_subagent_as_content(&output).unwrap();
-
-        assert_eq!(content[0]["content"]["type"], "text");
-        assert_eq!(
-            content[0]["content"]["text"],
-            "Subagent `call_00`\n\nStatus: `running`\n\nsubagent started"
-        );
-    }
-
-    #[test]
-    fn subagent_progress_output_uses_flow_markdown() {
-        let output = json!({
-            "runtime": {"kind": "subagent"},
-            "progress": "Agent Flow:\n\n[tool] terminal_exec"
-        });
-
-        let content = render_subagent_as_content(&output).unwrap();
-
-        assert_eq!(
-            content[0]["content"]["text"],
-            "Agent Flow:\n\n[tool] terminal_exec"
-        );
-    }
 
     #[tokio::test]
     async fn cancel_running_tools_keeps_manager_open() {
@@ -989,22 +1001,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_wait_uses_time_without_session_id() {
+    async fn wait_uses_seconds_without_session_name() {
         let manager = ToolRunManager::new(None, 30, AgentTools::default())
             .await
             .unwrap();
 
         let output = manager
-            .execute_tool_call("wait-1", "terminal_wait", Some(&json!({"time": 0.1})), None)
+            .execute_tool_call("wait-1", "wait", Some(&json!({"seconds": 0.1})), None)
             .await;
 
-        assert_eq!(output["status"], "ok");
-        assert_eq!(output["done"], true);
-        assert_eq!(output["waited_seconds"], 0.1);
+        assert_eq!(output["tool"], "wait");
+        assert_eq!(output["kind"], "wait");
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["seconds"], 0.1);
     }
 
     #[tokio::test]
-    async fn terminal_checkout_uses_id_and_tail_line_num() {
+    async fn terminal_checkout_uses_name_and_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let manager = ToolRunManager::new(Some(tmp.path()), 30, AgentTools::default())
             .await
@@ -1019,22 +1032,22 @@ mod tests {
             .execute_tool_call(
                 "term-1",
                 "terminal_exec",
-                Some(&json!({"command": command, "timeout": 5})),
+                Some(&json!({"terminal_name": "build", "command": command, "timeout": 5})),
                 None,
             )
             .await;
         assert_eq!(started["id"], "term-1");
+        assert_eq!(started["name"], "build");
 
         let checked = manager
             .execute_tool_call(
                 "check-1",
                 "terminal_checkout",
-                Some(&json!({"id": "term-1", "tail_line_num": 2})),
+                Some(&json!({"terminal_name": "build", "lines": 2})),
                 None,
             )
             .await;
 
-        assert_eq!(checked["returned_lines"], 2);
         assert_eq!(
             checked["output"].as_str().unwrap().replace("\r\n", "\n"),
             "line4\nline5\n"
@@ -1090,7 +1103,7 @@ mod tests {
                     .contains("Multiple file_edit calls")
             );
         }
-        assert_eq!(outputs[1]["status"], "completed_success");
+        assert_eq!(outputs[1]["status"], "completed");
         assert!(
             outputs[1]["output"]
                 .as_str()

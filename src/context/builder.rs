@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 use crate::config::models::AgentTools;
 
 use super::contextblock::{
-    agent_prompt::build_agent_prompt, env_context::build_env_context, rule::build_rule,
-    skills::prompt::build_available_skills, tools::build_tools, xml::join_agent_context,
+    agent_prompt::build_agent_prompt, env_context::build_env_context, mcp::build_mcp,
+    rule::build_rule, skills::prompt::build_available_skills, tools::build_tools,
+    xml::join_agent_context,
 };
 
 /// Load and merge system prompt blocks for agent context. Returns the system
@@ -30,6 +31,7 @@ pub fn build_agent_system_context(
         build_agent_prompt(&resources_dir, agent_id)?,
         build_rule(&resources_dir, agent_id, cwd, external_rule_files)?,
         build_tools(tools),
+        build_mcp(&resources_dir),
         build_available_skills(&resources_dir, cwd, external_skills_dirs)?,
         build_env_context(cwd),
     ];
@@ -53,7 +55,7 @@ mod tests {
         let external_dir = temp.path().join("external");
         let agent_resources = agent_dir.join("resources");
 
-        std::fs::create_dir_all(agent_resources.join("agents")).unwrap();
+        std::fs::create_dir_all(agent_resources.join("prompt")).unwrap();
         std::fs::create_dir_all(agent_resources.join("skills").join("agent-skill")).unwrap();
         std::fs::create_dir_all(external_dir.join("skills").join("external-skill")).unwrap();
         std::fs::create_dir_all(
@@ -64,12 +66,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            agent_resources.join("agents").join("test-agent.agent.md"),
+            agent_resources.join("prompt").join("system.md"),
             "Agent prompt",
         )
         .unwrap();
         std::fs::write(
-            agent_resources.join("agents").join("test-agent.rule.md"),
+            agent_resources.join("prompt").join("AGENTS.md"),
             "Agent rule",
         )
         .unwrap();
@@ -106,6 +108,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(workspace_dir.join("AGENTS.md"), "Root agent rule").unwrap();
+        std::fs::write(agent_resources.join("mcp.json"), "{}").unwrap();
 
         let message = build_agent_system_context(
             &agent_dir,
@@ -125,5 +128,11 @@ mod tests {
         assert!(content.contains("<name>\nagent-skill\n</name>"));
         assert!(content.contains("<name>\nexternal-skill\n</name>"));
         assert!(content.contains("<name>\nworkspace-skill\n</name>"));
+        assert!(content.contains("<mcp>"));
+        assert!(content.contains("<config>"));
+        assert!(content.contains("mcp.json"));
+        assert!(content.contains("mcporter --version"));
+        assert!(content.contains("mcporter --config"));
+        assert!(content.contains("--schema --json"));
     }
 }

@@ -24,7 +24,7 @@ use super::response::ChannelUpdateCollector;
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
 use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
-use crate::config::loader::resolve_agent_structure_dir;
+use crate::config::loader::{channel_secret_dir, resolve_agent_structure_dir};
 use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::PermissionRequester;
 use crate::tools::{
@@ -33,9 +33,9 @@ use crate::tools::{
 };
 use crate::utils::files::read_utf8_text;
 
-const FEISHU_SECRET_DIR: &str = "channel_secret/feishu";
+const FEISHU_SECRET_SUBDIR: &str = "feishu";
 const FEISHU_AUTH_FILE: &str = "auth.yaml";
-const FEISHU_SESSION_SUBDIR: &str = "feishu";
+const FEISHU_STATE_SUBDIR: &str = "feishu";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,7 +115,7 @@ pub fn run_feishu_login(
     app_secret: Option<String>,
 ) -> Result<()> {
     let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
-    let secret_dir = agent_structure_dir.join(FEISHU_SECRET_DIR);
+    let secret_dir = channel_secret_dir(&agent_structure_dir).join(FEISHU_SECRET_SUBDIR);
     std::fs::create_dir_all(&secret_dir)
         .with_context(|| format!("create {}", secret_dir.display()))?;
 
@@ -154,7 +154,7 @@ impl FeishuChannel {
         agent_structure_dir: &Path,
         config: &FeishuChannelConfig,
     ) -> Result<Self> {
-        let secret_dir = agent_structure_dir.join(FEISHU_SECRET_DIR);
+        let secret_dir = channel_secret_dir(agent_structure_dir).join(FEISHU_SECRET_SUBDIR);
         let auth_path = secret_dir.join(FEISHU_AUTH_FILE);
         let auth = read_auth(&auth_path)?;
         let workspace_dir = resolve_config_path(agent_structure_dir, &config.workspace_dir);
@@ -228,32 +228,23 @@ impl FeishuChannel {
         let lock = self.session_lock(&session_key).await;
         let _guard = lock.lock().await;
 
-        let session_dir = self
+        let state_dir = self
             .agent
-            .channel_session_dir()
-            .join(FEISHU_SESSION_SUBDIR)
+            .channel_state_dir()
+            .join(FEISHU_STATE_SUBDIR)
             .join(chat_kind_name(kind))
             .join(sanitize_filename(peer_id));
-        let channel_tools = feishu_tool_schemas(self.config.media_output, self.config.card_output);
-
-        let default_session = self
-            .agent
-            .load_or_create_channel_session(
-                &self.workspace_dir.to_string_lossy(),
-                session_dir.clone(),
-                channel_tools.clone(),
-                self.config.override_model.as_deref(),
-                self.config.override_reasoning_mode,
-            )
-            .await?;
         let holder = format!("feishu:{}:{peer_id}", chat_kind_name(kind));
         let bridge = ChannelBridge::new(
             self.agent.clone(),
             self.leases.clone(),
             self.confirmations.clone(),
             holder.clone(),
-            &session_dir,
-            default_session.session_id().to_string(),
+            &state_dir,
+            self.workspace_dir.to_string_lossy().to_string(),
+            self.config.default_session_id.as_deref(),
+            self.config.override_model.as_deref(),
+            self.config.override_reasoning_mode,
         );
         if let Some(command_text) = command_text(&msg.content)
             && let Some(reply) = bridge.handle_command(&command_text).await?
@@ -262,13 +253,13 @@ impl FeishuChannel {
             return Ok(());
         }
 
-        let Some((user_input, user_blocks)) =
-            self.build_user_input(&msg, kind, &session_dir).await?
+        let session = bridge.active_session().await?;
+        let Some((user_input, user_blocks)) = self
+            .build_user_input(&msg, kind, session.session_dir())
+            .await?
         else {
             return Ok(());
         };
-
-        let session = bridge.active_session(default_session).await?;
 
         let expose_output_tools = self.config.media_output || self.config.card_output;
         let tool_manager = session.tool_manager().await;
@@ -279,7 +270,10 @@ impl FeishuChannel {
             });
             let executor = Arc::new(FeishuToolExecutor::new(
                 bridge,
-                vec![self.workspace_dir.clone(), session_dir.clone()],
+                vec![
+                    self.workspace_dir.clone(),
+                    session.session_dir().to_path_buf(),
+                ],
                 self.config.media_output,
                 self.config.card_output,
             ));
@@ -295,7 +289,13 @@ impl FeishuChannel {
             holder,
         );
         let run_result = session
-            .run_prompt(user_input, user_blocks, emit_update, request_permission)
+            .run_prompt(
+                user_input,
+                user_blocks,
+                emit_update,
+                request_permission,
+                feishu_tool_schemas(self.config.media_output, self.config.card_output),
+            )
             .await;
         if expose_output_tools {
             tool_manager.set_channel_tool_executor(None).await;
@@ -365,6 +365,12 @@ impl FeishuChannel {
         if blocks.is_empty() {
             return Ok(None);
         }
+        append_channel_context(
+            &mut blocks,
+            "Feishu",
+            self.config.media_output,
+            self.config.card_output,
+        )?;
 
         let user_input = if blocks.len() == 1 {
             blocks[0]
@@ -386,6 +392,8 @@ impl FeishuChannel {
     ) -> Result<DownloadedFeishuMedia> {
         let attachments_dir = session_dir
             .join("attachments")
+            .join("inbox")
+            .join("feishu")
             .join(sanitize_filename(&msg.id));
         tokio::fs::create_dir_all(&attachments_dir).await?;
         let resource_type = match media.kind {
@@ -946,6 +954,31 @@ fn image_url_block_from_file(path: &Path, mime_type: &str) -> Result<Option<Valu
     let data = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     Ok(Some(content_block::image_url_data(mime_type, &encoded)?))
+}
+
+fn append_channel_context(
+    blocks: &mut Vec<Value>,
+    channel: &str,
+    media_output: bool,
+    card_output: bool,
+) -> Result<()> {
+    let mut lines = vec![
+        "<channel_context>".to_string(),
+        format!("当前消息来自 {channel} 频道。"),
+    ];
+    if media_output {
+        lines.push(
+            "本轮如需发送本地文件或图片，请使用 feishu_reply_media 回复当前飞书对话。".to_string(),
+        );
+    }
+    if card_output {
+        lines.push(
+            "本轮如需发送飞书交互卡片，请使用 feishu_reply_card 回复当前飞书对话。".to_string(),
+        );
+    }
+    lines.push("</channel_context>".to_string());
+    blocks.push(content_block::text(&lines.join("\n"))?);
+    Ok(())
 }
 
 fn file_uri_from_path(path: &Path) -> String {

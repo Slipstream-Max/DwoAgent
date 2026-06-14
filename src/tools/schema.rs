@@ -16,6 +16,9 @@ pub fn tool_schemas(tools: &AgentTools) -> Vec<Value> {
     if tools.subagent_enabled() {
         sources.push(templates::subagent::TOOL_SCHEMA);
     }
+    if tools.terminal_enabled() || tools.subagent_enabled() {
+        sources.push(templates::wait::TOOL_SCHEMA);
+    }
     tool_schemas_from_templates(&sources)
 }
 

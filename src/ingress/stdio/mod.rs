@@ -14,10 +14,10 @@ use super::acp::{AcpSessionLeaseBridge, run_acp_transport_with_leases};
 use super::bridge::SessionLeaseRegistry;
 use super::config::{StdioChannelConfig, load_channel_runtime_config};
 use crate::agent::service::AgentService;
-use crate::config::loader::{resolve_agent_structure_dir, utc_iso};
+use crate::config::loader::{channel_secret_dir, resolve_agent_structure_dir, utc_iso};
 use crate::utils::files::read_utf8_text;
 
-const STDIO_SECRET_DIR: &str = "channel_secret/stdio";
+const STDIO_SECRET_SUBDIR: &str = "stdio";
 const ACP_AUTH_FILE: &str = "auth.yaml";
 const ACP_DAEMON_FILE: &str = "daemon.yaml";
 const TOKEN_PREFIX: &str = "dwo_stdio_";
@@ -103,10 +103,10 @@ pub fn run_stdio_login(agent_folder: &Path) -> Result<()> {
     let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
     let config = load_channel_runtime_config(&agent_structure_dir)?;
     if !config.stdio.enabled {
-        bail!("stdio channel is not enabled in channels.yaml.");
+        bail!("stdio channel is not enabled in agent.yaml `channels.stdio`.");
     }
     if !config.stdio.auth {
-        bail!("stdio auth is disabled in channels.yaml; set `stdio.auth: true` first.");
+        bail!("stdio auth is disabled in agent.yaml; set `channels.stdio.auth: true` first.");
     }
 
     let auth = AcpAuth {
@@ -132,7 +132,7 @@ pub async fn run_stdio_connect(agent_folder: &Path, ipc: Option<String>) -> Resu
     let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
     let config = load_channel_runtime_config(&agent_structure_dir)?;
     if !config.stdio.enabled {
-        bail!("stdio channel is not enabled in channels.yaml.");
+        bail!("stdio channel is not enabled in agent.yaml `channels.stdio`.");
     }
 
     let endpoint = match ipc {
@@ -252,14 +252,14 @@ where
 }
 
 fn auth_path(agent_structure_dir: &Path) -> PathBuf {
-    agent_structure_dir
-        .join(STDIO_SECRET_DIR)
+    channel_secret_dir(agent_structure_dir)
+        .join(STDIO_SECRET_SUBDIR)
         .join(ACP_AUTH_FILE)
 }
 
 fn daemon_path(agent_structure_dir: &Path) -> PathBuf {
-    agent_structure_dir
-        .join(STDIO_SECRET_DIR)
+    channel_secret_dir(agent_structure_dir)
+        .join(STDIO_SECRET_SUBDIR)
         .join(ACP_DAEMON_FILE)
 }
 
@@ -558,39 +558,31 @@ mod tests {
     }
 
     fn write_agent_structure_at(agent_dir: &Path, stdio_enabled: bool, stdio_auth: bool) {
-        std::fs::create_dir_all(agent_dir.join("resources").join("agents")).unwrap();
+        let prompt_dir = agent_dir.join("resources").join("prompt");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
         std::fs::write(
             agent_dir.join("agent.yaml"),
-            "\
+            format!(
+                "\
 agent_id: acp-test
 name: acp-test
 description: acp auth test
 policy_mode: full_access
-",
-        )
-        .unwrap();
-        std::fs::write(
-            agent_dir.join("model.yaml"),
-            "\
-default_model_id: mock
-models:
-  - model_name: mock
-    provider: deepseek
-    model_id: deepseek-v4-pro
-    api_key: test
-",
-        )
-        .unwrap();
-        std::fs::write(
-            agent_dir.join("channels.yaml"),
-            format!(
-                "\
-stdio:
-  enabled: {stdio_enabled}
-  auth: {stdio_auth}
+model:
+  default_model_id: mock
+  models:
+    - model_name: mock
+      provider: deepseek
+      model_id: deepseek-v4-pro
+      api_key: test
+channels:
+  stdio:
+    enabled: {stdio_enabled}
+    auth: {stdio_auth}
 "
             ),
         )
         .unwrap();
+        std::fs::write(prompt_dir.join("system.md"), "You are an ACP test agent.").unwrap();
     }
 }

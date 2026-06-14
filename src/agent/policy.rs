@@ -44,7 +44,7 @@ pub fn resolve_tool_policy(
         return resolve_terminal_exec(&mode, tool_args, policy);
     }
 
-    if is_terminal_read_tool(name) || is_subagent_tool(name) {
+    if name == "wait" || is_terminal_read_tool(name) || is_subagent_tool(name) {
         return Ok(ToolPolicyAction::Allow);
     }
 
@@ -131,10 +131,7 @@ fn reject(reason: &str) -> ToolPolicyAction {
 }
 
 fn is_terminal_read_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "list_terminals" | "terminal_wait" | "terminal_checkout"
-    )
+    matches!(name, "list_terminals" | "terminal_checkout")
 }
 
 fn is_subagent_tool(name: &str) -> bool {
@@ -142,7 +139,6 @@ fn is_subagent_tool(name: &str) -> bool {
         name,
         "spawn_subagent"
             | "list_subagents"
-            | "wait_subagent"
             | "checkout_subagent"
             | "send_subagent"
             | "close_subagent"

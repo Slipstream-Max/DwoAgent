@@ -51,6 +51,7 @@ fn acp_connect_bridges_stdio_to_running_serve() {
 
 fn wait_for_daemon_manifest(folder: &Path, server: &mut ServerProcess) {
     let path = folder
+        .join("runtime")
         .join("channel_secret")
         .join("stdio")
         .join("daemon.yaml");
@@ -69,8 +70,8 @@ fn wait_for_daemon_manifest(folder: &Path, server: &mut ServerProcess) {
 
 fn create_acp_agent_folder(tmp_dir: &Path) -> PathBuf {
     let agent_dir = tmp_dir.join("agent");
-    let agents_dir = agent_dir.join("resources").join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
+    let prompt_dir = agent_dir.join("resources").join("prompt");
+    std::fs::create_dir_all(&prompt_dir).unwrap();
 
     std::fs::write(
         agent_dir.join("agent.yaml"),
@@ -80,38 +81,27 @@ name: ACP Connect Test Agent
 description: Test agent for ACP connect bridge
 max_running_turn: 5
 policy_mode: full_access
-session_store_dir: sessions
-channel_session_dir: channel_sessions
+model:
+  default_model_id: mock-model
+  models:
+    - model_name: mock-model
+      provider: deepseek
+      model_id: deepseek-v4-pro
+      api_key: test-key-not-real
+      api_base: http://127.0.0.1:9/v1
+      default_reasoning_mode: auto
+      compact_threshold: 0.8
+channels:
+  stdio:
+    enabled: true
+    auth: true
 ",
     )
     .unwrap();
-
-    std::fs::write(
-        agent_dir.join("model.yaml"),
-        "\
-default_model_id: mock-model
-models:
-  - model_name: mock-model
-    provider: deepseek
-    model_id: deepseek-v4-pro
-    api_key: test-key-not-real
-    api_base: http://127.0.0.1:9/v1
-    default_reasoning_mode: auto
-    compact_threshold: 0.8
-",
-    )
-    .unwrap();
-
-    std::fs::write(
-        agent_dir.join("channels.yaml"),
-        "\
-stdio:
-  enabled: true
-  auth: true
-",
-    )
-    .unwrap();
-    let secret_dir = agent_dir.join("channel_secret").join("stdio");
+    let secret_dir = agent_dir
+        .join("runtime")
+        .join("channel_secret")
+        .join("stdio");
     std::fs::create_dir_all(&secret_dir).unwrap();
     std::fs::write(
         secret_dir.join("auth.yaml"),
@@ -120,7 +110,7 @@ stdio:
     .unwrap();
 
     std::fs::write(
-        agents_dir.join("acp-connect-test-agent.agent.md"),
+        prompt_dir.join("system.md"),
         "You are an ACP connect test agent.\n",
     )
     .unwrap();

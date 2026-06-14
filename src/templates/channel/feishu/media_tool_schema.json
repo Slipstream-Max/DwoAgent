@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "feishu_reply_media",
-      "description": "Reply to the current Feishu conversation with a local image or file. The path must be inside the configured workspace or the Feishu channel session directory.",
+      "description": "Reply to the current Feishu conversation with a local image or file. The path must be inside the configured workspace or the active session directory.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,

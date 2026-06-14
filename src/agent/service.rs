@@ -14,8 +14,8 @@ use super::factory::{CreateSessionArgs, RuntimeFactoryBuilder, SessionAgentFacto
 use super::session::{SESSION_META_FILE, SESSION_MODEL_CONTEXT_FILE};
 use super::session_agent::SessionAgent;
 use crate::config::loader::{
-    read_agent_meta, read_json_model, read_model_registry, read_tool_policy,
-    resolve_agent_structure_dir, resolve_channel_session_dir, resolve_session_store_dir,
+    agent_yaml_path, read_agent_meta, read_json_model, read_model_registry, read_tool_policy,
+    resolve_agent_structure_dir, resolve_channel_state_dir, resolve_session_store_dir,
 };
 use crate::config::models::{
     AgentMeta, AgentState, AgentTools, ContextUsageSnapshot, ModelProfile, PolicyMode,
@@ -36,29 +36,26 @@ pub struct AgentService {
     model_profiles: HashMap<String, ModelProfile>,
     tool_policy: Arc<ToolPolicyConfig>,
     session_store_dir: PathBuf,
-    channel_session_dir: PathBuf,
+    channel_state_dir: PathBuf,
     agents: Mutex<HashMap<String, Arc<SessionAgent>>>,
 }
 
 impl AgentService {
     pub fn new(agent_folder: &Path) -> Result<Self> {
         let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
-        let agent_meta = read_agent_meta(&agent_structure_dir.join("agent.yaml"))?;
+        let agent_yaml = agent_yaml_path(&agent_structure_dir);
+        let agent_meta = read_agent_meta(&agent_yaml)?;
         let tool_policy = Arc::new(read_tool_policy(&agent_structure_dir)?);
-        let (default_model_id, model_profiles) =
-            read_model_registry(&agent_structure_dir.join("model.yaml"))?;
+        let (default_model_id, model_profiles) = read_model_registry(&agent_yaml)?;
 
         let session_store_dir =
             resolve_session_store_dir(&agent_meta.session_store_dir, &agent_structure_dir)?;
         std::fs::create_dir_all(&session_store_dir)
             .with_context(|| format!("create session store {}", session_store_dir.display()))?;
-        let channel_session_dir =
-            resolve_channel_session_dir(&agent_meta.channel_session_dir, &agent_structure_dir)?;
-        std::fs::create_dir_all(&channel_session_dir).with_context(|| {
-            format!(
-                "create channel session store {}",
-                channel_session_dir.display()
-            )
+        let channel_state_dir =
+            resolve_channel_state_dir(&agent_meta.channel_state_dir, &agent_structure_dir)?;
+        std::fs::create_dir_all(&channel_state_dir).with_context(|| {
+            format!("create channel state store {}", channel_state_dir.display())
         })?;
 
         Ok(Self {
@@ -68,7 +65,7 @@ impl AgentService {
             model_profiles,
             tool_policy,
             session_store_dir,
-            channel_session_dir,
+            channel_state_dir,
             agents: Mutex::new(HashMap::new()),
         })
     }
@@ -81,8 +78,8 @@ impl AgentService {
         &self.agent_structure_dir
     }
 
-    pub fn channel_session_dir(&self) -> &Path {
-        &self.channel_session_dir
+    pub fn channel_state_dir(&self) -> &Path {
+        &self.channel_state_dir
     }
 
     pub fn default_model_id(&self) -> &str {
@@ -94,55 +91,20 @@ impl AgentService {
     }
 
     pub async fn new_session(&self, cwd: &str) -> Result<Arc<SessionAgent>> {
-        let agent = self
-            .create_agent(CreateAgentArgs {
-                cwd: cwd.to_string(),
-                model_id: self.default_model_id.clone(),
-                mode_id: self.agent_meta.policy_mode,
-                max_running_turn: self.agent_meta.max_running_turn,
-                runtime_tools: self.agent_meta.runtime_tools,
-                tool_schemas: tool_schemas(&self.agent_meta.runtime_tools),
-                ..CreateAgentArgs::default()
-            })
-            .await?;
-        {
-            let mut agents = self.agents.lock().await;
-            agents.insert(agent.session_id().to_string(), agent.clone());
-        }
-        agent.persist_async().await?;
-        Ok(agent)
+        self.new_session_with_options(cwd, None, None).await
     }
 
-    pub async fn load_or_create_channel_session(
+    pub async fn new_session_with_options(
         &self,
         cwd: &str,
-        session_dir: PathBuf,
-        channel_tools: Vec<Value>,
         override_model: Option<&str>,
         override_reasoning_mode: Option<ReasoningMode>,
     ) -> Result<Arc<SessionAgent>> {
-        let meta_path = session_dir.join(SESSION_META_FILE);
-        if meta_path.is_file() {
-            let meta: SessionMetaPayload = read_json_model(&meta_path)?;
-            if let Some(agent) = self.agents.lock().await.get(&meta.session_id).cloned() {
-                return Ok(agent);
-            }
-        }
-
-        if let Some(agent) = self.load_persisted_session_from_dir(&session_dir).await? {
-            {
-                let mut agents = self.agents.lock().await;
-                agents.insert(agent.session_id().to_string(), agent.clone());
-            }
-            agent.mark_loaded(true).await?;
-            return Ok(agent);
-        }
-
         let model_id = match override_model {
             Some(model) => {
                 let trimmed = model.trim();
                 if trimmed.is_empty() {
-                    bail!("channel override_model must not be empty");
+                    bail!("override_model must not be empty");
                 }
                 trimmed.to_string()
             }
@@ -151,20 +113,15 @@ impl AgentService {
         if let Some(reasoning_mode) = override_reasoning_mode {
             self.validate_reasoning_mode(&model_id, reasoning_mode)?;
         }
-
-        let mut tool_schemas_for_session = tool_schemas(&self.agent_meta.runtime_tools);
-        tool_schemas_for_session.extend(channel_tools);
-
         let agent = self
             .create_agent(CreateAgentArgs {
                 cwd: cwd.to_string(),
                 model_id,
                 mode_id: self.agent_meta.policy_mode,
                 max_running_turn: self.agent_meta.max_running_turn,
-                runtime_tools: self.agent_meta.runtime_tools,
-                tool_schemas: tool_schemas_for_session,
+                runtime_tools: self.agent_meta.tools,
+                tool_schemas: tool_schemas(&self.agent_meta.tools),
                 reasoning_mode: override_reasoning_mode,
-                session_dir: Some(session_dir),
                 ..CreateAgentArgs::default()
             })
             .await?;
@@ -326,7 +283,13 @@ impl AgentService {
                 .ok_or_else(|| anyhow::anyhow!("Unknown session: {session_id}"))?
         };
         agent
-            .run_prompt(user_input, user_blocks, emit_update, request_permission)
+            .run_prompt(
+                user_input,
+                user_blocks,
+                emit_update,
+                request_permission,
+                Vec::new(),
+            )
             .await
     }
 
@@ -690,13 +653,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn write_agent_folder(root: &Path, max_running_turn: u32, tools: &str) {
-        write_agent_folder_with_dirs(
-            root,
-            max_running_turn,
-            tools,
-            ".sessions",
-            "channel_sessions",
-        )
+        write_agent_folder_with_dirs(root, max_running_turn, tools, ".sessions", "channel_state")
     }
 
     fn write_agent_folder_with_dirs(
@@ -704,12 +661,12 @@ mod tests {
         max_running_turn: u32,
         tools: &str,
         session_store_dir: &str,
-        channel_session_dir: &str,
+        channel_state_dir: &str,
     ) {
         let resources_dir = root.join("resources");
-        let agents_dir = resources_dir.join("agents");
+        let prompt_dir = resources_dir.join("prompt");
         let skills_dir = resources_dir.join("skills");
-        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&prompt_dir).unwrap();
         std::fs::create_dir_all(&skills_dir).unwrap();
         std::fs::write(
             root.join("agent.yaml"),
@@ -721,31 +678,22 @@ description: Test
 max_running_turn: {max_running_turn}
 policy_mode: confirm
 session_store_dir: {session_store_dir}
-channel_session_dir: {channel_session_dir}
+channel_state_dir: {channel_state_dir}
 tools:
 {tools}
+model:
+  default_model_id: mock-model
+  models:
+    - model_name: mock-model
+      provider: deepseek
+      model_id: deepseek-v4-pro
+      api_key: test-key
+      default_reasoning_mode: auto
 "
             ),
         )
         .unwrap();
-        std::fs::write(
-            root.join("model.yaml"),
-            "\
-default_model_id: mock-model
-models:
-  - model_name: mock-model
-    provider: deepseek
-    model_id: deepseek-v4-pro
-    api_key: test-key
-    default_reasoning_mode: auto
-",
-        )
-        .unwrap();
-        std::fs::write(
-            agents_dir.join("test-agent.agent.md"),
-            "You are a test agent.\n",
-        )
-        .unwrap();
+        std::fs::write(prompt_dir.join("system.md"), "You are a test agent.\n").unwrap();
     }
 
     #[tokio::test]
@@ -795,8 +743,8 @@ models:
         );
 
         let service = AgentService::new(&agent_dir).unwrap();
-        assert!(service.channel_session_dir().ends_with("channel-state"));
-        assert!(service.channel_session_dir().is_dir());
+        assert!(service.channel_state_dir().ends_with("channel-state"));
+        assert!(service.channel_state_dir().is_dir());
 
         let cwd = tmp.path().to_string_lossy().to_string();
         let session = service.new_session(&cwd).await.unwrap();

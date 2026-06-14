@@ -21,6 +21,13 @@ pub fn build_tools(tools: &AgentTools) -> String {
             templates::subagent::TOOLS_PROMPT.trim(),
         ));
     }
+    if tools.terminal_enabled() || tools.subagent_enabled() {
+        chunks.push(text_block("wait", templates::wait::TOOLS_PROMPT.trim()));
+    }
+    chunks.push(text_block(
+        "channel",
+        templates::channel::TOOLS_PROMPT.trim(),
+    ));
     block("tools", &chunks.join("\n\n"))
 }
 

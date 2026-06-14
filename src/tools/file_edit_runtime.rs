@@ -120,8 +120,9 @@ pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
     }
 
     Ok(json!({
-        "status": "completed_success",
-        "done": true,
+        "tool": "file_edit",
+        "kind": "file_edit",
+        "status": "completed",
         "added": added,
         "modified": modified,
         "deleted": deleted,
@@ -568,7 +569,9 @@ mod tests {
 
         let output = file_edit_text(patch, tmp.path()).unwrap();
 
-        assert_eq!(output["status"], "completed_success");
+        assert_eq!(output["tool"], "file_edit");
+        assert_eq!(output["kind"], "file_edit");
+        assert_eq!(output["status"], "completed");
         let path = tmp.path().join("notes.txt");
         assert!(has_utf8_bom(&path).unwrap());
         assert_eq!(read_utf8_bom_text(&path).unwrap(), "alpha\ngamma\n");
@@ -590,7 +593,7 @@ mod tests {
 
         let output = file_edit_text(patch, tmp.path()).unwrap();
 
-        assert_eq!(output["status"], "completed_success");
+        assert_eq!(output["status"], "completed");
         assert!(has_utf8_bom(&path).unwrap());
         assert_eq!(read_utf8_bom_text(&path).unwrap(), "alpha\ngamma\n");
     }
@@ -611,7 +614,7 @@ mod tests {
 
         let output = file_edit_text(patch, tmp.path()).unwrap();
 
-        assert_eq!(output["status"], "completed_success");
+        assert_eq!(output["status"], "completed");
         assert_eq!(utf8_bom_count(&path).unwrap(), 1);
         assert_eq!(read_utf8_bom_text(&path).unwrap(), "alpha\ngamma\n");
     }
@@ -649,7 +652,7 @@ mod tests {
         let output = file_edit_text(patch, &workspace).unwrap();
 
         let path = tmp.path().join("outside.txt");
-        assert_eq!(output["status"], "completed_success");
+        assert_eq!(output["status"], "completed");
         assert!(has_utf8_bom(&path).unwrap());
         assert_eq!(read_utf8_bom_text(&path).unwrap(), "outside\n");
     }
@@ -665,7 +668,7 @@ mod tests {
 
         let output = file_edit_text(&patch, tmp.path()).unwrap();
 
-        assert_eq!(output["status"], "completed_success");
+        assert_eq!(output["status"], "completed");
         assert!(has_utf8_bom(&path).unwrap());
         assert_eq!(read_utf8_bom_text(&path).unwrap(), "absolute\n");
     }

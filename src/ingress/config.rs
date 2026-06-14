@@ -7,17 +7,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::response::ChannelResponseDetail;
+use crate::config::loader::{agent_yaml_path, read_agent_config_section};
 use crate::config::models::ReasoningMode;
-use crate::utils::files::read_utf8_text;
-
-pub const CHANNELS_CONFIG_FILE: &str = "channels.yaml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebSocketIngressConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_websocket_bind_addr", alias = "bind")]
+    #[serde(default = "default_websocket_bind_addr")]
     pub bind_addr: String,
     #[serde(default = "default_true")]
     pub auth: bool,
@@ -70,6 +68,8 @@ pub struct WeixinChannelConfig {
     pub override_model: Option<String>,
     #[serde(default)]
     pub override_reasoning_mode: Option<ReasoningMode>,
+    #[serde(default)]
+    pub default_session_id: Option<String>,
 }
 
 impl Default for WeixinChannelConfig {
@@ -83,6 +83,7 @@ impl Default for WeixinChannelConfig {
             response_detail: ChannelResponseDetail::default(),
             override_model: None,
             override_reasoning_mode: None,
+            default_session_id: None,
         }
     }
 }
@@ -102,9 +103,9 @@ impl Default for FeishuChannelDomain {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FeishuAccessPolicy {
-    #[serde(rename = "allow_all", alias = "open")]
+    #[serde(rename = "allow_all")]
     AllowAll,
-    #[serde(rename = "white_list", alias = "whitelist", alias = "allowlist")]
+    #[serde(rename = "white_list")]
     WhiteList,
 }
 
@@ -145,6 +146,8 @@ pub struct FeishuChannelConfig {
     pub override_model: Option<String>,
     #[serde(default)]
     pub override_reasoning_mode: Option<ReasoningMode>,
+    #[serde(default)]
+    pub default_session_id: Option<String>,
 }
 
 impl Default for FeishuChannelConfig {
@@ -164,15 +167,16 @@ impl Default for FeishuChannelConfig {
             response_detail: ChannelResponseDetail::default(),
             override_model: None,
             override_reasoning_mode: None,
+            default_session_id: None,
         }
     }
 }
 
-/// Optional ingress configuration loaded from an agent's channels.yaml.
+/// Optional ingress configuration loaded from the `channels` section in agent.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelRuntimeConfig {
-    #[serde(default, alias = "acp")]
+    #[serde(default)]
     pub stdio: StdioChannelConfig,
     #[serde(default)]
     pub websocket: WebSocketIngressConfig,
@@ -212,29 +216,16 @@ fn default_true() -> bool {
 }
 
 pub fn load_channel_runtime_config(agent_structure_dir: &Path) -> Result<ChannelRuntimeConfig> {
-    let path = agent_structure_dir.join(CHANNELS_CONFIG_FILE);
-    if !path.is_file() {
-        return Ok(ChannelRuntimeConfig::default());
-    }
-
-    let text = read_utf8_text(&path)?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(ChannelRuntimeConfig::default());
-    }
-
-    let loaded: Value = serde_yaml::from_str(trimmed)
-        .with_context(|| format!("parse YAML in {}", path.display()))?;
-
-    match loaded {
-        Value::Null => Ok(ChannelRuntimeConfig::default()),
-        Value::Object(map) => {
+    let path = agent_yaml_path(agent_structure_dir);
+    match read_agent_config_section(agent_structure_dir, "channels")? {
+        None | Some(Value::Null) => Ok(ChannelRuntimeConfig::default()),
+        Some(Value::Object(map)) => {
             let config: ChannelRuntimeConfig = serde_json::from_value(Value::Object(map))
-                .with_context(|| format!("Invalid YAML config in {}", path.display()))?;
+                .with_context(|| format!("Invalid `channels` section in {}", path.display()))?;
             Ok(config)
         }
-        _ => bail!(
-            "Invalid YAML config in {}: expected a mapping",
+        Some(_) => bail!(
+            "Invalid `channels` section in {}: expected a mapping",
             path.display()
         ),
     }
@@ -254,6 +245,7 @@ weixin:
   response_detail: detailed
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
+  default_session_id: s1
 "#,
         )
         .unwrap();
@@ -272,6 +264,7 @@ weixin:
             config.weixin.override_reasoning_mode,
             Some(ReasoningMode::High)
         );
+        assert_eq!(config.weixin.default_session_id.as_deref(), Some("s1"));
     }
 
     #[test]
@@ -325,6 +318,7 @@ feishu:
   response_detail: detailed
   override_model: deepseek-v4-pro
   override_reasoning_mode: high
+  default_session_id: s2
 "#,
         )
         .unwrap();
@@ -351,5 +345,6 @@ feishu:
             config.feishu.override_reasoning_mode,
             Some(ReasoningMode::High)
         );
+        assert_eq!(config.feishu.default_session_id.as_deref(), Some("s2"));
     }
 }

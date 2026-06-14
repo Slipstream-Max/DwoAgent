@@ -21,18 +21,16 @@ use super::config::WeixinChannelConfig;
 use super::response::{ChannelResponseDetail, ChannelUpdateCollector};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
-use crate::agent::session_agent::SessionAgent;
 use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
-use crate::config::loader::resolve_agent_structure_dir;
+use crate::config::loader::{channel_secret_dir, resolve_agent_structure_dir};
 use crate::context::content_block;
 use crate::tools::subagent_tool_runtime::PermissionRequester;
-use crate::tools::{
-    WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor, weixin_tool_schemas,
-};
+use crate::tools::weixin_tool_schemas;
+use crate::tools::{WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor};
 use crate::utils::files::{read_json_utf8, read_utf8_text, write_json_utf8};
 
-const WEIXIN_SECRET_DIR: &str = "channel_secret/weixin";
-const WEIXIN_SESSION_SUBDIR: &str = "weixin/session";
+const WEIXIN_SECRET_SUBDIR: &str = "weixin";
+const WEIXIN_STATE_SUBDIR: &str = "weixin";
 const WEIXIN_AUTH_FILE: &str = "auth.yaml";
 const WEIXIN_CONTEXT_TOKENS_FILE: &str = "context_tokens.json";
 const WEIXIN_SYNC_BUF_FILE: &str = "sync_buf.txt";
@@ -57,12 +55,10 @@ pub struct WeixinChannel {
 
 #[derive(Clone)]
 struct WeixinHandler {
-    session: Arc<SessionAgent>,
     bridge: ChannelBridge,
     confirmations: Arc<PendingConfirmationRegistry>,
     auth: WeixinAuth,
     workspace_dir: PathBuf,
-    session_dir: PathBuf,
     sync_buf_path: PathBuf,
     context_tokens_path: PathBuf,
     media_input: bool,
@@ -92,7 +88,7 @@ pub fn run_weixin_login_sync(agent_folder: PathBuf) -> Result<()> {
 
 pub async fn run_weixin_login(agent_folder: &Path) -> Result<()> {
     let agent_structure_dir = resolve_agent_structure_dir(agent_folder)?;
-    let secret_dir = agent_structure_dir.join(WEIXIN_SECRET_DIR);
+    let secret_dir = channel_secret_dir(&agent_structure_dir).join(WEIXIN_SECRET_SUBDIR);
     std::fs::create_dir_all(&secret_dir)
         .with_context(|| format!("create {}", secret_dir.display()))?;
 
@@ -170,44 +166,31 @@ impl WeixinChannel {
         agent_structure_dir: &Path,
         config: &WeixinChannelConfig,
     ) -> Result<Self> {
-        let secret_dir = agent_structure_dir.join(WEIXIN_SECRET_DIR);
-        let session_dir = agent.channel_session_dir().join(WEIXIN_SESSION_SUBDIR);
+        let secret_dir = channel_secret_dir(agent_structure_dir).join(WEIXIN_SECRET_SUBDIR);
+        let state_dir = agent.channel_state_dir().join(WEIXIN_STATE_SUBDIR);
         let auth_path = secret_dir.join(WEIXIN_AUTH_FILE);
-        let context_tokens_path = secret_dir.join(WEIXIN_CONTEXT_TOKENS_FILE);
-        let sync_buf_path = session_dir.join(WEIXIN_SYNC_BUF_FILE);
+        let context_tokens_path = state_dir.join(WEIXIN_CONTEXT_TOKENS_FILE);
+        let sync_buf_path = state_dir.join(WEIXIN_SYNC_BUF_FILE);
         let auth = read_auth(&auth_path)?;
         let workspace_dir = resolve_config_path(agent_structure_dir, &config.workspace_dir);
 
         let client_ref = Arc::new(OnceLock::new());
-        let channel_tools = if config.media_output {
-            weixin_tool_schemas()
-        } else {
-            Vec::new()
-        };
-        let session = agent
-            .load_or_create_channel_session(
-                &workspace_dir.to_string_lossy(),
-                session_dir.clone(),
-                channel_tools,
-                config.override_model.as_deref(),
-                config.override_reasoning_mode,
-            )
-            .await?;
         let bridge = ChannelBridge::new(
             agent.clone(),
             leases,
             confirmations.clone(),
             format!("weixin:user:{}", auth.bound_user_id),
-            &session_dir,
-            session.session_id().to_string(),
+            &state_dir,
+            workspace_dir.to_string_lossy().to_string(),
+            config.default_session_id.as_deref(),
+            config.override_model.as_deref(),
+            config.override_reasoning_mode,
         );
         let handler = WeixinHandler {
-            session,
             bridge,
             confirmations,
             auth: auth.clone(),
             workspace_dir: workspace_dir.clone(),
-            session_dir: session_dir.clone(),
             sync_buf_path: sync_buf_path.clone(),
             context_tokens_path: context_tokens_path.clone(),
             media_input: config.media_input,
@@ -303,10 +286,12 @@ impl WeixinHandler {
             ctx.reply_text(&reply).await?;
             return Ok(());
         }
-        let Some((user_input, user_blocks)) = self.build_user_input(ctx).await? else {
+        let agent = self.bridge.active_session().await?;
+        let Some((user_input, user_blocks)) =
+            self.build_user_input(ctx, agent.session_dir()).await?
+        else {
             return Ok(());
         };
-        let agent = self.bridge.active_session(self.session.clone()).await?;
 
         let tool_manager = agent.tool_manager().await;
         if self.media_output {
@@ -322,7 +307,10 @@ impl WeixinHandler {
             });
             let reply_media = Arc::new(WeixinToolExecutor::new(
                 reply_media_bridge,
-                vec![self.workspace_dir.clone(), self.session_dir.clone()],
+                vec![
+                    self.workspace_dir.clone(),
+                    agent.session_dir().to_path_buf(),
+                ],
             ));
             tool_manager
                 .set_channel_tool_executor(Some(reply_media))
@@ -345,7 +333,17 @@ impl WeixinHandler {
         );
         let run_result = agent
             .clone()
-            .run_prompt(user_input, user_blocks, emit_update, request_permission)
+            .run_prompt(
+                user_input,
+                user_blocks,
+                emit_update,
+                request_permission,
+                if self.media_output {
+                    weixin_tool_schemas()
+                } else {
+                    Vec::new()
+                },
+            )
             .await;
 
         if self.media_output {
@@ -366,7 +364,11 @@ impl WeixinHandler {
         Ok(())
     }
 
-    async fn build_user_input(&self, ctx: &MessageContext) -> Result<Option<(Value, Vec<Value>)>> {
+    async fn build_user_input(
+        &self,
+        ctx: &MessageContext,
+        active_session_dir: &Path,
+    ) -> Result<Option<(Value, Vec<Value>)>> {
         let mut blocks: Vec<Value> = Vec::new();
         if let Some(text) = ctx.body.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             blocks.push(content_block::text(text)?);
@@ -379,7 +381,7 @@ impl WeixinHandler {
                     return Ok(None);
                 }
             } else {
-                let path = download_message_media(ctx, media, &self.session_dir).await?;
+                let path = download_message_media(ctx, media, active_session_dir).await?;
                 let uri = file_uri_from_path(&path);
                 let name = path.file_name().and_then(|name| name.to_str());
                 let mime_type = mime_type_for_media(&path, media.media_type);
@@ -395,6 +397,7 @@ impl WeixinHandler {
         if blocks.is_empty() {
             return Ok(None);
         }
+        append_channel_context(&mut blocks, "Weixin", self.media_output)?;
 
         let user_input = if blocks.len() == 1 {
             blocks[0]
@@ -551,6 +554,8 @@ async fn download_message_media(
 ) -> Result<PathBuf> {
     let attachments_dir = session_dir
         .join("attachments")
+        .join("inbox")
+        .join("weixin")
         .join(sanitize_filename(&message_key(ctx)));
     tokio::fs::create_dir_all(&attachments_dir).await?;
     let filename = media
@@ -624,6 +629,25 @@ fn mime_type_for_media(path: &Path, media_type: MediaType) -> &'static str {
             _ => "application/octet-stream",
         },
     }
+}
+
+fn append_channel_context(
+    blocks: &mut Vec<Value>,
+    channel: &str,
+    media_output: bool,
+) -> Result<()> {
+    let mut lines = vec![
+        "<channel_context>".to_string(),
+        format!("当前消息来自 {channel} 频道。"),
+    ];
+    if media_output {
+        lines.push(
+            "本轮如需发送本地文件或图片，请使用 weixin_reply_media 回复当前微信对话。".to_string(),
+        );
+    }
+    lines.push("</channel_context>".to_string());
+    blocks.push(content_block::text(&lines.join("\n"))?);
+    Ok(())
 }
 
 fn file_uri_from_path(path: &Path) -> String {

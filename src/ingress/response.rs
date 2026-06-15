@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::agent::activity::event::{
     EVENT_AGENT_MESSAGE_CHUNK, EVENT_AGENT_THOUGHT_CHUNK, EVENT_TOOL_CALL, update_type,
 };
-use crate::tools::subagent_tool_runtime::UpdateEmitter;
+use crate::tools::UpdateEmitter;
 
 const TOOL_ARG_STRING_LIMIT: usize = 220;
 const TOOL_ARG_COLLECTION_LIMIT: usize = 24;

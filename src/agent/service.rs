@@ -22,10 +22,7 @@ use crate::config::models::{
     ReasoningMode, SessionMetaPayload, SessionModelContextPayload, StopReason,
 };
 use crate::config::policy::ToolPolicyConfig;
-use crate::tools::{
-    subagent_tool_runtime::{PermissionRequester, UpdateEmitter},
-    tool_schemas,
-};
+use crate::tools::{PermissionRequester, UpdateEmitter, tool_schemas};
 use crate::utils::policy::parse_policy_mode;
 
 /// Own session lifecycle + run loop state transitions.

@@ -7,10 +7,8 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::subagent_tool_runtime::ToolExecutionContext;
-use super::tool_run_manager::ChannelToolExecutor;
 use crate::templates;
-use crate::tools::tool_schemas_from_templates;
+use crate::tools::{ChannelToolExecutor, ToolExecutionContext, tool_schemas_from_templates};
 
 pub const WEIXIN_REPLY_MEDIA_TOOL: &str = "weixin_reply_media";
 

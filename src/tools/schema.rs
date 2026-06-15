@@ -68,6 +68,7 @@ mod tests {
 
         assert!(names.contains(&"terminal_exec".to_string()));
         assert!(!names.contains(&"file_edit".to_string()));
+        assert!(!names.contains(&"text_replace".to_string()));
         assert!(!names.contains(&"spawn_subagent".to_string()));
     }
 

@@ -25,11 +25,12 @@ use crate::config::policy::ToolPolicyConfig;
 use crate::context::manager::{CancelEvent, ConversationContextManager};
 use crate::llm::client::BaseLlmClient;
 use crate::tools::session::{Cap, ToolArgs, ToolSession};
-use crate::tools::subagent_tool_runtime::{
-    PermissionRequester, StateSetter, ToolExecutionContext, UpdateEmitter,
-};
-use crate::tools::tool_run_manager::{SubagentExecutor as SubagentExecutorTrait, ToolRunManager};
+use crate::tools::tool_run_manager::ToolRunManager;
 use crate::tools::tool_schemas;
+use crate::tools::{
+    PermissionRequester, StateSetter, SubagentExecutor as SubagentExecutorTrait,
+    ToolExecutionContext, UpdateEmitter,
+};
 use crate::utils::perf::{messages_size, perf_log};
 
 /// Collect the subagent tool schemas that match the parent agent's allowed

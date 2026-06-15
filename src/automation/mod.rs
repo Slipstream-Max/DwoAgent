@@ -17,7 +17,7 @@ use crate::config::loader::{agent_yaml_path, read_agent_config_section, utc_iso}
 use crate::context::content_block;
 use crate::ingress::bridge::SessionLeaseRegistry;
 use crate::ingress::response::{ChannelResponseDetail, ChannelUpdateCollector};
-use crate::tools::subagent_tool_runtime::PermissionRequester;
+use crate::tools::PermissionRequester;
 use crate::utils::files::read_utf8_text;
 
 const AUTOMATION_SESSION_SUBDIR: &str = "automation";

@@ -4,7 +4,24 @@
 
 - Relative paths are resolved against the current workspace. Absolute paths are allowed.
 - Keep patches small and exact. Use enough context lines to identify the target text.
-- Call `file_edit` at most once in a single assistant turn. If you need to edit multiple files, combine all file operations into one patch.
+- Call at most one file-writing tool in a single assistant turn. If you need to edit multiple files, combine all file operations into one `file_edit` patch.
+
+### `text_replace`
+
+Use `text_replace` for a simple exact replacement in one existing file. It is best when you can copy the old text exactly and only need to replace that text with new text.
+
+Arguments:
+
+- `path`: file path to modify.
+- `old_text`: exact text to replace. It must not be empty.
+- `new_text`: replacement text. It must differ from `old_text`.
+- `replace_all`: optional boolean. Defaults to `false`. Set it to `true` only when every occurrence should be replaced.
+
+Rules:
+
+- By default, `old_text` must occur exactly once. If it occurs more than once, either add more surrounding text to make it unique or set `replace_all` to `true`.
+- `text_replace` only modifies an existing file. It does not create files, delete files, move files, or replace entire files.
+- For multi-file edits, file creation, deletion, movement, or structured changes, use `file_edit` instead.
 
 ### `file_edit`
 

@@ -18,5 +18,39 @@
         "additionalProperties": false
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "text_replace",
+      "description": "Replace exact text in one existing file. Use this for simple local replacements when the old text can be copied exactly. Relative paths are resolved against the current workspace. This tool does not create files or replace entire files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "File path to modify. May be relative to the current workspace or absolute."
+          },
+          "old_text": {
+            "type": "string",
+            "description": "Exact text to replace. Must not be empty. By default it must occur exactly once in the file."
+          },
+          "new_text": {
+            "type": "string",
+            "description": "Replacement text. Must be different from old_text."
+          },
+          "replace_all": {
+            "type": "boolean",
+            "description": "When true, replace every occurrence of old_text. Defaults to false."
+          }
+        },
+        "required": [
+          "path",
+          "old_text",
+          "new_text"
+        ],
+        "additionalProperties": false
+      }
+    }
   }
 ]

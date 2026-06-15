@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 pub const BEGIN_PATCH: &str = "*** Begin Patch";
@@ -61,6 +61,35 @@ pub enum Operation {
     Update(UpdateFile),
 }
 
+struct TextFile {
+    text: String,
+    bom: bool,
+}
+
+pub fn execute_file_tool(name: &str, args: &Map<String, Value>, cwd: &Path) -> Result<Value> {
+    match name {
+        "file_edit" => {
+            let patch = args
+                .get("patch")
+                .or_else(|| args.get("patchText"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            file_edit_text(patch, cwd)
+        }
+        "text_replace" => {
+            let args = text_replace_args(args)?;
+            text_replace_file(
+                &args.path,
+                &args.old_text,
+                &args.new_text,
+                args.replace_all,
+                cwd,
+            )
+        }
+        other => Err(FileEditError::new(format!("Unknown file tool: {other}")).into()),
+    }
+}
+
 /// Entry point — parses a patch and resolves relative paths against *cwd*.
 pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
     let operations = parse_patch(patch)?;
@@ -76,7 +105,7 @@ pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
             Operation::Add(add) => {
                 let path = resolve_workspace_path(&root, &add.path)?;
                 let content = format!("{}\n", add.lines.join("\n"));
-                write_text(&path, &content)?;
+                write_text(&path, &content, true)?;
                 added.push(relative_display(&root, &path));
             }
             Operation::Delete(del) => {
@@ -101,18 +130,18 @@ pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
                     ))
                     .into());
                 }
-                let original = read_text(&source_path)?;
-                let updated = apply_update_segments(&original, &update.segments)?;
+                let original = read_text_file(&source_path)?;
+                let updated = apply_update_segments(&original.text, &update.segments)?;
 
                 if let Some(dest_raw) = update.move_to {
                     let dest_path = resolve_workspace_path(&root, &dest_raw)?;
-                    write_text(&dest_path, &updated)?;
+                    write_text(&dest_path, &updated, original.bom)?;
                     std::fs::remove_file(&source_path)
                         .with_context(|| format!("remove {}", source_path.display()))?;
                     modified.push(relative_display(&root, &dest_path));
                     deleted.push(relative_display(&root, &source_path));
                 } else {
-                    write_text(&source_path, &updated)?;
+                    write_text(&source_path, &updated, original.bom)?;
                     modified.push(relative_display(&root, &source_path));
                 }
             }
@@ -127,6 +156,93 @@ pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
         "modified": modified,
         "deleted": deleted,
     }))
+}
+
+/// Replace exact text in a single existing file.
+pub fn text_replace_file(
+    raw_path: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+    cwd: &Path,
+) -> Result<Value> {
+    let root = std::fs::canonicalize(cwd)
+        .with_context(|| format!("resolve workspace root {}", cwd.display()))?;
+    let path = resolve_workspace_path(&root, &non_empty_path(raw_path)?)?;
+    if !path.is_file() {
+        return Err(
+            FileEditError::new(format!("File to text_replace does not exist: {raw_path}")).into(),
+        );
+    }
+
+    let original = read_text_file(&path)?;
+    let line_ending = detect_line_ending(&original.text);
+    let old = convert_line_endings(&normalize_line_endings(old_text), line_ending);
+    let new = convert_line_endings(&normalize_line_endings(new_text), line_ending);
+    if old.is_empty() {
+        return Err(FileEditError::new("old_text must not be empty.").into());
+    }
+    if old == new {
+        return Err(FileEditError::new("old_text and new_text must be different.").into());
+    }
+
+    let replacements = original.text.matches(&old).count();
+    if replacements == 0 {
+        return Err(FileEditError::new("Text replace target not found.").into());
+    }
+    if !replace_all && replacements > 1 {
+        return Err(FileEditError::new(
+            "Text replace target is not unique. Set replace_all to true to replace every match.",
+        )
+        .into());
+    }
+
+    let updated = if replace_all {
+        original.text.replace(&old, &new)
+    } else {
+        original.text.replacen(&old, &new, 1)
+    };
+    write_text(&path, &updated, original.bom)?;
+
+    Ok(json!({
+        "tool": "text_replace",
+        "kind": "file_edit",
+        "status": "completed",
+        "modified": [relative_display(&root, &path)],
+        "replacements": if replace_all { replacements } else { 1 },
+    }))
+}
+
+struct TextReplaceArgs {
+    path: String,
+    old_text: String,
+    new_text: String,
+    replace_all: bool,
+}
+
+fn text_replace_args(args: &Map<String, Value>) -> Result<TextReplaceArgs> {
+    Ok(TextReplaceArgs {
+        path: required_string(args, "path")?,
+        old_text: required_string(args, "old_text")?,
+        new_text: required_string(args, "new_text")?,
+        replace_all: optional_bool(args, "replace_all")?.unwrap_or(false),
+    })
+}
+
+fn required_string(args: &Map<String, Value>, key: &str) -> Result<String> {
+    match args.get(key) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => anyhow::bail!("{key} must be a string."),
+        None => anyhow::bail!("{key} is required."),
+    }
+}
+
+fn optional_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => anyhow::bail!("{key} must be a boolean."),
+        None => Ok(None),
+    }
 }
 
 /// Parse patch text into an ordered list of operations.
@@ -351,22 +467,25 @@ fn apply_update_segments(content: &str, segments: &[UpdateSegment]) -> Result<St
 }
 
 fn find_single_line(lines: &[String], needle: &str, start: usize) -> Result<usize> {
-    let mut matches: Vec<usize> = Vec::new();
-    for (index, line) in lines.iter().enumerate().skip(start) {
-        if line == needle {
-            matches.push(index);
+    for strategy in MatchStrategy::all() {
+        let mut matches: Vec<usize> = Vec::new();
+        for (index, line) in lines.iter().enumerate().skip(start) {
+            if line_matches(line, needle, strategy) {
+                matches.push(index);
+            }
         }
+        if matches.is_empty() {
+            continue;
+        }
+        if matches.len() > 1 {
+            return Err(FileEditError::new(format!(
+                "Anchor is not unique after current position: {needle}"
+            ))
+            .into());
+        }
+        return Ok(matches[0]);
     }
-    if matches.is_empty() {
-        return Err(FileEditError::new(format!("Anchor not found: {needle}")).into());
-    }
-    if matches.len() > 1 {
-        return Err(FileEditError::new(format!(
-            "Anchor is not unique after current position: {needle}"
-        ))
-        .into());
-    }
-    Ok(matches[0])
+    Err(FileEditError::new(format!("Anchor not found: {needle}")).into())
 }
 
 fn find_sequence(
@@ -380,21 +499,28 @@ fn find_sequence(
     if length == 0 {
         return Ok(start);
     }
-    let upper = lines.len().saturating_sub(length);
-    let mut index = start;
-    while index <= upper {
-        if &lines[index..index + length] == needle {
-            matches.push(index);
-        }
-        index += 1;
-    }
-    if matches.is_empty() {
+    if lines.len() < length {
         return Err(FileEditError::new("Update target not found.").into());
     }
-    if require_unique && matches.len() > 1 {
-        return Err(FileEditError::new("Update target is not unique.").into());
+    let upper = lines.len() - length;
+    for strategy in MatchStrategy::all() {
+        matches.clear();
+        let mut index = start;
+        while index <= upper {
+            if sequence_matches_at(lines, needle, index, strategy) {
+                matches.push(index);
+            }
+            index += 1;
+        }
+        if matches.is_empty() {
+            continue;
+        }
+        if require_unique && matches.len() > 1 {
+            return Err(FileEditError::new("Update target is not unique.").into());
+        }
+        return Ok(matches[0]);
     }
-    Ok(matches[0])
+    Err(FileEditError::new("Update target not found.").into())
 }
 
 fn find_at_eof(lines: &[String], needle: &[String]) -> Result<usize> {
@@ -405,10 +531,88 @@ fn find_at_eof(lines: &[String], needle: &[String]) -> Result<usize> {
         return Err(FileEditError::new("End-of-file update target not found.").into());
     }
     let start = lines.len() - needle.len();
-    if &lines[start..] != needle {
-        return Err(FileEditError::new("End-of-file update target not found.").into());
+    for strategy in MatchStrategy::all() {
+        if sequence_matches_at(lines, needle, start, strategy) {
+            return Ok(start);
+        }
     }
-    Ok(start)
+    Err(FileEditError::new("End-of-file update target not found.").into())
+}
+
+#[derive(Clone, Copy)]
+enum MatchStrategy {
+    Exact,
+    TrimEnd,
+    Trim,
+    NormalizeUnicode,
+}
+
+impl MatchStrategy {
+    fn all() -> [Self; 4] {
+        [
+            Self::Exact,
+            Self::TrimEnd,
+            Self::Trim,
+            Self::NormalizeUnicode,
+        ]
+    }
+}
+
+fn sequence_matches_at(
+    lines: &[String],
+    needle: &[String],
+    index: usize,
+    strategy: MatchStrategy,
+) -> bool {
+    needle
+        .iter()
+        .enumerate()
+        .all(|(offset, expected)| line_matches(&lines[index + offset], expected, strategy))
+}
+
+fn line_matches(actual: &str, expected: &str, strategy: MatchStrategy) -> bool {
+    match strategy {
+        MatchStrategy::Exact => actual == expected,
+        MatchStrategy::TrimEnd => actual.trim_end() == expected.trim_end(),
+        MatchStrategy::Trim => actual.trim() == expected.trim(),
+        MatchStrategy::NormalizeUnicode => {
+            normalize_unicode_punctuation(actual.trim())
+                == normalize_unicode_punctuation(expected.trim())
+        }
+    }
+}
+
+fn normalize_unicode_punctuation(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => output.push('\''),
+            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => output.push('"'),
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' => {
+                output.push('-')
+            }
+            '\u{2026}' => output.push_str("..."),
+            '\u{00a0}' => output.push(' '),
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+fn detect_line_ending(text: &str) -> &'static str {
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn convert_line_endings(text: &str, line_ending: &str) -> String {
+    if line_ending == "\r\n" {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_string()
+    }
 }
 
 fn resolve_workspace_path(root: &Path, raw_path: &str) -> Result<PathBuf> {
@@ -464,24 +668,35 @@ fn resolve_existing_prefix(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn write_text(path: &Path, content: &str) -> Result<()> {
+fn write_text(path: &Path, content: &str, bom: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create parent for {}", path.display()))?;
     }
     let mut bytes = Vec::with_capacity(UTF8_BOM.len() + content.len());
-    bytes.extend_from_slice(UTF8_BOM);
+    if bom {
+        bytes.extend_from_slice(UTF8_BOM);
+    }
     bytes.extend_from_slice(content.as_bytes());
     std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
+#[cfg(test)]
 fn read_text(path: &Path) -> Result<String> {
+    Ok(read_text_file(path)?.text)
+}
+
+fn read_text_file(path: &Path) -> Result<TextFile> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bom = bytes.starts_with(UTF8_BOM);
     let body = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes.as_slice());
     let text = std::str::from_utf8(body)
         .map_err(|_| FileEditError::new(format!("File is not UTF-8: {}", path.display())))?;
-    Ok(text.to_string())
+    Ok(TextFile {
+        text: text.to_string(),
+        bom,
+    })
 }
 
 #[cfg(test)]
@@ -578,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn file_edit_updates_utf8_without_bom_and_writes_bom() {
+    fn file_edit_updates_utf8_without_bom_and_preserves_no_bom() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("notes.txt");
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
@@ -594,8 +809,8 @@ mod tests {
         let output = file_edit_text(patch, tmp.path()).unwrap();
 
         assert_eq!(output["status"], "completed");
-        assert!(has_utf8_bom(&path).unwrap());
-        assert_eq!(read_utf8_bom_text(&path).unwrap(), "alpha\ngamma\n");
+        assert!(!has_utf8_bom(&path).unwrap());
+        assert_eq!(read_text(&path).unwrap(), "alpha\ngamma\n");
     }
 
     #[test]
@@ -635,6 +850,133 @@ mod tests {
         let error = file_edit_text(patch, tmp.path()).unwrap_err();
 
         assert!(error.to_string().contains("File is not UTF-8"));
+    }
+
+    #[test]
+    fn file_edit_update_matches_with_trailing_whitespace_fallback() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "alpha   \nbeta\n").unwrap();
+        let patch = r#"
+*** Begin Patch
+*** Update File: notes.txt
+@@
+-alpha
++gamma
+*** End Patch
+"#;
+
+        let output = file_edit_text(patch, tmp.path()).unwrap();
+
+        assert_eq!(output["status"], "completed");
+        assert_eq!(read_text(&path).unwrap(), "gamma\nbeta\n");
+    }
+
+    #[test]
+    fn file_edit_update_matches_with_unicode_punctuation_fallback() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "title: “hello”\n").unwrap();
+        let patch = r#"
+*** Begin Patch
+*** Update File: notes.txt
+@@
+-title: "hello"
++title: "hi"
+*** End Patch
+"#;
+
+        let output = file_edit_text(patch, tmp.path()).unwrap();
+
+        assert_eq!(output["status"], "completed");
+        assert_eq!(read_text(&path).unwrap(), "title: \"hi\"\n");
+    }
+
+    #[test]
+    fn file_edit_update_fallback_still_rejects_non_unique_targets() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "alpha   \nalpha\t\n").unwrap();
+        let patch = r#"
+*** Begin Patch
+*** Update File: notes.txt
+@@
+-alpha
++gamma
+*** End Patch
+"#;
+
+        let error = file_edit_text(patch, tmp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("Update target is not unique"));
+    }
+
+    #[test]
+    fn text_replace_replaces_unique_text() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        let output = text_replace_file("notes.txt", "beta", "gamma", false, tmp.path()).unwrap();
+
+        assert_eq!(output["tool"], "text_replace");
+        assert_eq!(output["kind"], "file_edit");
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["replacements"], 1);
+        assert_eq!(read_text(&path).unwrap(), "alpha\ngamma\n");
+        assert!(!has_utf8_bom(&path).unwrap());
+    }
+
+    #[test]
+    fn text_replace_preserves_crlf_and_bom() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        write_utf8_bom_text_for_test(&path, "alpha\r\nbeta\r\n").unwrap();
+
+        let output = text_replace_file(
+            "notes.txt",
+            "alpha\nbeta",
+            "gamma\ndelta",
+            false,
+            tmp.path(),
+        )
+        .unwrap();
+
+        assert_eq!(output["status"], "completed");
+        assert!(has_utf8_bom(&path).unwrap());
+        assert_eq!(read_utf8_bom_text(&path).unwrap(), "gamma\r\ndelta\r\n");
+    }
+
+    #[test]
+    fn text_replace_rejects_non_unique_target_by_default() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "alpha\nalpha\n").unwrap();
+
+        let error = text_replace_file("notes.txt", "alpha", "beta", false, tmp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("target is not unique"));
+    }
+
+    #[test]
+    fn text_replace_can_replace_all_matches() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "alpha\nalpha\n").unwrap();
+
+        let output = text_replace_file("notes.txt", "alpha", "beta", true, tmp.path()).unwrap();
+
+        assert_eq!(output["replacements"], 2);
+        assert_eq!(read_text(&path).unwrap(), "beta\nbeta\n");
+    }
+
+    #[test]
+    fn text_replace_rejects_empty_old_text() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "alpha\n").unwrap();
+
+        let error = text_replace_file("notes.txt", "", "beta", false, tmp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("old_text must not be empty"));
     }
 
     #[test]

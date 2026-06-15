@@ -23,8 +23,8 @@ use crate::context::manager::{
     CancelEvent, CompactionOutcome, ConversationContextManager, SystemMessagesBuilder,
 };
 use crate::llm::client::{BaseLlmClient, LlmRequestOptions};
-use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
 use crate::tools::tool_run_manager::ToolRunManager;
+use crate::tools::{PermissionRequester, UpdateEmitter};
 use crate::utils::prompt::extract_first_text;
 use crate::watchers::runtime::WatcherRuntime;
 

@@ -7,10 +7,13 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::sync::Mutex;
 
 use crate::context::manager::CancelEvent;
 
 use crate::config::models::AgentState;
+
+use crate::tools::session::ToolSession;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,4 +131,18 @@ pub struct ToolExecutionContext {
     pub emit_update: UpdateEmitter,
     pub request_permission: PermissionRequester,
     pub set_state: StateSetter,
+}
+
+/// Builder hook for spawning subagent sessions. The concrete impl lives in
+/// `agent::subagent`; the tool runtime only needs this trait surface.
+#[async_trait::async_trait]
+pub trait SubagentExecutor: Send + Sync {
+    async fn create_session(
+        &self,
+        tool_call_id: &str,
+        session_name: &str,
+        task: &str,
+        policy: Option<&str>,
+        context: &ToolExecutionContext,
+    ) -> Result<Arc<Mutex<dyn ToolSession>>>;
 }

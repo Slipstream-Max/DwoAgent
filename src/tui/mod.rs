@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::agent::session::{
     SESSION_CLIENT_TRANSCRIPT_FILE, SESSION_META_FILE, SESSION_MODEL_CONTEXT_FILE,
@@ -43,7 +43,7 @@ use crate::ingress::config::{
 use crate::utils::files::read_utf8_text;
 
 const PAGE_COUNT: usize = 6;
-const AGENT_TAB_COUNT: usize = 3;
+const AGENT_TAB_COUNT: usize = 4;
 
 pub fn run_tui(agent_folder: PathBuf) -> Result<()> {
     let snapshot = TuiSnapshot::load(&agent_folder)?;
@@ -288,6 +288,7 @@ impl App {
             Page::Agent => match self.agent_tab_index {
                 0 => self.snapshot.skills.len(),
                 1 => 1,
+                2 => self.snapshot.mcp.servers.len(),
                 _ => self.snapshot.rules.len(),
             },
             Page::Sessions => self.snapshot.sessions.len(),
@@ -309,6 +310,7 @@ struct TuiSnapshot {
     sessions: Vec<SessionView>,
     skills: Vec<SkillView>,
     prompt: PromptView,
+    mcp: McpView,
     rules: Vec<RuleView>,
     runs: Vec<RunView>,
     service: ServiceView,
@@ -329,6 +331,7 @@ impl TuiSnapshot {
         let sessions = load_sessions(&session_store_dir, &model_profiles);
         let skills = load_skills(&agent_structure_dir, &meta);
         let prompt = load_prompt(&agent_structure_dir, &meta);
+        let mcp = load_mcp(&agent_structure_dir);
         let rules = load_rules(&agent_structure_dir, &meta);
         let runs = load_runs(&sessions);
         let service = load_service(&agent_structure_dir);
@@ -345,6 +348,7 @@ impl TuiSnapshot {
             sessions,
             skills,
             prompt,
+            mcp,
             rules,
             runs,
             service,
@@ -378,6 +382,22 @@ struct PromptView {
     path: PathBuf,
     status: String,
     lines: Vec<String>,
+}
+
+#[derive(Clone)]
+struct McpView {
+    path: PathBuf,
+    status: String,
+    servers: Vec<McpServerView>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct McpServerView {
+    name: String,
+    transport: String,
+    target: String,
+    details: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -583,6 +603,164 @@ fn load_rules(agent_structure_dir: &Path, meta: &AgentMeta) -> Vec<RuleView> {
         rules.push(load_rule_view("external rule", path));
     }
     rules
+}
+
+fn load_mcp(agent_structure_dir: &Path) -> McpView {
+    let path = agent_structure_dir.join("resources").join("mcp.json");
+    if !path.is_file() {
+        return McpView {
+            path,
+            status: "missing".to_string(),
+            servers: Vec::new(),
+            error: None,
+        };
+    }
+
+    let text = match read_utf8_text(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            return McpView {
+                path,
+                status: "invalid".to_string(),
+                servers: Vec::new(),
+                error: Some(err.to_string()),
+            };
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(err) => {
+            return McpView {
+                path,
+                status: "invalid".to_string(),
+                servers: Vec::new(),
+                error: Some(err.to_string()),
+            };
+        }
+    };
+
+    let Some((_source, server_map)) = mcp_server_map(&value) else {
+        return McpView {
+            path,
+            status: "empty".to_string(),
+            servers: Vec::new(),
+            error: Some("no mcpServers object found".to_string()),
+        };
+    };
+
+    let mut servers = server_map
+        .iter()
+        .map(|(name, config)| mcp_server_view(name, config))
+        .collect::<Vec<_>>();
+    servers.sort_by(|a, b| a.name.cmp(&b.name));
+    let status = if servers.is_empty() {
+        "empty"
+    } else {
+        "available"
+    };
+    McpView {
+        path,
+        status: status.to_string(),
+        servers,
+        error: None,
+    }
+}
+
+fn mcp_server_map(value: &Value) -> Option<(&'static str, &Map<String, Value>)> {
+    value
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .map(|servers| ("mcpServers", servers))
+        .or_else(|| {
+            value
+                .get("servers")
+                .and_then(Value::as_object)
+                .map(|servers| ("servers", servers))
+        })
+}
+
+fn mcp_server_view(name: &str, config: &Value) -> McpServerView {
+    let Some(map) = config.as_object() else {
+        return McpServerView {
+            name: name.to_string(),
+            transport: "invalid".to_string(),
+            target: "server entry is not an object".to_string(),
+            details: Vec::new(),
+        };
+    };
+
+    McpServerView {
+        name: name.to_string(),
+        transport: mcp_transport_label(map),
+        target: mcp_target_label(map),
+        details: mcp_server_details(map),
+    }
+}
+
+fn mcp_transport_label(config: &Map<String, Value>) -> String {
+    config
+        .get("transport")
+        .and_then(Value::as_str)
+        .or_else(|| config.get("type").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if config.get("url").and_then(Value::as_str).is_some() {
+                "http".to_string()
+            } else if config.get("command").and_then(Value::as_str).is_some() {
+                "stdio".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        })
+}
+
+fn mcp_target_label(config: &Map<String, Value>) -> String {
+    config
+        .get("command")
+        .and_then(Value::as_str)
+        .or_else(|| config.get("url").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn mcp_server_details(config: &Map<String, Value>) -> Vec<String> {
+    let mut details = Vec::new();
+    if let Some(args) = config.get("args").and_then(Value::as_array) {
+        details.push(format!("args: {}", args.len()));
+    }
+    if let Some(keys) = object_keys(config.get("env")) {
+        details.push(format!("env keys: {}", join_limited(&keys, 120)));
+    }
+    if let Some(keys) = object_keys(config.get("headers")) {
+        details.push(format!("header keys: {}", join_limited(&keys, 120)));
+    }
+
+    let known = [
+        "args",
+        "command",
+        "env",
+        "headers",
+        "transport",
+        "type",
+        "url",
+    ];
+    let mut other_keys = config
+        .keys()
+        .filter(|key| !known.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    other_keys.sort();
+    if !other_keys.is_empty() {
+        details.push(format!("other keys: {}", join_limited(&other_keys, 120)));
+    }
+    details
+}
+
+fn object_keys(value: Option<&Value>) -> Option<Vec<String>> {
+    let mut keys = value?.as_object()?.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    Some(keys)
 }
 
 fn load_rule_view(source: &str, path: PathBuf) -> RuleView {
@@ -987,7 +1165,7 @@ fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Length(12),
             Constraint::Min(7),
         ])
@@ -999,6 +1177,7 @@ fn render_overview(app: &App, frame: &mut Frame, area: Rect) {
         kv_line("default_model", &snapshot.default_model_id),
         kv_line("models", &snapshot.model_profiles.len().to_string()),
         kv_line("policy", snapshot.meta.policy_mode.as_str()),
+        kv_line("mcp", &mcp_overview_label(&snapshot.mcp)),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(profile_lines))
@@ -1017,7 +1196,7 @@ fn render_agent(app: &App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(area);
-    let tabs = Tabs::new(vec!["Skills", "Prompt", "Rules"])
+    let tabs = Tabs::new(vec!["Skills", "Prompt", "MCP", "Rules"])
         .select(app.agent_tab_index)
         .block(panel_block("Agent", app.focus == FocusPane::Content))
         .style(muted_style())
@@ -1027,6 +1206,7 @@ fn render_agent(app: &App, frame: &mut Frame, area: Rect) {
     match app.agent_tab_index {
         0 => render_agent_skills(app, frame, chunks[1]),
         1 => render_agent_prompt(app, frame, chunks[1]),
+        2 => render_agent_mcp(app, frame, chunks[1]),
         _ => render_agent_rules(app, frame, chunks[1]),
     }
 }
@@ -1095,6 +1275,66 @@ fn render_agent_prompt(app: &App, frame: &mut Frame, area: Rect) {
         lines,
         app.focus == FocusPane::Content,
     );
+}
+
+fn render_agent_mcp(app: &App, frame: &mut Frame, area: Rect) {
+    let mcp = &app.snapshot.mcp;
+    let chunks = split_pair(area);
+    let items = mcp
+        .servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| {
+            list_item(
+                app,
+                index,
+                vec![
+                    Span::styled(&server.name, text_style()),
+                    Span::styled("  ", muted_style()),
+                    Span::styled(&server.transport, blue_style()),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        list_or_empty(items, "no MCP servers configured")
+            .block(panel_block("MCP Servers", app.focus == FocusPane::Content)),
+        chunks[0],
+    );
+
+    let mut lines = vec![
+        kv_line("file", &mcp.path.display().to_string()),
+        kv_line("status", &mcp.status),
+        kv_line("servers", &mcp.servers.len().to_string()),
+        Line::from(""),
+    ];
+    if let Some(error) = &mcp.error {
+        lines.push(Line::from(Span::styled(error, error_style())));
+    } else if mcp.servers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "add entries under resources/mcp.json -> mcpServers to expose MCP candidates",
+            dim_style(),
+        )));
+    } else {
+        let server = selected(&mcp.servers, app.selected_index);
+        lines.extend([
+            kv_line("name", &server.name),
+            kv_line("transport", &server.transport),
+            kv_line("target", &server.target),
+            Line::from(""),
+        ]);
+        if server.details.is_empty() {
+            lines.push(Line::from(Span::styled("no extra fields", dim_style())));
+        } else {
+            lines.extend(
+                server
+                    .details
+                    .iter()
+                    .map(|detail| Line::from(Span::styled(detail, text_style()))),
+            );
+        }
+    }
+    render_text_panel(frame, chunks[1], "MCP Detail", lines, false);
 }
 
 fn render_agent_rules(app: &App, frame: &mut Frame, area: Rect) {
@@ -1797,6 +2037,14 @@ fn run_status_style(status: AutomationRunStatus) -> Style {
     }
 }
 
+fn mcp_overview_label(mcp: &McpView) -> String {
+    if mcp.servers.is_empty() {
+        mcp.status.clone()
+    } else {
+        format!("{} ({} servers)", mcp.status, mcp.servers.len())
+    }
+}
+
 #[derive(Clone)]
 struct ChannelRow {
     name: &'static str,
@@ -2153,6 +2401,73 @@ mod tests {
         let second = NaiveDate::from_ymd_opt(2026, 6, 14).unwrap();
         assert_eq!(days.get(&first), Some(&160));
         assert_eq!(days.get(&second), Some(&40));
+    }
+
+    #[test]
+    fn load_mcp_lists_servers_from_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let resources_dir = temp_dir.path().join("resources");
+        std::fs::create_dir_all(&resources_dir).unwrap();
+        std::fs::write(
+            resources_dir.join("mcp.json"),
+            serde_json::to_string(&json!({
+                "mcpServers": {
+                    "local": {
+                        "command": "node",
+                        "args": ["server.js"],
+                        "env": {
+                            "TOKEN": "secret-value"
+                        }
+                    },
+                    "remote": {
+                        "url": "https://example.test/mcp",
+                        "headers": {
+                            "Authorization": "Bearer secret"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mcp = load_mcp(temp_dir.path());
+
+        assert_eq!(mcp.status, "available");
+        assert_eq!(mcp.servers.len(), 2);
+        assert_eq!(mcp.servers[0].name, "local");
+        assert_eq!(mcp.servers[0].transport, "stdio");
+        assert_eq!(mcp.servers[0].target, "node");
+        assert!(
+            mcp.servers[0]
+                .details
+                .contains(&"env keys: TOKEN".to_string())
+        );
+        assert!(
+            !mcp.servers[0]
+                .details
+                .iter()
+                .any(|line| line.contains("secret-value"))
+        );
+        assert_eq!(mcp.servers[1].name, "remote");
+        assert_eq!(mcp.servers[1].transport, "http");
+        assert_eq!(mcp.servers[1].target, "https://example.test/mcp");
+        assert!(
+            mcp.servers[1]
+                .details
+                .contains(&"header keys: Authorization".to_string())
+        );
+    }
+
+    #[test]
+    fn load_mcp_reports_missing_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mcp = load_mcp(temp_dir.path());
+
+        assert_eq!(mcp.status, "missing");
+        assert!(mcp.servers.is_empty());
+        assert!(mcp.error.is_none());
     }
 
     fn transcript_line(updated_at: &str, update_type: &str, mut update: Value) -> String {

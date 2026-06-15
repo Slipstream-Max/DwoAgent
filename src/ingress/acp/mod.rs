@@ -43,7 +43,7 @@ use crate::agent::service::AgentService;
 use crate::agent::session::SESSION_CLIENT_TRANSCRIPT_FILE;
 use crate::config::models::{ContextUsageSnapshot, ModelProfile, SessionTranscriptEvent};
 use crate::context::content_block;
-use crate::tools::subagent_tool_runtime::{PermissionRequester, UpdateEmitter};
+use crate::tools::{PermissionRequester, UpdateEmitter};
 
 /// Run the agent over ACP stdio transport.
 pub async fn run_acp_stdio(agent: Arc<AgentService>) -> Result<()> {

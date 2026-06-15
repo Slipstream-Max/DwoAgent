@@ -1,30 +1,26 @@
 //! Tool runtimes and session management.
 
-pub mod feishu_runtime;
-pub mod file_edit_runtime;
+pub(crate) mod builtin;
 pub mod schema;
 pub mod session;
-pub mod subagent_tool_runtime;
-pub mod terminal_runtime;
+pub(crate) mod session_creator;
+pub(crate) mod session_manager;
+pub(crate) mod tool_catalog;
+pub(crate) mod tool_output;
 pub mod tool_run_manager;
-pub mod wait_runtime;
-pub mod weixin_runtime;
 
-pub use feishu_runtime::{
+pub use builtin::channel::{
     FEISHU_REPLY_CARD_TOOL, FEISHU_REPLY_MEDIA_TOOL, FeishuReplyCardResult, FeishuReplyMediaKind,
-    FeishuReplyMediaResult, FeishuToolBridge, FeishuToolExecutor, feishu_tool_schemas,
-};
-pub use file_edit_runtime::{FileEditError, file_edit_text};
-pub use schema::{tool_schemas, tool_schemas_from_templates};
-pub use session::{Cap, ToolArgs, ToolSession};
-pub use subagent_tool_runtime::{
-    PermissionRequester, SendSubagentPayload, SpawnSubagentPayload, StateSetter, SubagentIdPayload,
-    ToolExecutionContext, UpdateEmitter, subagent_not_found,
-};
-pub use terminal_runtime::{TerminalExecutor, TerminalHandle, TerminalSession, terminal_not_found};
-pub use tool_run_manager::{ChannelToolExecutor, SubagentExecutor, ToolRunManager};
-pub use wait_runtime::{WaitTarget, parse_wait_target, wait_seconds, wait_session};
-pub use weixin_runtime::{
-    WEIXIN_REPLY_MEDIA_TOOL, WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor,
+    FeishuReplyMediaResult, FeishuToolBridge, FeishuToolExecutor, WEIXIN_REPLY_MEDIA_TOOL,
+    WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor, feishu_tool_schemas,
     has_weixin_reply_media_tool, weixin_tool_schemas,
 };
+pub use builtin::{
+    FileEditError, PermissionRequester, SendSubagentPayload, SpawnSubagentPayload, StateSetter,
+    SubagentExecutor, SubagentIdPayload, TerminalExecutor, TerminalHandle, TerminalSession,
+    ToolExecutionContext, UpdateEmitter, WaitTarget, file_edit_text, parse_wait_target,
+    subagent_not_found, terminal_not_found, text_replace_file, wait_seconds, wait_session,
+};
+pub use schema::{tool_schemas, tool_schemas_from_templates};
+pub use session::{Cap, ToolArgs, ToolSession};
+pub use tool_run_manager::{ChannelToolExecutor, ToolRunManager};

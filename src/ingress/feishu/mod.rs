@@ -26,7 +26,7 @@ use crate::agent::service::AgentService;
 use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
 use crate::config::loader::{channel_secret_dir, resolve_agent_structure_dir};
 use crate::context::content_block;
-use crate::tools::subagent_tool_runtime::PermissionRequester;
+use crate::tools::PermissionRequester;
 use crate::tools::{
     FeishuReplyCardResult, FeishuReplyMediaKind, FeishuReplyMediaResult, FeishuToolBridge,
     FeishuToolExecutor, feishu_tool_schemas,

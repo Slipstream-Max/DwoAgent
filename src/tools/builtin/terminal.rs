@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use super::session::{Cap, ToolArgs, ToolSession};
+use crate::tools::session::{Cap, ToolArgs, ToolSession};
 
 const DEFAULT_CHECKOUT_LINES: usize = 200;
 

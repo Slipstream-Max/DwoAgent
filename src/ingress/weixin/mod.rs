@@ -24,7 +24,7 @@ use crate::agent::service::AgentService;
 use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
 use crate::config::loader::{channel_secret_dir, resolve_agent_structure_dir};
 use crate::context::content_block;
-use crate::tools::subagent_tool_runtime::PermissionRequester;
+use crate::tools::PermissionRequester;
 use crate::tools::weixin_tool_schemas;
 use crate::tools::{WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor};
 use crate::utils::files::{read_json_utf8, read_utf8_text, write_json_utf8};

@@ -1,7 +1,7 @@
 //! ACP protocol-level conformance tests for the Rust agent.
 //!
 //! Run with: `cargo test --test acp_protocol_test`
-//! Requires: `cargo build` first (needs the dwo-agent binary).
+//! Requires: `cargo build` first (needs the dwoagent binary).
 //!
 //! Coverage:
 //! - initialize: capabilities negotiation
@@ -469,9 +469,9 @@ impl AcpClient {
         let binary = find_agent_binary();
         let mut child = Command::new(&binary)
             .args([
-                "acp",
-                "embedded",
-                "--agent-folder",
+                "agent",
+                "run",
+                "--agent-profile",
                 agent_folder.to_str().unwrap(),
             ])
             .env("NO_PROXY", "127.0.0.1,localhost,::1")
@@ -641,15 +641,15 @@ fn find_agent_binary() -> PathBuf {
             .join("target")
             .join(sub)
             .join(if cfg!(windows) {
-                "dwo-agent.exe"
+                "dwoagent.exe"
             } else {
-                "dwo-agent"
+                "dwoagent"
             });
         if p.exists() {
             return p;
         }
     }
-    panic!("Cannot find dwo-agent binary. Run `cargo build` first.");
+    panic!("Cannot find dwoagent binary. Run `cargo build` first.");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -682,12 +682,7 @@ fn test_stdio_eof_exits_process() {
     let folder = create_mock_agent_folder(tmp.path(), mock.port);
     let binary = find_agent_binary();
     let mut child = Command::new(&binary)
-        .args([
-            "acp",
-            "embedded",
-            "--agent-folder",
-            folder.to_str().unwrap(),
-        ])
+        .args(["agent", "run", "--agent-profile", folder.to_str().unwrap()])
         .env("NO_PROXY", "127.0.0.1,localhost,::1")
         .env("no_proxy", "127.0.0.1,localhost,::1")
         .stdin(Stdio::piped())

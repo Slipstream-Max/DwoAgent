@@ -11,13 +11,13 @@ $env:DEEPSEEK_API_KEY = "..."
 2. Log in and bind Weixin:
 
 ```powershell
-cargo run -- channel login weixin --agent-folder examples/weixin-agent
+cargo run -- channel login weixin --agent-profile examples/weixin-agent
 ```
 
 3. Start the long-lived channel host:
 
 ```powershell
-cargo run -- serve --agent-folder examples/weixin-agent
+cargo run -- agent run --agent-profile examples/weixin-agent
 ```
 
 The Weixin channel routes messages to an ordinary session. When no

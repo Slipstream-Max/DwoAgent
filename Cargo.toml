@@ -1,68 +1,59 @@
-[package]
-name = "dwo-agent"
+[workspace]
+members = [
+    ".",
+    "crates/dwo-agent-cli",
+    "crates/dwo-agent-core",
+    "crates/dwo-agent-supervisor",
+    "crates/dwo-llm",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Dwo Agent (赤铎) — modular multi-turn agent runtime"
-readme = "README.md"
 rust-version = "1.95"
 
-[[bin]]
-name = "dwo-agent"
-path = "src/main.rs"
-
-[lib]
-name = "dwo_agent"
-path = "src/lib.rs"
-
-[dependencies]
-# Async runtime
-tokio = { version = "1", features = [
-    "rt-multi-thread",
-    "macros",
-    "sync",
-    "time",
-    "fs",
-    "net",
-    "process",
-    "signal",
-    "io-std",
-    "io-util",
-] }
+[workspace.dependencies]
+agent-client-protocol = { version = "0.11", features = ["unstable_session_usage"] }
+anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+clawrs-feishu = { git = "https://github.com/AgenticWeb4/ZClaw-Channel-Feishu.git", rev = "5aa32ff" }
+eventsource-stream = "0.2"
 futures = "0.3"
-
-# Serialization
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-
-# LLM / Agent ecosystem
-agent-client-protocol = { version = "0.11", features = ["unstable_session_usage"] }
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "multipart",
-    "stream",
-    "rustls-tls",
-] }
-eventsource-stream = "0.2"
-tokio-tungstenite = { version = "0.23", default-features = false, features = ["handshake"] }
-weixin-agent = "0.2"
-clawrs-feishu = { git = "https://github.com/AgenticWeb4/ZClaw-Channel-Feishu.git", rev = "5aa32ff" }
-
-# CLI / Logging / Errors
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+tempfile = "3"
 thiserror = "2"
-tracing = "0.1"
-crossterm = "0.29"
-ratatui = "0.30.1"
-
-# Utilities
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "process", "signal", "io-std", "io-util"] }
+tokio-tungstenite = { version = "0.23", default-features = false, features = ["handshake"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-regex = "1"
-base64 = "0.22"
+weixin-agent = "0.2"
+
+[package]
+name = "dwo-agent"
+version.workspace = true
+edition.workspace = true
+description = "Dwo Agent (赤铎) — modular multi-turn agent runtime"
+readme = "README.md"
+rust-version.workspace = true
+
+[[bin]]
+name = "dwoagent"
+path = "src/main.rs"
+
+[dependencies]
+dwo-agent-cli = { path = "crates/dwo-agent-cli" }
+anyhow.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

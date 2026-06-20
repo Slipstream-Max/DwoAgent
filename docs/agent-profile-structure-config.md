@@ -2,6 +2,9 @@
 
 `dwo-agent` 的 agent profile 现在只保留三个顶层概念：
 
+完整 `agent.yaml` 模板见 `docs/agent.full.yaml`。Supervisor 是机器级配置，见
+`docs/supervisor-config.md` 和 `docs/supervisor.full.yaml`。
+
 ```text
 <agent-folder>/
   agent.yaml
@@ -56,7 +59,7 @@ model:
 - `policy_mode`：必填权限策略。允许 `full_access`、`confirm`、`watch`。
 - `max_running_turn`：可选正整数。省略时，agent loop 运行到模型停止、取消或出错。
 - `session_store_dir`：可选，默认 `runtime/sessions`。
-- `channel_state_dir`：可选，默认 `runtime/channel_state`。
+- Channel state 固定写入 `runtime/channel_state`，不提供 `agent.yaml` 配置项。
 - `external_skills_dirs`：可选，额外 skill roots，相对路径按 agent folder 解析。
 - `external_rule_files`：可选，额外 rule 文件，相对路径按 agent folder 解析。
 - `tools`：可选。支持 `file_edit`、`terminal`、`subagent`，每个值为 `enable` 或 `disable`，默认启用。
@@ -126,17 +129,10 @@ policy:
 
 ## channels
 
-`channels` section 配置 `dwo-agent serve` 启动的长生命周期入口。
+`channels` section 只配置 profile host 的外部入口：Weixin 和 Feishu。ACP stdio 是 `dwoagent supervisor acp --agent-profile <path>` 的 shim/transport；桌面/UI WebSocket 属于 supervisor，不写入 agent profile。
 
 ```yaml
 channels:
-  stdio:
-    enabled: true
-    auth: true
-  websocket:
-    enabled: false
-    bind_addr: 127.0.0.1:8765
-    auth: true
   weixin:
     enabled: false
     workspace_dir: .
@@ -148,51 +144,7 @@ channels:
     domain: feishu
 ```
 
-如果 `channels` 缺失或为空，所有 channel 默认禁用。`serve` host 要求至少启用一个 channel 或一个 automation job。
-
-### Stdio
-
-```yaml
-channels:
-  stdio:
-    enabled: true
-    auth: true
-```
-
-登录生成 token：
-
-```powershell
-cargo run -- channel login stdio --agent-folder examples/dwo-agent
-```
-
-凭据写入：
-
-```text
-runtime/channel_secret/stdio/auth.yaml
-```
-
-`serve` 启动后会写入：
-
-```text
-runtime/channel_secret/stdio/daemon.yaml
-```
-
-### WebSocket
-
-```yaml
-channels:
-  websocket:
-    enabled: true
-    bind_addr: 127.0.0.1:8765
-    auth: true
-```
-
-凭据写入：
-
-```text
-runtime/channel_secret/websocket/auth.yaml
-```
-
+如果 `channels` 缺失或为空，所有外部 channel 默认禁用。`dwoagent agent run` 仍会启动 stdio JSON-RPC profile host。
 ### Weixin
 
 ```yaml
@@ -217,7 +169,7 @@ runtime/channel_state/weixin/sync_buf.txt
 runtime/channel_state/weixin/bridge_state.yaml
 ```
 
-Weixin 不创建特殊会话目录。它通过 `bridge_state.yaml` 记录默认普通 session 和当前 `/switch` 绑定；真实对话、上下文和附件都保存在普通 session 中。附件下载到当前 active session 的 `attachments/inbox/weixin/<message_id>/`，并以 `resource_link` 加入本轮输入。
+Weixin 不创建特殊会话目录。它通过 channel control state（兼容文件名 `bridge_state.yaml`）记录默认普通 session 和当前 `/switch` 绑定；真实对话、上下文和附件都保存在普通 session 中。附件下载到当前 active session 的 `attachments/inbox/weixin/<message_id>/`，并以 ACP `resource_link` 加入本轮输入。
 
 ### Feishu
 
@@ -250,13 +202,18 @@ Feishu 私聊和群聊使用独立 channel state。真实对话、上下文和�
 Weixin 和 Feishu 支持：
 
 ```text
+/help
+/new
 /list
 /switch <session_id>
 /back
 /where
+/cancel
 /approve <confirmation_id>
-/deny <confirmation_id>
+/deny <confirmation_id> [reason]
 ```
+
+这些 slash commands 属于 Dwo channel control 语义；入站消息内容本身优先复用 ACP `ContentBlock`。
 
 确认审计写入：
 
@@ -266,7 +223,7 @@ runtime/channel_secret/audit/confirm_audit.jsonl
 
 ## automation
 
-`automation` section 配置 `serve` 启动的 scheduler。Automation 不是 ingress channel；它只是按计划触发普通 agent session。
+`automation` section 配置 `dwoagent agent run` 启动的 scheduler。Automation 不是 ingress channel；它只是按计划触发普通 agent session。
 
 ```yaml
 automation:
@@ -418,3 +375,4 @@ agent.yaml external_skills_dirs entries
 ```
 
 `<mcp>` 只在 `resources/mcp.json` 存在时出现。
+

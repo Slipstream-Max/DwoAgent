@@ -185,9 +185,9 @@ impl AcpClient {
         let binary = find_binary();
         let mut child = Command::new(&binary)
             .args([
-                "acp",
-                "embedded",
-                "--agent-folder",
+                "agent",
+                "run",
+                "--agent-profile",
                 agent_folder.to_str().unwrap(),
             ])
             .env("NO_PROXY", "127.0.0.1,localhost,::1")
@@ -268,16 +268,16 @@ fn find_binary() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for sub in ["debug", "release"] {
         let name = if cfg!(windows) {
-            "dwo-agent.exe"
+            "dwoagent.exe"
         } else {
-            "dwo-agent"
+            "dwoagent"
         };
         let p = dir.join("target").join(sub).join(name);
         if p.exists() {
             return p;
         }
     }
-    panic!("dwo-agent not found");
+    panic!("dwoagent not found");
 }
 
 // ── Test ───────────────────────────────────────────────────────────────────

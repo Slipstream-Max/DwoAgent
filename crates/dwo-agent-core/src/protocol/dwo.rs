@@ -1,11 +1,11 @@
 //! Dwo JSON-RPC extension protocol.
 
+use std::path::PathBuf;
+
 use agent_client_protocol::JsonRpcRequest;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-use crate::agent::service::{AgentProfileSnapshot, SessionContextSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DwoChannelCommand {
@@ -102,6 +102,21 @@ pub struct DwoSessionContextRequest {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DwoWorkerProfileSnapshot {
+    pub agent_id: String,
+    pub name: String,
+    pub description: String,
+    pub agent_structure_dir: PathBuf,
+    pub default_model_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DwoSessionContextSnapshot {
+    pub session_id: String,
+    pub messages: Vec<Value>,
+}
+
 pub fn normalize_session_context_request(req: DwoSessionContextRequest) -> Result<String> {
     let session_id = req.session_id.trim().to_string();
     if session_id.is_empty() {
@@ -114,7 +129,7 @@ pub fn worker_ping_response() -> Value {
     json!({ "ok": true })
 }
 
-pub fn worker_profile_response(snapshot: &AgentProfileSnapshot) -> Value {
+pub fn worker_profile_response(snapshot: &DwoWorkerProfileSnapshot) -> Value {
     json!({
         "agent_id": snapshot.agent_id,
         "name": snapshot.name,
@@ -124,7 +139,7 @@ pub fn worker_profile_response(snapshot: &AgentProfileSnapshot) -> Value {
     })
 }
 
-pub fn session_context_response(snapshot: &SessionContextSnapshot) -> Value {
+pub fn session_context_response(snapshot: &DwoSessionContextSnapshot) -> Value {
     json!({
         "session_id": snapshot.session_id,
         "messages": snapshot.messages,

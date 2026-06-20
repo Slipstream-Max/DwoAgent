@@ -26,7 +26,15 @@ pub async fn worker_profile(
     _cx: ConnectionTo<Client>,
 ) -> std::result::Result<(), agent_client_protocol::Error> {
     let snapshot = agent.profile_snapshot();
-    responder.respond(dwo::worker_profile_response(&snapshot))
+    responder.respond(dwo::worker_profile_response(
+        &dwo::DwoWorkerProfileSnapshot {
+            agent_id: snapshot.agent_id,
+            name: snapshot.name,
+            description: snapshot.description,
+            agent_structure_dir: snapshot.agent_structure_dir,
+            default_model_id: snapshot.default_model_id,
+        },
+    ))
 }
 
 pub async fn session_context(
@@ -40,7 +48,12 @@ pub async fn session_context(
         Err(err) => return responder.respond_with_error(invalid_params(err)),
     };
     match agent.session_context_snapshot(&session_id).await {
-        Ok(Some(snapshot)) => responder.respond(dwo::session_context_response(&snapshot)),
+        Ok(Some(snapshot)) => responder.respond(dwo::session_context_response(
+            &dwo::DwoSessionContextSnapshot {
+                session_id: snapshot.session_id,
+                messages: snapshot.messages,
+            },
+        )),
         Ok(None) => {
             responder.respond_with_error(invalid_params(format!("unknown session `{session_id}`")))
         }

@@ -289,9 +289,8 @@ impl FeishuChannel {
             reply_target(&msg, kind).to_string(),
             holder,
         );
-        let run_result = self
-            .agent
-            .run_prompt_with_extra_tools(
+        let run_result = channel_control
+            .run_prompt(
                 session.session_id(),
                 user_input,
                 user_blocks,

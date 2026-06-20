@@ -227,9 +227,24 @@ pub async fn run_automation_jobs(
     agent_structure_dir: &Path,
     jobs: Vec<AutomationJobConfig>,
 ) -> Result<()> {
+    run_automation_jobs_with_leases(
+        agent,
+        agent_structure_dir,
+        jobs,
+        Arc::new(SessionLeaseRegistry::new()),
+    )
+    .await
+}
+
+pub async fn run_automation_jobs_with_leases(
+    agent: Arc<AgentService>,
+    agent_structure_dir: &Path,
+    jobs: Vec<AutomationJobConfig>,
+    leases: Arc<SessionLeaseRegistry>,
+) -> Result<()> {
     let automation = AutomationRuntime::new(
         agent,
-        Arc::new(SessionLeaseRegistry::new()),
+        leases,
         agent_structure_dir,
         jobs,
         AutomationNotificationSinks::default(),

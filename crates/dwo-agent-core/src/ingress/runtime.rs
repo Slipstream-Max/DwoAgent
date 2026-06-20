@@ -24,11 +24,23 @@ pub struct ChannelRuntime {
 
 impl ChannelRuntime {
     pub fn new(agent: Arc<AgentService>, agent_structure_dir: &Path) -> Result<Self> {
+        Self::new_with_leases(
+            agent,
+            agent_structure_dir,
+            Arc::new(SessionLeaseRegistry::new()),
+        )
+    }
+
+    pub fn new_with_leases(
+        agent: Arc<AgentService>,
+        agent_structure_dir: &Path,
+        lease_registry: Arc<SessionLeaseRegistry>,
+    ) -> Result<Self> {
         let config = load_channel_runtime_config(agent_structure_dir)?;
         Ok(Self {
             agent,
             config,
-            lease_registry: Arc::new(SessionLeaseRegistry::new()),
+            lease_registry,
             confirmation_registry: Arc::new(PendingConfirmationRegistry::new(agent_structure_dir)),
             started: false,
         })

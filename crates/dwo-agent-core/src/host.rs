@@ -6,8 +6,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::agent::service::AgentService;
-use crate::automation::{load_automation_config, run_automation_jobs};
-use crate::ingress::{ChannelRuntime, run_rpc_stdio};
+use crate::automation::{load_automation_config, run_automation_jobs_with_leases};
+use crate::ingress::{ChannelRuntime, SessionLeaseRegistry, run_rpc_stdio};
 
 #[derive(Debug, Clone, Copy)]
 pub enum HostMode {
@@ -33,7 +33,12 @@ async fn run_host(agent_folder: &Path, mode: HostMode) -> Result<()> {
 }
 
 async fn run_profile_host(agent: Arc<AgentService>, agent_structure_dir: &Path) -> Result<()> {
-    let mut channels = ChannelRuntime::new(agent.clone(), agent_structure_dir)?;
+    let lease_registry = Arc::new(SessionLeaseRegistry::new());
+    let mut channels = ChannelRuntime::new_with_leases(
+        agent.clone(),
+        agent_structure_dir,
+        lease_registry.clone(),
+    )?;
     let automation_config = load_automation_config(agent_structure_dir)?;
     let has_channels = channels.config().has_enabled_channels();
     let has_automation = automation_config.has_enabled_jobs();
@@ -72,7 +77,9 @@ async fn run_profile_host(agent: Arc<AgentService>, agent_structure_dir: &Path) 
         let jobs = automation_config.jobs;
         let tx = result_tx.clone();
         tasks.push(tokio::spawn(async move {
-            let result = run_automation_jobs(agent, &agent_structure_dir, jobs).await;
+            let result =
+                run_automation_jobs_with_leases(agent, &agent_structure_dir, jobs, lease_registry)
+                    .await;
             let _ = tx
                 .send(RuntimeResult {
                     kind: RuntimeKind::External,

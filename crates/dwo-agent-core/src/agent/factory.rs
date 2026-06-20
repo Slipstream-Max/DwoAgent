@@ -31,9 +31,53 @@ pub struct AgentRuntimeParts {
     pub watcher_runtime: Option<Arc<WatcherRuntime>>,
 }
 
-/// Strategy hook used for rebuilding the factory on model switches.
-pub type RuntimeFactoryBuilder =
-    Arc<dyn Fn(&str, &ModelProfile) -> Result<SessionAgentFactory> + Send + Sync>;
+/// Cloneable runtime shape used to rebuild per-model factories.
+#[derive(Clone)]
+pub struct RuntimeFactorySpec {
+    agent_structure_dir: PathBuf,
+    agent_id: String,
+    runtime_tools: AgentTools,
+    tool_policy: Arc<ToolPolicyConfig>,
+    external_skills_dirs: Vec<PathBuf>,
+    external_rule_files: Vec<PathBuf>,
+}
+
+impl RuntimeFactorySpec {
+    pub fn new(
+        agent_structure_dir: impl Into<PathBuf>,
+        agent_id: impl Into<String>,
+        runtime_tools: AgentTools,
+        tool_policy: Arc<ToolPolicyConfig>,
+        external_skills_dirs: Vec<PathBuf>,
+        external_rule_files: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            agent_structure_dir: agent_structure_dir.into(),
+            agent_id: agent_id.into(),
+            runtime_tools,
+            tool_policy,
+            external_skills_dirs,
+            external_rule_files,
+        }
+    }
+
+    pub fn create_factory(&self, cwd: &str, profile: &ModelProfile) -> SessionAgentFactory {
+        SessionAgentFactory::new(
+            &self.agent_structure_dir,
+            &self.agent_id,
+            cwd.to_string(),
+            profile.context_window,
+            profile.compact_threshold,
+            profile.config.clone(),
+            profile.capabilities,
+            profile.default_reasoning_mode.as_str(),
+            self.runtime_tools,
+            self.tool_policy.clone(),
+            self.external_skills_dirs.clone(),
+            self.external_rule_files.clone(),
+        )
+    }
+}
 
 /// Initialize model, tool, context, and subagent runtime wiring.
 pub struct SessionAgentFactory {
@@ -58,7 +102,7 @@ pub struct CreateSessionArgs {
     pub session_dir: PathBuf,
     pub model_id: String,
     pub model_profiles: HashMap<String, ModelProfile>,
-    pub runtime_factory_builder: RuntimeFactoryBuilder,
+    pub runtime_factory_spec: RuntimeFactorySpec,
     pub max_running_turn: Option<u32>,
     pub runtime_tools: AgentTools,
     pub mode_id: PolicyMode,
@@ -217,7 +261,7 @@ impl SessionAgentFactory {
             parts.tool_manager.clone(),
             parts.context_manager,
             args.model_profiles,
-            args.runtime_factory_builder,
+            args.runtime_factory_spec,
             parts.watcher_runtime,
             self.tool_policy.clone(),
         );

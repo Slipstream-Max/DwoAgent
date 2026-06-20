@@ -19,18 +19,9 @@ pub struct ChannelRuntime {
     config: ChannelRuntimeConfig,
     lease_registry: Arc<SessionLeaseRegistry>,
     confirmation_registry: Arc<PendingConfirmationRegistry>,
-    started: bool,
 }
 
 impl ChannelRuntime {
-    pub fn new(agent: Arc<AgentService>, agent_structure_dir: &Path) -> Result<Self> {
-        Self::new_with_leases(
-            agent,
-            agent_structure_dir,
-            Arc::new(SessionLeaseRegistry::new()),
-        )
-    }
-
     pub fn new_with_leases(
         agent: Arc<AgentService>,
         agent_structure_dir: &Path,
@@ -42,7 +33,6 @@ impl ChannelRuntime {
             config,
             lease_registry,
             confirmation_registry: Arc::new(PendingConfirmationRegistry::new(agent_structure_dir)),
-            started: false,
         })
     }
 
@@ -50,24 +40,9 @@ impl ChannelRuntime {
         &self.config
     }
 
-    pub fn lease_registry(&self) -> Arc<SessionLeaseRegistry> {
-        self.lease_registry.clone()
-    }
-
-    pub async fn start(&mut self) -> Result<()> {
-        if self.started {
-            return Ok(());
-        }
+    pub async fn run(&self) -> Result<()> {
         self.validate_ready()?;
-        self.started = true;
-        Ok(())
-    }
-
-    pub async fn run(&mut self) -> Result<()> {
-        self.start().await?;
-        let result = self.run_inner().await;
-        self.shutdown().await;
-        result
+        self.run_inner().await
     }
 
     async fn run_inner(&self) -> Result<()> {
@@ -139,10 +114,6 @@ impl ChannelRuntime {
                 result.unwrap_or_else(|| Ok(()))
             }
         }
-    }
-
-    pub async fn shutdown(&mut self) {
-        self.started = false;
     }
 
     fn validate_ready(&self) -> Result<()> {

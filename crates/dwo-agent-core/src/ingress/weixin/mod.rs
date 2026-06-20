@@ -7,7 +7,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
@@ -17,10 +16,16 @@ use weixin_agent::{
 };
 
 use super::channel_control::{ChannelControl, PendingConfirmationRegistry, SessionLeaseRegistry};
+use super::channel_input::{
+    append_channel_context, file_uri_from_path, image_mime_type_for_path,
+    image_url_block_from_path as image_url_block_from_file, resolve_config_path,
+    resource_link_block, sanitize_filename,
+};
 use super::config::WeixinChannelConfig;
-use super::response::{ChannelResponseDetail, ChannelUpdateCollector};
+use super::response::{ChannelCollectedUpdates, ChannelResponseDetail, ChannelUpdateCollector};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
+use crate::agent::session_agent::SessionAgent;
 use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
 use crate::config::loader::{channel_secret_dir, resolve_agent_structure_dir};
 use crate::protocol::acp::mapper;
@@ -28,7 +33,7 @@ use crate::tools::PermissionRequester;
 use crate::tools::weixin_tool_schemas;
 use crate::tools::{WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor};
 use crate::utils::files::{read_json_utf8, read_utf8_text, write_json_utf8};
-use agent_client_protocol::schema::{ContentBlock, ImageContent, ResourceLink, TextContent};
+use agent_client_protocol::schema::{ContentBlock, TextContent};
 
 const WEIXIN_SECRET_SUBDIR: &str = "weixin";
 const WEIXIN_STATE_SUBDIR: &str = "weixin";
@@ -294,6 +299,23 @@ impl WeixinHandler {
             return Ok(());
         };
 
+        let collected = self
+            .run_prompt_for_message(ctx, agent, user_input, user_blocks)
+            .await?;
+        self.reply_collected(ctx, &collected).await?;
+        if let Some(client) = self.client.get() {
+            export_context_tokens(client, Some(&self.context_tokens_path))?;
+        }
+        Ok(())
+    }
+
+    async fn run_prompt_for_message(
+        &self,
+        ctx: &MessageContext,
+        agent: Arc<SessionAgent>,
+        user_input: Value,
+        user_blocks: Vec<Value>,
+    ) -> Result<ChannelCollectedUpdates> {
         let tool_manager = agent.tool_manager().await;
         if self.media_output {
             let client = self
@@ -354,14 +376,19 @@ impl WeixinHandler {
         run_result?;
 
         let collected = update_collector.finish().await;
+        Ok(collected)
+    }
+
+    async fn reply_collected(
+        &self,
+        ctx: &MessageContext,
+        collected: &ChannelCollectedUpdates,
+    ) -> Result<()> {
         if let Some(detail) = collected.detail_text.as_deref() {
             ctx.reply_text(detail).await?;
         }
         if !collected.response_text.is_empty() {
             ctx.reply_text(&collected.response_text).await?;
-        }
-        if let Some(client) = self.client.get() {
-            export_context_tokens(client, Some(&self.context_tokens_path))?;
         }
         Ok(())
     }
@@ -399,7 +426,12 @@ impl WeixinHandler {
         if blocks.is_empty() {
             return Ok(None);
         }
-        append_channel_context(&mut blocks, "Weixin", self.media_output)?;
+        let instructions = if self.media_output {
+            vec!["本轮如需发送本地文件或图片，请使用 weixin_reply_media 回复当前微信对话。"]
+        } else {
+            Vec::new()
+        };
+        append_channel_context(&mut blocks, "Weixin", &instructions);
 
         Ok(Some(mapper::normalize_prompt_blocks(&blocks)?))
     }
@@ -530,16 +562,6 @@ fn read_sync_buf(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn resolve_config_path(agent_structure_dir: &Path, raw: &str) -> PathBuf {
-    let path = PathBuf::from(raw);
-    let resolved = if path.is_absolute() {
-        path
-    } else {
-        agent_structure_dir.join(path)
-    };
-    std::fs::canonicalize(&resolved).unwrap_or(resolved)
-}
-
 async fn download_message_media(
     ctx: &MessageContext,
     media: &MediaInfo,
@@ -568,35 +590,8 @@ fn message_key(ctx: &MessageContext) -> String {
         .unwrap_or_else(|| ctx.message_id.clone())
 }
 
-fn image_url_block_from_file(path: &Path) -> Result<Option<ContentBlock>> {
-    let Some(mime_type) = image_mime_type(path) else {
-        return Ok(None);
-    };
-    let data = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-    Ok(Some(ContentBlock::Image(ImageContent::new(
-        encoded, mime_type,
-    ))))
-}
-
-fn image_mime_type(path: &Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
-        Some("png") => Some("image/png"),
-        Some("gif") => Some("image/gif"),
-        Some("webp") => Some("image/webp"),
-        Some("bmp") => Some("image/bmp"),
-        _ => None,
-    }
-}
-
 fn mime_type_for_media(path: &Path, media_type: MediaType) -> &'static str {
-    if let Some(mime_type) = image_mime_type(path) {
+    if let Some(mime_type) = image_mime_type_for_path(path) {
         return mime_type;
     }
 
@@ -626,70 +621,6 @@ fn mime_type_for_media(path: &Path, media_type: MediaType) -> &'static str {
     }
 }
 
-fn append_channel_context(
-    blocks: &mut Vec<ContentBlock>,
-    channel: &str,
-    media_output: bool,
-) -> Result<()> {
-    let mut lines = vec![
-        "<channel_context>".to_string(),
-        format!("当前消息来自 {channel} 频道。"),
-    ];
-    if media_output {
-        lines.push(
-            "本轮如需发送本地文件或图片，请使用 weixin_reply_media 回复当前微信对话。".to_string(),
-        );
-    }
-    lines.push("</channel_context>".to_string());
-    blocks.push(ContentBlock::Text(TextContent::new(lines.join("\n"))));
-    Ok(())
-}
-
-fn resource_link_block(
-    uri: &str,
-    name: Option<&str>,
-    mime_type: Option<&str>,
-) -> Result<ContentBlock> {
-    let uri = uri.trim();
-    if uri.is_empty() {
-        bail!("resource_link block must provide uri");
-    }
-    let name = name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("attachment");
-    let mut link = ResourceLink::new(name, uri);
-    if let Some(mime_type) = mime_type.map(str::trim).filter(|value| !value.is_empty()) {
-        link = link.mime_type(mime_type.to_string());
-    }
-    Ok(ContentBlock::ResourceLink(link))
-}
-
-fn file_uri_from_path(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let encoded = percent_encode_file_path(&normalized);
-    if encoded.starts_with("//") {
-        format!("file:{encoded}")
-    } else if encoded.starts_with('/') {
-        format!("file://{encoded}")
-    } else {
-        format!("file:///{encoded}")
-    }
-}
-
-fn percent_encode_file_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 fn default_media_filename(media_type: MediaType) -> String {
     match media_type {
         MediaType::Image => "image.jpg",
@@ -698,55 +629,4 @@ fn default_media_filename(media_type: MediaType) -> String {
         MediaType::File => "file.bin",
     }
     .to_string()
-}
-
-fn sanitize_filename(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    sanitized.trim_matches('.').trim().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_uri_from_path_encodes_spaces() {
-        let uri = file_uri_from_path(Path::new("/tmp/a b.png"));
-
-        assert_eq!(uri, "file:///tmp/a%20b.png");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn file_uri_from_path_formats_windows_drive_paths() {
-        let uri = file_uri_from_path(Path::new(r"C:\tmp\a b.png"));
-
-        assert_eq!(uri, "file:///C:/tmp/a%20b.png");
-    }
-
-    #[test]
-    fn image_url_block_from_file_uses_data_url() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("image.png");
-        std::fs::write(&path, b"abc").unwrap();
-
-        let block = image_url_block_from_file(&path).unwrap().unwrap();
-
-        match block {
-            ContentBlock::Image(image) => {
-                assert_eq!(image.mime_type, "image/png");
-                assert_eq!(image.data, "YWJj");
-            }
-            other => panic!("expected image content block, got {other:?}"),
-        }
-    }
 }

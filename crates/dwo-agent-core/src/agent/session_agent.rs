@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use super::activity::{ActivityTurnHandle, SessionActivity};
 use super::constants::parse_policy_mode;
-use super::factory::RuntimeFactoryBuilder;
+use super::factory::RuntimeFactorySpec;
 use super::session::{SESSION_TITLE_LENGTH, Session, SessionPersistence};
 use super::turn::{PolicyModeGetter, TurnRuntime, run_turn};
 use crate::config::loader::utc_iso;
@@ -40,7 +40,7 @@ pub struct SessionAgent {
     runtime: Mutex<RuntimeState>,
     persistence: Arc<SessionPersistence>,
     model_profiles: Mutex<HashMap<String, ModelProfile>>,
-    runtime_factory_builder: RuntimeFactoryBuilder,
+    runtime_factory_spec: RuntimeFactorySpec,
     cancel_event: CancelEvent,
     tool_manager_cached: Arc<ToolRunManager>,
     tool_schemas_cached: Arc<Vec<Value>>,
@@ -62,7 +62,7 @@ impl SessionAgent {
         tool_manager: Arc<ToolRunManager>,
         context_manager: ConversationContextManager,
         model_profiles: HashMap<String, ModelProfile>,
-        runtime_factory_builder: RuntimeFactoryBuilder,
+        runtime_factory_spec: RuntimeFactorySpec,
         watcher_runtime: Option<Arc<WatcherRuntime>>,
         tool_policy: Arc<ToolPolicyConfig>,
     ) -> Arc<Self> {
@@ -92,7 +92,7 @@ impl SessionAgent {
             }),
             persistence,
             model_profiles: Mutex::new(model_profiles),
-            runtime_factory_builder,
+            runtime_factory_spec,
             cancel_event: CancelEvent::new(),
             tool_manager_cached: tool_manager.clone(),
             tool_schemas_cached,
@@ -502,7 +502,7 @@ impl SessionAgent {
             let session = self.session.lock().await;
             session.cwd.clone()
         };
-        let factory = (self.runtime_factory_builder)(&cwd, &profile)?;
+        let factory = self.runtime_factory_spec.create_factory(&cwd, &profile);
         let new_client = factory.create_model_client()?;
         let (current_messages, current_usage) = {
             let runtime = self.runtime.lock().await;
@@ -581,7 +581,7 @@ impl SessionAgent {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Unknown model_id: {model_id}"))?
         };
-        let factory = (self.runtime_factory_builder)(&cwd, &profile)?;
+        let factory = self.runtime_factory_spec.create_factory(&cwd, &profile);
         factory.rebuild_system_messages()
     }
 
@@ -652,7 +652,9 @@ impl SessionAgent {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Unknown model_id: {model_id}"))?
         };
-        let client = (self.runtime_factory_builder)(&cwd, &profile)?
+        let client = self
+            .runtime_factory_spec
+            .create_factory(&cwd, &profile)
             .create_model_client()
             .context("create title model client")?;
         let title_source = title_source_excerpt(source_text);

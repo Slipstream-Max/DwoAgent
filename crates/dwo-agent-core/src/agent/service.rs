@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::factory::{CreateSessionArgs, RuntimeFactoryBuilder, SessionAgentFactory};
+use super::factory::{CreateSessionArgs, RuntimeFactorySpec};
 use super::session::{SESSION_META_FILE, SESSION_MODEL_CONTEXT_FILE};
 use super::session_agent::SessionAgent;
 use crate::config::loader::{
@@ -412,14 +412,8 @@ impl AgentService {
             .get(&model_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Unknown model_id: {model_id}"))?;
-        let factory = self.create_runtime_factory(&resolved_cwd, &profile, runtime_tools)?;
-
-        let runtime_factory_builder: RuntimeFactoryBuilder = {
-            let service = self.snapshot_shape(runtime_tools);
-            Arc::new(move |cwd: &str, profile: &ModelProfile| {
-                service.create_runtime_factory(cwd, profile)
-            })
-        };
+        let runtime_factory_spec = self.runtime_factory_spec(runtime_tools);
+        let factory = runtime_factory_spec.create_factory(&resolved_cwd, &profile);
 
         let create_args = CreateSessionArgs {
             session_id: session_uuid,
@@ -427,7 +421,7 @@ impl AgentService {
             session_dir,
             model_id,
             model_profiles: self.model_profiles.clone(),
-            runtime_factory_builder,
+            runtime_factory_spec,
             max_running_turn,
             runtime_tools,
             mode_id,
@@ -444,21 +438,10 @@ impl AgentService {
         factory.create_session_agent(create_args).await
     }
 
-    fn create_runtime_factory(
-        &self,
-        cwd: &str,
-        profile: &ModelProfile,
-        runtime_tools: AgentTools,
-    ) -> Result<SessionAgentFactory> {
-        Ok(SessionAgentFactory::new(
-            &self.agent_structure_dir,
-            &self.agent_meta.agent_id,
-            cwd.to_string(),
-            profile.context_window,
-            profile.compact_threshold,
-            profile.config.clone(),
-            profile.capabilities,
-            profile.default_reasoning_mode.as_str(),
+    fn runtime_factory_spec(&self, runtime_tools: AgentTools) -> RuntimeFactorySpec {
+        RuntimeFactorySpec::new(
+            self.agent_structure_dir.clone(),
+            self.agent_meta.agent_id.clone(),
             runtime_tools,
             self.tool_policy.clone(),
             resolve_config_paths(
@@ -469,24 +452,7 @@ impl AgentService {
                 &self.agent_meta.external_rule_files,
                 &self.agent_structure_dir,
             ),
-        ))
-    }
-
-    fn snapshot_shape(&self, runtime_tools: AgentTools) -> AgentServiceShape {
-        AgentServiceShape {
-            agent_structure_dir: self.agent_structure_dir.clone(),
-            agent_id: self.agent_meta.agent_id.clone(),
-            runtime_tools,
-            tool_policy: self.tool_policy.clone(),
-            external_skills_dirs: resolve_config_paths(
-                &self.agent_meta.external_skills_dirs,
-                &self.agent_structure_dir,
-            ),
-            external_rule_files: resolve_config_paths(
-                &self.agent_meta.external_rule_files,
-                &self.agent_structure_dir,
-            ),
-        }
+        )
     }
 
     async fn load_persisted_session(&self, session_id: &str) -> Result<Option<Arc<SessionAgent>>> {
@@ -640,39 +606,6 @@ fn persisted_session_dir_matches(dir: &Path, session_id: &str) -> bool {
     }
     read_json_model::<SessionMetaPayload>(&meta_path)
         .is_ok_and(|meta| meta.session_id == session_id)
-}
-
-#[derive(Clone)]
-struct AgentServiceShape {
-    agent_structure_dir: PathBuf,
-    agent_id: String,
-    runtime_tools: AgentTools,
-    tool_policy: Arc<ToolPolicyConfig>,
-    external_skills_dirs: Vec<PathBuf>,
-    external_rule_files: Vec<PathBuf>,
-}
-
-impl AgentServiceShape {
-    fn create_runtime_factory(
-        &self,
-        cwd: &str,
-        profile: &ModelProfile,
-    ) -> Result<SessionAgentFactory> {
-        Ok(SessionAgentFactory::new(
-            &self.agent_structure_dir,
-            &self.agent_id,
-            cwd.to_string(),
-            profile.context_window,
-            profile.compact_threshold,
-            profile.config.clone(),
-            profile.capabilities,
-            profile.default_reasoning_mode.as_str(),
-            self.runtime_tools,
-            self.tool_policy.clone(),
-            self.external_skills_dirs.clone(),
-            self.external_rule_files.clone(),
-        ))
-    }
 }
 
 fn resolve_config_paths(paths: &[String], base_dir: &Path) -> Vec<PathBuf> {

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use clawrs_feishu::{
     Channel, ChannelMessage, FeishuConfig as ClawFeishuConfig,
     FeishuConnectionMode as ClawFeishuConnectionMode, FeishuDomain as ClawFeishuDomain,
@@ -19,10 +18,16 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
 use super::channel_control::{ChannelControl, PendingConfirmationRegistry, SessionLeaseRegistry};
+use super::channel_input::{
+    append_channel_context, extension_for_mime_type, file_uri_from_path, image_mime_type_for_path,
+    image_url_block_from_file, resolve_config_path, resource_link_block, sanitize_filename,
+    sanitize_filename_or,
+};
 use super::config::{FeishuAccessPolicy, FeishuChannelConfig, FeishuChannelDomain};
-use super::response::ChannelUpdateCollector;
+use super::response::{ChannelCollectedUpdates, ChannelUpdateCollector};
 use crate::agent::constants::PERMISSION_REJECT_ONCE;
 use crate::agent::service::AgentService;
+use crate::agent::session_agent::SessionAgent;
 use crate::automation::{AutomationNotificationSink, AutomationNotifyConfig};
 use crate::config::loader::{channel_secret_dir, resolve_agent_structure_dir};
 use crate::protocol::acp::mapper;
@@ -32,7 +37,7 @@ use crate::tools::{
     FeishuToolExecutor, feishu_tool_schemas,
 };
 use crate::utils::files::read_utf8_text;
-use agent_client_protocol::schema::{ContentBlock, ImageContent, ResourceLink, TextContent};
+use agent_client_protocol::schema::{ContentBlock, TextContent};
 
 const FEISHU_SECRET_SUBDIR: &str = "feishu";
 const FEISHU_AUTH_FILE: &str = "auth.yaml";
@@ -234,7 +239,7 @@ impl FeishuChannel {
             .channel_state_dir()
             .join(FEISHU_STATE_SUBDIR)
             .join(chat_kind_name(kind))
-            .join(sanitize_filename(peer_id));
+            .join(sanitize_filename_or(peer_id, "unknown"));
         let holder = format!("feishu:{}:{peer_id}", chat_kind_name(kind));
         let channel_control = ChannelControl::new(
             self.agent.clone(),
@@ -262,12 +267,37 @@ impl FeishuChannel {
             return Ok(());
         };
 
+        let collected = self
+            .run_prompt_for_message(
+                &msg,
+                kind,
+                &channel_control,
+                session,
+                user_input,
+                user_blocks,
+                holder,
+            )
+            .await?;
+        self.send_collected_response(&msg, kind, &collected).await?;
+        Ok(())
+    }
+
+    async fn run_prompt_for_message(
+        &self,
+        msg: &ChannelMessage,
+        kind: FeishuChatKind,
+        channel_control: &ChannelControl,
+        session: Arc<SessionAgent>,
+        user_input: Value,
+        user_blocks: Vec<Value>,
+        holder: String,
+    ) -> Result<ChannelCollectedUpdates> {
         let expose_output_tools = self.config.media_output || self.config.card_output;
         let tool_manager = session.tool_manager().await;
         if expose_output_tools {
             let bridge = Arc::new(FeishuReplyBridge {
                 rest: self.rest.clone(),
-                to: reply_target(&msg, kind).to_string(),
+                to: reply_target(msg, kind).to_string(),
             });
             let executor = Arc::new(FeishuToolExecutor::new(
                 bridge,
@@ -286,7 +316,7 @@ impl FeishuChannel {
         let request_permission = confirming_permission_requester(
             self.confirmations.clone(),
             self.channel.clone(),
-            reply_target(&msg, kind).to_string(),
+            reply_target(msg, kind).to_string(),
             holder,
         );
         let run_result = channel_control
@@ -305,7 +335,16 @@ impl FeishuChannel {
         run_result?;
 
         let collected = update_collector.finish().await;
-        let target = reply_target(&msg, kind);
+        Ok(collected)
+    }
+
+    async fn send_collected_response(
+        &self,
+        msg: &ChannelMessage,
+        kind: FeishuChatKind,
+        collected: &ChannelCollectedUpdates,
+    ) -> Result<()> {
+        let target = reply_target(msg, kind);
         if let Some(detail) = collected.detail_text.as_deref() {
             self.channel.send(detail, target).await?;
         }
@@ -367,12 +406,16 @@ impl FeishuChannel {
         if blocks.is_empty() {
             return Ok(None);
         }
-        append_channel_context(
-            &mut blocks,
-            "Feishu",
-            self.config.media_output,
-            self.config.card_output,
-        )?;
+        let mut instructions = Vec::new();
+        if self.config.media_output {
+            instructions
+                .push("本轮如需发送本地文件或图片，请使用 feishu_reply_media 回复当前飞书对话。");
+        }
+        if self.config.card_output {
+            instructions
+                .push("本轮如需发送飞书交互卡片，请使用 feishu_reply_card 回复当前飞书对话。");
+        }
+        append_channel_context(&mut blocks, "Feishu", &instructions);
 
         Ok(Some(mapper::normalize_prompt_blocks(&blocks)?))
     }
@@ -387,7 +430,7 @@ impl FeishuChannel {
             .join("attachments")
             .join("inbox")
             .join("feishu")
-            .join(sanitize_filename(&msg.id));
+            .join(sanitize_filename_or(&msg.id, "unknown"));
         tokio::fs::create_dir_all(&attachments_dir).await?;
         let resource_type = match media.kind {
             FeishuMediaKind::Image => "image",
@@ -840,25 +883,6 @@ fn is_feishu_image_path(path: &Path) -> bool {
     image_mime_type_for_path(path).is_some()
 }
 
-fn image_mime_type_for_path(path: &Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
-        Some("png") => Some("image/png"),
-        Some("gif") => Some("image/gif"),
-        Some("webp") => Some("image/webp"),
-        Some("bmp") => Some("image/bmp"),
-        Some("ico") => Some("image/x-icon"),
-        Some("tiff") | Some("tif") => Some("image/tiff"),
-        Some("heic") => Some("image/heic"),
-        _ => None,
-    }
-}
-
 fn feishu_file_type_for_path(path: &Path) -> &'static str {
     match path
         .extension()
@@ -930,97 +954,6 @@ fn message_text(content: &str, has_media: bool) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn resolve_config_path(agent_structure_dir: &Path, raw: &str) -> PathBuf {
-    let path = PathBuf::from(raw);
-    let resolved = if path.is_absolute() {
-        path
-    } else {
-        agent_structure_dir.join(path)
-    };
-    std::fs::canonicalize(&resolved).unwrap_or(resolved)
-}
-
-fn image_url_block_from_file(path: &Path, mime_type: &str) -> Result<Option<ContentBlock>> {
-    if !mime_type.starts_with("image/") {
-        return Ok(None);
-    }
-    let data = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-    Ok(Some(ContentBlock::Image(ImageContent::new(
-        encoded, mime_type,
-    ))))
-}
-
-fn append_channel_context(
-    blocks: &mut Vec<ContentBlock>,
-    channel: &str,
-    media_output: bool,
-    card_output: bool,
-) -> Result<()> {
-    let mut lines = vec![
-        "<channel_context>".to_string(),
-        format!("当前消息来自 {channel} 频道。"),
-    ];
-    if media_output {
-        lines.push(
-            "本轮如需发送本地文件或图片，请使用 feishu_reply_media 回复当前飞书对话。".to_string(),
-        );
-    }
-    if card_output {
-        lines.push(
-            "本轮如需发送飞书交互卡片，请使用 feishu_reply_card 回复当前飞书对话。".to_string(),
-        );
-    }
-    lines.push("</channel_context>".to_string());
-    blocks.push(ContentBlock::Text(TextContent::new(lines.join("\n"))));
-    Ok(())
-}
-
-fn resource_link_block(
-    uri: &str,
-    name: Option<&str>,
-    mime_type: Option<&str>,
-) -> Result<ContentBlock> {
-    let uri = uri.trim();
-    if uri.is_empty() {
-        bail!("resource_link block must provide uri");
-    }
-    let name = name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("attachment");
-    let mut link = ResourceLink::new(name, uri);
-    if let Some(mime_type) = mime_type.map(str::trim).filter(|value| !value.is_empty()) {
-        link = link.mime_type(mime_type.to_string());
-    }
-    Ok(ContentBlock::ResourceLink(link))
-}
-
-fn file_uri_from_path(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let encoded = percent_encode_file_path(&normalized);
-    if encoded.starts_with("//") {
-        format!("file:{encoded}")
-    } else if encoded.starts_with('/') {
-        format!("file://{encoded}")
-    } else {
-        format!("file:///{encoded}")
-    }
-}
-
-fn percent_encode_file_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 fn default_media_filename(kind: FeishuMediaKind, mime_type: &str) -> String {
     let stem = match kind {
         FeishuMediaKind::Image => "image",
@@ -1034,46 +967,5 @@ fn default_mime_type(resource_type: &str) -> &'static str {
     match resource_type {
         "image" => "image/jpeg",
         _ => "application/octet-stream",
-    }
-}
-
-fn extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
-    match mime_type {
-        "image/jpeg" => Some("jpg"),
-        "image/png" => Some("png"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        "image/bmp" => Some("bmp"),
-        "text/plain" => Some("txt"),
-        "text/markdown" => Some("md"),
-        "application/json" => Some("json"),
-        "application/pdf" => Some("pdf"),
-        "application/zip" => Some("zip"),
-        "audio/mpeg" => Some("mp3"),
-        "audio/wav" => Some("wav"),
-        "audio/ogg" => Some("ogg"),
-        "video/mp4" => Some("mp4"),
-        "video/quicktime" => Some("mov"),
-        "video/webm" => Some("webm"),
-        _ => None,
-    }
-}
-
-fn sanitize_filename(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches('.').trim().to_string();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
     }
 }

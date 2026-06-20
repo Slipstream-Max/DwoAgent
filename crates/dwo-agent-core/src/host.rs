@@ -34,7 +34,7 @@ async fn run_host(agent_folder: &Path, mode: HostMode) -> Result<()> {
 
 async fn run_profile_host(agent: Arc<AgentService>, agent_structure_dir: &Path) -> Result<()> {
     let lease_registry = Arc::new(SessionLeaseRegistry::new());
-    let mut channels = ChannelRuntime::new_with_leases(
+    let channels = ChannelRuntime::new_with_leases(
         agent.clone(),
         agent_structure_dir,
         lease_registry.clone(),

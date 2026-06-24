@@ -217,7 +217,7 @@ impl ToolRunManager {
             if has_multiple_file_writes && is_file_write_tool(&tool_name) {
                 let output = ToolOutput::error(
                     &tool_name,
-                    "Multiple file write tool calls in one assistant turn are not allowed. Combine the changes into one file_edit patch, one write_file call, or one text_replace call.",
+                    "Multiple file write tool calls in one assistant turn are not allowed. Combine the changes into one file_edit patch.",
                 );
                 self.emit_tool_update(
                     context,
@@ -431,34 +431,6 @@ mod tests {
             output.get("error").and_then(Value::as_str),
             Some("Tool is disabled: file_edit")
         );
-
-        let output = manager
-            .execute_tool_call(
-                "call-2",
-                "text_replace",
-                Some(&json!({"path": "notes.txt", "old_text": "a", "new_text": "b"})),
-                None,
-            )
-            .await;
-
-        assert_eq!(
-            output.get("error").and_then(Value::as_str),
-            Some("Tool is disabled: text_replace")
-        );
-
-        let output = manager
-            .execute_tool_call(
-                "call-3",
-                "write_file",
-                Some(&json!({"filePath": "notes.txt", "content": "alpha"})),
-                None,
-            )
-            .await;
-
-        assert_eq!(
-            output.get("error").and_then(Value::as_str),
-            Some("Tool is disabled: write_file")
-        );
     }
 
     #[tokio::test]
@@ -472,7 +444,7 @@ mod tests {
             .execute_tool_call(
                 "call-1",
                 "file_edit",
-                Some(&json!({"patchText": "*** Begin Patch\n*** Add File: notes.txt\n+alpha\n*** End Patch"})),
+                Some(&json!({"patchText": "*** Begin Patch\n*** Write File: notes.txt\n+alpha\n*** End Patch"})),
                 None,
             )
             .await;
@@ -482,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_replace_updates_file() {
+    async fn file_edit_replace_all_updates_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.txt"), "alpha\nbeta\n").unwrap();
         let manager = ToolRunManager::new(Some(tmp.path()), 30, AgentTools::default())
@@ -492,14 +464,14 @@ mod tests {
         let output = manager
             .execute_tool_call(
                 "call-1",
-                "text_replace",
-                Some(&json!({"path": "notes.txt", "old_text": "beta", "new_text": "gamma"})),
+                "file_edit",
+                Some(&json!({"patch": "*** Begin Patch\n*** Replace All: notes.txt\n-beta\n+gamma\n*** End Patch"})),
                 None,
             )
             .await;
 
         assert_eq!(output["status"], "completed");
-        assert_eq!(output["replacements"], 1);
+        assert_eq!(output["replacements"][0]["count"], 1);
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("notes.txt")).unwrap(),
             "alpha\ngamma\n"
@@ -507,7 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_replaces_entire_file() {
+    async fn file_edit_write_file_replaces_entire_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("notes.txt");
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
@@ -518,15 +490,15 @@ mod tests {
         let output = manager
             .execute_tool_call(
                 "call-1",
-                "write_file",
-                Some(&json!({"filePath": "notes.txt", "content": "gamma"})),
+                "file_edit",
+                Some(&json!({"patch": "*** Begin Patch\n*** Write File: notes.txt\n+gamma\n*** End Patch"})),
                 None,
             )
             .await;
 
         assert_eq!(output["status"], "completed");
-        assert_eq!(output["tool"], "write_file");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gamma");
+        assert_eq!(output["tool"], "file_edit");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gamma\n");
     }
 
     #[tokio::test]
@@ -606,7 +578,7 @@ mod tests {
                     json!({
                         "tool_call_id": "edit-1",
                         "name": "file_edit",
-                        "arguments": {"patch": "*** Begin Patch\n*** Add File: a.txt\n+alpha\n*** End Patch"},
+                        "arguments": {"patch": "*** Begin Patch\n*** Write File: a.txt\n+alpha\n*** End Patch"},
                     }),
                     json!({
                         "tool_call_id": "term-1",
@@ -615,21 +587,16 @@ mod tests {
                     }),
                     json!({
                         "tool_call_id": "edit-2",
-                        "name": "text_replace",
-                        "arguments": {"path": "existing.txt", "old_text": "alpha", "new_text": "beta"},
-                    }),
-                    json!({
-                        "tool_call_id": "edit-3",
-                        "name": "write_file",
-                        "arguments": {"filePath": "other.txt", "content": "other"},
+                        "name": "file_edit",
+                        "arguments": {"patch": "*** Begin Patch\n*** Replace All: existing.txt\n-alpha\n+beta\n*** End Patch"},
                     }),
                 ],
                 None,
             )
             .await;
 
-        assert_eq!(outputs.len(), 4);
-        for output in [&outputs[0], &outputs[2], &outputs[3]] {
+        assert_eq!(outputs.len(), 3);
+        for output in [&outputs[0], &outputs[2]] {
             assert_eq!(output["status"], "error");
             assert!(
                 output["error"]

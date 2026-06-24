@@ -32,7 +32,7 @@ pub fn resolve_tool_policy(
     let mode = parse_policy_mode(mode_id)?;
     let name = tool_name.trim();
 
-    if matches!(name, "file_edit" | "text_replace" | "write_file") {
+    if name == "file_edit" {
         return Ok(match mode.as_str() {
             MODE_FULL_ACCESS => ToolPolicyAction::Allow,
             MODE_CONFIRM => ToolPolicyAction::Confirm,
@@ -394,36 +394,6 @@ mod tests {
         );
         assert!(matches!(
             resolve_tool_policy(MODE_WATCH, "file_edit", args, &policy).unwrap(),
-            ToolPolicyAction::Reject(_)
-        ));
-
-        let args_value = json!({"path": "notes.txt", "old_text": "a", "new_text": "b"});
-        let args = args_value.as_object().unwrap();
-        assert_eq!(
-            resolve_tool_policy(MODE_FULL_ACCESS, "text_replace", args, &policy).unwrap(),
-            ToolPolicyAction::Allow
-        );
-        assert_eq!(
-            resolve_tool_policy(MODE_CONFIRM, "text_replace", args, &policy).unwrap(),
-            ToolPolicyAction::Confirm
-        );
-        assert!(matches!(
-            resolve_tool_policy(MODE_WATCH, "text_replace", args, &policy).unwrap(),
-            ToolPolicyAction::Reject(_)
-        ));
-
-        let args_value = json!({"filePath": "notes.txt", "content": "alpha"});
-        let args = args_value.as_object().unwrap();
-        assert_eq!(
-            resolve_tool_policy(MODE_FULL_ACCESS, "write_file", args, &policy).unwrap(),
-            ToolPolicyAction::Allow
-        );
-        assert_eq!(
-            resolve_tool_policy(MODE_CONFIRM, "write_file", args, &policy).unwrap(),
-            ToolPolicyAction::Confirm
-        );
-        assert!(matches!(
-            resolve_tool_policy(MODE_WATCH, "write_file", args, &policy).unwrap(),
             ToolPolicyAction::Reject(_)
         ));
     }

@@ -1168,7 +1168,7 @@ fn test_policy_mode_change_applies_to_next_tool_call_in_running_turn() {
     let workspace = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let patch =
-        "*** Begin Patch\n*** Add File: live_policy.txt\n+policy switched live\n*** End Patch\n"
+        "*** Begin Patch\n*** Write File: live_policy.txt\n+policy switched live\n*** End Patch\n"
             .to_string();
     let mock = ToolCallingLlm::start_with_first_response_delay(Duration::from_millis(800), patch);
     let folder = create_mock_agent_folder(tmp.path(), mock.port);

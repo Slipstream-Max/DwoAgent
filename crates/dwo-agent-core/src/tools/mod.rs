@@ -19,8 +19,7 @@ pub use builtin::{
     FileEditError, PermissionRequester, SendSubagentPayload, SpawnSubagentPayload, StateSetter,
     SubagentExecutor, SubagentIdPayload, TerminalExecutor, TerminalHandle, TerminalSession,
     ToolExecutionContext, UpdateEmitter, WaitTarget, file_edit_text, parse_wait_target,
-    subagent_not_found, terminal_not_found, text_replace_file, wait_seconds, wait_session,
-    write_file,
+    subagent_not_found, terminal_not_found, wait_seconds, wait_session,
 };
 pub use schema::{tool_schemas, tool_schemas_from_templates};
 pub use session::{Cap, ToolArgs, ToolSession};

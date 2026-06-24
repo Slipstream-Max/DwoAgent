@@ -9,9 +9,10 @@ use thiserror::Error;
 
 pub const BEGIN_PATCH: &str = "*** Begin Patch";
 pub const END_PATCH: &str = "*** End Patch";
-pub const ADD_FILE: &str = "*** Add File: ";
+pub const WRITE_FILE: &str = "*** Write File: ";
 pub const DELETE_FILE: &str = "*** Delete File: ";
 pub const UPDATE_FILE: &str = "*** Update File: ";
+pub const REPLACE_ALL: &str = "*** Replace All: ";
 pub const MOVE_TO: &str = "*** Move to: ";
 pub const CHANGE_CONTEXT: &str = "@@";
 pub const END_OF_FILE: &str = "*** End of File";
@@ -28,7 +29,7 @@ impl FileEditError {
 }
 
 #[derive(Debug, Clone)]
-pub struct AddFile {
+pub struct WriteFile {
     pub path: String,
     pub lines: Vec<String>,
 }
@@ -55,10 +56,18 @@ pub struct UpdateFile {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReplaceAll {
+    pub path: String,
+    pub old_lines: Vec<String>,
+    pub new_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Operation {
-    Add(AddFile),
+    Write(WriteFile),
     Delete(DeleteFile),
     Update(UpdateFile),
+    ReplaceAll(ReplaceAll),
 }
 
 struct TextFile {
@@ -76,20 +85,6 @@ pub fn execute_file_tool(name: &str, args: &Map<String, Value>, cwd: &Path) -> R
                 .unwrap_or("");
             file_edit_text(patch, cwd)
         }
-        "write_file" => {
-            let args = write_file_args(args)?;
-            write_file(&args.path, &args.content, cwd)
-        }
-        "text_replace" => {
-            let args = text_replace_args(args)?;
-            text_replace_file(
-                &args.path,
-                &args.old_text,
-                &args.new_text,
-                args.replace_all,
-                cwd,
-            )
-        }
         other => Err(FileEditError::new(format!("Unknown file tool: {other}")).into()),
     }
 }
@@ -103,14 +98,25 @@ pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
     let mut added: Vec<String> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
+    let mut replacements: Vec<Value> = Vec::new();
 
     for operation in operations {
         match operation {
-            Operation::Add(add) => {
-                let path = resolve_workspace_path(&root, &add.path)?;
-                let content = format!("{}\n", add.lines.join("\n"));
-                write_text(&path, &content, true)?;
-                added.push(relative_display(&root, &path));
+            Operation::Write(write) => {
+                let path = resolve_workspace_path(&root, &write.path)?;
+                let existed = path.is_file();
+                let bom = if existed {
+                    read_text_file(&path)?.bom
+                } else {
+                    true
+                };
+                let content = patch_lines_to_file_content(&write.lines);
+                write_text(&path, &content, bom)?;
+                if existed {
+                    modified.push(relative_display(&root, &path));
+                } else {
+                    added.push(relative_display(&root, &path));
+                }
             }
             Operation::Delete(del) => {
                 let path = resolve_workspace_path(&root, &del.path)?;
@@ -156,6 +162,34 @@ pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
                     modified.push(relative_display(&root, &source_path));
                 }
             }
+            Operation::ReplaceAll(replace) => {
+                let path = resolve_workspace_path(&root, &replace.path)?;
+                if !path.is_file() {
+                    return Err(FileEditError::new(format!(
+                        "File to replace all does not exist: {}",
+                        replace.path
+                    ))
+                    .into());
+                }
+                let original = read_text_file(&path)?;
+                let line_ending = detect_line_ending(&original.text);
+                let old = convert_line_endings(
+                    &normalize_line_endings(&replace.old_lines.join("\n")),
+                    line_ending,
+                );
+                let new = convert_line_endings(
+                    &normalize_line_endings(&replace.new_lines.join("\n")),
+                    line_ending,
+                );
+                let (updated, count) = replace_all_text(&original.text, &old, &new)?;
+                write_text(&path, &updated, original.bom)?;
+                let relative = relative_display(&root, &path);
+                modified.push(relative.clone());
+                replacements.push(json!({
+                    "path": relative,
+                    "count": count,
+                }));
+            }
         }
     }
 
@@ -166,135 +200,8 @@ pub fn file_edit_text(patch: &str, cwd: &Path) -> Result<Value> {
         "added": added,
         "modified": modified,
         "deleted": deleted,
+        "replacements": replacements,
     }))
-}
-
-/// Create a file or fully replace an existing one.
-pub fn write_file(raw_path: &str, content: &str, cwd: &Path) -> Result<Value> {
-    let root = std::fs::canonicalize(cwd)
-        .with_context(|| format!("resolve workspace root {}", cwd.display()))?;
-    let path = resolve_workspace_path(&root, &non_empty_path(raw_path)?)?;
-    let bom = if path.is_file() {
-        read_text_file(&path)?.bom
-    } else {
-        true
-    };
-    write_text(&path, content, bom)?;
-    Ok(json!({
-        "tool": "write_file",
-        "kind": "file_edit",
-        "status": "completed",
-        "modified": [relative_display(&root, &path)],
-    }))
-}
-
-/// Replace exact text in a single existing file.
-pub fn text_replace_file(
-    raw_path: &str,
-    old_text: &str,
-    new_text: &str,
-    replace_all: bool,
-    cwd: &Path,
-) -> Result<Value> {
-    let root = std::fs::canonicalize(cwd)
-        .with_context(|| format!("resolve workspace root {}", cwd.display()))?;
-    let path = resolve_workspace_path(&root, &non_empty_path(raw_path)?)?;
-    if !path.is_file() {
-        return Err(
-            FileEditError::new(format!("File to text_replace does not exist: {raw_path}")).into(),
-        );
-    }
-
-    let original = read_text_file(&path)?;
-    let line_ending = detect_line_ending(&original.text);
-    let old = convert_line_endings(&normalize_line_endings(old_text), line_ending);
-    let new = convert_line_endings(&normalize_line_endings(new_text), line_ending);
-    if old.is_empty() {
-        return Err(FileEditError::new("old_text must not be empty.").into());
-    }
-    if old == new {
-        return Err(FileEditError::new("old_text and new_text must be different.").into());
-    }
-
-    let replacements = original.text.matches(&old).count();
-    if replacements == 0 {
-        return Err(FileEditError::new("Text replace target not found.").into());
-    }
-    if !replace_all && replacements > 1 {
-        return Err(FileEditError::new(
-            "Text replace target is not unique. Set replace_all to true to replace every match.",
-        )
-        .into());
-    }
-
-    let updated = if replace_all {
-        original.text.replace(&old, &new)
-    } else {
-        original.text.replacen(&old, &new, 1)
-    };
-    write_text(&path, &updated, original.bom)?;
-
-    Ok(json!({
-        "tool": "text_replace",
-        "kind": "file_edit",
-        "status": "completed",
-        "modified": [relative_display(&root, &path)],
-        "replacements": if replace_all { replacements } else { 1 },
-    }))
-}
-
-struct TextReplaceArgs {
-    path: String,
-    old_text: String,
-    new_text: String,
-    replace_all: bool,
-}
-
-#[derive(Debug, Clone)]
-struct WriteFileArgs {
-    path: String,
-    content: String,
-}
-
-fn text_replace_args(args: &Map<String, Value>) -> Result<TextReplaceArgs> {
-    Ok(TextReplaceArgs {
-        path: required_string(args, "path")?,
-        old_text: required_string(args, "old_text")?,
-        new_text: required_string(args, "new_text")?,
-        replace_all: optional_bool(args, "replace_all")?.unwrap_or(false),
-    })
-}
-
-fn write_file_args(args: &Map<String, Value>) -> Result<WriteFileArgs> {
-    Ok(WriteFileArgs {
-        path: {
-            let value = args
-                .get("filePath")
-                .or_else(|| args.get("path"))
-                .ok_or_else(|| anyhow::anyhow!("filePath is required."))?;
-            match value {
-                Value::String(value) => value.clone(),
-                _ => anyhow::bail!("filePath must be a string."),
-            }
-        },
-        content: required_string(args, "content")?,
-    })
-}
-
-fn required_string(args: &Map<String, Value>, key: &str) -> Result<String> {
-    match args.get(key) {
-        Some(Value::String(value)) => Ok(value.clone()),
-        Some(_) => anyhow::bail!("{key} must be a string."),
-        None => anyhow::bail!("{key} is required."),
-    }
-}
-
-fn optional_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>> {
-    match args.get(key) {
-        Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(_) => anyhow::bail!("{key} must be a boolean."),
-        None => Ok(None),
-    }
 }
 
 /// Parse patch text into an ordered list of operations.
@@ -317,9 +224,9 @@ pub fn parse_patch(patch: &str) -> Result<Vec<Operation>> {
 
     while index < end_index {
         let line = lines[index];
-        if let Some(rest) = line.strip_prefix(ADD_FILE) {
-            let (op, next) = parse_add_file(&lines, index, end_index, rest)?;
-            operations.push(Operation::Add(op));
+        if let Some(rest) = line.strip_prefix(WRITE_FILE) {
+            let (op, next) = parse_write_file(&lines, index, end_index, rest)?;
+            operations.push(Operation::Write(op));
             index = next;
         } else if let Some(rest) = line.strip_prefix(DELETE_FILE) {
             operations.push(Operation::Delete(DeleteFile {
@@ -329,6 +236,10 @@ pub fn parse_patch(patch: &str) -> Result<Vec<Operation>> {
         } else if let Some(rest) = line.strip_prefix(UPDATE_FILE) {
             let (op, next) = parse_update_file(&lines, index, end_index, rest)?;
             operations.push(Operation::Update(op));
+            index = next;
+        } else if let Some(rest) = line.strip_prefix(REPLACE_ALL) {
+            let (op, next) = parse_replace_all(&lines, index, end_index, rest)?;
+            operations.push(Operation::ReplaceAll(op));
             index = next;
         } else if line.trim().is_empty() {
             index += 1;
@@ -343,30 +254,80 @@ pub fn parse_patch(patch: &str) -> Result<Vec<Operation>> {
     Ok(operations)
 }
 
-fn parse_add_file(
+fn parse_write_file(
     lines: &[&str],
     start: usize,
     end_index: usize,
     first_rest: &str,
-) -> Result<(AddFile, usize)> {
+) -> Result<(WriteFile, usize)> {
     let path = non_empty_path(first_rest)?;
     let mut index = start + 1;
-    let mut add_lines: Vec<String> = Vec::new();
+    let mut write_lines: Vec<String> = Vec::new();
     while index < end_index && !is_operation_header(lines[index]) {
         let line = lines[index];
         if !line.starts_with('+') {
-            return Err(FileEditError::new("Add File body lines must start with '+'.").into());
+            return Err(FileEditError::new("Write File body lines must start with '+'.").into());
         }
-        add_lines.push(line[1..].to_string());
+        write_lines.push(line[1..].to_string());
         index += 1;
     }
-    if add_lines.is_empty() {
-        return Err(FileEditError::new(format!("Add File body is empty: {path}")).into());
-    }
     Ok((
-        AddFile {
+        WriteFile {
             path,
-            lines: add_lines,
+            lines: write_lines,
+        },
+        index,
+    ))
+}
+
+fn parse_replace_all(
+    lines: &[&str],
+    start: usize,
+    end_index: usize,
+    first_rest: &str,
+) -> Result<(ReplaceAll, usize)> {
+    let path = non_empty_path(first_rest)?;
+    let mut index = start + 1;
+    let mut old_lines: Vec<String> = Vec::new();
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut saw_new = false;
+
+    while index < end_index && !is_operation_header(lines[index]) {
+        let line = lines[index];
+        if line.is_empty() {
+            return Err(FileEditError::new("Replace All lines must start with '-' or '+'.").into());
+        }
+        let (prefix, text) = line.split_at(1);
+        match prefix {
+            "-" if !saw_new => old_lines.push(text.to_string()),
+            "-" => {
+                return Err(FileEditError::new(
+                    "Replace All old text lines must come before replacement lines.",
+                )
+                .into());
+            }
+            "+" => {
+                saw_new = true;
+                new_lines.push(text.to_string());
+            }
+            _ => {
+                return Err(
+                    FileEditError::new("Replace All lines must start with '-' or '+'.").into(),
+                );
+            }
+        }
+        index += 1;
+    }
+
+    if old_lines.is_empty() {
+        return Err(FileEditError::new(format!("Replace All old text is empty: {path}")).into());
+    }
+
+    Ok((
+        ReplaceAll {
+            path,
+            old_lines,
+            new_lines,
         },
         index,
     ))
@@ -516,6 +477,33 @@ fn apply_update_segments(content: &str, segments: &[UpdateSegment]) -> Result<St
         joined.push('\n');
     }
     Ok(joined)
+}
+
+fn patch_lines_to_file_content(lines: &[String]) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn replace_all_text(content: &str, old: &str, new: &str) -> Result<(String, usize)> {
+    if old.is_empty() {
+        return Err(FileEditError::new("Replace All old text must not be empty.").into());
+    }
+    if old == new {
+        return Err(FileEditError::new(
+            "Replace All old text and replacement text must be different.",
+        )
+        .into());
+    }
+
+    let replacements = content.matches(old).count();
+    if replacements == 0 {
+        return Err(FileEditError::new("Replace All target not found.").into());
+    }
+
+    Ok((content.replace(old, new), replacements))
 }
 
 fn find_single_line(lines: &[String], needle: &str, start: usize) -> Result<usize> {
@@ -800,9 +788,10 @@ fn relative_display(root: &Path, path: &Path) -> String {
 }
 
 fn is_operation_header(line: &str) -> bool {
-    line.starts_with(ADD_FILE)
+    line.starts_with(WRITE_FILE)
         || line.starts_with(DELETE_FILE)
         || line.starts_with(UPDATE_FILE)
+        || line.starts_with(REPLACE_ALL)
         || line.trim() == END_PATCH
 }
 
@@ -824,7 +813,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let patch = r#"
 *** Begin Patch
-*** Add File: notes.txt
+*** Write File: notes.txt
 +alpha
 +beta
 *** Update File: notes.txt
@@ -986,88 +975,112 @@ mod tests {
     }
 
     #[test]
-    fn text_replace_replaces_unique_text() {
+    fn replace_all_replaces_unique_text() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("notes.txt");
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let patch = r#"
+*** Begin Patch
+*** Replace All: notes.txt
+-beta
++gamma
+*** End Patch
+"#;
 
-        let output = text_replace_file("notes.txt", "beta", "gamma", false, tmp.path()).unwrap();
+        let output = file_edit_text(patch, tmp.path()).unwrap();
 
-        assert_eq!(output["tool"], "text_replace");
+        assert_eq!(output["tool"], "file_edit");
         assert_eq!(output["kind"], "file_edit");
         assert_eq!(output["status"], "completed");
-        assert_eq!(output["replacements"], 1);
+        assert_eq!(output["replacements"][0]["count"], 1);
         assert_eq!(read_text(&path).unwrap(), "alpha\ngamma\n");
         assert!(!has_utf8_bom(&path).unwrap());
     }
 
     #[test]
-    fn write_file_creates_and_overwrites() {
+    fn write_file_operation_creates_and_overwrites() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("notes.txt");
 
-        let output = write_file("notes.txt", "alpha\n", tmp.path()).unwrap();
-        assert_eq!(output["tool"], "write_file");
-        assert_eq!(output["kind"], "file_edit");
-        assert_eq!(output["status"], "completed");
-        assert!(has_utf8_bom(&path).unwrap());
-        assert_eq!(read_utf8_bom_text(&path).unwrap(), "alpha\n");
-
-        let output = write_file("notes.txt", "beta", tmp.path()).unwrap();
-        assert_eq!(output["status"], "completed");
-        assert_eq!(read_utf8_bom_text(&path).unwrap(), "beta");
-    }
-
-    #[test]
-    fn text_replace_preserves_crlf_and_bom() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("notes.txt");
-        write_utf8_bom_text_for_test(&path, "alpha\r\nbeta\r\n").unwrap();
-
-        let output = text_replace_file(
-            "notes.txt",
-            "alpha\nbeta",
-            "gamma\ndelta",
-            false,
+        let output = file_edit_text(
+            "*** Begin Patch\n*** Write File: notes.txt\n+alpha\n*** End Patch",
             tmp.path(),
         )
         .unwrap();
+        assert_eq!(output["tool"], "file_edit");
+        assert_eq!(output["kind"], "file_edit");
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["added"][0], "notes.txt");
+        assert!(has_utf8_bom(&path).unwrap());
+        assert_eq!(read_utf8_bom_text(&path).unwrap(), "alpha\n");
+
+        let output = file_edit_text(
+            "*** Begin Patch\n*** Write File: notes.txt\n+beta\n*** End Patch",
+            tmp.path(),
+        )
+        .unwrap();
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["modified"][0], "notes.txt");
+        assert_eq!(read_utf8_bom_text(&path).unwrap(), "beta\n");
+    }
+
+    #[test]
+    fn replace_all_preserves_crlf_and_bom() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("notes.txt");
+        write_utf8_bom_text_for_test(&path, "alpha\r\nbeta\r\n").unwrap();
+        let patch = r#"
+*** Begin Patch
+*** Replace All: notes.txt
+-alpha
+-beta
++gamma
++delta
+*** End Patch
+"#;
+
+        let output = file_edit_text(patch, tmp.path()).unwrap();
 
         assert_eq!(output["status"], "completed");
+        assert_eq!(output["replacements"][0]["count"], 1);
         assert!(has_utf8_bom(&path).unwrap());
         assert_eq!(read_utf8_bom_text(&path).unwrap(), "gamma\r\ndelta\r\n");
     }
 
     #[test]
-    fn text_replace_rejects_non_unique_target_by_default() {
-        let tmp = tempdir().unwrap();
-        std::fs::write(tmp.path().join("notes.txt"), "alpha\nalpha\n").unwrap();
-
-        let error = text_replace_file("notes.txt", "alpha", "beta", false, tmp.path()).unwrap_err();
-
-        assert!(error.to_string().contains("target is not unique"));
-    }
-
-    #[test]
-    fn text_replace_can_replace_all_matches() {
+    fn replace_all_replaces_all_matches() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("notes.txt");
         std::fs::write(&path, "alpha\nalpha\n").unwrap();
+        let patch = r#"
+*** Begin Patch
+*** Replace All: notes.txt
+-alpha
++beta
+*** End Patch
+"#;
 
-        let output = text_replace_file("notes.txt", "alpha", "beta", true, tmp.path()).unwrap();
+        let output = file_edit_text(patch, tmp.path()).unwrap();
 
-        assert_eq!(output["replacements"], 2);
+        assert_eq!(output["replacements"][0]["count"], 2);
         assert_eq!(read_text(&path).unwrap(), "beta\nbeta\n");
     }
 
     #[test]
-    fn text_replace_rejects_empty_old_text() {
+    fn replace_all_rejects_empty_old_text() {
         let tmp = tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.txt"), "alpha\n").unwrap();
+        let patch = r#"
+*** Begin Patch
+*** Replace All: notes.txt
+-
++beta
+*** End Patch
+"#;
 
-        let error = text_replace_file("notes.txt", "", "beta", false, tmp.path()).unwrap_err();
+        let error = file_edit_text(patch, tmp.path()).unwrap_err();
 
-        assert!(error.to_string().contains("old_text must not be empty"));
+        assert!(error.to_string().contains("old text must not be empty"));
     }
 
     #[test]
@@ -1077,7 +1090,7 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
         let patch = r#"
 *** Begin Patch
-*** Add File: ../outside.txt
+*** Write File: ../outside.txt
 +outside
 *** End Patch
 "#;
@@ -1095,7 +1108,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("absolute.txt");
         let patch = format!(
-            "*** Begin Patch\n*** Add File: {}\n+absolute\n*** End Patch\n",
+            "*** Begin Patch\n*** Write File: {}\n+absolute\n*** End Patch\n",
             path.display()
         );
 

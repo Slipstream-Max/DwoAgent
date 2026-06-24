@@ -50,20 +50,6 @@ const TOOL_SPECS: &[ToolSpec] = &[
         is_file_write: true,
     },
     ToolSpec {
-        name: "text_replace",
-        kind: "file_edit",
-        route: ToolRoute::Immediate,
-        gate: ToolGate::FileEdit,
-        is_file_write: true,
-    },
-    ToolSpec {
-        name: "write_file",
-        kind: "file_edit",
-        route: ToolRoute::Immediate,
-        gate: ToolGate::FileEdit,
-        is_file_write: true,
-    },
-    ToolSpec {
         name: "terminal_exec",
         kind: "terminal",
         route: ToolRoute::CreateSession,
@@ -163,17 +149,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_tools_share_gate_and_kind() {
+    fn file_edit_is_file_write() {
         let file_edit = lookup_tool("file_edit").unwrap();
-        let text_replace = lookup_tool("text_replace").unwrap();
-        let write_file = lookup_tool("write_file").unwrap();
 
         assert_eq!(file_edit.kind, "file_edit");
-        assert_eq!(text_replace.kind, "file_edit");
-        assert_eq!(write_file.kind, "file_edit");
         assert!(file_edit.is_file_write());
-        assert!(text_replace.is_file_write());
-        assert!(write_file.is_file_write());
+        assert!(lookup_tool("text_replace").is_none());
+        assert!(lookup_tool("write_file").is_none());
     }
 
     #[test]

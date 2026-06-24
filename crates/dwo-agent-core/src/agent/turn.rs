@@ -270,6 +270,9 @@ async fn request_assistant_message_stream(
     runtime: &mut TurnRuntime<'_>,
 ) -> Result<AssistantStreamResult> {
     inject_pending_watcher_content(runtime).await;
+    maybe_compact_with_activity(runtime).await?;
+    raise_if_cancelled(runtime.activity.cancel_event())?;
+
     let messages_for_model = runtime
         .context_manager
         .messages_for_model(runtime.model_client.capabilities.vision);

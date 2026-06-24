@@ -7,6 +7,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -19,6 +20,7 @@ struct CompactionMockLlm {
     _handle: thread::JoinHandle<()>,
     port: u16,
     compaction_count: Arc<AtomicUsize>,
+    request_kinds: Arc<Mutex<Vec<RequestKind>>>,
 }
 
 impl CompactionMockLlm {
@@ -27,11 +29,14 @@ impl CompactionMockLlm {
         let port = listener.local_addr().unwrap().port();
         let compaction_count = Arc::new(AtomicUsize::new(0));
         let cc = compaction_count.clone();
+        let request_kinds = Arc::new(Mutex::new(Vec::new()));
+        let kinds_for_thread = request_kinds.clone();
 
         let handle = thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let cc = cc.clone();
-                thread::spawn(move || handle_http_request(stream, cc));
+                let kinds = kinds_for_thread.clone();
+                thread::spawn(move || handle_http_request(stream, cc, kinds));
             }
         });
         thread::sleep(Duration::from_millis(50));
@@ -39,11 +44,30 @@ impl CompactionMockLlm {
             _handle: handle,
             port,
             compaction_count,
+            request_kinds,
         }
+    }
+
+    fn clear_request_kinds(&self) {
+        self.request_kinds.lock().unwrap().clear();
+    }
+
+    fn request_kinds(&self) -> Vec<RequestKind> {
+        self.request_kinds.lock().unwrap().clone()
     }
 }
 
-fn handle_http_request(mut stream: std::net::TcpStream, compaction_count: Arc<AtomicUsize>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Compaction,
+    Normal,
+}
+
+fn handle_http_request(
+    mut stream: std::net::TcpStream,
+    compaction_count: Arc<AtomicUsize>,
+    request_kinds: Arc<Mutex<Vec<RequestKind>>>,
+) {
     // Read the full HTTP request.
     let mut buf_reader = BufReader::new(&stream);
     let mut request_line = String::new();
@@ -87,6 +111,11 @@ fn handle_http_request(mut stream: std::net::TcpStream, compaction_count: Arc<At
     if is_compaction {
         compaction_count.fetch_add(1, Ordering::SeqCst);
     }
+    request_kinds.lock().unwrap().push(if is_compaction {
+        RequestKind::Compaction
+    } else {
+        RequestKind::Normal
+    });
 
     let response_text = if is_compaction {
         "Summary: The user said hello."
@@ -280,6 +309,38 @@ fn find_binary() -> PathBuf {
     panic!("dwoagent not found");
 }
 
+fn find_session_context_file(agent_folder: &Path, session_id: &str) -> PathBuf {
+    let sessions = agent_folder.join(".sessions");
+    let mut stack = vec![sessions];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read session dir {}: {err}", dir.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) == Some(session_id) {
+                    return path.join("model_context.json");
+                }
+                stack.push(path);
+            }
+        }
+    }
+    panic!("session dir not found for {session_id}");
+}
+
+fn rewrite_persisted_usage(agent_folder: &Path, session_id: &str, used: u64, size: u64) {
+    let context_file = find_session_context_file(agent_folder, session_id);
+    let raw = std::fs::read_to_string(&context_file)
+        .unwrap_or_else(|err| panic!("read {}: {err}", context_file.display()));
+    let mut payload: Value = serde_json::from_str(&raw).unwrap();
+    payload["usage"] = json!({"used": used, "size": size});
+    std::fs::write(
+        &context_file,
+        serde_json::to_string_pretty(&payload).unwrap(),
+    )
+    .unwrap_or_else(|err| panic!("write {}: {err}", context_file.display()));
+}
+
 // ── Test ───────────────────────────────────────────────────────────────────
 
 #[test]
@@ -322,4 +383,52 @@ fn test_compaction_triggers_after_token_threshold() {
 
     let count2 = mock.compaction_count.load(Ordering::SeqCst);
     assert!(count2 >= 2, "Expected 2+ compactions, got count={count2}");
+}
+
+#[test]
+fn test_loaded_high_usage_session_compacts_before_model_request() {
+    let mock = CompactionMockLlm::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = create_agent_folder(tmp.path(), mock.port);
+    let sid = {
+        let mut c = AcpClient::spawn(&folder);
+        c.request("initialize", json!({"protocolVersion": 1}));
+        let s = c.request("session/new", json!({"cwd": ".", "mcpServers": []}));
+        let sid = s["sessionId"].as_str().unwrap().to_string();
+        c.request(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{"type": "text", "text": "Hello"}]
+            }),
+        );
+        sid
+    };
+
+    rewrite_persisted_usage(&folder, &sid, 120, 1_024_000);
+    mock.clear_request_kinds();
+
+    let mut c = AcpClient::spawn(&folder);
+    c.request("initialize", json!({"protocolVersion": 1}));
+    c.request(
+        "session/load",
+        json!({"cwd": ".", "sessionId": sid, "mcpServers": []}),
+    );
+    c.request(
+        "session/prompt",
+        json!({
+            "sessionId": sid,
+            "prompt": [{"type": "text", "text": "Second"}]
+        }),
+    );
+
+    let kinds = mock.request_kinds();
+    assert!(
+        matches!(kinds.first(), Some(RequestKind::Compaction)),
+        "Expected loaded high-usage session to compact before normal model request, got: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| *kind == RequestKind::Normal),
+        "Expected prompt to continue to a normal model request after compaction, got: {kinds:?}"
+    );
 }

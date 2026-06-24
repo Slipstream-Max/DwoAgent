@@ -1060,7 +1060,7 @@ Function IsDwoAgentSupervisorRunning()
   For Each process In processes
     command = process.CommandLine
     If Not IsNull(command) Then
-      If InStr(1, command, "supervisor run", 1) > 0 Then
+      If InStr(1, command, exePath, 1) > 0 And InStr(1, command, "supervisor run", 1) > 0 Then
         IsDwoAgentSupervisorRunning = True
         Exit Function
       End If
@@ -1111,9 +1111,15 @@ fn windows_supervisor_status() -> Result<Option<String>> {
 }
 
 fn windows_supervisor_processes() -> Result<Vec<SupervisorProcess>> {
-    let script = "$matches = foreach ($process in Get-CimInstance Win32_Process) { \
+    let script = "$selfPid = $PID; \
+       $matches = foreach ($process in Get-CimInstance Win32_Process) { \
          $command = $process.CommandLine; \
-         if ($null -ne $command -and $command.IndexOf('supervisor run', [StringComparison]::OrdinalIgnoreCase) -ge 0) { \
+         $exe = $process.ExecutablePath; \
+         if ($process.ProcessId -ne $selfPid -and \
+             $null -ne $command -and \
+             $null -ne $exe -and \
+             [IO.Path]::GetFileName($exe).Equals('dwoagent.exe', [StringComparison]::OrdinalIgnoreCase) -and \
+             $command.IndexOf('supervisor run', [StringComparison]::OrdinalIgnoreCase) -ge 0) { \
            [pscustomobject]@{ pid = [int]$process.ProcessId; command_line = $command }; \
          } \
        }; \

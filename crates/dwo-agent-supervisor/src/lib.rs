@@ -33,7 +33,7 @@ const LINUX_SYSTEMD_UNIT: &str = "dwoagent-supervisor.service";
 const LINUX_DESKTOP_FILE: &str = "dwoagent-supervisor.desktop";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SupervisorConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -60,7 +60,7 @@ impl Default for SupervisorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SupervisorEndpointConfig {
     #[serde(default = "default_websocket_bind_addr")]
     pub websocket_bind_addr: String,
@@ -85,7 +85,7 @@ pub struct SupervisorProfileConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SupervisorPoolConfig {
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
@@ -342,6 +342,7 @@ struct SupervisorState {
     config: SupervisorConfig,
     worker_pool: WorkerPool,
     event_bus: SessionEventBus,
+    config_cache: SessionConfigCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -360,6 +361,132 @@ struct SupervisorConnectionContext {
 struct SessionEventBus {
     subscribers: Mutex<HashMap<SessionKey, HashMap<String, mpsc::UnboundedSender<Value>>>>,
     by_connection: Mutex<HashMap<String, HashSet<SessionKey>>>,
+}
+
+#[derive(Default)]
+struct SessionConfigCache {
+    sessions: Mutex<HashMap<SessionKey, Vec<Value>>>,
+}
+
+impl SessionConfigCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn update_from_response(
+        &self,
+        profile: &str,
+        session_id: Option<String>,
+        response: &Value,
+    ) {
+        let Some(session_id) = session_id.or_else(|| session_id_from_response(response)) else {
+            return;
+        };
+        let Some(config_options) = config_options_from_value(response) else {
+            return;
+        };
+        self.sessions.lock().await.insert(
+            SessionKey {
+                profile: profile.to_string(),
+                session_id,
+            },
+            config_options,
+        );
+    }
+
+    async fn update_from_event(&self, profile: &str, event: &Value) {
+        if event.get("method").and_then(Value::as_str) != Some("session/update") {
+            return;
+        }
+        let Some(params) = event.get("params") else {
+            return;
+        };
+        let Some(session_id) = session_id_from_params(params) else {
+            return;
+        };
+        let Some(update) = params.get("update") else {
+            return;
+        };
+
+        match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some("config_option_update") => {
+                if let Some(config_options) = config_options_from_value(update) {
+                    self.merge_config_options(profile, &session_id, config_options)
+                        .await;
+                }
+            }
+            Some("current_mode_update") => {
+                if let Some(value) = update.get("currentModeId").and_then(Value::as_str) {
+                    self.apply_config_value(profile, &session_id, "policy_mode", value)
+                        .await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn apply_control(&self, profile: &str, control: &ControlRequest) -> Vec<Value> {
+        let key = SessionKey {
+            profile: profile.to_string(),
+            session_id: control.session_id.clone(),
+        };
+        let mut sessions = self.sessions.lock().await;
+        let options = sessions
+            .entry(key)
+            .or_insert_with(|| vec![fallback_config_option("policy_mode", MODE_FULL_ACCESS)]);
+        let Some(index) = options.iter().position(|option| {
+            option.get("id").and_then(Value::as_str) == Some(&control.config_id)
+        }) else {
+            let option = fallback_config_option(&control.config_id, &control.value);
+            options.push(option);
+            return options.clone();
+        };
+        if let Some(option) = options[index].as_object_mut() {
+            option.insert(
+                "currentValue".to_string(),
+                Value::String(control.value.clone()),
+            );
+        }
+        ensure_current_value_is_selectable(&mut options[index]);
+        options.clone()
+    }
+
+    async fn apply_config_value(
+        &self,
+        profile: &str,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) {
+        let control = ControlRequest {
+            session_id: session_id.to_string(),
+            config_id: config_id.to_string(),
+            value: value.to_string(),
+            response_kind: ControlResponseKind::SetConfigOption,
+        };
+        self.apply_control(profile, &control).await;
+    }
+
+    async fn merge_config_options(&self, profile: &str, session_id: &str, incoming: Vec<Value>) {
+        let key = SessionKey {
+            profile: profile.to_string(),
+            session_id: session_id.to_string(),
+        };
+        let mut sessions = self.sessions.lock().await;
+        let cached = sessions.entry(key).or_default();
+        for option in incoming {
+            let Some(option_id) = option.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            match cached
+                .iter()
+                .position(|item| item.get("id").and_then(Value::as_str) == Some(option_id))
+            {
+                Some(index) => cached[index] = option,
+                None => cached.push(option),
+            }
+        }
+    }
 }
 
 impl SessionEventBus {
@@ -476,6 +603,7 @@ impl SupervisorState {
         Ok(Self {
             worker_pool: WorkerPool::new(env::current_exe().context("resolve current executable")?),
             event_bus: SessionEventBus::new(),
+            config_cache: SessionConfigCache::new(),
             config,
         })
     }
@@ -487,7 +615,7 @@ impl SupervisorState {
                 .config
                 .default_profile
                 .as_deref()
-                .context("no profile requested and supervisor.default_profile is not set")?,
+                .context("no profile requested and supervisor.defaultProfile is not set")?,
         };
         let profile = self
             .config
@@ -556,12 +684,13 @@ impl SupervisorState {
                 {
                     return Ok(result);
                 }
+                let request_session_id = session_id_from_params(&params);
                 if let Some(connection) = connection.as_ref()
                     && should_subscribe_for_request(method)
-                    && let Some(session_id) = session_id_from_params(&params)
+                    && let Some(session_id) = request_session_id.as_deref()
                 {
                     self.event_bus
-                        .subscribe(connection, &profile.id, &session_id)
+                        .subscribe(connection, &profile.id, session_id)
                         .await;
                 }
                 let request_id = request.id.clone();
@@ -583,6 +712,9 @@ impl SupervisorState {
                         let exclude_connection_id = exclude_connection_id.clone();
                         let emit_future = emit_event(supervisor_event);
                         async move {
+                            self.config_cache
+                                .update_from_event(&profile_id_for_bus, &event_for_bus)
+                                .await;
                             if should_fanout_events {
                                 self.event_bus
                                     .broadcast_worker_event(
@@ -596,6 +728,9 @@ impl SupervisorState {
                         }
                     })
                     .await?;
+                self.config_cache
+                    .update_from_response(&profile.id, request_session_id, &result)
+                    .await;
                 if let Some(connection) = connection.as_ref()
                     && method == "session/new"
                     && let Some(session_id) = session_id_from_response(&result)
@@ -659,13 +794,17 @@ impl SupervisorState {
         let Some(control) = ControlRequest::from_worker_request(method, params)? else {
             return Ok(None);
         };
+        if !self.worker_pool.is_profile_busy(&profile.id).await {
+            return Ok(None);
+        }
+        let config_options = self.config_cache.apply_control(&profile.id, &control).await;
         self.worker_pool
             .notify(
                 profile,
                 "_dwo/session/set_config_option",
                 json!({
-                    "session_id": control.session_id.clone(),
-                    "config_id": control.config_id.clone(),
+                    "sessionId": control.session_id.clone(),
+                    "configId": control.config_id.clone(),
                     "value": control.value.clone(),
                 }),
                 &self.config.pool,
@@ -677,11 +816,15 @@ impl SupervisorState {
                 .await;
         }
         self.event_bus
-            .broadcast_worker_event(&profile.id, &control.session_update_event(), None)
+            .broadcast_worker_event(
+                &profile.id,
+                &control.session_update_event(config_options.clone()),
+                None,
+            )
             .await;
         Ok(Some(json!({
             "profile": profile.id,
-            "result": control.response(),
+            "result": control.response(config_options),
         })))
     }
 
@@ -737,7 +880,6 @@ impl ControlRequest {
                     .context("session/set_mode requires `sessionId`")?;
                 let mode_id = params
                     .get("modeId")
-                    .or_else(|| params.get("mode_id"))
                     .and_then(Value::as_str)
                     .context("session/set_mode requires `modeId`")?;
                 let value = parse_policy_mode(mode_id)?;
@@ -751,7 +893,6 @@ impl ControlRequest {
             "session/set_config_option" => {
                 let config_id = params
                     .get("configId")
-                    .or_else(|| params.get("config_id"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if !matches!(config_id, "policy_mode" | "model" | "reasoning_mode") {
@@ -777,16 +918,16 @@ impl ControlRequest {
         }
     }
 
-    fn response(&self) -> Value {
+    fn response(&self, config_options: Vec<Value>) -> Value {
         match self.response_kind {
             ControlResponseKind::SetMode => json!({}),
             ControlResponseKind::SetConfigOption => json!({
-                "configOptions": [self.config_option()],
+                "configOptions": config_options,
             }),
         }
     }
 
-    fn session_update_event(&self) -> Value {
+    fn session_update_event(&self, config_options: Vec<Value>) -> Value {
         if self.config_id == "policy_mode" {
             return json!({
                 "method": "session/update",
@@ -805,57 +946,74 @@ impl ControlRequest {
                 "sessionId": self.session_id,
                 "update": {
                     "sessionUpdate": "config_option_update",
-                    "configOptions": [self.config_option()],
+                    "configOptions": config_options,
                 },
             },
         })
     }
+}
 
-    fn config_option(&self) -> Value {
-        match self.config_id.as_str() {
-            "policy_mode" => json!({
-                "id": "policy_mode",
-                "name": "Policy",
-                "category": "mode",
-                "type": "select",
-                "currentValue": self.value,
-                "options": [
-                    {"id": MODE_FULL_ACCESS, "name": "Full Access"},
-                    {"id": MODE_CONFIRM, "name": "Confirm"},
-                    {"id": MODE_WATCH, "name": "Watch"},
-                ],
-            }),
-            "model" => json!({
-                "id": "model",
-                "name": "Model",
-                "category": "model",
-                "type": "select",
-                "currentValue": self.value,
-                "options": [],
-            }),
-            "reasoning_mode" => json!({
-                "id": "reasoning_mode",
-                "name": "Reasoning Mode",
-                "category": "thought_level",
-                "type": "select",
-                "currentValue": self.value,
-                "options": [],
-            }),
-            _ => json!({
-                "id": self.config_id,
-                "name": self.config_id,
-                "type": "select",
-                "currentValue": self.value,
-                "options": [],
-            }),
-        }
+fn config_options_from_value(value: &Value) -> Option<Vec<Value>> {
+    value
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|items| items.to_vec())
+}
+
+fn fallback_config_option(config_id: &str, value: &str) -> Value {
+    let (name, category) = match config_id {
+        "policy_mode" => ("Policy", "mode"),
+        "model" => ("Model", "model"),
+        "reasoning_mode" => ("Reasoning Mode", "thought_level"),
+        other => (other, "mode"),
+    };
+    let options = if config_id == "policy_mode" {
+        vec![
+            json!({"value": MODE_FULL_ACCESS, "name": "Full Access"}),
+            json!({"value": MODE_CONFIRM, "name": "Confirm"}),
+            json!({"value": MODE_WATCH, "name": "Watch"}),
+        ]
+    } else if value.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"value": value, "name": value})]
+    };
+    json!({
+        "id": config_id,
+        "name": name,
+        "category": category,
+        "type": "select",
+        "currentValue": value,
+        "options": options,
+    })
+}
+
+fn ensure_current_value_is_selectable(option: &mut Value) {
+    let current_value = option
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if current_value.is_empty() {
+        return;
+    }
+    let Some(options) = option.get_mut("options").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let has_value = options
+        .iter()
+        .any(|item| item.get("value").and_then(Value::as_str) == Some(current_value.as_str()));
+    if !has_value {
+        options.push(json!({
+            "value": current_value,
+            "name": current_value,
+        }));
     }
 }
 
 fn session_id_from_params(params: &Value) -> Option<String> {
     params
         .get("sessionId")
-        .or_else(|| params.get("session_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -865,7 +1023,6 @@ fn session_id_from_params(params: &Value) -> Option<String> {
 fn session_id_from_response(response: &Value) -> Option<String> {
     response
         .get("sessionId")
-        .or_else(|| response.get("session_id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1006,6 +1163,17 @@ impl WorkerPool {
         let worker = self.ensure_worker(profile, pool_config).await?;
         worker.touch().await;
         worker.notify(method, params).await
+    }
+
+    async fn is_profile_busy(&self, profile_id: &str) -> bool {
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(profile_id).cloned()
+        };
+        match worker {
+            Some(worker) => worker.is_busy().await,
+            None => false,
+        }
     }
 
     async fn ensure_worker(
@@ -2034,6 +2202,7 @@ mod tests {
                 Vec::new(),
             )),
             event_bus: SessionEventBus::new(),
+            config_cache: SessionConfigCache::new(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2155,6 +2324,7 @@ mod tests {
                 Vec::new(),
             )),
             event_bus: SessionEventBus::new(),
+            config_cache: SessionConfigCache::new(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2244,7 +2414,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_config_request_is_acknowledged_while_prompt_is_running() -> Result<()> {
+    async fn config_request_is_acknowledged_with_cached_options_while_prompt_is_running()
+    -> Result<()> {
         let (fake_worker_exe, fake_worker_args, fake_worker_script) =
             fake_control_worker_command()?;
         let profile_id = "test-profile".to_string();
@@ -2271,6 +2442,7 @@ mod tests {
                 Vec::new(),
             )),
             event_bus: SessionEventBus::new(),
+            config_cache: SessionConfigCache::new(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2289,6 +2461,21 @@ mod tests {
         websocket
             .send(Message::Text(
                 json!({
+                    "id": "new",
+                    "type": "worker.request",
+                    "secret": secret,
+                    "profile": profile_id,
+                    "method": "session/new",
+                    "params": {},
+                })
+                .to_string(),
+            ))
+            .await?;
+        wait_supervisor_result(&mut websocket, "new").await?;
+
+        websocket
+            .send(Message::Text(
+                json!({
                     "id": "prompt",
                     "type": "worker.request",
                     "secret": secret,
@@ -2303,27 +2490,46 @@ mod tests {
         websocket
             .send(Message::Text(
                 json!({
-                    "id": "policy",
+                    "id": "model",
                     "type": "worker.request",
                     "secret": "test-secret",
                     "profile": "test-profile",
                     "method": "session/set_config_option",
                     "params": {
                         "sessionId": "s1",
-                        "configId": "policy_mode",
-                        "value": "watch"
+                        "configId": "model",
+                        "value": "mock-flash"
                     },
                 })
                 .to_string(),
             ))
             .await?;
 
-        let response = wait_supervisor_result(&mut websocket, "policy").await?;
+        let response = wait_supervisor_result(&mut websocket, "model").await?;
+        let config_options = response
+            .pointer("/result/result/configOptions")
+            .and_then(Value::as_array)
+            .context("configOptions should be an array")?;
+        assert_eq!(config_options.len(), 3);
+        let model_option = config_options
+            .iter()
+            .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+            .context("model config option should be present")?;
         assert_eq!(
-            response
-                .pointer("/result/result/configOptions/0/currentValue")
+            model_option.get("currentValue").and_then(Value::as_str),
+            Some("mock-flash")
+        );
+        assert_eq!(
+            model_option
+                .pointer("/options/0/value")
                 .and_then(Value::as_str),
-            Some("watch")
+            Some("mock-model")
+        );
+        assert_eq!(
+            model_option
+                .pointer("/options/1/value")
+                .and_then(Value::as_str),
+            Some("mock-flash")
         );
 
         let _ = websocket.close(None).await;
@@ -2500,6 +2706,80 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   if ($null -ne $message.id) {
     if ($message.method -eq 'session/prompt') {
       $pending = [string]$message.id
+      continue
+    }
+    if ($message.method -eq 'session/new') {
+      $response = @{
+        jsonrpc = '2.0'
+        id = [string]$message.id
+        result = @{
+          sessionId = 's1'
+          configOptions = @(
+            @{
+              id = 'policy_mode'
+              name = 'Policy'
+              category = 'mode'
+              type = 'select'
+              currentValue = 'full_access'
+              options = @(
+                @{ value = 'full_access'; name = 'Full Access' },
+                @{ value = 'confirm'; name = 'Confirm' },
+                @{ value = 'watch'; name = 'Watch' }
+              )
+            },
+            @{
+              id = 'model'
+              name = 'Model'
+              category = 'model'
+              type = 'select'
+              currentValue = 'mock-model'
+              options = @(
+                @{ value = 'mock-model'; name = 'Mock Model' },
+                @{ value = 'mock-flash'; name = 'Mock Flash' }
+              )
+            },
+            @{
+              id = 'reasoning_mode'
+              name = 'Reasoning Mode'
+              category = 'thought_level'
+              type = 'select'
+              currentValue = 'auto'
+              options = @(
+                @{ value = 'auto'; name = 'auto' },
+                @{ value = 'max'; name = 'max' }
+              )
+            }
+          )
+        }
+      } | ConvertTo-Json -Depth 12 -Compress
+      [Console]::Out.WriteLine($response)
+      [Console]::Out.Flush()
+      continue
+    }
+    if ($message.method -eq 'session/set_config_option') {
+      $configId = [string]$message.params.configId
+      $value = [string]$message.params.value
+      $response = @{
+        jsonrpc = '2.0'
+        id = [string]$message.id
+        result = @{
+          configOptions = @(
+            @{
+              id = $configId
+              name = $configId
+              category = 'model'
+              type = 'select'
+              currentValue = $value
+              options = @(
+                @{ value = 'mock-model'; name = 'Mock Model' },
+                @{ value = 'mock-flash'; name = 'Mock Flash' }
+              )
+            }
+          )
+        }
+      } | ConvertTo-Json -Depth 12 -Compress
+      [Console]::Out.WriteLine($response)
+      [Console]::Out.Flush()
       continue
     }
     $response = @{

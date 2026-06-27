@@ -28,7 +28,7 @@ const AUTOMATION_STATE_FILE: &str = "state.yaml";
 const RUN_FILE: &str = "run.yaml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -52,7 +52,7 @@ impl AutomationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationJobConfig {
     pub id: String,
     #[serde(default = "default_true")]
@@ -70,7 +70,12 @@ pub struct AutomationJobConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "mode",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum AutomationSessionConfig {
     New,
     Fixed { session_id: String },
@@ -84,14 +89,19 @@ impl Default for AutomationSessionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum AutomationSchedule {
     Interval { every_seconds: u64 },
     Daily { at: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationNotifyConfig {
     pub channel: AutomationNotifyChannel,
     #[serde(default)]
@@ -106,7 +116,7 @@ pub enum AutomationNotifyChannel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationNotifyRecipient {
     #[serde(rename = "type")]
     pub recipient_type: String,
@@ -114,7 +124,7 @@ pub struct AutomationNotifyRecipient {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AutomationStickyState {
     job_id: String,
     session_id: String,
@@ -138,7 +148,7 @@ pub fn load_automation_config(agent_structure_dir: &Path) -> Result<AutomationCo
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationRunRecord {
     pub job_id: String,
     pub run_id: String,
@@ -171,7 +181,7 @@ pub enum AutomationRunStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationNotificationRecord {
     pub channel: AutomationNotifyChannel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -814,27 +824,27 @@ mod tests {
         std::fs::write(
             tmp.path().join("agent.yaml"),
             r#"
-agent_id: test-agent
+agentId: test-agent
 name: Test Agent
 description: test
-policy_mode: confirm
+policyMode: confirm
 model:
-  default_model_id: test
+  defaultModelId: test
   models: []
 automation:
   enabled: true
   jobs:
     - id: daily_digest
       enabled: true
-      workspace_dir: .
+      workspaceDir: .
       session:
         mode: fixed
-        session_id: abc-123
+        sessionId: abc-123
       schedule:
         type: daily
         at: "09:00"
       prompt: "总结今天"
-      response_detail: detailed
+      responseDetail: detailed
       notify:
         - channel: weixin
         - channel: feishu
@@ -871,7 +881,7 @@ session:
   mode: new
 schedule:
   type: interval
-  every_seconds: 1
+  everySeconds: 1
 prompt: run
 "#,
         )
@@ -885,7 +895,7 @@ session:
   mode: sticky
 schedule:
   type: interval
-  every_seconds: 1
+  everySeconds: 1
 prompt: run
 "#,
         )

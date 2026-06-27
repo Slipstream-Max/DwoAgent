@@ -21,23 +21,23 @@ cargo run -- agent run --agent-profile examples/weixin-agent
 ```
 
 The Weixin channel routes messages to an ordinary session. When no
-`default_session_id` is configured, the first inbound message creates a normal
+`defaultSessionId` is configured, the first inbound message creates a normal
 session using the initial model settings from `agent.yaml`:
 
 ```yaml
 channels:
   weixin:
-    media_input: true
-    media_output: true
-    response_detail: response_only
-    override_model: deepseek-v4-pro
-    override_reasoning_mode: high
+    mediaInput: true
+    mediaOutput: true
+    responseDetail: response_only
+    overrideModel: deepseek-v4-pro
+    overrideReasoningMode: high
 ```
 
 These overrides only apply when the channel creates a new default ordinary
 session. After that, the session keeps its own model and reasoning mode.
 
-When `media_output: false`, `weixin_reply_media(path)` is not exposed on
+When `mediaOutput: false`, `weixin_reply_media(path)` is not exposed on
 Weixin-triggered turns and the channel will not attach the Weixin media sender
 for tool calls.
 

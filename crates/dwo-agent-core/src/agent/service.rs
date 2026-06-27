@@ -707,22 +707,22 @@ mod tests {
             root.join("agent.yaml"),
             format!(
                 "\
-agent_id: test-agent
+agentId: test-agent
 name: Test Agent
 description: Test
-max_running_turn: {max_running_turn}
-policy_mode: confirm
-session_store_dir: {session_store_dir}
+maxRunningTurn: {max_running_turn}
+policyMode: confirm
+sessionStoreDir: {session_store_dir}
 tools:
 {tools}
 model:
-  default_model_id: mock-model
+  defaultModelId: mock-model
   models:
-    - model_name: mock-model
+    - modelName: mock-model
       provider: deepseek
-      model_id: deepseek-v4-pro
-      api_key: test-key
-      default_reasoning_mode: auto
+      modelId: deepseek-v4-pro
+      apiKey: test-key
+      defaultReasoningMode: auto
 "
             ),
         )
@@ -738,7 +738,7 @@ model:
         write_agent_folder(
             &agent_dir,
             7,
-            "  file_edit: disable\n  terminal: enable\n  subagent: disable",
+            "  fileEdit: disable\n  terminal: enable\n  subagent: disable",
         );
         let cwd = tmp.path().to_string_lossy().to_string();
 
@@ -751,7 +751,7 @@ model:
         write_agent_folder(
             &agent_dir,
             3,
-            "  file_edit: enable\n  terminal: enable\n  subagent: enable",
+            "  fileEdit: enable\n  terminal: enable\n  subagent: enable",
         );
         let service = AgentService::new(&agent_dir).unwrap();
         let loaded = service.load_session(&session_id).await.unwrap().unwrap();
@@ -771,7 +771,7 @@ model:
         write_agent_folder_with_dirs(
             &agent_dir,
             7,
-            "  file_edit: enable\n  terminal: enable\n  subagent: enable",
+            "  fileEdit: enable\n  terminal: enable\n  subagent: enable",
             "agent-sessions",
         );
 

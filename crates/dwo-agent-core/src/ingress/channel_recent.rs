@@ -269,7 +269,7 @@ mod tests {
             .iter()
             .map(|(update_type, text)| {
                 json!({
-                    "updated_at": "2026-06-12T00:00:00.000000+00:00",
+                    "updatedAt": "2026-06-12T00:00:00.000000+00:00",
                     "update": {
                         "session_update": update_type,
                         "content": {"type": "text", "text": text}

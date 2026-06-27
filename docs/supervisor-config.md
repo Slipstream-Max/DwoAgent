@@ -21,28 +21,28 @@ dwoagent create supervisor --default
 ```yaml
 version: 1
 endpoint:
-  websocket_bind_addr: 127.0.0.1:8766
+  websocketBindAddr: 127.0.0.1:8766
   secret: dwo_sup_xxx
 profiles:
   - id: coder
     path: C:\Users\you\.dwoagent\profiles\coder
-default_profile: coder
+defaultProfile: coder
 pool:
-  max_workers: 3
-  idle_seconds: 600
+  maxWorkers: 3
+  idleSeconds: 600
 ```
 
 ## 字段
 
 - `version`：配置版本。当前为 `1`。
-- `endpoint.websocket_bind_addr`：supervisor WebSocket 监听地址。桌面 UI 和 shim 连接这里。
+- `endpoint.websocketBindAddr`：supervisor WebSocket 监听地址。桌面 UI 和 shim 连接这里。
 - `endpoint.secret`：请求鉴权 secret。空字符串表示不校验，推荐仅开发时使用。
 - `profiles`：profile 注册表。supervisor 只按这里声明的 id/path 调度 profile host。
 - `profiles[].id`：请求里的 profile id，例如 `coder`。
 - `profiles[].path`：agent profile 目录，目录内应包含 `agent.yaml`。
-- `default_profile`：请求未带 `profile` 时使用的 profile id。可为空，但此时请求必须显式带 `profile`。
-- `pool.max_workers`：最多保留的 worker 数量。超过时按最久未使用 worker 做 LRU 回收。
-- `pool.idle_seconds`：worker 空闲超过该秒数后回收。
+- `defaultProfile`：请求未带 `profile` 时使用的 profile id。可为空，但此时请求必须显式带 `profile`。
+- `pool.maxWorkers`：最多保留的 worker 数量。超过时按最久未使用 worker 做 LRU 回收。
+- `pool.idleSeconds`：worker 空闲超过该秒数后回收。
 
 ## 运行关系
 
@@ -64,7 +64,7 @@ supervisor 是 OS 自启动 daemon 的作用域；agent profile 不是 daemon �
 {"id":1,"type":"profiles.list","secret":"dwo_sup_xxx"}
 {"id":2,"type":"worker.request","secret":"dwo_sup_xxx","profile":"coder","method":"session/new","params":{"cwd":".","mcpServers":[]}}
 {"id":3,"type":"worker.request","secret":"dwo_sup_xxx","profile":"coder","method":"session/prompt","params":{"sessionId":"...","prompt":[{"type":"text","text":"hello"}]}}
-{"id":4,"type":"worker.request","secret":"dwo_sup_xxx","profile":"coder","method":"_dwo/session/context","params":{"session_id":"..."}}
+{"id":4,"type":"worker.request","secret":"dwo_sup_xxx","profile":"coder","method":"_dwo/session/context","params":{"sessionId":"..."}}
 ```
 
 长任务会先推 `supervisor.event`，最后推 `supervisor.result`：

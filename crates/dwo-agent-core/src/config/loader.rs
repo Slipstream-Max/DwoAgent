@@ -159,7 +159,7 @@ where
 // ── Private: build the merged registry payload ────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConfiguredModel {
     model_name: String,
     provider: String,
@@ -189,7 +189,7 @@ fn default_compact_threshold() -> f64 {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConfiguredModelRegistry {
     default_model_id: String,
     models: Vec<ConfiguredModel>,
@@ -248,20 +248,20 @@ fn build_model_registry_payload(raw: Map<String, Value>) -> Result<Map<String, V
             .collect();
 
         models_out.push(json!({
-            "model_name": item.model_name,
+            "modelName": item.model_name,
             "config": serde_json::to_value(&config)?,
             "capabilities": serde_json::to_value(&model_spec.capabilities)?,
-            "context_window": model_spec.context_window,
-            "max_output_tokens": model_spec.max_output_tokens,
-            "compact_threshold": item.compact_threshold,
-            "reasoning_modes": reasoning_modes,
-            "default_reasoning_mode": default_reasoning_mode,
+            "contextWindow": model_spec.context_window,
+            "maxOutputTokens": model_spec.max_output_tokens,
+            "compactThreshold": item.compact_threshold,
+            "reasoningModes": reasoning_modes,
+            "defaultReasoningMode": default_reasoning_mode,
         }));
     }
 
     let mut out = Map::new();
     out.insert(
-        "default_model_id".to_string(),
+        "defaultModelId".to_string(),
         Value::String(configured.default_model_id),
     );
     out.insert("models".to_string(), Value::Array(models_out));

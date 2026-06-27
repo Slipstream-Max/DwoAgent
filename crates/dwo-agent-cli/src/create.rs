@@ -111,12 +111,12 @@ fn agent_yaml(
     api_key_env: &str,
 ) -> Value {
     let mut root = Mapping::new();
-    root.insert(Value::from("agent_id"), Value::from(name));
+    root.insert(Value::from("agentId"), Value::from(name));
     root.insert(Value::from("name"), Value::from(name));
     root.insert(Value::from("description"), Value::from(description));
-    root.insert(Value::from("policy_mode"), Value::from("confirm"));
-    root.insert(Value::from("external_skills_dirs"), Value::Sequence(vec![]));
-    root.insert(Value::from("external_rule_files"), Value::Sequence(vec![]));
+    root.insert(Value::from("policyMode"), Value::from("confirm"));
+    root.insert(Value::from("externalSkillsDirs"), Value::Sequence(vec![]));
+    root.insert(Value::from("externalRuleFiles"), Value::Sequence(vec![]));
     root.insert(Value::from("tools"), tools_yaml());
     root.insert(
         Value::from("model"),
@@ -128,7 +128,7 @@ fn agent_yaml(
 
 fn tools_yaml() -> Value {
     let mut tools = Mapping::new();
-    tools.insert(Value::from("file_edit"), Value::from("enable"));
+    tools.insert(Value::from("fileEdit"), Value::from("enable"));
     tools.insert(Value::from("terminal"), Value::from("enable"));
     tools.insert(Value::from("subagent"), Value::from("enable"));
     Value::Mapping(tools)
@@ -136,14 +136,14 @@ fn tools_yaml() -> Value {
 
 fn model_yaml(provider: &str, model_name: &str, model_id: &str, api_key_env: &str) -> Value {
     let mut model = Mapping::new();
-    model.insert(Value::from("default_model_id"), Value::from(model_name));
+    model.insert(Value::from("defaultModelId"), Value::from(model_name));
 
     let mut entry = Mapping::new();
-    entry.insert(Value::from("model_name"), Value::from(model_name));
+    entry.insert(Value::from("modelName"), Value::from(model_name));
     entry.insert(Value::from("provider"), Value::from(provider));
-    entry.insert(Value::from("model_id"), Value::from(model_id));
-    entry.insert(Value::from("api_key_env"), Value::from(api_key_env));
-    entry.insert(Value::from("compact_threshold"), Value::from(0.8));
+    entry.insert(Value::from("modelId"), Value::from(model_id));
+    entry.insert(Value::from("apiKeyEnv"), Value::from(api_key_env));
+    entry.insert(Value::from("compactThreshold"), Value::from(0.8));
 
     model.insert(
         Value::from("models"),

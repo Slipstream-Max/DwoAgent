@@ -123,7 +123,7 @@ fn handle_http_request(
         "Hello from mock LLM with a long response to inflate tokens."
     };
 
-    // Report high token usage: with compact_threshold=0.0001 and
+    // Report high token usage: with compactThreshold=0.0001 and
     // context_window=1024000, trigger = 102 tokens. Report 120.
     let usage = json!({"prompt_tokens": 80, "completion_tokens": 40, "total_tokens": 120});
 
@@ -175,22 +175,22 @@ fn create_agent_folder(tmp_dir: &Path, llm_port: u16) -> PathBuf {
         agent_dir.join("agent.yaml"),
         format!(
             "\
-agent_id: test-agent
+agentId: test-agent
 name: Compaction Test Agent
 description: Test
-max_running_turn: 5
-policy_mode: full_access
-session_store_dir: .sessions
+maxRunningTurn: 5
+policyMode: full_access
+sessionStoreDir: .sessions
 model:
-  default_model_id: mock-model
+  defaultModelId: mock-model
   models:
-    - model_name: mock-model
+    - modelName: mock-model
       provider: deepseek
-      model_id: deepseek-v4-pro
-      api_key: test-key
-      api_base: http://127.0.0.1:{llm_port}/v1
-      default_reasoning_mode: auto
-      compact_threshold: 0.0001
+      modelId: deepseek-v4-pro
+      apiKey: test-key
+      apiBase: http://127.0.0.1:{llm_port}/v1
+      defaultReasoningMode: auto
+      compactThreshold: 0.0001
 "
         ),
     )

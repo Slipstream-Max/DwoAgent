@@ -1,26 +1,26 @@
-agent_id: weixin-agent
+agentId: weixin-agent
 name: weixin-agent
 description: Weixin single-user assistant example
-policy_mode: full_access
+policyMode: full_access
 tools:
-  file_edit: enable
+  fileEdit: enable
   terminal: enable
   subagent: disable
 model:
-  default_model_id: deepseek-v4-flash
+  defaultModelId: deepseek-v4-flash
   models:
-    - model_name: deepseek-v4-flash
+    - modelName: deepseek-v4-flash
       provider: deepseek
-      model_id: deepseek-v4-flash
-      api_key_env: DEEPSEEK_API_KEY
-      default_reasoning_mode: auto
-      compact_threshold: 0.8
-    - model_name: deepseek-v4-pro
+      modelId: deepseek-v4-flash
+      apiKeyEnv: DEEPSEEK_API_KEY
+      defaultReasoningMode: auto
+      compactThreshold: 0.8
+    - modelName: deepseek-v4-pro
       provider: deepseek
-      model_id: deepseek-v4-pro
-      api_key_env: DEEPSEEK_API_KEY
-      default_reasoning_mode: high
-      compact_threshold: 0.8
+      modelId: deepseek-v4-pro
+      apiKeyEnv: DEEPSEEK_API_KEY
+      defaultReasoningMode: high
+      compactThreshold: 0.8
 policy:
   terminal:
     deny:
@@ -36,7 +36,7 @@ policy:
       - prefix: rg
       - prefix: cargo check
       - prefix: cargo test
-    watch_allow:
+    watchAllow:
       - exact: git status
       - prefix: git diff
       - prefix: git show
@@ -48,9 +48,9 @@ policy:
 channels:
   weixin:
     enabled: true
-    workspace_dir: .
-    markdown_filter: true
-    media_input: true
-    media_output: true
-    override_model: deepseek-v4-pro
-    override_reasoning_mode: high
+    workspaceDir: .
+    markdownFilter: true
+    mediaInput: true
+    mediaOutput: true
+    overrideModel: deepseek-v4-pro
+    overrideReasoningMode: high

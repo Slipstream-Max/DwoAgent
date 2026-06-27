@@ -11,7 +11,7 @@ use crate::config::loader::{agent_yaml_path, read_agent_config_section};
 use crate::config::models::ReasoningMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WeixinChannelConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -77,7 +77,7 @@ impl Default for FeishuAccessPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FeishuChannelConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -135,7 +135,7 @@ impl Default for FeishuChannelConfig {
 
 /// Optional ingress configuration loaded from the `channels` section in agent.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChannelRuntimeConfig {
     #[serde(default)]
     pub weixin: WeixinChannelConfig,
@@ -192,11 +192,11 @@ mod tests {
             r#"
 weixin:
   enabled: true
-  media_output: true
-  response_detail: detailed
-  override_model: deepseek-v4-pro
-  override_reasoning_mode: high
-  default_session_id: s1
+  mediaOutput: true
+  responseDetail: detailed
+  overrideModel: deepseek-v4-pro
+  overrideReasoningMode: high
+  defaultSessionId: s1
 "#,
         )
         .unwrap();
@@ -224,20 +224,20 @@ weixin:
             r#"
 feishu:
   enabled: true
-  workspace_dir: .
+  workspaceDir: .
   domain: feishu
-  dm_policy: allow_all
-  group_policy: white_list
-  allow_from: ["*"]
-  group_allow_from: ["oc_abc"]
-  group_require_mention: true
-  media_input: true
-  media_output: true
-  card_output: true
-  response_detail: detailed
-  override_model: deepseek-v4-pro
-  override_reasoning_mode: high
-  default_session_id: s2
+  dmPolicy: allow_all
+  groupPolicy: white_list
+  allowFrom: ["*"]
+  groupAllowFrom: ["oc_abc"]
+  groupRequireMention: true
+  mediaInput: true
+  mediaOutput: true
+  cardOutput: true
+  responseDetail: detailed
+  overrideModel: deepseek-v4-pro
+  overrideReasoningMode: high
+  defaultSessionId: s2
 "#,
         )
         .unwrap();

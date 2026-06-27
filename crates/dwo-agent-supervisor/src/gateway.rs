@@ -185,7 +185,7 @@ async fn run_automation_job_loop(
             &state,
             &profile,
             "_dwo/automation/run_job",
-            json!({ "job_id": job_id }),
+            json!({ "jobId": job_id }),
         )
         .await?;
         let notifications = response
@@ -203,9 +203,9 @@ async fn run_automation_job_loop(
         let Some(record) = response.get("record") else {
             continue;
         };
-        let run_id = record.get("run_id").and_then(Value::as_str).unwrap_or("");
+        let run_id = record.get("runId").and_then(Value::as_str).unwrap_or("");
         let session_id = record
-            .get("session_id")
+            .get("sessionId")
             .and_then(Value::as_str)
             .unwrap_or("");
         if run_id.is_empty() || session_id.is_empty() {
@@ -216,9 +216,9 @@ async fn run_automation_job_loop(
             &profile,
             "_dwo/automation/record_delivery",
             json!({
-                "job_id": job_id,
-                "run_id": run_id,
-                "session_id": session_id,
+                "jobId": job_id,
+                "runId": run_id,
+                "sessionId": session_id,
                 "notifications": delivery_records,
             }),
         )

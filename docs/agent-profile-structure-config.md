@@ -32,43 +32,43 @@
 最小可用配置：
 
 ```yaml
-agent_id: dwo-agent
+agentId: dwo-agent
 name: dwo-agent
 description: Dwo Agent runtime
-policy_mode: confirm
+policyMode: confirm
 tools:
-  file_edit: enable
+  fileEdit: enable
   terminal: enable
   subagent: enable
 model:
-  default_model_id: deepseek-v4-pro
+  defaultModelId: deepseek-v4-pro
   models:
-    - model_name: deepseek-v4-pro
+    - modelName: deepseek-v4-pro
       provider: deepseek
-      model_id: deepseek-v4-pro
-      api_key_env: DEEPSEEK_API_KEY
-      default_reasoning_mode: high
-      compact_threshold: 0.8
+      modelId: deepseek-v4-pro
+      apiKeyEnv: DEEPSEEK_API_KEY
+      defaultReasoningMode: high
+      compactThreshold: 0.8
 ```
 
 顶层字段：
 
-- `agent_id`：必填 id，用于 session metadata 和展示。
+- `agentId`：必填 id，用于 session metadata 和展示。
 - `name`：必填显示名称。
 - `description`：必填简短描述。
-- `policy_mode`：必填权限策略。允许 `full_access`、`confirm`、`watch`。
-- `max_running_turn`：可选正整数。省略时，agent loop 运行到模型停止、取消或出错。
-- `session_store_dir`：可选，默认 `runtime/sessions`。
+- `policyMode`：必填权限策略。允许 `full_access`、`confirm`、`watch`。
+- `maxRunningTurn`：可选正整数。省略时，agent loop 运行到模型停止、取消或出错。
+- `sessionStoreDir`：可选，默认 `runtime/sessions`。
 - Channel state 固定写入 `runtime/channel_state`，不提供 `agent.yaml` 配置项。
-- `external_skills_dirs`：可选，额外 skill roots，相对路径按 agent folder 解析。
-- `external_rule_files`：可选，额外 rule 文件，相对路径按 agent folder 解析。
-- `tools`：可选。支持 `file_edit`、`terminal`、`subagent`，每个值为 `enable` 或 `disable`，默认启用。
+- `externalSkillsDirs`：可选，额外 skill roots，相对路径按 agent folder 解析。
+- `externalRuleFiles`：可选，额外 rule 文件，相对路径按 agent folder 解析。
+- `tools`：可选。支持 `fileEdit`、`terminal`、`subagent`，每个值为 `enable` 或 `disable`，默认启用。
 
 运行时行为：
 
-- `tools`、`max_running_turn`、policy mode、model id、reasoning mode、tool schemas 会在 session 创建时快照。
+- `tools`、`maxRunningTurn`、policy mode、model id、reasoning mode、tool schemas 会在 session 创建时快照。
 - 修改 `agent.yaml` 会影响新 session；已有 session 保留自己的持久化快照。
-- 普通 session 写入 `<session_store_dir>/<year>/<month>/<day>/<session_id>/`。
+- 普通 session 写入 `<sessionStoreDir>/<year>/<month>/<day>/<sessionId>/`。
 
 ## model
 
@@ -76,33 +76,33 @@ model:
 
 ```yaml
 model:
-  default_model_id: deepseek-v4-pro
+  defaultModelId: deepseek-v4-pro
   models:
-    - model_name: deepseek-v4-pro
+    - modelName: deepseek-v4-pro
       provider: deepseek
-      model_id: deepseek-v4-pro
-      api_key_env: DEEPSEEK_API_KEY
-      default_reasoning_mode: high
-      compact_threshold: 0.8
+      modelId: deepseek-v4-pro
+      apiKeyEnv: DEEPSEEK_API_KEY
+      defaultReasoningMode: high
+      compactThreshold: 0.8
 ```
 
-- `default_model_id`：必填默认模型别名，必须匹配某个 `model_name`。
+- `defaultModelId`：必填默认模型别名，必须匹配某个 `modelName`。
 - `models`：非空模型别名列表。
-- `model_name`：会话使用的本地模型别名。
+- `modelName`：会话使用的本地模型别名。
 - `provider`：内置 provider catalog 里的 provider id。
-- `model_id`：内置 provider catalog 里的 provider model id。
-- `api_key_env`：可选，读取 API key 的环境变量名。
-- `api_key`：可选，内联 API key。
-- `api_base`：可选，provider base URL 覆盖。
-- `temperature`、`top_p`、`timeout_seconds`、`max_tokens`：可选请求参数。
-- `default_reasoning_mode`：可选 reasoning mode，必须被所选 catalog model 支持。
-- `compact_threshold`：可选上下文压缩阈值，范围 `(0, 1]`，默认 `0.8`。
+- `modelId`：内置 provider catalog 里的 provider model id。
+- `apiKeyEnv`：可选，读取 API key 的环境变量名。
+- `apiKey`：可选，内联 API key。
+- `apiBase`：可选，provider base URL 覆盖。
+- `temperature`、`topP`、`timeoutSeconds`、`maxTokens`：可选请求参数。
+- `defaultReasoningMode`：可选 reasoning mode，必须被所选 catalog model 支持。
+- `compactThreshold`：可选上下文压缩阈值，范围 `(0, 1]`，默认 `0.8`。
 
 运行时会把 `model` section 和内置 provider catalog 合并。catalog 提供模型能力、context window、max output tokens 和支持的 reasoning modes。
 
 ## policy
 
-`policy` section 配置 terminal 命令黑白名单。它不决定当前 mode；默认 mode 仍由顶层 `policy_mode` 决定。
+`policy` section 配置 terminal 命令黑白名单。它不决定当前 mode；默认 mode 仍由顶层 `policyMode` 决定。
 
 ```yaml
 policy:
@@ -115,7 +115,7 @@ policy:
       - prefix: git diff
       - prefix: rg
       - prefix: cargo check
-    watch_allow:
+    watchAllow:
       - exact: git status
       - prefix: git diff
       - prefix: Get-Content
@@ -123,8 +123,8 @@ policy:
 
 - `full_access`：`terminal_exec.command` 命中 `deny` 就拒绝，否则执行。
 - `confirm`：命中 `deny` 就拒绝；命中 `allow` 且是单条简单命令时直接执行；其他进入确认流程。
-- `watch`：只有命中 `watch_allow` 且是单条简单命令时执行；其他拒绝。
-- `file_edit` 不读取 `policy.terminal`：`full_access` 直接执行，`confirm` 一律确认，`watch` 一律拒绝。
+- `watch`：只有命中 `watchAllow` 且是单条简单命令时执行；其他拒绝。
+- `fileEdit` 不读取 `policy.terminal`：`full_access` 直接执行，`confirm` 一律确认，`watch` 一律拒绝。
 - subagent 固定继承父 session 的 mode，上限不能高于父 session。
 
 ## channels
@@ -135,12 +135,12 @@ policy:
 channels:
   weixin:
     enabled: false
-    workspace_dir: .
-    media_input: false
-    media_output: false
+    workspaceDir: .
+    mediaInput: false
+    mediaOutput: false
   feishu:
     enabled: false
-    workspace_dir: .
+    workspaceDir: .
     domain: feishu
 ```
 
@@ -151,13 +151,13 @@ channels:
 channels:
   weixin:
     enabled: true
-    workspace_dir: .
-    markdown_filter: true
-    media_input: true
-    media_output: true
-    override_model: deepseek-v4-pro
-    override_reasoning_mode: high
-    default_session_id: null
+    workspaceDir: .
+    markdownFilter: true
+    mediaInput: true
+    mediaOutput: true
+    overrideModel: deepseek-v4-pro
+    overrideReasoningMode: high
+    defaultSessionId: null
 ```
 
 运行时文件：
@@ -169,7 +169,7 @@ runtime/channel_state/weixin/sync_buf.txt
 runtime/channel_state/weixin/bridge_state.yaml
 ```
 
-Weixin 不创建特殊会话目录。它通过 channel control state（兼容文件名 `bridge_state.yaml`）记录默认普通 session 和当前 `/switch` 绑定；真实对话、上下文和附件都保存在普通 session 中。附件下载到当前 active session 的 `attachments/inbox/weixin/<message_id>/`，并以 ACP `resource_link` 加入本轮输入。
+Weixin 不创建特殊会话目录。它通过 channel control state（兼容文件名 `bridge_state.yaml`）记录默认普通 session 和当前 `/switch` 绑定；真实对话、上下文和附件都保存在普通 session 中。附件下载到当前 active session 的 `attachments/inbox/weixin/<messageId>/`，并以 ACP `resource_link` 加入本轮输入。
 
 ### Feishu
 
@@ -177,16 +177,16 @@ Weixin 不创建特殊会话目录。它通过 channel control state（兼容文
 channels:
   feishu:
     enabled: true
-    workspace_dir: .
+    workspaceDir: .
     domain: feishu
-    dm_policy: allow_all
-    group_policy: white_list
-    allow_from: ["*"]
-    group_allow_from: []
-    group_require_mention: true
-    media_input: true
-    media_output: true
-    card_output: true
+    dmPolicy: allow_all
+    groupPolicy: white_list
+    allowFrom: ["*"]
+    groupAllowFrom: []
+    groupRequireMention: true
+    mediaInput: true
+    mediaOutput: true
+    cardOutput: true
 ```
 
 运行时文件：
@@ -197,7 +197,7 @@ runtime/channel_state/feishu/dm/<sender>/bridge_state.yaml
 runtime/channel_state/feishu/group/<chat_id>/bridge_state.yaml
 ```
 
-Feishu 私聊和群聊使用独立 channel state。真实对话、上下文和附件仍然保存在普通 session 中。开启 `media_input` 后，入站图片和文件会下载到当前 active session 的 `attachments/inbox/feishu/<message_id>/`。
+Feishu 私聊和群聊使用独立 channel state。真实对话、上下文和附件仍然保存在普通 session 中。开启 `mediaInput` 后，入站图片和文件会下载到当前 active session 的 `attachments/inbox/feishu/<messageId>/`。
 
 Weixin 和 Feishu 支持：
 
@@ -205,7 +205,7 @@ Weixin 和 Feishu 支持：
 /help
 /new
 /list
-/switch <session_id>
+/switch <sessionId>
 /back
 /where
 /cancel
@@ -231,12 +231,12 @@ automation:
   jobs:
     - id: daily_digest
       enabled: true
-      workspace_dir: .
+      workspaceDir: .
       session:
         mode: new
       schedule:
         type: interval
-        every_seconds: 3600
+        everySeconds: 3600
       prompt: "总结当前项目状态。"
       notify:
         - channel: weixin
@@ -251,13 +251,13 @@ automation:
 Sticky 状态写入：
 
 ```text
-runtime/automation_state/<job_id>/state.yaml
+runtime/automation_state/<jobId>/state.yaml
 ```
 
 每次 run 记录写入普通 session：
 
 ```text
-runtime/sessions/<year>/<month>/<day>/<session_id>/automation/<job_id>/runs/<run_id>/run.yaml
+runtime/sessions/<year>/<month>/<day>/<sessionId>/automation/<jobId>/runs/<runId>/run.yaml
 ```
 
 ## resources/prompt
@@ -280,7 +280,7 @@ Rules 读取顺序：
 
 ```text
 resources/prompt/AGENTS.md
-agent.yaml external_rule_files entries
+agent.yaml externalRuleFiles entries
 <cwd>/.agent/AGENTS.md
 <cwd>/AGENTS.md
 <cwd>/CLAUDE.md
@@ -294,7 +294,7 @@ Skills 是可选的。运行时从以下位置发现：
 
 ```text
 resources/skills
-agent.yaml external_skills_dirs entries
+agent.yaml externalSkillsDirs entries
 <cwd>/.agent/skills
 ```
 
@@ -336,13 +336,13 @@ mcporter --config "<config-path>" call <server.tool> --args '<json>' --output js
 
 ```text
 resources/prompt/AGENTS.md
-agent.yaml external_rule_files entries
+agent.yaml externalRuleFiles entries
 <cwd>/.agent/AGENTS.md
 <cwd>/AGENTS.md
 <cwd>/CLAUDE.md
 resources/mcp.json
 resources/skills
-agent.yaml external_skills_dirs entries
+agent.yaml externalSkillsDirs entries
 <cwd>/.agent/skills
 ```
 

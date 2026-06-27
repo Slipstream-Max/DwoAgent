@@ -91,15 +91,15 @@ Supervisor configuration:
 ```yaml
 version: 1
 endpoint:
-  websocket_bind_addr: 127.0.0.1:8766
+  websocketBindAddr: 127.0.0.1:8766
   secret: dwo_sup_xxx
 profiles:
   - id: coder
     path: C:\Users\you\.dwoagent\profiles\coder
-default_profile: coder
+defaultProfile: coder
 pool:
-  max_workers: 3
-  idle_seconds: 600
+  maxWorkers: 3
+  idleSeconds: 600
 ```
 
 Supervisor WebSocket speaks JSON messages. Each request must include the

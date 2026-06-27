@@ -22,7 +22,7 @@ pub const SESSION_TITLE_LENGTH: usize = 10;
 
 /// Serializable session state — pure data, no runtime objects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Session {
     pub session_id: String,
     pub cwd: String,

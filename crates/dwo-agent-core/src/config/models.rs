@@ -161,7 +161,7 @@ fn default_session_store_dir() -> String {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentTools {
     #[serde(default = "default_tool_switch")]
     pub file_edit: ToolSwitch,
@@ -199,7 +199,7 @@ impl AgentTools {
 
 /// Registry entry for one model alias.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelProfile {
     pub model_name: String,
     pub config: ModelConfig,
@@ -243,7 +243,7 @@ impl ModelProfile {
 
 /// Top-level registry loaded from the `model` section in `agent.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelRegistry {
     pub default_model_id: String,
     pub models: Vec<ModelProfile>,
@@ -277,7 +277,7 @@ impl ModelRegistry {
 // ── Agent metadata ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentMeta {
     pub agent_id: String,
     pub name: String,
@@ -333,7 +333,7 @@ fn normalize_string_list(values: &[String], field: &str) -> Result<Vec<String>> 
 // ── Session payloads ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTranscriptEvent {
     pub updated_at: String,
     pub update: Map<String, Value>,
@@ -347,7 +347,7 @@ impl SessionTranscriptEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionModelContextPayload {
     pub messages: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -355,14 +355,14 @@ pub struct SessionModelContextPayload {
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContextUsageSnapshot {
     pub used: u64,
     pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionMetaPayload {
     pub session_id: String,
     pub cwd: String,
@@ -426,11 +426,11 @@ mod tests {
     #[test]
     fn agent_meta_allows_missing_max_running_turn() {
         let meta = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
+            "agentId": "test-agent",
             "name": "Test Agent",
             "description": "test",
-            "policy_mode": "confirm",
-            "session_store_dir": ".sessions"
+            "policyMode": "confirm",
+            "sessionStoreDir": ".sessions"
         }))
         .unwrap();
 
@@ -441,10 +441,10 @@ mod tests {
     #[test]
     fn agent_meta_uses_default_session_dir() {
         let meta = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
+            "agentId": "test-agent",
             "name": "Test Agent",
             "description": "test",
-            "policy_mode": "confirm"
+            "policyMode": "confirm"
         }))
         .unwrap();
 
@@ -454,31 +454,31 @@ mod tests {
     #[test]
     fn agent_meta_rejects_channel_state_dir() {
         let err = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
+            "agentId": "test-agent",
             "name": "Test Agent",
             "description": "test",
-            "policy_mode": "confirm",
-            "session_store_dir": ".sessions",
-            "channel_state_dir": " channel-state "
+            "policyMode": "confirm",
+            "sessionStoreDir": ".sessions",
+            "channelStateDir": " channel-state "
         }))
         .unwrap_err();
 
-        assert!(format!("{err:#}").contains("channel_state_dir"));
+        assert!(format!("{err:#}").contains("channelStateDir"));
     }
 
     #[test]
     fn agent_meta_reads_tool_switches() {
         let meta = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
+            "agentId": "test-agent",
             "name": "Test Agent",
             "description": "test",
             "tools": {
-                "file_edit": "disable",
+                "fileEdit": "disable",
                 "terminal": "enable",
                 "subagent": "disable"
             },
-            "policy_mode": "confirm",
-            "session_store_dir": ".sessions"
+            "policyMode": "confirm",
+            "sessionStoreDir": ".sessions"
         }))
         .unwrap();
 
@@ -490,13 +490,13 @@ mod tests {
     #[test]
     fn agent_meta_reads_external_context_paths() {
         let meta = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
+            "agentId": "test-agent",
             "name": "Test Agent",
             "description": "test",
-            "policy_mode": "confirm",
-            "session_store_dir": ".sessions",
-            "external_skills_dirs": [" shared/skills "],
-            "external_rule_files": [" shared/rules/common.md "]
+            "policyMode": "confirm",
+            "sessionStoreDir": ".sessions",
+            "externalSkillsDirs": [" shared/skills "],
+            "externalRuleFiles": [" shared/rules/common.md "]
         }))
         .unwrap();
 
@@ -507,12 +507,12 @@ mod tests {
     #[test]
     fn agent_meta_rejects_zero_max_running_turn() {
         let err = deserialize_agent_meta(serde_json::json!({
-            "agent_id": "test-agent",
+            "agentId": "test-agent",
             "name": "Test Agent",
             "description": "test",
-            "max_running_turn": 0,
-            "policy_mode": "confirm",
-            "session_store_dir": ".sessions"
+            "maxRunningTurn": 0,
+            "policyMode": "confirm",
+            "sessionStoreDir": ".sessions"
         }))
         .unwrap_err();
 

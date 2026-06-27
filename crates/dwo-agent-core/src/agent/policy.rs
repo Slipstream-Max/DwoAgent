@@ -222,7 +222,7 @@ mod tests {
                     {"prefix": "cargo check"},
                     {"prefix": "rg "}
                 ],
-                "watch_allow": [
+                "watchAllow": [
                     {"exact": "git status"},
                     {"prefix": "git diff"},
                     {"prefix": "rg "},

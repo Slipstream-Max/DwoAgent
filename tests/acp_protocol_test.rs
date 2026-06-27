@@ -414,29 +414,29 @@ fn create_mock_agent_folder(tmp_dir: &Path, llm_port: u16) -> PathBuf {
         agent_dir.join("agent.yaml"),
         format!(
             "\
-agent_id: test-agent
+agentId: test-agent
 name: Test Agent
 description: Test agent for protocol conformance
-max_running_turn: 5
-policy_mode: full_access
-session_store_dir: .sessions
+maxRunningTurn: 5
+policyMode: full_access
+sessionStoreDir: .sessions
 model:
-  default_model_id: mock-model
+  defaultModelId: mock-model
   models:
-    - model_name: mock-model
+    - modelName: mock-model
       provider: deepseek
-      model_id: deepseek-v4-pro
-      api_key: test-key-not-real
-      api_base: http://127.0.0.1:{llm_port}/v1
-      default_reasoning_mode: auto
-      compact_threshold: 0.8
-    - model_name: mock-flash
+      modelId: deepseek-v4-pro
+      apiKey: test-key-not-real
+      apiBase: http://127.0.0.1:{llm_port}/v1
+      defaultReasoningMode: auto
+      compactThreshold: 0.8
+    - modelName: mock-flash
       provider: deepseek
-      model_id: deepseek-v4-flash
-      api_key: test-key-not-real
-      api_base: http://127.0.0.1:{llm_port}/v1
-      default_reasoning_mode: auto
-      compact_threshold: 0.8
+      modelId: deepseek-v4-flash
+      apiKey: test-key-not-real
+      apiBase: http://127.0.0.1:{llm_port}/v1
+      defaultReasoningMode: auto
+      compactThreshold: 0.8
 "
         ),
     )

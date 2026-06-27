@@ -25,13 +25,13 @@ pub enum CommandRule {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct RawToolPolicyConfig {
     terminal: RawTerminalPolicyConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 struct RawTerminalPolicyConfig {
     deny: Vec<RawCommandRule>,
     allow: Vec<RawCommandRule>,
@@ -174,7 +174,7 @@ mod tests {
             "terminal": {
                 "deny": [{"regex": "(?i)^git reset --hard\\b"}],
                 "allow": [{"exact": "git status"}, {"prefix": "rg "}],
-                "watch_allow": [{"prefix": "git diff"}]
+                "watchAllow": [{"prefix": "git diff"}]
             }
         }))
         .unwrap();

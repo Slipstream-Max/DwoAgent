@@ -123,6 +123,15 @@ pub struct DwoOutboundActionNotification {
     pub action: DwoOutboundAction,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_dwo/session/set_config_option")]
+#[serde(deny_unknown_fields)]
+pub struct DwoSessionSetConfigOptionNotification {
+    pub session_id: String,
+    pub config_id: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[request(method = "_dwo/automation/run_job", response = serde_json::Value)]
 #[serde(deny_unknown_fields)]

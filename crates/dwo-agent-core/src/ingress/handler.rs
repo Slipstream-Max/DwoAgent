@@ -28,8 +28,9 @@ use crate::protocol::dwo::{
 };
 use crate::tools::{
     FeishuReplyCardResult, FeishuReplyMediaKind, FeishuReplyMediaResult, FeishuToolBridge,
-    FeishuToolExecutor, PermissionRequester, WEIXIN_REPLY_MEDIA_TOOL, WeixinReplyMediaResult,
-    WeixinToolBridge, WeixinToolExecutor, feishu_tool_schemas, weixin_tool_schemas,
+    FeishuToolExecutor, PermissionRequester, UpdateEmitter, WEIXIN_REPLY_MEDIA_TOOL,
+    WeixinReplyMediaResult, WeixinToolBridge, WeixinToolExecutor, feishu_tool_schemas,
+    weixin_tool_schemas,
 };
 
 const FEISHU_STATE_SUBDIR: &str = "feishu";
@@ -44,14 +45,29 @@ pub async fn handle_ingress_event(
     agent: Arc<AgentService>,
     event: DwoIngressEvent,
     emit_outbound: Option<OutboundEmitter>,
+    emit_session_update: Option<UpdateEmitter>,
 ) -> Result<Vec<DwoOutboundAction>> {
     let config = load_channel_runtime_config(agent.agent_structure_dir())?;
     match event.channel {
         DwoIngressChannel::Weixin => {
-            handle_weixin_event(agent, event, &config.weixin, emit_outbound).await
+            handle_weixin_event(
+                agent,
+                event,
+                &config.weixin,
+                emit_outbound,
+                emit_session_update,
+            )
+            .await
         }
         DwoIngressChannel::Feishu => {
-            handle_feishu_event(agent, event, &config.feishu, emit_outbound).await
+            handle_feishu_event(
+                agent,
+                event,
+                &config.feishu,
+                emit_outbound,
+                emit_session_update,
+            )
+            .await
         }
     }
 }
@@ -61,6 +77,7 @@ async fn handle_weixin_event(
     event: DwoIngressEvent,
     config: &WeixinChannelConfig,
     emit_outbound: Option<OutboundEmitter>,
+    emit_session_update: Option<UpdateEmitter>,
 ) -> Result<Vec<DwoOutboundAction>> {
     if !config.enabled {
         return Ok(Vec::new());
@@ -113,12 +130,13 @@ async fn handle_weixin_event(
     }
 
     let update_collector = ChannelUpdateCollector::new(config.response_detail);
+    let emit_update = tee_update_emitter(update_collector.emitter(), emit_session_update);
     let run_result = channel_control
         .run_prompt(
             session.session_id(),
             user_input,
             user_blocks,
-            update_collector.emitter(),
+            emit_update,
             channel_permission_requester(
                 agent.pending_confirmations(),
                 emit_outbound.clone(),
@@ -153,6 +171,7 @@ async fn handle_feishu_event(
     event: DwoIngressEvent,
     config: &FeishuChannelConfig,
     emit_outbound: Option<OutboundEmitter>,
+    emit_session_update: Option<UpdateEmitter>,
 ) -> Result<Vec<DwoOutboundAction>> {
     if !config.enabled || !is_feishu_allowed(&event, config) {
         return Ok(Vec::new());
@@ -223,12 +242,13 @@ async fn handle_feishu_event(
     }
 
     let update_collector = ChannelUpdateCollector::new(config.response_detail);
+    let emit_update = tee_update_emitter(update_collector.emitter(), emit_session_update);
     let run_result = channel_control
         .run_prompt(
             session.session_id(),
             user_input,
             user_blocks,
-            update_collector.emitter(),
+            emit_update,
             channel_permission_requester(
                 agent.pending_confirmations(),
                 emit_outbound.clone(),
@@ -379,6 +399,20 @@ fn text_action(
         channel,
         target,
         body: DwoOutboundBody::Text { text: text.into() },
+    }
+}
+
+fn tee_update_emitter(primary: UpdateEmitter, secondary: Option<UpdateEmitter>) -> UpdateEmitter {
+    match secondary {
+        Some(secondary) => Arc::new(move |session_id: String, update: Map<String, Value>| {
+            let primary = primary.clone();
+            let secondary = secondary.clone();
+            Box::pin(async move {
+                primary(session_id.clone(), update.clone()).await?;
+                secondary(session_id, update).await
+            })
+        }),
+        None => primary,
     }
 }
 

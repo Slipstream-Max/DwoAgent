@@ -19,7 +19,7 @@ use crate::config::loader::{agent_yaml_path, read_agent_config_section, utc_iso}
 use crate::ingress::channel_control::SessionLeaseRegistry;
 use crate::ingress::response::{ChannelResponseDetail, ChannelUpdateCollector};
 use crate::protocol::acp::mapper;
-use crate::tools::PermissionRequester;
+use crate::tools::{PermissionRequester, UpdateEmitter};
 use crate::utils::files::read_utf8_text;
 
 const AUTOMATION_SESSION_SUBDIR: &str = "automation";
@@ -220,6 +220,7 @@ pub struct AutomationRuntime {
     agent_structure_dir: PathBuf,
     jobs: Vec<AutomationJobConfig>,
     sinks: AutomationNotificationSinks,
+    emit_updates: Option<UpdateEmitter>,
 }
 
 pub async fn run_automation_jobs(
@@ -248,6 +249,7 @@ pub async fn run_automation_jobs_with_leases(
         agent_structure_dir,
         jobs,
         AutomationNotificationSinks::default(),
+        None,
     );
     tokio::select! {
         result = automation.run() => result,
@@ -261,6 +263,23 @@ pub async fn run_automation_job_once_with_leases(
     job_id: &str,
     leases: Arc<SessionLeaseRegistry>,
 ) -> Result<(AutomationJobConfig, AutomationRunRecord)> {
+    run_automation_job_once_with_leases_and_updates(
+        agent,
+        agent_structure_dir,
+        job_id,
+        leases,
+        None,
+    )
+    .await
+}
+
+pub async fn run_automation_job_once_with_leases_and_updates(
+    agent: Arc<AgentService>,
+    agent_structure_dir: &Path,
+    job_id: &str,
+    leases: Arc<SessionLeaseRegistry>,
+    emit_updates: Option<UpdateEmitter>,
+) -> Result<(AutomationJobConfig, AutomationRunRecord)> {
     let config = load_automation_config(agent_structure_dir)?;
     let job = config
         .jobs
@@ -273,6 +292,7 @@ pub async fn run_automation_job_once_with_leases(
         agent_structure_dir,
         Vec::new(),
         AutomationNotificationSinks::default(),
+        emit_updates,
     );
     let record = automation.run_job_once(&job).await?;
     Ok((job, record))
@@ -311,6 +331,7 @@ impl AutomationRuntime {
         agent_structure_dir: &Path,
         jobs: Vec<AutomationJobConfig>,
         sinks: AutomationNotificationSinks,
+        emit_updates: Option<UpdateEmitter>,
     ) -> Self {
         Self {
             agent,
@@ -318,6 +339,7 @@ impl AutomationRuntime {
             agent_structure_dir: agent_structure_dir.to_path_buf(),
             jobs,
             sinks,
+            emit_updates,
         }
     }
 
@@ -340,6 +362,7 @@ impl AutomationRuntime {
                 agent_structure_dir: self.agent_structure_dir.clone(),
                 jobs: Vec::new(),
                 sinks: self.sinks.clone(),
+                emit_updates: self.emit_updates.clone(),
             };
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -436,13 +459,14 @@ impl AutomationRuntime {
         }
 
         let collector = ChannelUpdateCollector::new(job.response_detail);
+        let emit_update = tee_update_emitter(collector.emitter(), self.emit_updates.clone());
         let run_result = self
             .agent
             .run_prompt(
                 session.session_id(),
                 user_input,
                 blocks,
-                collector.emitter(),
+                emit_update,
                 rejecting_permission_requester(),
             )
             .await;
@@ -680,6 +704,20 @@ fn rejecting_permission_requester() -> PermissionRequester {
     Arc::new(move |_target: String, _payload: Map<String, Value>| {
         Box::pin(async move { Ok(PERMISSION_REJECT_ONCE.to_string()) })
     })
+}
+
+fn tee_update_emitter(primary: UpdateEmitter, secondary: Option<UpdateEmitter>) -> UpdateEmitter {
+    match secondary {
+        Some(secondary) => Arc::new(move |session_id: String, update: Map<String, Value>| {
+            let primary = primary.clone();
+            let secondary = secondary.clone();
+            Box::pin(async move {
+                primary(session_id.clone(), update.clone()).await?;
+                secondary(session_id, update).await
+            })
+        }),
+        None => primary,
+    }
 }
 
 fn write_run_record(path: &Path, record: &AutomationRunRecord) -> Result<()> {

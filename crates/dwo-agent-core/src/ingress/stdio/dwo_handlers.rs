@@ -8,15 +8,18 @@ use serde_json::Value;
 use crate::agent::service::AgentService;
 use crate::automation::{
     AutomationNotificationRecord, AutomationNotifyChannel, automation_notification_text,
-    record_automation_delivery, run_automation_job_once_with_leases,
+    record_automation_delivery, run_automation_job_once_with_leases_and_updates,
 };
 use crate::ingress::handler::{OutboundEmitter, handle_ingress_event};
+use crate::protocol::acp::notifications;
 use crate::protocol::dwo::{
     self, DwoAutomationRecordDeliveryRequest, DwoAutomationRunJobRequest, DwoIngressChannel,
     DwoIngressHandleEventRequest, DwoIngressNotifyEventNotification, DwoOutboundAction,
-    DwoOutboundActionNotification, DwoOutboundBody, DwoSessionContextRequest, DwoWorkerPingRequest,
-    DwoWorkerProfileRequest, DwoWorkerShutdownRequest,
+    DwoOutboundActionNotification, DwoOutboundBody, DwoSessionContextRequest,
+    DwoSessionSetConfigOptionNotification, DwoWorkerPingRequest, DwoWorkerProfileRequest,
+    DwoWorkerShutdownRequest,
 };
+use crate::tools::UpdateEmitter;
 
 pub async fn worker_ping(
     _req: DwoWorkerPingRequest,
@@ -75,8 +78,16 @@ pub async fn ingress_handle_event(
     cx: ConnectionTo<Client>,
 ) -> std::result::Result<(), agent_client_protocol::Error> {
     let emit_outbound = outbound_emitter(&cx);
+    let emit_session_update = session_update_emitter(&cx);
     cx.spawn(async move {
-        match handle_ingress_event(agent, req.event, Some(emit_outbound)).await {
+        match handle_ingress_event(
+            agent,
+            req.event,
+            Some(emit_outbound),
+            Some(emit_session_update),
+        )
+        .await
+        {
             Ok(actions) => responder.respond(dwo::ingress_handle_event_response(actions)),
             Err(err) => responder.respond_with_error(invalid_params(err)),
         }
@@ -89,8 +100,27 @@ pub async fn ingress_notify_event(
     notif: DwoIngressNotifyEventNotification,
     _cx: ConnectionTo<Client>,
 ) -> std::result::Result<(), agent_client_protocol::Error> {
-    if let Err(err) = handle_ingress_event(agent, notif.event, None).await {
+    if let Err(err) = handle_ingress_event(agent, notif.event, None, None).await {
         tracing::warn!(error = %format!("{err:#}"), "failed to handle ingress notification");
+    }
+    Ok(())
+}
+
+pub async fn session_set_config_option(
+    agent: Arc<AgentService>,
+    notif: DwoSessionSetConfigOptionNotification,
+    _cx: ConnectionTo<Client>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    if let Err(err) = agent
+        .set_session_config_option(&notif.session_id, &notif.config_id, &notif.value)
+        .await
+    {
+        tracing::warn!(
+            session_id = %notif.session_id,
+            config_id = %notif.config_id,
+            error = %format!("{err:#}"),
+            "failed to apply session config notification"
+        );
     }
     Ok(())
 }
@@ -99,17 +129,19 @@ pub async fn automation_run_job(
     agent: Arc<AgentService>,
     req: DwoAutomationRunJobRequest,
     responder: Responder<Value>,
-    _cx: ConnectionTo<Client>,
+    cx: ConnectionTo<Client>,
 ) -> std::result::Result<(), agent_client_protocol::Error> {
     let job_id = match dwo::normalize_automation_run_job_request(req) {
         Ok(job_id) => job_id,
         Err(err) => return responder.respond_with_error(invalid_params(err)),
     };
-    match run_automation_job_once_with_leases(
+    let emit_session_update = session_update_emitter(&cx);
+    match run_automation_job_once_with_leases_and_updates(
         agent.clone(),
         agent.agent_structure_dir(),
         &job_id,
         agent.session_leases(),
+        Some(emit_session_update),
     )
     .await
     {
@@ -195,6 +227,17 @@ fn outbound_emitter(cx: &ConnectionTo<Client>) -> OutboundEmitter {
         let cx = cx_for_emit.clone();
         Box::pin(async move {
             let _ = cx.send_notification_to(Client, DwoOutboundActionNotification { action });
+            Ok(())
+        })
+    })
+}
+
+fn session_update_emitter(cx: &ConnectionTo<Client>) -> UpdateEmitter {
+    let cx_for_emit = cx.clone();
+    Arc::new(move |session_id: String, update| {
+        let cx = cx_for_emit.clone();
+        Box::pin(async move {
+            notifications::emit_session_update(&cx, &session_id, &update);
             Ok(())
         })
     })

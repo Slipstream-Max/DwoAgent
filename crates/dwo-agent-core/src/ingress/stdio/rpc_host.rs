@@ -24,8 +24,9 @@ use super::{acp_handlers, dwo_handlers};
 use crate::agent::service::AgentService;
 use crate::protocol::dwo::{
     DwoAutomationRecordDeliveryRequest, DwoAutomationRunJobRequest, DwoIngressHandleEventRequest,
-    DwoIngressNotifyEventNotification, DwoSessionContextRequest, DwoWorkerPingRequest,
-    DwoWorkerProfileRequest, DwoWorkerShutdownRequest,
+    DwoIngressNotifyEventNotification, DwoSessionContextRequest,
+    DwoSessionSetConfigOptionNotification, DwoWorkerPingRequest, DwoWorkerProfileRequest,
+    DwoWorkerShutdownRequest,
 };
 
 /// Run the profile RPC host over stdio.
@@ -64,6 +65,7 @@ where
     let agent_for_session_context = agent.clone();
     let agent_for_ingress = agent.clone();
     let agent_for_ingress_notify = agent.clone();
+    let agent_for_session_config_notify = agent.clone();
     let agent_for_automation = agent.clone();
     let agent_for_automation_delivery = agent.clone();
 
@@ -177,6 +179,17 @@ where
             async move |notif: DwoIngressNotifyEventNotification, cx: ConnectionTo<Client>| {
                 dwo_handlers::ingress_notify_event(agent_for_ingress_notify.clone(), notif, cx)
                     .await
+            },
+            on_receive_notification!(),
+        )
+        .on_receive_notification(
+            async move |notif: DwoSessionSetConfigOptionNotification, cx: ConnectionTo<Client>| {
+                dwo_handlers::session_set_config_option(
+                    agent_for_session_config_notify.clone(),
+                    notif,
+                    cx,
+                )
+                .await
             },
             on_receive_notification!(),
         )

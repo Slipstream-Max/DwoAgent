@@ -143,10 +143,18 @@ async fn worker_request(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    let profile_id = profile.id.clone();
     state
         .worker_pool
-        .request_with_events(profile, method, params, &state.config.pool, |_| async {
-            Ok(())
+        .request_with_events(profile, method, params, &state.config.pool, |event| {
+            let profile_id = profile_id.clone();
+            async move {
+                state
+                    .event_bus
+                    .broadcast_worker_event(&profile_id, &event, None)
+                    .await;
+                Ok(())
+            }
         })
         .await
 }
@@ -455,6 +463,10 @@ impl WeixinGatewayHandler {
                 json!({ "event": event }),
                 &self.state.config.pool,
                 |event| async move {
+                    self.state
+                        .event_bus
+                        .broadcast_worker_event(&self.profile.id, &event, None)
+                        .await;
                     match outbound_action_from_event(event) {
                         Some(Ok(action)) => {
                             if let Err(err) = self.deliver_context_action(ctx, action).await {
@@ -840,6 +852,10 @@ impl FeishuGateway {
                 json!({ "event": event }),
                 &self.state.config.pool,
                 |event| async move {
+                    self.state
+                        .event_bus
+                        .broadcast_worker_event(&self.profile.id, &event, None)
+                        .await;
                     match outbound_action_from_event(event) {
                         Some(Ok(action)) => {
                             if let Err(err) = self.deliver(&action).await {

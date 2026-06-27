@@ -21,6 +21,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioCommand};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+mod gateway;
+
 const WINDOWS_TASK_NAME: &str = "DwoAgentSupervisor";
 const WINDOWS_LAUNCHER_FILE: &str = "supervisor-startup.vbs";
 const MACOS_LAUNCH_AGENT_ID: &str = "com.dwoagent.supervisor";
@@ -299,6 +301,7 @@ async fn write_stdout_json(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: Value)
 async fn run_supervisor(config_path: Option<PathBuf>) -> Result<()> {
     let config = load_supervisor_config(config_path.as_deref())?;
     let state = Arc::new(SupervisorState::new(config.clone())?);
+    let gateway_tasks = gateway::spawn_gateways(state.clone()).await;
     let listener = tokio::net::TcpListener::bind(&config.endpoint.websocket_bind_addr)
         .await
         .with_context(|| {
@@ -322,6 +325,9 @@ async fn run_supervisor(config_path: Option<PathBuf>) -> Result<()> {
                 });
             }
             _ = tokio::signal::ctrl_c() => {
+                for task in gateway_tasks {
+                    task.abort();
+                }
                 state.worker_pool.shutdown_all().await;
                 return Ok(());
             },
@@ -634,7 +640,9 @@ impl WorkerPool {
         let stale = {
             let mut stale = Vec::new();
             for (id, worker) in workers.iter() {
-                if now.duration_since(worker.last_used().await) >= idle_after {
+                if !worker.is_busy().await
+                    && now.duration_since(worker.last_used().await) >= idle_after
+                {
                     stale.push(id.clone());
                 }
             }
@@ -743,6 +751,9 @@ async fn oldest_worker_key(
         if exclude == Some(id.as_str()) {
             continue;
         }
+        if worker.is_busy().await {
+            continue;
+        }
         let last_used = worker.last_used().await;
         if oldest
             .as_ref()
@@ -769,6 +780,7 @@ struct WorkerProcess {
     stdout: Mutex<Lines<BufReader<ChildStdout>>>,
     request_lock: Mutex<()>,
     last_used: Mutex<Instant>,
+    in_flight: Mutex<usize>,
 }
 
 impl WorkerProcess {
@@ -788,6 +800,7 @@ impl WorkerProcess {
             stdout: Mutex::new(BufReader::new(stdout).lines()),
             request_lock: Mutex::new(()),
             last_used: Mutex::new(Instant::now()),
+            in_flight: Mutex::new(0),
         })
     }
 
@@ -801,6 +814,22 @@ impl WorkerProcess {
 
     async fn last_used(&self) -> Instant {
         *self.last_used.lock().await
+    }
+
+    async fn is_busy(&self) -> bool {
+        *self.in_flight.lock().await > 0
+    }
+
+    async fn begin_request(&self) {
+        let mut in_flight = self.in_flight.lock().await;
+        *in_flight += 1;
+    }
+
+    async fn finish_request(&self) {
+        let mut in_flight = self.in_flight.lock().await;
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        self.touch().await;
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -836,6 +865,24 @@ impl WorkerProcess {
         Fut: Future<Output = Result<()>>,
     {
         let _request_guard = self.request_lock.lock().await;
+        self.begin_request().await;
+        let result = self
+            .request_with_events_locked(method, params, &mut emit_event)
+            .await;
+        self.finish_request().await;
+        result
+    }
+
+    async fn request_with_events_locked<F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        emit_event: &mut F,
+    ) -> Result<Value>
+    where
+        F: FnMut(Value) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         let id = Uuid::new_v4().to_string();
         let request = WorkerRequest {
             jsonrpc: "2.0",

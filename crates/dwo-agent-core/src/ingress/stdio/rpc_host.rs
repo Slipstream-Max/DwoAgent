@@ -23,6 +23,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use super::{acp_handlers, dwo_handlers};
 use crate::agent::service::AgentService;
 use crate::protocol::dwo::{
+    DwoAutomationRecordDeliveryRequest, DwoAutomationRunJobRequest, DwoIngressHandleEventRequest,
     DwoSessionContextRequest, DwoWorkerPingRequest, DwoWorkerProfileRequest,
     DwoWorkerShutdownRequest,
 };
@@ -61,6 +62,9 @@ where
     let agent_for_config = agent.clone();
     let agent_for_worker_profile = agent.clone();
     let agent_for_session_context = agent.clone();
+    let agent_for_ingress = agent.clone();
+    let agent_for_automation = agent.clone();
+    let agent_for_automation_delivery = agent.clone();
 
     Agent
         .builder()
@@ -156,6 +160,38 @@ where
                         cx: ConnectionTo<Client>| {
                 dwo_handlers::session_context(agent_for_session_context.clone(), req, responder, cx)
                     .await
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: DwoIngressHandleEventRequest,
+                        responder: Responder<Value>,
+                        cx: ConnectionTo<Client>| {
+                dwo_handlers::ingress_handle_event(agent_for_ingress.clone(), req, responder, cx)
+                    .await
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: DwoAutomationRunJobRequest,
+                        responder: Responder<Value>,
+                        cx: ConnectionTo<Client>| {
+                dwo_handlers::automation_run_job(agent_for_automation.clone(), req, responder, cx)
+                    .await
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: DwoAutomationRecordDeliveryRequest,
+                        responder: Responder<Value>,
+                        cx: ConnectionTo<Client>| {
+                dwo_handlers::automation_record_delivery(
+                    agent_for_automation_delivery.clone(),
+                    req,
+                    responder,
+                    cx,
+                )
+                .await
             },
             on_receive_request!(),
         )

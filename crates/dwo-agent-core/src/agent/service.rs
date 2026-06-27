@@ -22,6 +22,7 @@ use crate::config::models::{
     ReasoningMode, SessionMetaPayload, SessionModelContextPayload, StopReason,
 };
 use crate::config::policy::ToolPolicyConfig;
+use crate::ingress::channel_control::{PendingConfirmationRegistry, SessionLeaseRegistry};
 use crate::tools::{PermissionRequester, UpdateEmitter, tool_schemas};
 use crate::utils::policy::parse_policy_mode;
 
@@ -34,6 +35,8 @@ pub struct AgentService {
     tool_policy: Arc<ToolPolicyConfig>,
     session_store_dir: PathBuf,
     channel_state_dir: PathBuf,
+    session_leases: Arc<SessionLeaseRegistry>,
+    pending_confirmations: Arc<PendingConfirmationRegistry>,
     agents: Mutex<HashMap<String, Arc<SessionAgent>>>,
 }
 
@@ -68,6 +71,9 @@ impl AgentService {
         std::fs::create_dir_all(&channel_state_dir).with_context(|| {
             format!("create channel state store {}", channel_state_dir.display())
         })?;
+        let session_leases = Arc::new(SessionLeaseRegistry::new());
+        let pending_confirmations =
+            Arc::new(PendingConfirmationRegistry::new(&agent_structure_dir));
 
         Ok(Self {
             agent_structure_dir,
@@ -77,6 +83,8 @@ impl AgentService {
             tool_policy,
             session_store_dir,
             channel_state_dir,
+            session_leases,
+            pending_confirmations,
             agents: Mutex::new(HashMap::new()),
         })
     }
@@ -91,6 +99,14 @@ impl AgentService {
 
     pub fn channel_state_dir(&self) -> &Path {
         &self.channel_state_dir
+    }
+
+    pub fn session_leases(&self) -> Arc<SessionLeaseRegistry> {
+        self.session_leases.clone()
+    }
+
+    pub fn pending_confirmations(&self) -> Arc<PendingConfirmationRegistry> {
+        self.pending_confirmations.clone()
     }
 
     pub fn default_model_id(&self) -> &str {

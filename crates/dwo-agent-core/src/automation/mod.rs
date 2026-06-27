@@ -255,6 +255,55 @@ pub async fn run_automation_jobs_with_leases(
     }
 }
 
+pub async fn run_automation_job_once_with_leases(
+    agent: Arc<AgentService>,
+    agent_structure_dir: &Path,
+    job_id: &str,
+    leases: Arc<SessionLeaseRegistry>,
+) -> Result<(AutomationJobConfig, AutomationRunRecord)> {
+    let config = load_automation_config(agent_structure_dir)?;
+    let job = config
+        .jobs
+        .into_iter()
+        .find(|job| job.enabled && job.id == job_id)
+        .ok_or_else(|| anyhow::anyhow!("enabled automation job not found: {job_id}"))?;
+    let automation = AutomationRuntime::new(
+        agent,
+        leases,
+        agent_structure_dir,
+        Vec::new(),
+        AutomationNotificationSinks::default(),
+    );
+    let record = automation.run_job_once(&job).await?;
+    Ok((job, record))
+}
+
+pub async fn record_automation_delivery(
+    agent: Arc<AgentService>,
+    job_id: &str,
+    run_id: &str,
+    session_id: &str,
+    notifications: Vec<AutomationNotificationRecord>,
+) -> Result<()> {
+    let session = agent
+        .load_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("automation delivery session not found: {session_id}"))?;
+    let run_path = automation_run_dir(session.session_dir(), job_id, run_id).join(RUN_FILE);
+    let text = read_utf8_text(&run_path)?;
+    let mut record: AutomationRunRecord = serde_yaml::from_str(&text)
+        .with_context(|| format!("Invalid automation run record in {}", run_path.display()))?;
+    record.notifications = notifications;
+    write_run_record(&run_path, &record)
+}
+
+pub fn automation_notification_text(
+    job: &AutomationJobConfig,
+    record: &AutomationRunRecord,
+) -> String {
+    render_notification_text(job, record)
+}
+
 impl AutomationRuntime {
     pub fn new(
         agent: Arc<AgentService>,
@@ -650,7 +699,7 @@ fn new_run_id() -> String {
     )
 }
 
-fn next_schedule_delay(schedule: &AutomationSchedule) -> Result<Duration> {
+pub fn next_schedule_delay(schedule: &AutomationSchedule) -> Result<Duration> {
     match schedule {
         AutomationSchedule::Interval { every_seconds } => {
             if *every_seconds == 0 {

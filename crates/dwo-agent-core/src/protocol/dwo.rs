@@ -102,6 +102,113 @@ pub struct DwoSessionContextRequest {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_dwo/ingress/handle_event", response = serde_json::Value)]
+#[serde(deny_unknown_fields)]
+pub struct DwoIngressHandleEventRequest {
+    pub event: DwoIngressEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_dwo/automation/run_job", response = serde_json::Value)]
+#[serde(deny_unknown_fields)]
+pub struct DwoAutomationRunJobRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_dwo/automation/record_delivery", response = serde_json::Value)]
+#[serde(deny_unknown_fields)]
+pub struct DwoAutomationRecordDeliveryRequest {
+    pub job_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub notifications: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DwoIngressChannel {
+    Weixin,
+    Feishu,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DwoIngressEvent {
+    pub channel: DwoIngressChannel,
+    pub source: DwoIngressSource,
+    pub conversation: DwoIngressConversation,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<DwoIngressAttachment>,
+    #[serde(default)]
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DwoIngressSource {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DwoIngressConversation {
+    pub id: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub holder: Option<String>,
+    #[serde(default)]
+    pub state_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DwoIngressAttachment {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DwoOutboundAction {
+    pub channel: DwoIngressChannel,
+    pub target: String,
+    #[serde(flatten)]
+    pub body: DwoOutboundBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DwoOutboundBody {
+    Text {
+        text: String,
+    },
+    Media {
+        path: PathBuf,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        file_type: Option<String>,
+    },
+    Card {
+        card: Value,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct DwoWorkerProfileSnapshot {
     pub agent_id: String,
@@ -125,6 +232,37 @@ pub fn normalize_session_context_request(req: DwoSessionContextRequest) -> Resul
     Ok(session_id)
 }
 
+pub fn normalize_automation_run_job_request(req: DwoAutomationRunJobRequest) -> Result<String> {
+    let job_id = req.job_id.trim().to_string();
+    if job_id.is_empty() {
+        bail!("_dwo/automation/run_job requires non-empty job_id");
+    }
+    Ok(job_id)
+}
+
+pub fn normalize_automation_record_delivery_request(
+    req: DwoAutomationRecordDeliveryRequest,
+) -> Result<DwoAutomationRecordDeliveryRequest> {
+    let job_id = req.job_id.trim().to_string();
+    let run_id = req.run_id.trim().to_string();
+    let session_id = req.session_id.trim().to_string();
+    if job_id.is_empty() {
+        bail!("_dwo/automation/record_delivery requires non-empty job_id");
+    }
+    if run_id.is_empty() {
+        bail!("_dwo/automation/record_delivery requires non-empty run_id");
+    }
+    if session_id.is_empty() {
+        bail!("_dwo/automation/record_delivery requires non-empty session_id");
+    }
+    Ok(DwoAutomationRecordDeliveryRequest {
+        job_id,
+        run_id,
+        session_id,
+        notifications: req.notifications,
+    })
+}
+
 pub fn worker_ping_response() -> Value {
     json!({ "ok": true })
 }
@@ -144,6 +282,21 @@ pub fn session_context_response(snapshot: &DwoSessionContextSnapshot) -> Value {
         "session_id": snapshot.session_id,
         "messages": snapshot.messages,
     })
+}
+
+pub fn ingress_handle_event_response(actions: Vec<DwoOutboundAction>) -> Value {
+    json!({ "actions": actions })
+}
+
+pub fn automation_run_job_response(record: Value, notifications: Vec<DwoOutboundAction>) -> Value {
+    json!({
+        "record": record,
+        "notifications": notifications,
+    })
+}
+
+pub fn automation_record_delivery_response() -> Value {
+    json!({ "ok": true })
 }
 
 pub fn worker_shutdown_response() -> Value {

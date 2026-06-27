@@ -3,6 +3,7 @@ pub mod channel_input;
 mod channel_recent;
 pub mod config;
 pub mod feishu;
+pub mod handler;
 pub mod response;
 pub mod runtime;
 pub mod stdio;

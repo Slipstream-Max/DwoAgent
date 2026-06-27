@@ -47,7 +47,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
-    /// Start configured external channels for one agent profile.
+    /// Run one agent profile worker RPC host.
     Run(AgentProfileArgs),
 }
 

@@ -6,8 +6,12 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64.workspace = true
+clawrs-feishu.workspace = true
+dwo-agent-core = { path = "../dwo-agent-core" }
 futures.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -15,3 +19,4 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+weixin-agent.workspace = true

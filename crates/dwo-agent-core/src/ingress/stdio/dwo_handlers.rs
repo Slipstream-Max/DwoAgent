@@ -6,9 +6,15 @@ use agent_client_protocol::{Client, ConnectionTo, Responder};
 use serde_json::Value;
 
 use crate::agent::service::AgentService;
+use crate::automation::{
+    AutomationNotificationRecord, AutomationNotifyChannel, automation_notification_text,
+    record_automation_delivery, run_automation_job_once_with_leases,
+};
+use crate::ingress::handler::handle_ingress_event;
 use crate::protocol::dwo::{
-    self, DwoSessionContextRequest, DwoWorkerPingRequest, DwoWorkerProfileRequest,
-    DwoWorkerShutdownRequest,
+    self, DwoAutomationRecordDeliveryRequest, DwoAutomationRunJobRequest, DwoIngressChannel,
+    DwoIngressHandleEventRequest, DwoOutboundAction, DwoOutboundBody, DwoSessionContextRequest,
+    DwoWorkerPingRequest, DwoWorkerProfileRequest, DwoWorkerShutdownRequest,
 };
 
 pub async fn worker_ping(
@@ -61,6 +67,96 @@ pub async fn session_context(
     }
 }
 
+pub async fn ingress_handle_event(
+    agent: Arc<AgentService>,
+    req: DwoIngressHandleEventRequest,
+    responder: Responder<Value>,
+    _cx: ConnectionTo<Client>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    match handle_ingress_event(agent, req.event).await {
+        Ok(actions) => responder.respond(dwo::ingress_handle_event_response(actions)),
+        Err(err) => responder.respond_with_error(invalid_params(err)),
+    }
+}
+
+pub async fn automation_run_job(
+    agent: Arc<AgentService>,
+    req: DwoAutomationRunJobRequest,
+    responder: Responder<Value>,
+    _cx: ConnectionTo<Client>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    let job_id = match dwo::normalize_automation_run_job_request(req) {
+        Ok(job_id) => job_id,
+        Err(err) => return responder.respond_with_error(invalid_params(err)),
+    };
+    match run_automation_job_once_with_leases(
+        agent.clone(),
+        agent.agent_structure_dir(),
+        &job_id,
+        agent.session_leases(),
+    )
+    .await
+    {
+        Ok((job, record)) => {
+            let text = automation_notification_text(&job, &record);
+            let notifications = job
+                .notify
+                .iter()
+                .map(|notify| DwoOutboundAction {
+                    channel: match notify.channel {
+                        AutomationNotifyChannel::Weixin => DwoIngressChannel::Weixin,
+                        AutomationNotifyChannel::Feishu => DwoIngressChannel::Feishu,
+                    },
+                    target: notify
+                        .recipient
+                        .as_ref()
+                        .map(|recipient| recipient.id.clone())
+                        .unwrap_or_default(),
+                    body: DwoOutboundBody::Text { text: text.clone() },
+                })
+                .collect::<Vec<_>>();
+            match serde_json::to_value(&record) {
+                Ok(record) => {
+                    responder.respond(dwo::automation_run_job_response(record, notifications))
+                }
+                Err(err) => responder.respond_with_error(internal_error(err)),
+            }
+        }
+        Err(err) => responder.respond_with_error(internal_error(err)),
+    }
+}
+
+pub async fn automation_record_delivery(
+    agent: Arc<AgentService>,
+    req: DwoAutomationRecordDeliveryRequest,
+    responder: Responder<Value>,
+    _cx: ConnectionTo<Client>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    let req = match dwo::normalize_automation_record_delivery_request(req) {
+        Ok(req) => req,
+        Err(err) => return responder.respond_with_error(invalid_params(err)),
+    };
+    let mut notifications = Vec::new();
+    for value in req.notifications {
+        match serde_json::from_value::<AutomationNotificationRecord>(value) {
+            Ok(record) => notifications.push(record),
+            Err(err) => return responder.respond_with_error(invalid_params(err)),
+        }
+    }
+    match record_automation_delivery(
+        agent,
+        &req.job_id,
+        &req.run_id,
+        &req.session_id,
+        notifications,
+    )
+    .await
+    {
+        Ok(()) => responder.respond(dwo::automation_record_delivery_response()),
+        Err(err) => responder.respond_with_error(internal_error(err)),
+    }
+}
+
 pub async fn worker_shutdown(
     _req: DwoWorkerShutdownRequest,
     responder: Responder<Value>,
@@ -71,4 +167,8 @@ pub async fn worker_shutdown(
 
 fn invalid_params(err: impl std::fmt::Display) -> agent_client_protocol::schema::Error {
     agent_client_protocol::schema::Error::invalid_params().data(format!("{err:#}"))
+}
+
+fn internal_error(err: impl std::fmt::Display) -> agent_client_protocol::schema::Error {
+    agent_client_protocol::schema::Error::internal_error().data(format!("{err:#}"))
 }

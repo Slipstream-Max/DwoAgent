@@ -547,14 +547,22 @@ struct WorkerMessage {
 }
 
 struct WorkerPool {
-    exe: PathBuf,
-    workers: Mutex<HashMap<String, Arc<Mutex<WorkerProcess>>>>,
+    launcher: WorkerLauncher,
+    workers: Mutex<HashMap<String, Arc<WorkerProcess>>>,
 }
 
 impl WorkerPool {
     fn new(exe: PathBuf) -> Self {
         Self {
-            exe,
+            launcher: WorkerLauncher::agent_profile(exe),
+            workers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_launcher(launcher: WorkerLauncher) -> Self {
+        Self {
+            launcher,
             workers: Mutex::new(HashMap::new()),
         }
     }
@@ -572,8 +580,7 @@ impl WorkerPool {
         Fut: Future<Output = Result<()>>,
     {
         let worker = self.ensure_worker(profile, pool_config).await?;
-        let mut worker = worker.lock().await;
-        worker.last_used = Instant::now();
+        worker.touch().await;
         worker.request_with_events(method, params, emit_event).await
     }
 
@@ -585,8 +592,7 @@ impl WorkerPool {
         pool_config: &SupervisorPoolConfig,
     ) -> Result<()> {
         let worker = self.ensure_worker(profile, pool_config).await?;
-        let mut worker = worker.lock().await;
-        worker.last_used = Instant::now();
+        worker.touch().await;
         worker.notify(method, params).await
     }
 
@@ -594,7 +600,7 @@ impl WorkerPool {
         &self,
         profile: &ResolvedProfile,
         pool_config: &SupervisorPoolConfig,
-    ) -> Result<Arc<Mutex<WorkerProcess>>> {
+    ) -> Result<Arc<WorkerProcess>> {
         self.prune_idle(pool_config).await;
         let mut workers = self.workers.lock().await;
         if let Some(worker) = workers.get(&profile.id) {
@@ -612,11 +618,11 @@ impl WorkerPool {
             }
         }
 
-        let worker = Arc::new(Mutex::new(
-            WorkerProcess::spawn(&self.exe, profile)
+        let worker = Arc::new(
+            WorkerProcess::spawn(&self.launcher, profile)
                 .await
                 .with_context(|| format!("spawn worker for profile `{}`", profile.id))?,
-        ));
+        );
         workers.insert(profile.id.clone(), worker.clone());
         Ok(worker)
     }
@@ -628,8 +634,7 @@ impl WorkerPool {
         let stale = {
             let mut stale = Vec::new();
             for (id, worker) in workers.iter() {
-                let worker = worker.lock().await;
-                if now.duration_since(worker.last_used) >= idle_after {
+                if now.duration_since(worker.last_used().await) >= idle_after {
                     stale.push(id.clone());
                 }
             }
@@ -648,10 +653,9 @@ impl WorkerPool {
         let workers = self.workers.lock().await;
         let mut items = Vec::new();
         for (profile, worker) in workers.iter() {
-            let worker = worker.lock().await;
             items.push(json!({
                 "profile": profile,
-                "pid": worker.child.id(),
+                "pid": worker.child_id().await,
             }));
         }
         json!({ "workers": items })
@@ -684,8 +688,54 @@ impl WorkerPool {
     }
 }
 
+enum WorkerLauncher {
+    AgentProfile {
+        exe: PathBuf,
+    },
+    #[cfg(test)]
+    Custom {
+        exe: PathBuf,
+        args: Vec<OsString>,
+        envs: Vec<(OsString, OsString)>,
+    },
+}
+
+impl WorkerLauncher {
+    fn agent_profile(exe: PathBuf) -> Self {
+        Self::AgentProfile { exe }
+    }
+
+    #[cfg(test)]
+    fn custom(exe: PathBuf, args: Vec<OsString>, envs: Vec<(OsString, OsString)>) -> Self {
+        Self::Custom { exe, args, envs }
+    }
+
+    fn command(&self, profile: &ResolvedProfile) -> TokioCommand {
+        match self {
+            Self::AgentProfile { exe } => {
+                let mut command = TokioCommand::new(exe);
+                command
+                    .arg("agent")
+                    .arg("run")
+                    .arg("--agent-profile")
+                    .arg(&profile.path);
+                command
+            }
+            #[cfg(test)]
+            Self::Custom { exe, args, envs } => {
+                let mut command = TokioCommand::new(exe);
+                command.args(args);
+                for (key, value) in envs {
+                    command.env(key, value);
+                }
+                command
+            }
+        }
+    }
+}
+
 async fn oldest_worker_key(
-    workers: &HashMap<String, Arc<Mutex<WorkerProcess>>>,
+    workers: &HashMap<String, Arc<WorkerProcess>>,
     exclude: Option<&str>,
 ) -> Option<String> {
     let mut oldest: Option<(String, Instant)> = None;
@@ -693,61 +743,72 @@ async fn oldest_worker_key(
         if exclude == Some(id.as_str()) {
             continue;
         }
-        let worker = worker.lock().await;
+        let last_used = worker.last_used().await;
         if oldest
             .as_ref()
-            .is_none_or(|(_, last_used)| worker.last_used < *last_used)
+            .is_none_or(|(_, oldest_last_used)| last_used < *oldest_last_used)
         {
-            oldest = Some((id.clone(), worker.last_used));
+            oldest = Some((id.clone(), last_used));
         }
     }
     oldest.map(|(id, _)| id)
 }
 
-async fn stop_worker(worker: Arc<Mutex<WorkerProcess>>) -> Result<()> {
-    let mut worker = worker.lock().await;
+async fn stop_worker(worker: Arc<WorkerProcess>) -> Result<()> {
     let _ = worker.request("_dwo/worker/shutdown", json!({})).await;
-    if worker.child.try_wait()?.is_none() {
-        let _ = worker.child.kill().await;
+    let mut child = worker.child.lock().await;
+    if child.try_wait()?.is_none() {
+        let _ = child.kill().await;
     }
     Ok(())
 }
 
 struct WorkerProcess {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
-    last_used: Instant,
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    stdout: Mutex<Lines<BufReader<ChildStdout>>>,
+    request_lock: Mutex<()>,
+    last_used: Mutex<Instant>,
 }
 
 impl WorkerProcess {
-    async fn spawn(exe: &Path, profile: &ResolvedProfile) -> Result<Self> {
-        let mut child = TokioCommand::new(exe)
-            .arg("agent")
-            .arg("run")
-            .arg("--agent-profile")
-            .arg(&profile.path)
+    async fn spawn(launcher: &WorkerLauncher, profile: &ResolvedProfile) -> Result<Self> {
+        let mut command = launcher.command(profile);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("spawn {}", exe.display()))?;
+            .context("spawn worker process")?;
         let stdin = child.stdin.take().context("worker stdin was not piped")?;
         let stdout = child.stdout.take().context("worker stdout was not piped")?;
         Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout).lines(),
-            last_used: Instant::now(),
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout).lines()),
+            request_lock: Mutex::new(()),
+            last_used: Mutex::new(Instant::now()),
         })
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn child_id(&self) -> Option<u32> {
+        self.child.lock().await.id()
+    }
+
+    async fn touch(&self) {
+        *self.last_used.lock().await = Instant::now();
+    }
+
+    async fn last_used(&self) -> Instant {
+        *self.last_used.lock().await
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
         self.request_with_events(method, params, |_| async { Ok(()) })
             .await
     }
 
-    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+    async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let request = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -755,19 +816,17 @@ impl WorkerProcess {
         });
         let mut line = serde_json::to_vec(&request).context("serialize worker notification")?;
         line.push(b'\n');
-        self.stdin
+        let mut stdin = self.stdin.lock().await;
+        stdin
             .write_all(&line)
             .await
             .context("write worker notification")?;
-        self.stdin
-            .flush()
-            .await
-            .context("flush worker notification")?;
+        stdin.flush().await.context("flush worker notification")?;
         Ok(())
     }
 
     async fn request_with_events<F, Fut>(
-        &mut self,
+        &self,
         method: &str,
         params: Value,
         mut emit_event: F,
@@ -776,6 +835,7 @@ impl WorkerProcess {
         F: FnMut(Value) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let _request_guard = self.request_lock.lock().await;
         let id = Uuid::new_v4().to_string();
         let request = WorkerRequest {
             jsonrpc: "2.0",
@@ -785,19 +845,21 @@ impl WorkerProcess {
         };
         let mut line = serde_json::to_vec(&request).context("serialize worker request")?;
         line.push(b'\n');
-        self.stdin
-            .write_all(&line)
-            .await
-            .context("write worker request")?;
-        self.stdin.flush().await.context("flush worker request")?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            stdin
+                .write_all(&line)
+                .await
+                .context("write worker request")?;
+            stdin.flush().await.context("flush worker request")?;
+        }
 
         loop {
-            let Some(response_line) = self
-                .stdout
-                .next_line()
-                .await
-                .context("read worker response")?
-            else {
+            let response_line = {
+                let mut stdout = self.stdout.lock().await;
+                stdout.next_line().await.context("read worker response")?
+            };
+            let Some(response_line) = response_line else {
                 bail!("worker exited before responding");
             };
             let response: WorkerMessage =
@@ -864,31 +926,51 @@ async fn handle_supervisor_connection(
         let text = message
             .into_text()
             .context("read supervisor message text")?;
-        let response = match serde_json::from_str::<SupervisorRequest>(&text) {
-            Ok(request) => {
-                let write_for_events = write.clone();
-                state
-                    .handle_request_with_events(request, move |event| {
-                        let write = write_for_events.clone();
-                        async move {
-                            write
-                                .lock()
-                                .await
-                                .send(Message::Text(serde_json::to_string(&event)?))
-                                .await
-                                .context("send supervisor event")
-                        }
-                    })
+        let request = match serde_json::from_str::<SupervisorRequest>(&text) {
+            Ok(request) => request,
+            Err(err) => {
+                let response = SupervisorResponse::error(None, format!("invalid request: {err}"));
+                write
+                    .lock()
                     .await
+                    .send(Message::Text(serde_json::to_string(&response)?))
+                    .await
+                    .context("send supervisor response")?;
+                continue;
             }
-            Err(err) => SupervisorResponse::error(None, format!("invalid request: {err}")),
         };
-        write
-            .lock()
-            .await
-            .send(Message::Text(serde_json::to_string(&response)?))
-            .await
-            .context("send supervisor response")?;
+
+        let state = state.clone();
+        let write_for_response = write.clone();
+        let write_for_events = write.clone();
+        tokio::spawn(async move {
+            let response = state
+                .handle_request_with_events(request, move |event| {
+                    let write = write_for_events.clone();
+                    async move {
+                        write
+                            .lock()
+                            .await
+                            .send(Message::Text(serde_json::to_string(&event)?))
+                            .await
+                            .context("send supervisor event")
+                    }
+                })
+                .await;
+
+            let send_result = async {
+                write_for_response
+                    .lock()
+                    .await
+                    .send(Message::Text(serde_json::to_string(&response)?))
+                    .await
+                    .context("send supervisor response")
+            }
+            .await;
+            if let Err(err) = send_result {
+                tracing::warn!(error = %format!("{err:#}"), "send supervisor response failed");
+            }
+        });
     }
     Ok(())
 }
@@ -1453,4 +1535,181 @@ fn xml_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{SinkExt, StreamExt};
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[tokio::test]
+    async fn notify_reaches_worker_while_request_is_running() -> Result<()> {
+        let (fake_worker_exe, fake_worker_args, fake_worker_script) = fake_worker_command()?;
+        let profile_id = "test-profile".to_string();
+        let secret = "test-secret".to_string();
+        let state = Arc::new(SupervisorState {
+            config: SupervisorConfig {
+                endpoint: SupervisorEndpointConfig {
+                    websocket_bind_addr: "127.0.0.1:0".to_string(),
+                    secret: secret.clone(),
+                },
+                profiles: vec![SupervisorProfileConfig {
+                    id: profile_id.clone(),
+                    path: PathBuf::from("unused-profile-path"),
+                }],
+                pool: SupervisorPoolConfig {
+                    max_workers: 1,
+                    idle_seconds: 60,
+                },
+                ..SupervisorConfig::default()
+            },
+            worker_pool: WorkerPool::new_with_launcher(WorkerLauncher::custom(
+                fake_worker_exe,
+                fake_worker_args,
+                Vec::new(),
+            )),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server_state = state.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            handle_supervisor_connection(stream, server_state).await
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let url = format!("ws://{addr}");
+        let (mut websocket, _) = tokio_tungstenite::client_async(url, stream).await?;
+        let ready = websocket
+            .next()
+            .await
+            .context("supervisor did not send ready")??;
+        assert!(ready.is_text());
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": "prompt",
+                    "type": "worker.request",
+                    "secret": secret,
+                    "profile": profile_id,
+                    "method": "session/prompt",
+                    "params": { "sessionId": "s1" },
+                })
+                .to_string(),
+            ))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": "cancel",
+                    "type": "worker.notify",
+                    "secret": "test-secret",
+                    "profile": "test-profile",
+                    "method": "session/cancel",
+                    "params": { "sessionId": "s1" },
+                })
+                .to_string(),
+            ))
+            .await?;
+
+        let mut saw_cancel_ack = false;
+        let mut saw_prompt_cancelled = false;
+        timeout(Duration::from_secs(3), async {
+            while !saw_prompt_cancelled {
+                let message = websocket
+                    .next()
+                    .await
+                    .context("websocket closed before prompt response")??;
+                if !message.is_text() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(message.to_text()?)?;
+                if value.get("type").and_then(Value::as_str) != Some("supervisor.result") {
+                    continue;
+                }
+                match value.get("id").and_then(Value::as_str) {
+                    Some("cancel") => {
+                        saw_cancel_ack = true;
+                    }
+                    Some("prompt") => {
+                        assert_eq!(
+                            value
+                                .pointer("/result/result/stopReason")
+                                .and_then(Value::as_str),
+                            Some("cancelled")
+                        );
+                        saw_prompt_cancelled = true;
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("cancel notification was blocked behind the running prompt")??;
+
+        assert!(
+            saw_cancel_ack,
+            "supervisor should acknowledge worker.notify"
+        );
+        websocket.close(None).await?;
+        state.worker_pool.shutdown_all().await;
+        let _ = timeout(Duration::from_secs(1), server_task).await;
+        let _ = std::fs::remove_file(fake_worker_script);
+        Ok(())
+    }
+
+    fn fake_worker_command() -> Result<(PathBuf, Vec<OsString>, PathBuf)> {
+        let script_path =
+            std::env::temp_dir().join(format!("dwo-supervisor-fake-worker-{}.ps1", Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"
+$pending = $null
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  try {
+    $message = $line | ConvertFrom-Json
+  } catch {
+    continue
+  }
+
+  if ($null -ne $message.id) {
+    $pending = [string]$message.id
+    continue
+  }
+
+  if ($message.method -eq 'session/cancel') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = $pending
+      result = @{ stopReason = 'cancelled' }
+    } | ConvertTo-Json -Compress
+    [Console]::Out.WriteLine($response)
+    [Console]::Out.Flush()
+    exit 0
+  }
+}
+"#,
+        )
+        .with_context(|| format!("write fake worker script {}", script_path.display()))?;
+        let exe = find_executable("pwsh.exe")
+            .or_else(|| find_executable("powershell.exe"))
+            .context("PowerShell is required for supervisor fake worker test")?;
+        Ok((
+            exe,
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-File"),
+                script_path.clone().into_os_string(),
+            ],
+            script_path,
+        ))
+    }
 }

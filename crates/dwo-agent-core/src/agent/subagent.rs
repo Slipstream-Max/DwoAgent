@@ -128,6 +128,13 @@ impl SubagentCardState {
     pub fn render(&self) -> String {
         render_card(&self.session_name, &self.policy, &self.status, &self.flow)
     }
+
+    pub fn session_slice(&self, message_num: usize) -> Value {
+        slice_session_items(
+            self.flow.iter().map(flow_item_session_item).collect(),
+            message_num,
+        )
+    }
 }
 
 fn render_card(session_name: &str, policy: &str, status: &str, flow: &[FlowItem]) -> String {
@@ -174,6 +181,40 @@ fn render_card(session_name: &str, policy: &str, status: &str, flow: &[FlowItem]
 
 fn format_card_value(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn flow_item_session_item(item: &FlowItem) -> Value {
+    match item.kind.as_str() {
+        "user" => json!({
+            "kind": "user",
+            "content": item.text,
+        }),
+        "thinking" => json!({
+            "kind": "assistant_thought",
+            "content": item.text,
+        }),
+        "tool_call" => {
+            let input = if item.text.trim().is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str::<Value>(&item.text)
+                    .unwrap_or_else(|_| Value::String(item.text.clone()))
+            };
+            json!({
+                "kind": "tool_call",
+                "tool": item.title,
+                "input": input,
+            })
+        }
+        "response" => json!({
+            "kind": "assistant_response",
+            "content": item.text,
+        }),
+        other => json!({
+            "kind": other,
+            "content": item.text,
+        }),
+    }
 }
 
 // ── Executor (trait impl) ──────────────────────────────────────────────────
@@ -564,22 +605,13 @@ impl SubagentSession {
     }
 
     async fn session_slice(&self, message_num: usize) -> Value {
-        let messages = {
-            let guard = self.inner.context_manager.lock().await;
-            guard
-                .as_ref()
-                .map(|cm| cm.messages().to_vec())
-                .unwrap_or_default()
-        };
-        let all_items = session_slice_items(&messages);
-        let count = message_num.max(1);
-        let start = all_items.len().saturating_sub(count);
-        let items: Vec<Value> = all_items[start..].to_vec();
-        json!({
-            "items": items,
-            "total": all_items.len(),
-            "returned": all_items.len() - start,
-        })
+        if let Ok(guard) = self.inner.context_manager.try_lock()
+            && let Some(cm) = guard.as_ref()
+        {
+            return slice_session_items(session_slice_items(cm.messages()), message_num);
+        }
+
+        self.inner.card.lock().await.session_slice(message_num)
     }
 
     async fn error_output(&self, tool: &str, error: &str) -> Value {
@@ -697,6 +729,18 @@ fn session_slice_items(messages: &[Value]) -> Vec<Value> {
         }
     }
     items
+}
+
+fn slice_session_items(all_items: Vec<Value>, message_num: usize) -> Value {
+    let count = message_num.max(1);
+    let start = all_items.len().saturating_sub(count);
+    let returned = all_items.len() - start;
+    let items: Vec<Value> = all_items[start..].to_vec();
+    json!({
+        "items": items,
+        "total": all_items.len(),
+        "returned": returned,
+    })
 }
 
 fn is_empty_content(value: &Value) -> bool {

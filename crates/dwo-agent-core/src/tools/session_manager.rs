@@ -157,7 +157,11 @@ impl SessionManager {
         };
         match operate_on_session(&session, spec.name, args).await {
             Ok(value) => {
-                self.registry.touch(&session).await;
+                if spec.name == "close_subagent" {
+                    self.registry.remove_aliases_for(&session).await;
+                } else {
+                    self.registry.touch(&session).await;
+                }
                 value
             }
             Err(err) => ToolOutput::error(spec.name, format!("{err:#}")),
@@ -460,11 +464,20 @@ impl SessionRegistry {
         let expired: Vec<String> = snapshot
             .into_iter()
             .filter_map(|(key, session, updated)| {
-                let is_done = session
+                let expires_when_done = session
                     .try_lock()
-                    .map(|guard| guard.is_done())
+                    .map(|guard| {
+                        let is_done = guard.is_done();
+                        let kind = guard
+                            .list_item()
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        is_done && kind != "subagent"
+                    })
                     .unwrap_or(false);
-                (is_done && now.saturating_duration_since(updated) >= ttl).then_some(key)
+                (expires_when_done && now.saturating_duration_since(updated) >= ttl).then_some(key)
             })
             .collect();
         for key in expired {
@@ -526,4 +539,167 @@ fn session_key(kind: &str, name: &str) -> String {
 
 fn default_terminal_prefix() -> &'static str {
     if cfg!(windows) { "powershell" } else { "sh" }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+    use crate::tools::tool_catalog::lookup_tool;
+
+    struct FakeSession {
+        id: String,
+        name: String,
+        kind: String,
+        done: bool,
+        cancel_count: Arc<AtomicUsize>,
+    }
+
+    impl FakeSession {
+        fn new(kind: &str, name: &str, done: bool) -> (Self, Arc<AtomicUsize>) {
+            let cancel_count = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    id: format!("{kind}-{name}"),
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                    done,
+                    cancel_count: cancel_count.clone(),
+                },
+                cancel_count,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ToolSession for FakeSession {
+        fn session_id(&self) -> &str {
+            &self.id
+        }
+
+        async fn start(&mut self, _args: &Map<String, Value>) -> Result<Value> {
+            Ok(json!({ "status": "ok" }))
+        }
+
+        async fn cancel(&mut self) -> Result<()> {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
+            self.done = true;
+            Ok(())
+        }
+
+        fn is_done(&self) -> bool {
+            self.done
+        }
+
+        fn list_item(&self) -> Value {
+            json!({
+                "id": self.id,
+                "name": self.name,
+                "kind": self.kind,
+                "status": if self.done { "completed" } else { "running" },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_finished_removes_terminals_but_keeps_subagents() {
+        let registry = SessionRegistry::new(30);
+        let (terminal, _) = FakeSession::new("terminal", "powershell-1", true);
+        let terminal = Arc::new(Mutex::new(terminal)) as Arc<Mutex<dyn ToolSession>>;
+        let (subagent, _) = FakeSession::new("subagent", "alice", true);
+        let subagent = Arc::new(Mutex::new(subagent)) as Arc<Mutex<dyn ToolSession>>;
+
+        registry.save_aliases("terminal-call", &terminal).await;
+        registry.save_aliases("subagent-call", &subagent).await;
+        {
+            let mut state = registry.state.lock().await;
+            let old = Instant::now() - Duration::from_secs(31);
+            for updated in state.updated_at.values_mut() {
+                *updated = old;
+            }
+        }
+
+        registry.prune_finished().await;
+
+        assert!(
+            registry
+                .resolve_name("terminal", "powershell-1")
+                .await
+                .is_none()
+        );
+        assert!(registry.resolve_name("subagent", "alice").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn close_subagent_removes_registered_aliases() {
+        let manager = SessionManager::new(std::env::current_dir().unwrap(), 30);
+        let (subagent, cancel_count) = FakeSession::new("subagent", "alice", false);
+        let subagent = Arc::new(Mutex::new(subagent)) as Arc<Mutex<dyn ToolSession>>;
+        manager
+            .registry
+            .save_aliases("subagent-call", &subagent)
+            .await;
+
+        let output = manager
+            .operate(
+                lookup_tool("close_subagent").unwrap(),
+                json!({ "subagent_name": "alice" }).as_object().unwrap(),
+            )
+            .await;
+
+        assert_eq!(output["status"], "ok");
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert!(manager.registry.get("subagent-call").await.is_none());
+        assert!(
+            manager
+                .registry
+                .resolve_name("subagent", "alice")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_running_tools_leaves_subagents_alive() {
+        let manager = SessionManager::new(std::env::current_dir().unwrap(), 30);
+        let (terminal, terminal_cancel_count) = FakeSession::new("terminal", "powershell-1", false);
+        let terminal = Arc::new(Mutex::new(terminal)) as Arc<Mutex<dyn ToolSession>>;
+        let (subagent, subagent_cancel_count) = FakeSession::new("subagent", "alice", false);
+        let subagent = Arc::new(Mutex::new(subagent)) as Arc<Mutex<dyn ToolSession>>;
+
+        manager
+            .registry
+            .save_aliases("terminal-call", &terminal)
+            .await;
+        manager
+            .registry
+            .save_aliases("subagent-call", &subagent)
+            .await;
+
+        manager.cancel_running_tools().await;
+
+        assert_eq!(terminal_cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(subagent_cancel_count.load(Ordering::SeqCst), 0);
+        assert!(
+            manager
+                .registry
+                .resolve_name("terminal", "powershell-1")
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .registry
+                .resolve_name("subagent", "alice")
+                .await
+                .is_some()
+        );
+    }
 }

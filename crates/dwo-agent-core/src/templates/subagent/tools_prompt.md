@@ -5,7 +5,7 @@
 - Do not use subagents for trivial work that you can finish directly.
 - Give each subagent a concrete, bounded task.
 - Subagents have their own context and tool manager, but their progress remains visible to the user through ACP updates.
-- A completed subagent remains available for follow-up messages until it is closed or expires.
+- A completed subagent remains available for follow-up messages until it is closed.
 
 ### Tools
 

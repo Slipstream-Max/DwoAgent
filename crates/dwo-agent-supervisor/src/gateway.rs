@@ -1,5 +1,6 @@
 //! Supervisor-owned external activation gateway.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,8 +23,9 @@ use dwo_agent_core::ingress::config::{
     FeishuChannelConfig, FeishuChannelDomain, WeixinChannelConfig, load_channel_runtime_config,
 };
 use dwo_agent_core::protocol::dwo::{
-    DwoIngressAttachment, DwoIngressChannel, DwoIngressConversation, DwoIngressEvent,
-    DwoIngressSource, DwoOutboundAction, DwoOutboundBody,
+    self, DwoChannelCommand, DwoIngressAttachment, DwoIngressChannel, DwoIngressConversation,
+    DwoIngressEvent, DwoIngressSource, DwoOutboundAction, DwoOutboundActionNotification,
+    DwoOutboundBody,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::multipart::{Form, Part};
@@ -146,6 +148,18 @@ async fn worker_request(
         .request_with_events(profile, method, params, &state.config.pool, |_| async {
             Ok(())
         })
+        .await
+}
+
+async fn worker_notify(
+    state: &SupervisorState,
+    profile: &ResolvedProfile,
+    method: &str,
+    params: Value,
+) -> Result<()> {
+    state
+        .worker_pool
+        .notify(profile, method, params, &state.config.pool)
         .await
 }
 
@@ -370,6 +384,22 @@ impl MessageHandler for WeixinGatewayHandler {
             return Ok(());
         }
 
+        match confirmation_command(ctx.body.as_deref()) {
+            Some(DwoChannelCommand::Approve { .. }) | Some(DwoChannelCommand::Deny { .. }) => {
+                let result = self.handle_confirmation_command(ctx).await;
+                if let Err(err) = result {
+                    tracing::warn!(target: "weixin", error = %format!("{err:#}"), "failed to notify weixin confirmation command");
+                    let _ = ctx.reply_text(&format!("处理确认指令失败：{err:#}")).await;
+                }
+                return Ok(());
+            }
+            Some(DwoChannelCommand::Usage(message)) => {
+                let _ = ctx.reply_text(&message).await;
+                return Ok(());
+            }
+            _ => {}
+        }
+
         let _guard = self.message_lock.lock().await;
         let _ = ctx.send_typing().await;
         let result = self.handle_message(ctx).await;
@@ -392,6 +422,20 @@ impl MessageHandler for WeixinGatewayHandler {
 }
 
 impl WeixinGatewayHandler {
+    async fn handle_confirmation_command(&self, ctx: &MessageContext) -> Result<()> {
+        let event = self.build_event(ctx, Vec::new());
+        worker_notify(
+            &self.state,
+            &self.profile,
+            "_dwo/ingress/notify_event",
+            json!({ "event": event }),
+        )
+        .await?;
+        ctx.reply_text("已收到确认指令；若请求仍在等待，会继续处理。")
+            .await?;
+        Ok(())
+    }
+
     async fn handle_message(&self, ctx: &MessageContext) -> Result<()> {
         let attachments = if self.media_input {
             match &ctx.media {
@@ -401,7 +445,44 @@ impl WeixinGatewayHandler {
         } else {
             Vec::new()
         };
-        let event = DwoIngressEvent {
+        let event = self.build_event(ctx, attachments);
+        let response = self
+            .state
+            .worker_pool
+            .request_with_events(
+                &self.profile,
+                "_dwo/ingress/handle_event",
+                json!({ "event": event }),
+                &self.state.config.pool,
+                |event| async move {
+                    match outbound_action_from_event(event) {
+                        Some(Ok(action)) => {
+                            if let Err(err) = self.deliver_context_action(ctx, action).await {
+                                tracing::warn!(target: "weixin", error = %format!("{err:#}"), "failed to deliver weixin outbound event");
+                            }
+                        }
+                        Some(Err(err)) => {
+                            tracing::warn!(target: "weixin", error = %format!("{err:#}"), "failed to parse weixin outbound event");
+                        }
+                        None => {}
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+        let actions = parse_actions(response)?;
+        for action in actions {
+            self.deliver_context_action(ctx, action).await?;
+        }
+        Ok(())
+    }
+
+    fn build_event(
+        &self,
+        ctx: &MessageContext,
+        attachments: Vec<DwoIngressAttachment>,
+    ) -> DwoIngressEvent {
+        DwoIngressEvent {
             channel: DwoIngressChannel::Weixin,
             source: DwoIngressSource {
                 id: self.auth.bound_user_id.clone(),
@@ -421,32 +502,41 @@ impl WeixinGatewayHandler {
                 "server_message_id": ctx.server_message_id,
                 "has_media": ctx.media.is_some(),
             }),
-        };
-        let response = worker_request(
-            &self.state,
-            &self.profile,
-            "_dwo/ingress/handle_event",
-            json!({ "event": event }),
-        )
-        .await?;
-        let actions = parse_actions(response)?;
-        for action in actions {
-            match action.body {
-                DwoOutboundBody::Text { text } => {
+        }
+    }
+
+    async fn deliver_context_action(
+        &self,
+        ctx: &MessageContext,
+        action: DwoOutboundAction,
+    ) -> Result<()> {
+        match action.body {
+            DwoOutboundBody::Text { text } => {
+                if action.target == ctx.from {
                     ctx.reply_text(&text).await?;
-                }
-                DwoOutboundBody::Media { path, .. } => {
+                } else {
                     let client = self
                         .client
                         .get()
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("Weixin client is not initialized"))?;
-                    client
-                        .send_media(&ctx.from, &path, ctx.context_token.as_deref())
-                        .await?;
+                    client.send_text(&action.target, &text, None).await?;
                 }
-                DwoOutboundBody::Card { .. } => {}
             }
+            DwoOutboundBody::Media { path, .. } => {
+                let client = self
+                    .client
+                    .get()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("Weixin client is not initialized"))?;
+                let context_token = (action.target == ctx.from)
+                    .then(|| ctx.context_token.as_deref())
+                    .flatten();
+                client
+                    .send_media(&action.target, &path, context_token)
+                    .await?;
+            }
+            DwoOutboundBody::Card { .. } => {}
         }
         Ok(())
     }
@@ -576,6 +666,26 @@ fn parse_actions(response: Value) -> Result<Vec<DwoOutboundAction>> {
         .map_err(Into::into)
 }
 
+fn outbound_action_from_event(event: Value) -> Option<Result<DwoOutboundAction>> {
+    if event.get("method").and_then(Value::as_str) != Some("_dwo/outbound/action") {
+        return None;
+    }
+    let params = event.get("params").cloned().unwrap_or(Value::Null);
+    Some(
+        serde_json::from_value::<DwoOutboundActionNotification>(params)
+            .map(|notification| notification.action)
+            .map_err(Into::into),
+    )
+}
+
+fn confirmation_command(text: Option<&str>) -> Option<DwoChannelCommand> {
+    let text = text?.trim();
+    if !text.starts_with("/approve") && !text.starts_with("/deny") {
+        return None;
+    }
+    dwo::parse_channel_command(text)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FeishuAuth {
@@ -614,6 +724,7 @@ struct FeishuGateway {
     rest: Arc<FeishuRestClient>,
     config: FeishuChannelConfig,
     state_dir: PathBuf,
+    message_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 struct CachedTenantToken {
@@ -665,6 +776,7 @@ impl FeishuGateway {
                 .join("runtime")
                 .join("channel_state")
                 .join(FEISHU_STATE_SUBDIR),
+            message_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -694,6 +806,22 @@ impl FeishuGateway {
         let peer = feishu_peer_id(&msg, kind).to_string();
         let media = parse_feishu_media(&msg.content);
         let text = message_text(&msg.content, media.is_some());
+        match confirmation_command(text.as_deref()) {
+            Some(DwoChannelCommand::Approve { .. }) | Some(DwoChannelCommand::Deny { .. }) => {
+                self.handle_confirmation_command(&msg, kind, &peer, text, media.is_some())
+                    .await?;
+                return Ok(());
+            }
+            Some(DwoChannelCommand::Usage(message)) => {
+                self.channel.send(&message, &peer).await?;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let session_key = format!("{}:{peer}", feishu_chat_kind_name(kind));
+        let lock = self.session_lock(&session_key).await;
+        let _guard = lock.lock().await;
         let attachments = if self.config.media_input {
             match media.as_ref() {
                 Some(media) => vec![self.download_message_media(&msg, &media).await?],
@@ -702,40 +830,31 @@ impl FeishuGateway {
         } else {
             Vec::new()
         };
-        let kind_name = feishu_chat_kind_name(kind);
-        let event = DwoIngressEvent {
-            channel: DwoIngressChannel::Feishu,
-            source: DwoIngressSource {
-                id: msg.sender.clone(),
-                name: Some(msg.sender.clone()),
-            },
-            conversation: DwoIngressConversation {
-                id: peer.clone(),
-                kind: Some(if kind == FeishuChatKind::Group {
-                    "group".to_string()
-                } else {
-                    "direct".to_string()
-                }),
-                reply_to: Some(peer.clone()),
-                holder: Some(format!("feishu:{kind_name}:{peer}")),
-                state_key: Some(peer),
-            },
-            text,
-            attachments,
-            raw: json!({
-                "message_id": msg.id,
-                "chat_type": msg.chat_type,
-                "channel": msg.channel,
-                "has_media": media.is_some(),
-            }),
-        };
-        let response = worker_request(
-            &self.state,
-            &self.profile,
-            "_dwo/ingress/handle_event",
-            json!({ "event": event }),
-        )
-        .await?;
+        let event = self.build_event(&msg, kind, &peer, text, attachments, media.is_some());
+        let response = self
+            .state
+            .worker_pool
+            .request_with_events(
+                &self.profile,
+                "_dwo/ingress/handle_event",
+                json!({ "event": event }),
+                &self.state.config.pool,
+                |event| async move {
+                    match outbound_action_from_event(event) {
+                        Some(Ok(action)) => {
+                            if let Err(err) = self.deliver(&action).await {
+                                tracing::warn!(target: "feishu", error = %format!("{err:#}"), "failed to deliver feishu outbound event");
+                            }
+                        }
+                        Some(Err(err)) => {
+                            tracing::warn!(target: "feishu", error = %format!("{err:#}"), "failed to parse feishu outbound event");
+                        }
+                        None => {}
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
         let actions = parse_actions(response)?;
         for action in actions {
             if let Err(err) = self.deliver(&action).await {
@@ -743,6 +862,74 @@ impl FeishuGateway {
             }
         }
         Ok(())
+    }
+
+    async fn handle_confirmation_command(
+        &self,
+        msg: &ChannelMessage,
+        kind: FeishuChatKind,
+        peer: &str,
+        text: Option<String>,
+        has_media: bool,
+    ) -> Result<()> {
+        let event = self.build_event(msg, kind, peer, text, Vec::new(), has_media);
+        worker_notify(
+            &self.state,
+            &self.profile,
+            "_dwo/ingress/notify_event",
+            json!({ "event": event }),
+        )
+        .await?;
+        self.channel
+            .send("已收到确认指令；若请求仍在等待，会继续处理。", peer)
+            .await?;
+        Ok(())
+    }
+
+    fn build_event(
+        &self,
+        msg: &ChannelMessage,
+        kind: FeishuChatKind,
+        peer: &str,
+        text: Option<String>,
+        attachments: Vec<DwoIngressAttachment>,
+        has_media: bool,
+    ) -> DwoIngressEvent {
+        let kind_name = feishu_chat_kind_name(kind);
+        DwoIngressEvent {
+            channel: DwoIngressChannel::Feishu,
+            source: DwoIngressSource {
+                id: msg.sender.clone(),
+                name: Some(msg.sender.clone()),
+            },
+            conversation: DwoIngressConversation {
+                id: peer.to_string(),
+                kind: Some(if kind == FeishuChatKind::Group {
+                    "group".to_string()
+                } else {
+                    "direct".to_string()
+                }),
+                reply_to: Some(peer.to_string()),
+                holder: Some(format!("feishu:{kind_name}:{peer}")),
+                state_key: Some(peer.to_string()),
+            },
+            text,
+            attachments,
+            raw: json!({
+                "message_id": msg.id,
+                "chat_type": msg.chat_type,
+                "channel": msg.channel,
+                "has_media": has_media,
+            }),
+        }
+    }
+
+    async fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.message_locks.lock().await;
+        locks
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     async fn download_message_media(

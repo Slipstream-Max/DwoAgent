@@ -1,7 +1,10 @@
 //! Core-side handling for gateway-delivered ingress events.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol::schema::{ContentBlock, TextContent};
 use anyhow::Result;
@@ -31,15 +34,25 @@ use crate::tools::{
 
 const FEISHU_STATE_SUBDIR: &str = "feishu";
 const WEIXIN_STATE_SUBDIR: &str = "weixin";
+const CHANNEL_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub type OutboundEmitter = Arc<
+    dyn Fn(DwoOutboundAction) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
+>;
 
 pub async fn handle_ingress_event(
     agent: Arc<AgentService>,
     event: DwoIngressEvent,
+    emit_outbound: Option<OutboundEmitter>,
 ) -> Result<Vec<DwoOutboundAction>> {
     let config = load_channel_runtime_config(agent.agent_structure_dir())?;
     match event.channel {
-        DwoIngressChannel::Weixin => handle_weixin_event(agent, event, &config.weixin).await,
-        DwoIngressChannel::Feishu => handle_feishu_event(agent, event, &config.feishu).await,
+        DwoIngressChannel::Weixin => {
+            handle_weixin_event(agent, event, &config.weixin, emit_outbound).await
+        }
+        DwoIngressChannel::Feishu => {
+            handle_feishu_event(agent, event, &config.feishu, emit_outbound).await
+        }
     }
 }
 
@@ -47,6 +60,7 @@ async fn handle_weixin_event(
     agent: Arc<AgentService>,
     event: DwoIngressEvent,
     config: &WeixinChannelConfig,
+    emit_outbound: Option<OutboundEmitter>,
 ) -> Result<Vec<DwoOutboundAction>> {
     if !config.enabled {
         return Ok(Vec::new());
@@ -105,7 +119,13 @@ async fn handle_weixin_event(
             user_input,
             user_blocks,
             update_collector.emitter(),
-            rejecting_channel_permission_requester(),
+            channel_permission_requester(
+                agent.pending_confirmations(),
+                emit_outbound.clone(),
+                DwoIngressChannel::Weixin,
+                target.clone(),
+                holder,
+            ),
             if config.media_output {
                 weixin_tool_schemas()
             } else {
@@ -132,6 +152,7 @@ async fn handle_feishu_event(
     agent: Arc<AgentService>,
     event: DwoIngressEvent,
     config: &FeishuChannelConfig,
+    emit_outbound: Option<OutboundEmitter>,
 ) -> Result<Vec<DwoOutboundAction>> {
     if !config.enabled || !is_feishu_allowed(&event, config) {
         return Ok(Vec::new());
@@ -208,7 +229,13 @@ async fn handle_feishu_event(
             user_input,
             user_blocks,
             update_collector.emitter(),
-            rejecting_channel_permission_requester(),
+            channel_permission_requester(
+                agent.pending_confirmations(),
+                emit_outbound.clone(),
+                DwoIngressChannel::Feishu,
+                target.clone(),
+                holder,
+            ),
             feishu_tool_schemas(config.media_output, config.card_output),
         )
         .await;
@@ -402,11 +429,38 @@ fn is_feishu_allowed(event: &DwoIngressEvent, config: &FeishuChannelConfig) -> b
         || allow_list.iter().any(|item| item == &event.conversation.id)
 }
 
-fn rejecting_channel_permission_requester() -> PermissionRequester {
+fn channel_permission_requester(
+    confirmations: Arc<super::channel_control::PendingConfirmationRegistry>,
+    emit_outbound: Option<OutboundEmitter>,
+    channel: DwoIngressChannel,
+    target: String,
+    holder: String,
+) -> PermissionRequester {
     Arc::new(move |session_id: String, payload: Map<String, Value>| {
+        let confirmations = confirmations.clone();
+        let emit_outbound = emit_outbound.clone();
+        let channel = channel.clone();
+        let target = target.clone();
+        let holder = holder.clone();
         Box::pin(async move {
-            let _ = (session_id, payload);
-            Ok(PERMISSION_REJECT_ONCE.to_string())
+            let (snapshot, rx) = confirmations.create(session_id, payload, holder.clone())?;
+            let message = ChannelControl::confirmation_message(&snapshot);
+            if let Some(emit) = emit_outbound {
+                emit(text_action(channel, target, message)).await?;
+            }
+            match tokio::time::timeout(CHANNEL_PERMISSION_TIMEOUT, rx).await {
+                Ok(Ok(decision)) => Ok(decision),
+                Ok(Err(_)) => Ok(PERMISSION_REJECT_ONCE.to_string()),
+                Err(_) => {
+                    let _ = confirmations.resolve(
+                        &snapshot.confirmation_id,
+                        &holder,
+                        PERMISSION_REJECT_ONCE,
+                        Some("timeout"),
+                    );
+                    Ok(PERMISSION_REJECT_ONCE.to_string())
+                }
+            }
         })
     })
 }

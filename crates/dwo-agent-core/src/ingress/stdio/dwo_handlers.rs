@@ -10,11 +10,12 @@ use crate::automation::{
     AutomationNotificationRecord, AutomationNotifyChannel, automation_notification_text,
     record_automation_delivery, run_automation_job_once_with_leases,
 };
-use crate::ingress::handler::handle_ingress_event;
+use crate::ingress::handler::{OutboundEmitter, handle_ingress_event};
 use crate::protocol::dwo::{
     self, DwoAutomationRecordDeliveryRequest, DwoAutomationRunJobRequest, DwoIngressChannel,
-    DwoIngressHandleEventRequest, DwoOutboundAction, DwoOutboundBody, DwoSessionContextRequest,
-    DwoWorkerPingRequest, DwoWorkerProfileRequest, DwoWorkerShutdownRequest,
+    DwoIngressHandleEventRequest, DwoIngressNotifyEventNotification, DwoOutboundAction,
+    DwoOutboundActionNotification, DwoOutboundBody, DwoSessionContextRequest, DwoWorkerPingRequest,
+    DwoWorkerProfileRequest, DwoWorkerShutdownRequest,
 };
 
 pub async fn worker_ping(
@@ -71,12 +72,27 @@ pub async fn ingress_handle_event(
     agent: Arc<AgentService>,
     req: DwoIngressHandleEventRequest,
     responder: Responder<Value>,
+    cx: ConnectionTo<Client>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    let emit_outbound = outbound_emitter(&cx);
+    cx.spawn(async move {
+        match handle_ingress_event(agent, req.event, Some(emit_outbound)).await {
+            Ok(actions) => responder.respond(dwo::ingress_handle_event_response(actions)),
+            Err(err) => responder.respond_with_error(invalid_params(err)),
+        }
+    })?;
+    Ok(())
+}
+
+pub async fn ingress_notify_event(
+    agent: Arc<AgentService>,
+    notif: DwoIngressNotifyEventNotification,
     _cx: ConnectionTo<Client>,
 ) -> std::result::Result<(), agent_client_protocol::Error> {
-    match handle_ingress_event(agent, req.event).await {
-        Ok(actions) => responder.respond(dwo::ingress_handle_event_response(actions)),
-        Err(err) => responder.respond_with_error(invalid_params(err)),
+    if let Err(err) = handle_ingress_event(agent, notif.event, None).await {
+        tracing::warn!(error = %format!("{err:#}"), "failed to handle ingress notification");
     }
+    Ok(())
 }
 
 pub async fn automation_run_job(
@@ -171,4 +187,15 @@ fn invalid_params(err: impl std::fmt::Display) -> agent_client_protocol::schema:
 
 fn internal_error(err: impl std::fmt::Display) -> agent_client_protocol::schema::Error {
     agent_client_protocol::schema::Error::internal_error().data(format!("{err:#}"))
+}
+
+fn outbound_emitter(cx: &ConnectionTo<Client>) -> OutboundEmitter {
+    let cx_for_emit = cx.clone();
+    Arc::new(move |action: DwoOutboundAction| {
+        let cx = cx_for_emit.clone();
+        Box::pin(async move {
+            let _ = cx.send_notification_to(Client, DwoOutboundActionNotification { action });
+            Ok(())
+        })
+    })
 }

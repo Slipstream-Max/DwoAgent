@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use agent_client_protocol::JsonRpcRequest;
+use agent_client_protocol::{JsonRpcNotification, JsonRpcRequest};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -107,6 +107,20 @@ pub struct DwoSessionContextRequest {
 #[serde(deny_unknown_fields)]
 pub struct DwoIngressHandleEventRequest {
     pub event: DwoIngressEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_dwo/ingress/notify_event")]
+#[serde(deny_unknown_fields)]
+pub struct DwoIngressNotifyEventNotification {
+    pub event: DwoIngressEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_dwo/outbound/action")]
+#[serde(deny_unknown_fields)]
+pub struct DwoOutboundActionNotification {
+    pub action: DwoOutboundAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]

@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::Mutex;
 use weixin_agent::{
     LoginStatus, MediaInfo, MediaType, MessageContext, MessageHandler, StandaloneQrLogin,
     WeixinClient, WeixinConfig,
@@ -71,7 +70,6 @@ struct WeixinHandler {
     media_output: bool,
     response_detail: ChannelResponseDetail,
     client: Arc<OnceLock<Arc<WeixinClient>>>,
-    message_lock: Arc<Mutex<()>>,
 }
 
 struct WeixinReplyMediaBridge {
@@ -203,7 +201,6 @@ impl WeixinChannel {
             media_output: config.media_output,
             response_detail: config.response_detail,
             client: client_ref.clone(),
-            message_lock: Arc::new(Mutex::new(())),
         };
 
         let mut builder = WeixinConfig::builder()
@@ -254,7 +251,6 @@ impl MessageHandler for WeixinHandler {
             return Ok(());
         }
 
-        let _guard = self.message_lock.lock().await;
         let _ = ctx.send_typing().await;
         let result = self.handle_message(ctx).await;
         let _ = ctx.cancel_typing().await;
@@ -387,8 +383,10 @@ impl WeixinHandler {
         if let Some(detail) = collected.detail_text.as_deref() {
             ctx.reply_text(detail).await?;
         }
-        if !collected.response_text.is_empty() {
-            ctx.reply_text(&collected.response_text).await?;
+        for text in &collected.response_messages {
+            if !text.is_empty() {
+                ctx.reply_text(text).await?;
+            }
         }
         Ok(())
     }

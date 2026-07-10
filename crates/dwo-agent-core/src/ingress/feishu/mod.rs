@@ -1,6 +1,5 @@
 //! Feishu assistant channel.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,7 +57,6 @@ pub struct FeishuChannel {
     rest: Arc<FeishuRestClient>,
     config: FeishuChannelConfig,
     workspace_dir: PathBuf,
-    message_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,13 +189,13 @@ impl FeishuChannel {
             rest: Arc::new(FeishuRestClient::new(auth, base_url)),
             config: config.clone(),
             workspace_dir,
-            message_locks: Mutex::new(HashMap::new()),
         })
     }
 
     pub async fn run(self) -> Result<()> {
+        let this = Arc::new(self);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(256);
-        let channel = self.channel.clone();
+        let channel = this.channel.clone();
         let mut listen_task = tokio::spawn(async move { channel.listen(tx).await });
 
         loop {
@@ -209,9 +207,12 @@ impl FeishuChannel {
                     let Some(msg) = maybe_msg else {
                         return Ok(());
                     };
-                    if let Err(err) = self.handle_message(msg).await {
-                        tracing::warn!(target: "feishu", error = %err, "failed to handle feishu message");
-                    }
+                    let handler = this.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = handler.handle_message(msg).await {
+                            tracing::warn!(target: "feishu", error = %err, "failed to handle feishu message");
+                        }
+                    });
                 }
             }
         }
@@ -229,10 +230,6 @@ impl FeishuChannel {
         if !self.is_allowed(&msg, kind) {
             return Ok(());
         }
-
-        let session_key = format!("{}:{peer_id}", chat_kind_name(kind));
-        let lock = self.session_lock(&session_key).await;
-        let _guard = lock.lock().await;
 
         let state_dir = self
             .agent
@@ -348,8 +345,10 @@ impl FeishuChannel {
         if let Some(detail) = collected.detail_text.as_deref() {
             self.channel.send(detail, target).await?;
         }
-        if !collected.response_text.is_empty() {
-            self.channel.send(&collected.response_text, target).await?;
+        for text in &collected.response_messages {
+            if !text.is_empty() {
+                self.channel.send(text, target).await?;
+            }
         }
         Ok(())
     }
@@ -454,14 +453,6 @@ impl FeishuChannel {
             path,
             mime_type: downloaded.mime_type,
         })
-    }
-
-    async fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
-        let mut locks = self.message_locks.lock().await;
-        locks
-            .entry(session_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
     }
 
     fn is_allowed(&self, msg: &ChannelMessage, kind: FeishuChatKind) -> bool {

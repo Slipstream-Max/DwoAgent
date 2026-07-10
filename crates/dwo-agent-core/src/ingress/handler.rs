@@ -41,12 +41,17 @@ pub type OutboundEmitter = Arc<
     dyn Fn(DwoOutboundAction) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
 >;
 
+pub struct DwoIngressHandleEventResult {
+    pub session_id: Option<String>,
+    pub actions: Vec<DwoOutboundAction>,
+}
+
 pub async fn handle_ingress_event(
     agent: Arc<AgentService>,
     event: DwoIngressEvent,
     emit_outbound: Option<OutboundEmitter>,
     emit_session_update: Option<UpdateEmitter>,
-) -> Result<Vec<DwoOutboundAction>> {
+) -> Result<DwoIngressHandleEventResult> {
     let config = load_channel_runtime_config(agent.agent_structure_dir())?;
     match event.channel {
         DwoIngressChannel::Weixin => {
@@ -78,9 +83,12 @@ async fn handle_weixin_event(
     config: &WeixinChannelConfig,
     emit_outbound: Option<OutboundEmitter>,
     emit_session_update: Option<UpdateEmitter>,
-) -> Result<Vec<DwoOutboundAction>> {
+) -> Result<DwoIngressHandleEventResult> {
     if !config.enabled {
-        return Ok(Vec::new());
+        return Ok(DwoIngressHandleEventResult {
+            session_id: None,
+            actions: Vec::new(),
+        });
     }
 
     let target = reply_target(&event);
@@ -106,14 +114,26 @@ async fn handle_weixin_event(
     if let Some(text) = command_text(&event)
         && let Some(reply) = channel_control.handle_command(text).await?
     {
-        return Ok(vec![text_action(DwoIngressChannel::Weixin, target, reply)]);
+        let session_id = channel_control
+            .active_session()
+            .await
+            .ok()
+            .map(|session| session.session_id().to_string());
+        return Ok(DwoIngressHandleEventResult {
+            session_id,
+            actions: vec![text_action(DwoIngressChannel::Weixin, target, reply)],
+        });
     }
 
     let session = channel_control.active_session().await?;
+    let session_id = session.session_id().to_string();
     let Some((user_input, user_blocks)) =
         build_weixin_user_input(&event, config, session.session_dir())?
     else {
-        return Ok(Vec::new());
+        return Ok(DwoIngressHandleEventResult {
+            session_id: Some(session_id),
+            actions: Vec::new(),
+        });
     };
 
     let action_collector = OutboundActionCollector::new(DwoIngressChannel::Weixin, target.clone());
@@ -133,7 +153,7 @@ async fn handle_weixin_event(
     let emit_update = tee_update_emitter(update_collector.emitter(), emit_session_update);
     let run_result = channel_control
         .run_prompt(
-            session.session_id(),
+            &session_id,
             user_input,
             user_blocks,
             emit_update,
@@ -163,7 +183,10 @@ async fn handle_weixin_event(
         target,
         update_collector.finish().await,
     );
-    Ok(actions)
+    Ok(DwoIngressHandleEventResult {
+        session_id: Some(session_id),
+        actions,
+    })
 }
 
 async fn handle_feishu_event(
@@ -172,9 +195,12 @@ async fn handle_feishu_event(
     config: &FeishuChannelConfig,
     emit_outbound: Option<OutboundEmitter>,
     emit_session_update: Option<UpdateEmitter>,
-) -> Result<Vec<DwoOutboundAction>> {
+) -> Result<DwoIngressHandleEventResult> {
     if !config.enabled || !is_feishu_allowed(&event, config) {
-        return Ok(Vec::new());
+        return Ok(DwoIngressHandleEventResult {
+            session_id: None,
+            actions: Vec::new(),
+        });
     }
 
     let target = reply_target(&event);
@@ -215,14 +241,26 @@ async fn handle_feishu_event(
     if let Some(text) = command_text(&event)
         && let Some(reply) = channel_control.handle_command(text).await?
     {
-        return Ok(vec![text_action(DwoIngressChannel::Feishu, target, reply)]);
+        let session_id = channel_control
+            .active_session()
+            .await
+            .ok()
+            .map(|session| session.session_id().to_string());
+        return Ok(DwoIngressHandleEventResult {
+            session_id,
+            actions: vec![text_action(DwoIngressChannel::Feishu, target, reply)],
+        });
     }
 
     let session = channel_control.active_session().await?;
+    let session_id = session.session_id().to_string();
     let Some((user_input, user_blocks)) =
         build_feishu_user_input(&event, config, session.session_dir())?
     else {
-        return Ok(Vec::new());
+        return Ok(DwoIngressHandleEventResult {
+            session_id: Some(session_id),
+            actions: Vec::new(),
+        });
     };
 
     let action_collector = OutboundActionCollector::new(DwoIngressChannel::Feishu, target.clone());
@@ -245,7 +283,7 @@ async fn handle_feishu_event(
     let emit_update = tee_update_emitter(update_collector.emitter(), emit_session_update);
     let run_result = channel_control
         .run_prompt(
-            session.session_id(),
+            &session_id,
             user_input,
             user_blocks,
             emit_update,
@@ -271,7 +309,10 @@ async fn handle_feishu_event(
         target,
         update_collector.finish().await,
     );
-    Ok(actions)
+    Ok(DwoIngressHandleEventResult {
+        session_id: Some(session_id),
+        actions,
+    })
 }
 
 fn build_weixin_user_input(
@@ -385,8 +426,12 @@ fn append_collected_text_actions(
     if let Some(detail) = collected.detail_text.filter(|text| !text.is_empty()) {
         actions.push(text_action(channel.clone(), target.clone(), detail));
     }
-    if !collected.response_text.is_empty() {
-        actions.push(text_action(channel, target, collected.response_text));
+    for text in collected
+        .response_messages
+        .into_iter()
+        .filter(|text| !text.is_empty())
+    {
+        actions.push(text_action(channel.clone(), target.clone(), text));
     }
 }
 

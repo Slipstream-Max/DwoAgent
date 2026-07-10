@@ -120,6 +120,48 @@ pub fn emit_session_update(
     session_id: &str,
     update: &Map<String, Value>,
 ) {
+    if let Some(notif) = session_update_notification(session_id, update) {
+        let _ = cx.send_notification_to(Client, notif);
+    }
+}
+
+pub fn session_update_event(session_id: &str, update: &Map<String, Value>) -> Option<Value> {
+    notification_event(session_update_notification(session_id, update)?)
+}
+
+pub fn session_info_event(
+    session_id: &str,
+    title: Option<&str>,
+    updated_at: Option<&str>,
+) -> Option<Value> {
+    let title = title?;
+    let info_update = SessionInfoUpdate::new()
+        .title(title.to_string())
+        .updated_at(updated_at.unwrap_or_default().to_string());
+    notification_event(SessionNotification::new(
+        SessionId::new(session_id),
+        SessionUpdate::SessionInfoUpdate(info_update),
+    ))
+}
+
+pub fn context_usage_event(session_id: &str, usage: ContextUsageSnapshot) -> Option<Value> {
+    notification_event(SessionNotification::new(
+        SessionId::new(session_id),
+        SessionUpdate::UsageUpdate(UsageUpdate::new(usage.used, usage.size)),
+    ))
+}
+
+fn notification_event(notification: SessionNotification) -> Option<Value> {
+    Some(serde_json::json!({
+        "method": "session/update",
+        "params": serde_json::to_value(notification).ok()?,
+    }))
+}
+
+fn session_update_notification(
+    session_id: &str,
+    update: &Map<String, Value>,
+) -> Option<SessionNotification> {
     let session_update_type = update
         .get("session_update")
         .and_then(Value::as_str)
@@ -128,7 +170,7 @@ pub fn emit_session_update(
 
     let sid = SessionId::new(session_id);
 
-    let notification = match session_update_type {
+    match session_update_type {
         s if s == EVENT_AGENT_MESSAGE_CHUNK => {
             let text = extract_content_text(update);
             let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
@@ -337,10 +379,6 @@ pub fn emit_session_update(
             ))
         }
         _ => None,
-    };
-
-    if let Some(notif) = notification {
-        let _ = cx.send_notification_to(Client, notif);
     }
 }
 

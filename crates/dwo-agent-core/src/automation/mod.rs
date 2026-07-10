@@ -482,7 +482,7 @@ impl AutomationRuntime {
             .await;
         let collected = collector.finish().await;
         record.detail_text = collected.detail_text;
-        record.response_text = collected.response_text;
+        record.response_text = collected.response_messages.join("");
         record.finished_at = Some(utc_iso());
 
         match run_result {
@@ -670,7 +670,7 @@ fn render_notification_text(job: &AutomationJobConfig, record: &AutomationRunRec
         AutomationRunStatus::Skipped => "skipped",
     };
     let mut text = format!(
-        "automation `{}` {status}\nsession: {}\n/switch {}",
+        "automation `{}` {status}\nsession: {}\n/load {}",
         job.id, record.session_id, record.session_id
     );
     if let Some(error) = record.error.as_deref() {

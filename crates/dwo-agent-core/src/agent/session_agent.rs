@@ -129,6 +129,10 @@ impl SessionAgent {
         self.runtime.lock().await.context_manager.usage_snapshot()
     }
 
+    pub fn persisted_context_usage_snapshot(&self) -> Result<Option<ContextUsageSnapshot>> {
+        self.persistence.load_context_usage()
+    }
+
     pub async fn tool_manager(&self) -> Arc<ToolRunManager> {
         self.tool_manager_cached.clone()
     }
@@ -228,7 +232,7 @@ impl SessionAgent {
 
         self.persist_async().await?;
 
-        self.activity
+        activity
             .record_user_input(&user_input, &user_blocks)
             .await?;
         self.persist_async().await?;
@@ -322,19 +326,24 @@ impl SessionAgent {
     }
 
     pub async fn mark_loaded(&self, reset_active: bool) -> Result<()> {
-        {
+        let should_persist_context = {
             let mut session = self.session.lock().await;
             session.updated_at = Some(utc_iso());
-            if reset_active
-                || !matches!(
-                    session.state,
-                    AgentState::Running | AgentState::WaitingUserConfirm | AgentState::Cancelling
-                )
-            {
+            let active = matches!(
+                session.state,
+                AgentState::Running | AgentState::WaitingUserConfirm | AgentState::Cancelling
+            );
+            let should_reset = reset_active || !active;
+            if should_reset {
                 session.state = AgentState::Idle;
             }
+            should_reset
+        };
+        if should_persist_context {
+            self.persist_async().await
+        } else {
+            self.persist_session_meta_async().await
         }
-        self.persist_async().await
     }
 
     pub async fn set_mode(&self, mode_id: &str) -> Result<()> {
@@ -756,4 +765,75 @@ fn clean_generated_session_title(raw: &str) -> Option<String> {
         return None;
     }
     Some(title.chars().take(GENERATED_TITLE_LENGTH).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::agent::service::AgentService;
+
+    fn write_agent_folder(root: &Path) {
+        let resources_dir = root.join("resources");
+        let prompt_dir = resources_dir.join("prompt");
+        let skills_dir = resources_dir.join("skills");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            root.join("agent.yaml"),
+            "\
+agentId: test-agent
+name: Test Agent
+description: Test
+maxRunningTurn: 7
+policyMode: confirm
+sessionStoreDir: .sessions
+tools:
+  fileEdit: disable
+  terminal: disable
+  subagent: disable
+model:
+  defaultModelId: mock-model
+  models:
+    - modelName: mock-model
+      provider: deepseek
+      modelId: deepseek-v4-pro
+      apiKey: test-key
+      defaultReasoningMode: auto
+",
+        )
+        .unwrap();
+        std::fs::write(prompt_dir.join("system.md"), "You are a test agent.\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn mark_loaded_for_active_session_does_not_wait_for_runtime_lock() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        write_agent_folder(&agent_dir);
+
+        let service = AgentService::new(&agent_dir).unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let session = service.new_session(&cwd).await.unwrap();
+        {
+            let mut snapshot = session.session.lock().await;
+            snapshot.state = AgentState::Running;
+        }
+
+        let runtime_guard = session.runtime.lock().await;
+        let result = timeout(Duration::from_millis(500), session.mark_loaded(false)).await;
+        drop(runtime_guard);
+
+        result
+            .expect("mark_loaded(false) for an active session should not wait on runtime")
+            .unwrap();
+        let snapshot = session.session_snapshot().await;
+        assert_eq!(snapshot.state, AgentState::Running);
+    }
 }

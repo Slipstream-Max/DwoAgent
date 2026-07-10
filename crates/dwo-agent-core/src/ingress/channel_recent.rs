@@ -1,14 +1,9 @@
-//! Recent transcript rendering for channel session switches.
+//! Recent transcript selection helpers retained for replay-focused tests.
 
-use std::path::Path;
-
-use anyhow::Result;
 use serde_json::{Map, Value};
 
 use crate::agent::activity::event::{EVENT_AGENT_MESSAGE_CHUNK, EVENT_USER_MESSAGE_CHUNK};
-use crate::agent::session::SESSION_CLIENT_TRANSCRIPT_FILE;
 use crate::config::models::SessionTranscriptEvent;
-use crate::utils::files::read_utf8_text;
 
 const RECENT_CONTEXT_ENTRY_LIMIT: usize = 800;
 
@@ -22,15 +17,6 @@ enum DialogueRole {
 struct DialogueEntry {
     role: DialogueRole,
     text: String,
-}
-
-pub(super) fn render_recent_session_context(session_dir: &Path) -> Result<Option<String>> {
-    let transcript_path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
-    if !transcript_path.is_file() {
-        return Ok(None);
-    }
-    let text = read_utf8_text(&transcript_path)?;
-    Ok(render_recent_context_from_transcript(&text))
 }
 
 fn render_recent_context_from_transcript(text: &str) -> Option<String> {

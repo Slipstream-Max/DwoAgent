@@ -19,9 +19,9 @@ use dwo_agent_core::agent::constants::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioCommand};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 mod gateway;
@@ -179,15 +179,27 @@ async fn run_acp_shim(config: SupervisorConfig, profile_id: String) -> Result<()
         .await
         .context("open supervisor websocket")?;
     let (mut write, mut read) = websocket.split();
+    let (supervisor_tx, mut supervisor_rx) = mpsc::unbounded_channel::<Value>();
 
     let suppressed_ids = Arc::new(Mutex::new(HashSet::<String>::new()));
     let suppressed_for_stdin = suppressed_ids.clone();
     let secret = config.endpoint.secret.clone();
     let stdin_profile = profile_id.clone();
+    let stdin_supervisor_tx = supervisor_tx.clone();
     let stdin_task = tokio::spawn(async move {
         let mut stdin = BufReader::new(tokio::io::stdin()).lines();
         while let Some(line) = stdin.next_line().await.context("read ACP stdin")? {
             let message: Value = serde_json::from_str(&line).context("parse ACP JSON-RPC")?;
+            if message.get("method").is_none() {
+                stdin_supervisor_tx
+                    .send(json!({
+                        "type": "client.response",
+                        "secret": secret,
+                        "message": message,
+                    }))
+                    .context("queue ACP client response")?;
+                continue;
+            }
             let method = message
                 .get("method")
                 .and_then(Value::as_str)
@@ -215,8 +227,17 @@ async fn run_acp_shim(config: SupervisorConfig, profile_id: String) -> Result<()
                     })
                 }
             };
+            stdin_supervisor_tx
+                .send(supervisor_message)
+                .context("queue supervisor websocket message")?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = supervisor_rx.recv().await {
             write
-                .send(Message::Text(supervisor_message.to_string()))
+                .send(Message::Text(message.to_string()))
                 .await
                 .context("write supervisor websocket message")?;
         }
@@ -248,8 +269,20 @@ async fn run_acp_shim(config: SupervisorConfig, profile_id: String) -> Result<()
                         write_stdout_json(&stdout_for_ws, out).await?;
                     }
                 }
+                "supervisor.client_request" => {
+                    let out = json!({
+                        "jsonrpc": "2.0",
+                        "id": value.get("id").cloned().unwrap_or(Value::Null),
+                        "method": value.get("method").cloned().unwrap_or(Value::Null),
+                        "params": value.get("params").cloned().unwrap_or(Value::Null),
+                    });
+                    write_stdout_json(&stdout_for_ws, out).await?;
+                }
                 "supervisor.result" | "supervisor.error" => {
                     let id = value.get("id").cloned().unwrap_or(Value::Null);
+                    if id.is_null() {
+                        continue;
+                    }
                     if let Some(id_text) = id.as_str()
                         && suppressed_ids.lock().await.remove(id_text)
                     {
@@ -266,19 +299,36 @@ async fn run_acp_shim(config: SupervisorConfig, profile_id: String) -> Result<()
                                 .unwrap_or(Value::Null),
                         })
                     } else {
+                        let error = value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("supervisor request failed");
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "error": {
-                                "code": -32000,
-                                "message": value
-                                    .get("error")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("supervisor request failed"),
+                                "code": -32603,
+                                "message": error,
+                                "data": error,
                             },
                         })
                     };
                     write_stdout_json(&stdout_for_ws, out).await?;
+                    if kind == "supervisor.result"
+                        && let Some(events) = value
+                            .get("result")
+                            .and_then(|result| result.get("replayEvents"))
+                            .and_then(Value::as_array)
+                    {
+                        for event in events {
+                            let out = json!({
+                                "jsonrpc": "2.0",
+                                "method": event.get("method").cloned().unwrap_or(Value::Null),
+                                "params": event.get("params").cloned().unwrap_or(Value::Null),
+                            });
+                            write_stdout_json(&stdout_for_ws, out).await?;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -289,6 +339,7 @@ async fn run_acp_shim(config: SupervisorConfig, profile_id: String) -> Result<()
     tokio::select! {
         result = stdin_task => result.context("ACP stdin task panicked")?,
         result = ws_task => result.context("supervisor websocket task panicked")?,
+        result = writer_task => result.context("supervisor websocket writer task panicked")?,
     }
 }
 
@@ -341,8 +392,9 @@ async fn run_supervisor(config_path: Option<PathBuf>) -> Result<()> {
 struct SupervisorState {
     config: SupervisorConfig,
     worker_pool: WorkerPool,
-    event_bus: SessionEventBus,
-    config_cache: SessionConfigCache,
+    event_bus: Arc<SessionEventBus>,
+    config_cache: Arc<SessionConfigCache>,
+    permissions: Arc<SupervisorPermissionRegistry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -361,11 +413,162 @@ struct SupervisorConnectionContext {
 struct SessionEventBus {
     subscribers: Mutex<HashMap<SessionKey, HashMap<String, mpsc::UnboundedSender<Value>>>>,
     by_connection: Mutex<HashMap<String, HashSet<SessionKey>>>,
+    prompt_origins: Mutex<HashMap<SessionKey, PromptOrigin>>,
+}
+
+#[derive(Clone)]
+struct PromptOrigin {
+    connection_id: String,
+    token: String,
 }
 
 #[derive(Default)]
 struct SessionConfigCache {
     sessions: Mutex<HashMap<SessionKey, Vec<Value>>>,
+}
+
+#[derive(Clone)]
+struct PendingPermissionSnapshot {
+    confirmation_id: String,
+    request_id: Value,
+    profile: String,
+    session_id: String,
+    params: Value,
+}
+
+#[derive(Default)]
+struct SupervisorPermissionRegistry {
+    pending: Mutex<HashMap<String, PendingPermissionSnapshot>>,
+    by_request: Mutex<HashMap<String, String>>,
+    stale_requests: Mutex<HashSet<String>>,
+    stale_confirmations: Mutex<HashSet<String>>,
+}
+
+impl SupervisorPermissionRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn register_client_request(
+        &self,
+        profile: &str,
+        event: &Value,
+    ) -> Option<PendingPermissionSnapshot> {
+        if event.get("type").and_then(Value::as_str) != Some("client_request")
+            || event.get("method").and_then(Value::as_str) != Some("session/request_permission")
+        {
+            return None;
+        }
+        let request_id = event.get("id")?.clone();
+        let request_key = worker_response_key(&request_id);
+        let params = event.get("params")?.clone();
+        let session_id = params.get("sessionId").and_then(Value::as_str)?.to_string();
+        let confirmation_id = short_confirmation_id();
+        let snapshot = PendingPermissionSnapshot {
+            confirmation_id: confirmation_id.clone(),
+            request_id,
+            profile: profile.to_string(),
+            session_id,
+            params,
+        };
+        self.pending
+            .lock()
+            .await
+            .insert(confirmation_id.clone(), snapshot.clone());
+        self.by_request
+            .lock()
+            .await
+            .insert(request_key.clone(), confirmation_id.clone());
+        self.stale_requests.lock().await.remove(&request_key);
+        self.stale_confirmations
+            .lock()
+            .await
+            .remove(&confirmation_id);
+        Some(snapshot)
+    }
+
+    async fn snapshot_by_request_id(
+        &self,
+        request_id: &Value,
+    ) -> Option<PendingPermissionSnapshot> {
+        let request_key = worker_response_key(request_id);
+        let confirmation_id = self.by_request.lock().await.get(&request_key).cloned()?;
+        self.pending.lock().await.get(&confirmation_id).cloned()
+    }
+
+    async fn take_confirmation(&self, confirmation_id: &str) -> Option<PendingPermissionSnapshot> {
+        let snapshot = self.pending.lock().await.remove(confirmation_id)?;
+        let request_key = worker_response_key(&snapshot.request_id);
+        self.by_request.lock().await.remove(&request_key);
+        self.stale_requests.lock().await.insert(request_key);
+        self.stale_confirmations
+            .lock()
+            .await
+            .insert(confirmation_id.to_string());
+        Some(snapshot)
+    }
+
+    async fn is_stale_confirmation(&self, confirmation_id: &str) -> bool {
+        self.stale_confirmations
+            .lock()
+            .await
+            .contains(confirmation_id)
+    }
+
+    async fn should_forward_client_response(&self, message: &Value) -> bool {
+        let Some(request_id) = message.get("id") else {
+            return true;
+        };
+        let request_key = worker_response_key(request_id);
+        if self.stale_requests.lock().await.contains(&request_key) {
+            return false;
+        }
+        let confirmation_id = self.by_request.lock().await.remove(&request_key);
+        if let Some(confirmation_id) = confirmation_id {
+            self.pending.lock().await.remove(&confirmation_id);
+            self.stale_requests.lock().await.insert(request_key);
+            self.stale_confirmations
+                .lock()
+                .await
+                .insert(confirmation_id);
+        }
+        true
+    }
+
+    async fn invalidate_session(&self, profile: &str, session_id: &str) {
+        let stale = {
+            let mut pending = self.pending.lock().await;
+            let stale_ids = pending
+                .iter()
+                .filter(|(_, item)| item.profile == profile && item.session_id == session_id)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            stale_ids
+                .into_iter()
+                .filter_map(|id| pending.remove(&id).map(|item| (id, item)))
+                .collect::<Vec<_>>()
+        };
+        if stale.is_empty() {
+            return;
+        }
+        let mut by_request = self.by_request.lock().await;
+        let mut stale_requests = self.stale_requests.lock().await;
+        let mut stale_confirmations = self.stale_confirmations.lock().await;
+        for (confirmation_id, item) in stale {
+            let request_key = worker_response_key(&item.request_id);
+            by_request.remove(&request_key);
+            stale_requests.insert(request_key);
+            stale_confirmations.insert(confirmation_id);
+        }
+    }
+}
+
+fn short_confirmation_id() -> String {
+    Uuid::new_v4()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>()
 }
 
 impl SessionConfigCache {
@@ -527,6 +730,10 @@ impl SessionEventBus {
             let mut by_connection = self.by_connection.lock().await;
             by_connection.remove(connection_id).unwrap_or_default()
         };
+        {
+            let mut prompt_origins = self.prompt_origins.lock().await;
+            prompt_origins.retain(|_, origin| origin.connection_id != connection_id);
+        }
         if keys.is_empty() {
             return;
         }
@@ -596,14 +803,152 @@ impl SessionEventBus {
             }
         }
     }
+
+    async fn broadcast_worker_message(&self, profile: &str, event: &Value) {
+        let (session_id, message) =
+            if event.get("type").and_then(Value::as_str) == Some("client_request") {
+                let Some(session_id) = event.get("params").and_then(session_id_from_params) else {
+                    return;
+                };
+                (
+                    session_id,
+                    json!({
+                        "type": "supervisor.client_request",
+                        "profile": profile,
+                        "id": event.get("id").cloned().unwrap_or(Value::Null),
+                        "method": event.get("method").cloned().unwrap_or(Value::Null),
+                        "params": event.get("params").cloned().unwrap_or(Value::Null),
+                    }),
+                )
+            } else {
+                let Some(session_id) = session_id_from_worker_event(event) else {
+                    return;
+                };
+                (
+                    session_id,
+                    json!({
+                        "type": "supervisor.event",
+                        "profile": profile,
+                        "event": event,
+                    }),
+                )
+            };
+        let key = SessionKey {
+            profile: profile.to_string(),
+            session_id,
+        };
+        let exclude_connection = if is_user_message_update_event(event) {
+            self.prompt_origin_connection(&key).await
+        } else {
+            None
+        };
+        self.broadcast_to_key(&key, message, exclude_connection.as_deref())
+            .await;
+    }
+
+    async fn begin_prompt_origin(
+        &self,
+        connection: &SupervisorConnectionContext,
+        profile: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+        let key = SessionKey {
+            profile: profile.to_string(),
+            session_id: session_id.to_string(),
+        };
+        let token = Uuid::new_v4().to_string();
+        self.prompt_origins.lock().await.insert(
+            key,
+            PromptOrigin {
+                connection_id: connection.id.clone(),
+                token: token.clone(),
+            },
+        );
+        Some(token)
+    }
+
+    async fn end_prompt_origin(&self, profile: &str, session_id: &str, token: &str) {
+        let key = SessionKey {
+            profile: profile.to_string(),
+            session_id: session_id.to_string(),
+        };
+        let mut prompt_origins = self.prompt_origins.lock().await;
+        if prompt_origins
+            .get(&key)
+            .is_some_and(|origin| origin.token == token)
+        {
+            prompt_origins.remove(&key);
+        }
+    }
+
+    async fn prompt_origin_connection(&self, key: &SessionKey) -> Option<String> {
+        self.prompt_origins
+            .lock()
+            .await
+            .get(key)
+            .map(|origin| origin.connection_id.clone())
+    }
+
+    async fn broadcast_to_key(
+        &self,
+        key: &SessionKey,
+        message: Value,
+        exclude_connection_id: Option<&str>,
+    ) {
+        let mut closed = Vec::new();
+        {
+            let mut subscribers = self.subscribers.lock().await;
+            let Some(items) = subscribers.get_mut(key) else {
+                return;
+            };
+            for (connection_id, sender) in items.iter() {
+                if exclude_connection_id == Some(connection_id.as_str()) {
+                    continue;
+                }
+                if sender.send(message.clone()).is_err() {
+                    closed.push(connection_id.clone());
+                }
+            }
+            for connection_id in &closed {
+                items.remove(connection_id);
+            }
+            if items.is_empty() {
+                subscribers.remove(key);
+            }
+        }
+        if !closed.is_empty() {
+            let mut by_connection = self.by_connection.lock().await;
+            for connection_id in closed {
+                if let Some(keys) = by_connection.get_mut(&connection_id) {
+                    keys.remove(key);
+                    if keys.is_empty() {
+                        by_connection.remove(&connection_id);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl SupervisorState {
     fn new(config: SupervisorConfig) -> Result<Self> {
+        let event_bus = Arc::new(SessionEventBus::new());
+        let config_cache = Arc::new(SessionConfigCache::new());
+        let permissions = Arc::new(SupervisorPermissionRegistry::new());
         Ok(Self {
-            worker_pool: WorkerPool::new(env::current_exe().context("resolve current executable")?),
-            event_bus: SessionEventBus::new(),
-            config_cache: SessionConfigCache::new(),
+            worker_pool: WorkerPool::new(
+                env::current_exe().context("resolve current executable")?,
+                event_bus.clone(),
+                config_cache.clone(),
+                permissions.clone(),
+            ),
+            event_bus,
+            config_cache,
+            permissions,
             config,
         })
     }
@@ -653,7 +998,7 @@ impl SupervisorState {
         &self,
         request: SupervisorRequest,
         connection: Option<SupervisorConnectionContext>,
-        mut emit_event: F,
+        _emit_event: F,
     ) -> Result<Value>
     where
         F: FnMut(Value) -> Fut,
@@ -662,6 +1007,20 @@ impl SupervisorState {
         self.validate_secret(request.secret.as_deref())?;
         match request.kind.as_str() {
             "supervisor.ping" => Ok(json!({ "ok": true })),
+            "client.response" => {
+                let message = request
+                    .message
+                    .context("client.response requires `message`")?;
+                if !self
+                    .permissions
+                    .should_forward_client_response(&message)
+                    .await
+                {
+                    return Ok(json!({ "forwarded": false, "stale": true }));
+                }
+                self.forward_client_response_message(message).await?;
+                Ok(json!({ "forwarded": true }))
+            }
             "profiles.list" => Ok(json!({
                 "profiles": self.config.profiles.iter().map(|profile| {
                     json!({
@@ -685,6 +1044,13 @@ impl SupervisorState {
                     return Ok(result);
                 }
                 let request_session_id = session_id_from_params(&params);
+                if method == "session/cancel"
+                    && let Some(session_id) = request_session_id.as_deref()
+                {
+                    self.permissions
+                        .invalidate_session(&profile.id, session_id)
+                        .await;
+                }
                 if let Some(connection) = connection.as_ref()
                     && should_subscribe_for_request(method)
                     && let Some(session_id) = request_session_id.as_deref()
@@ -693,41 +1059,49 @@ impl SupervisorState {
                         .subscribe(connection, &profile.id, session_id)
                         .await;
                 }
-                let request_id = request.id.clone();
-                let profile_id = profile.id.clone();
-                let should_fanout_events = should_fanout_worker_events(method);
-                let exclude_connection_id =
-                    connection.as_ref().map(|connection| connection.id.clone());
-                let result = self
+                let (worker_method, worker_params) = if method == "session/load" {
+                    let session_id = request_session_id
+                        .as_deref()
+                        .context("session/load requires `sessionId`")?;
+                    ("_dwo/session/load", json!({ "sessionId": session_id }))
+                } else {
+                    (method, params)
+                };
+                let prompt_origin = if method == "session/prompt" {
+                    match (connection.as_ref(), request_session_id.as_deref()) {
+                        (Some(connection), Some(session_id)) => self
+                            .event_bus
+                            .begin_prompt_origin(connection, &profile.id, session_id)
+                            .await
+                            .map(|token| (session_id.to_string(), token)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let worker_result = self
                     .worker_pool
-                    .request_with_events(&profile, method, params, &self.config.pool, |event| {
-                        let supervisor_event = json!({
-                            "id": request_id.clone(),
-                            "type": "supervisor.event",
-                            "profile": profile_id.clone(),
-                            "event": event.clone(),
-                        });
-                        let event_for_bus = event.clone();
-                        let profile_id_for_bus = profile_id.clone();
-                        let exclude_connection_id = exclude_connection_id.clone();
-                        let emit_future = emit_event(supervisor_event);
-                        async move {
-                            self.config_cache
-                                .update_from_event(&profile_id_for_bus, &event_for_bus)
-                                .await;
-                            if should_fanout_events {
-                                self.event_bus
-                                    .broadcast_worker_event(
-                                        &profile_id_for_bus,
-                                        &event_for_bus,
-                                        exclude_connection_id.as_deref(),
-                                    )
-                                    .await;
-                            }
-                            emit_future.await
-                        }
-                    })
-                    .await?;
+                    .request(&profile, worker_method, worker_params, &self.config.pool)
+                    .await;
+                if let Some((session_id, token)) = prompt_origin {
+                    let event_bus = self.event_bus.clone();
+                    let profile_id = profile.id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        event_bus
+                            .end_prompt_origin(&profile_id, &session_id, &token)
+                            .await;
+                    });
+                }
+                let result = worker_result?;
+                let (result, replay_events) = if method == "session/load" {
+                    (
+                        result.get("response").cloned().unwrap_or(Value::Null),
+                        result.get("replayEvents").cloned(),
+                    )
+                } else {
+                    (result, None)
+                };
                 self.config_cache
                     .update_from_response(&profile.id, request_session_id, &result)
                     .await;
@@ -739,10 +1113,16 @@ impl SupervisorState {
                         .subscribe(connection, &profile.id, &session_id)
                         .await;
                 }
-                Ok(json!({
+                let mut response = json!({
                     "profile": profile.id,
                     "result": result,
-                }))
+                });
+                if let Some(replay_events) = replay_events
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert("replayEvents".to_string(), replay_events);
+                }
+                Ok(response)
             }
             "worker.notify" => {
                 let method = request
@@ -751,6 +1131,13 @@ impl SupervisorState {
                     .context("worker.notify requires `method`")?;
                 let profile = self.resolve_profile(request.profile.as_deref())?;
                 let params = request.params.unwrap_or(Value::Null);
+                if method == "session/cancel"
+                    && let Some(session_id) = session_id_from_params(&params)
+                {
+                    self.permissions
+                        .invalidate_session(&profile.id, &session_id)
+                        .await;
+                }
                 if let Some(connection) = connection.as_ref()
                     && should_subscribe_for_request(method)
                     && let Some(session_id) = session_id_from_params(&params)
@@ -828,6 +1215,32 @@ impl SupervisorState {
         })))
     }
 
+    async fn worker_for_client_response(
+        &self,
+        response: &Value,
+    ) -> Result<(Arc<WorkerProcess>, Value)> {
+        let request_id = response
+            .get("id")
+            .context("client response requires `id`")?;
+        let Some((profile_id, worker_request_id)) = pending_client_request_parts(request_id) else {
+            bail!("client response id is not a supervisor-routed worker request");
+        };
+        let worker = self
+            .worker_pool
+            .get_worker(&profile_id)
+            .await
+            .with_context(|| format!("worker not found for profile `{profile_id}`"))?;
+        Ok((worker, worker_request_id))
+    }
+
+    async fn forward_client_response_message(&self, mut message: Value) -> Result<()> {
+        let (worker, worker_request_id) = self.worker_for_client_response(&message).await?;
+        if let Some(object) = message.as_object_mut() {
+            object.insert("id".to_string(), worker_request_id);
+        }
+        worker.forward_client_response(message).await
+    }
+
     fn validate_secret(&self, secret: Option<&str>) -> Result<()> {
         if self.config.endpoint.secret.is_empty() {
             return Ok(());
@@ -858,6 +1271,8 @@ struct SupervisorRequest {
     method: Option<String>,
     #[serde(default)]
     params: Option<Value>,
+    #[serde(default)]
+    message: Option<Value>,
 }
 
 struct ControlRequest {
@@ -1036,6 +1451,18 @@ fn session_id_from_worker_event(event: &Value) -> Option<String> {
     event.get("params").and_then(session_id_from_params)
 }
 
+fn is_user_message_update_event(event: &Value) -> bool {
+    if event.get("method").and_then(Value::as_str) != Some("session/update") {
+        return false;
+    }
+    event
+        .get("params")
+        .and_then(|params| params.get("update"))
+        .and_then(|update| update.get("sessionUpdate"))
+        .and_then(Value::as_str)
+        == Some("user_message_chunk")
+}
+
 fn config_value_as_string(value: Option<&Value>) -> Option<String> {
     match value? {
         Value::String(text) => Some(text.clone()),
@@ -1053,17 +1480,6 @@ fn should_subscribe_for_request(method: &str) -> bool {
             | "session/cancel"
             | "session/set_mode"
             | "session/set_config_option"
-    )
-}
-
-fn should_fanout_worker_events(method: &str) -> bool {
-    matches!(
-        method,
-        "session/prompt"
-            | "session/set_mode"
-            | "session/set_config_option"
-            | "_dwo/ingress/handle_event"
-            | "_dwo/automation/run_job"
     )
 }
 
@@ -1118,22 +1534,53 @@ struct WorkerMessage {
 struct WorkerPool {
     launcher: WorkerLauncher,
     workers: Mutex<HashMap<String, Arc<WorkerProcess>>>,
+    event_bus: Arc<SessionEventBus>,
+    config_cache: Arc<SessionConfigCache>,
+    permissions: Arc<SupervisorPermissionRegistry>,
 }
 
 impl WorkerPool {
-    fn new(exe: PathBuf) -> Self {
+    fn new(
+        exe: PathBuf,
+        event_bus: Arc<SessionEventBus>,
+        config_cache: Arc<SessionConfigCache>,
+        permissions: Arc<SupervisorPermissionRegistry>,
+    ) -> Self {
         Self {
             launcher: WorkerLauncher::agent_profile(exe),
             workers: Mutex::new(HashMap::new()),
+            event_bus,
+            config_cache,
+            permissions,
         }
     }
 
     #[cfg(test)]
-    fn new_with_launcher(launcher: WorkerLauncher) -> Self {
+    fn new_with_launcher(
+        launcher: WorkerLauncher,
+        event_bus: Arc<SessionEventBus>,
+        config_cache: Arc<SessionConfigCache>,
+        permissions: Arc<SupervisorPermissionRegistry>,
+    ) -> Self {
         Self {
             launcher,
             workers: Mutex::new(HashMap::new()),
+            event_bus,
+            config_cache,
+            permissions,
         }
+    }
+
+    async fn request(
+        &self,
+        profile: &ResolvedProfile,
+        method: &str,
+        params: Value,
+        pool_config: &SupervisorPoolConfig,
+    ) -> Result<Value> {
+        let worker = self.ensure_worker(profile, pool_config).await?;
+        worker.touch().await;
+        worker.request(method, params).await
     }
 
     async fn request_with_events<F, Fut>(
@@ -1142,7 +1589,7 @@ impl WorkerPool {
         method: &str,
         params: Value,
         pool_config: &SupervisorPoolConfig,
-        emit_event: F,
+        mut emit_event: F,
     ) -> Result<Value>
     where
         F: FnMut(Value) -> Fut,
@@ -1150,7 +1597,21 @@ impl WorkerPool {
     {
         let worker = self.ensure_worker(profile, pool_config).await?;
         worker.touch().await;
-        worker.request_with_events(method, params, emit_event).await
+        let mut events = worker.subscribe_events();
+        let request = worker.request(method, params);
+        tokio::pin!(request);
+
+        loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => match event {
+                    Ok(event) => emit_event(event).await?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return request.await,
+                },
+                result = &mut request => return result,
+            }
+        }
     }
 
     async fn notify(
@@ -1174,6 +1635,10 @@ impl WorkerPool {
             Some(worker) => worker.is_busy().await,
             None => false,
         }
+    }
+
+    async fn get_worker(&self, profile_id: &str) -> Option<Arc<WorkerProcess>> {
+        self.workers.lock().await.get(profile_id).cloned()
     }
 
     async fn ensure_worker(
@@ -1203,8 +1668,43 @@ impl WorkerPool {
                 .await
                 .with_context(|| format!("spawn worker for profile `{}`", profile.id))?,
         );
+        self.spawn_event_forwarder(profile.id.clone(), worker.clone());
         workers.insert(profile.id.clone(), worker.clone());
         Ok(worker)
+    }
+
+    fn spawn_event_forwarder(&self, profile_id: String, worker: Arc<WorkerProcess>) {
+        let mut events = worker.subscribe_events();
+        let event_bus = self.event_bus.clone();
+        let config_cache = self.config_cache.clone();
+        let permissions = self.permissions.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        if event.get("type").and_then(Value::as_str) == Some("client_request") {
+                            permissions
+                                .register_client_request(&profile_id, &event)
+                                .await;
+                        } else {
+                            config_cache.update_from_event(&profile_id, &event).await;
+                            if is_user_message_update_event(&event)
+                                && let Some(session_id) = session_id_from_worker_event(&event)
+                            {
+                                permissions
+                                    .invalidate_session(&profile_id, &session_id)
+                                    .await;
+                            }
+                        }
+                        event_bus
+                            .broadcast_worker_message(&profile_id, &event)
+                            .await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     async fn prune_idle(&self, pool_config: &SupervisorPoolConfig) {
@@ -1351,8 +1851,8 @@ async fn stop_worker(worker: Arc<WorkerProcess>) -> Result<()> {
 struct WorkerProcess {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
-    stdout: Mutex<Lines<BufReader<ChildStdout>>>,
-    request_lock: Mutex<()>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<WorkerMessage, String>>>>>,
+    events: broadcast::Sender<Value>,
     last_used: Mutex<Instant>,
     in_flight: Mutex<usize>,
 }
@@ -1368,11 +1868,14 @@ impl WorkerProcess {
             .context("spawn worker process")?;
         let stdin = child.stdin.take().context("worker stdin was not piped")?;
         let stdout = child.stdout.take().context("worker stdout was not piped")?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1024);
+        spawn_worker_stdout_reader(profile.id.clone(), stdout, pending.clone(), events.clone());
         Ok(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout).lines()),
-            request_lock: Mutex::new(()),
+            pending,
+            events,
             last_used: Mutex::new(Instant::now()),
             in_flight: Mutex::new(0),
         })
@@ -1407,8 +1910,50 @@ impl WorkerProcess {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.request_with_events(method, params, |_| async { Ok(()) })
+        self.begin_request().await;
+        let result = self.request_locked(method, params).await;
+        self.finish_request().await;
+        result
+    }
+
+    async fn request_locked(&self, method: &str, params: Value) -> Result<Value> {
+        let id = Uuid::new_v4().to_string();
+        let request = WorkerRequest {
+            jsonrpc: "2.0",
+            id: id.clone(),
+            method: method.to_string(),
+            params,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), response_tx);
+        let mut line = serde_json::to_vec(&request).context("serialize worker request")?;
+        line.push(b'\n');
+        let write_result = async {
+            let mut stdin = self.stdin.lock().await;
+            stdin
+                .write_all(&line)
+                .await
+                .context("write worker request")?;
+            stdin.flush().await.context("flush worker request")?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = write_result {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
+
+        let response = response_rx
             .await
+            .context("worker response channel closed")?
+            .map_err(anyhow::Error::msg)?;
+        if response.id.as_ref() != Some(&Value::String(id.clone())) {
+            bail!("worker response id mismatch");
+        }
+        if let Some(error) = response.error {
+            bail!("{}", worker_error_message(&error));
+        }
+        Ok(response.result.unwrap_or(Value::Null))
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -1428,80 +1973,107 @@ impl WorkerProcess {
         Ok(())
     }
 
-    async fn request_with_events<F, Fut>(
-        &self,
-        method: &str,
-        params: Value,
-        mut emit_event: F,
-    ) -> Result<Value>
-    where
-        F: FnMut(Value) -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
-        let _request_guard = self.request_lock.lock().await;
-        self.begin_request().await;
-        let result = self
-            .request_with_events_locked(method, params, &mut emit_event)
-            .await;
-        self.finish_request().await;
-        result
+    async fn forward_client_response(&self, response: Value) -> Result<()> {
+        let mut line = serde_json::to_vec(&response).context("serialize client response")?;
+        line.push(b'\n');
+        let mut stdin = self.stdin.lock().await;
+        stdin
+            .write_all(&line)
+            .await
+            .context("write client response to worker")?;
+        stdin
+            .flush()
+            .await
+            .context("flush client response to worker")?;
+        Ok(())
     }
 
-    async fn request_with_events_locked<F, Fut>(
-        &self,
-        method: &str,
-        params: Value,
-        emit_event: &mut F,
-    ) -> Result<Value>
-    where
-        F: FnMut(Value) -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
-        let id = Uuid::new_v4().to_string();
-        let request = WorkerRequest {
-            jsonrpc: "2.0",
-            id: id.clone(),
-            method: method.to_string(),
-            params,
-        };
-        let mut line = serde_json::to_vec(&request).context("serialize worker request")?;
-        line.push(b'\n');
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(&line)
-                .await
-                .context("write worker request")?;
-            stdin.flush().await.context("flush worker request")?;
-        }
+    fn subscribe_events(&self) -> broadcast::Receiver<Value> {
+        self.events.subscribe()
+    }
+}
 
+fn spawn_worker_stdout_reader(
+    profile_id: String,
+    stdout: ChildStdout,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<WorkerMessage, String>>>>>,
+    events: broadcast::Sender<Value>,
+) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
         loop {
-            let response_line = {
-                let mut stdout = self.stdout.lock().await;
-                stdout.next_line().await.context("read worker response")?
+            let response_line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(err) => {
+                    fail_pending_responses(&pending, format!("read worker response: {err}")).await;
+                    return;
+                }
             };
-            let Some(response_line) = response_line else {
-                bail!("worker exited before responding");
+            let response: WorkerMessage = match serde_json::from_str(&response_line) {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::warn!(
+                        profile = %profile_id,
+                        error = %err,
+                        "failed to parse worker stdout message"
+                    );
+                    continue;
+                }
             };
-            let response: WorkerMessage =
-                serde_json::from_str(&response_line).context("parse worker response")?;
             if let Some(method) = response.method {
-                emit_event(json!({
-                    "method": method,
-                    "params": response.params.unwrap_or(Value::Null),
-                }))
-                .await?;
+                let params = response.params.unwrap_or(Value::Null);
+                let event = if let Some(worker_request_id) = response.id {
+                    json!({
+                        "type": "client_request",
+                        "id": pending_client_request_id(&profile_id, &worker_request_id),
+                        "method": method,
+                        "params": params,
+                    })
+                } else {
+                    json!({
+                        "method": method,
+                        "params": params,
+                    })
+                };
+                let _ = events.send(event);
                 continue;
             }
-            if response.id.as_ref() != Some(&Value::String(id.clone())) {
-                bail!("worker response id mismatch");
+            let Some(id) = response.id.as_ref().map(worker_response_key) else {
+                tracing::warn!(profile = %profile_id, "worker response without id");
+                continue;
+            };
+            let sender = pending.lock().await.remove(&id);
+            match sender {
+                Some(sender) => {
+                    let _ = sender.send(Ok(response));
+                }
+                None => {
+                    tracing::warn!(profile = %profile_id, response_id = %id, "unexpected worker response id");
+                }
             }
-            if let Some(error) = response.error {
-                bail!("{}", worker_error_message(&error));
-            }
-            return Ok(response.result.unwrap_or(Value::Null));
         }
+        fail_pending_responses(&pending, "worker exited before responding".to_string()).await;
+    });
+}
+
+async fn fail_pending_responses(
+    pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Result<WorkerMessage, String>>>>>,
+    error: String,
+) {
+    let pending = {
+        let mut guard = pending.lock().await;
+        std::mem::take(&mut *guard)
+    };
+    for (_, sender) in pending {
+        let _ = sender.send(Err(error.clone()));
     }
+}
+
+fn worker_response_key(id: &Value) -> String {
+    id.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| id.to_string())
 }
 
 fn worker_error_message(error: &Value) -> String {
@@ -1510,6 +2082,23 @@ fn worker_error_message(error: &Value) -> String {
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .unwrap_or_else(|| error.to_string())
+}
+
+fn pending_client_request_id(profile_id: &str, worker_request_id: &Value) -> String {
+    let encoded_profile = URL_SAFE_NO_PAD.encode(profile_id.as_bytes());
+    let encoded_id = URL_SAFE_NO_PAD.encode(worker_request_id.to_string().as_bytes());
+    format!("_dwo_worker_client_request:{encoded_profile}:{encoded_id}")
+}
+
+fn pending_client_request_parts(request_id: &Value) -> Option<(String, Value)> {
+    let id = request_id.as_str()?;
+    let rest = id.strip_prefix("_dwo_worker_client_request:")?;
+    let (encoded_profile, encoded_worker_id) = rest.split_once(':')?;
+    let profile_bytes = URL_SAFE_NO_PAD.decode(encoded_profile).ok()?;
+    let worker_id_bytes = URL_SAFE_NO_PAD.decode(encoded_worker_id).ok()?;
+    let profile_id = String::from_utf8(profile_bytes).ok()?;
+    let worker_request_id = serde_json::from_slice(&worker_id_bytes).ok()?;
+    Some((profile_id, worker_request_id))
 }
 
 async fn handle_supervisor_connection(
@@ -2180,6 +2769,9 @@ mod tests {
         let (fake_worker_exe, fake_worker_args, fake_worker_script) = fake_worker_command()?;
         let profile_id = "test-profile".to_string();
         let secret = "test-secret".to_string();
+        let event_bus = Arc::new(SessionEventBus::new());
+        let config_cache = Arc::new(SessionConfigCache::new());
+        let permissions = Arc::new(SupervisorPermissionRegistry::new());
         let state = Arc::new(SupervisorState {
             config: SupervisorConfig {
                 endpoint: SupervisorEndpointConfig {
@@ -2196,13 +2788,15 @@ mod tests {
                 },
                 ..SupervisorConfig::default()
             },
-            worker_pool: WorkerPool::new_with_launcher(WorkerLauncher::custom(
-                fake_worker_exe,
-                fake_worker_args,
-                Vec::new(),
-            )),
-            event_bus: SessionEventBus::new(),
-            config_cache: SessionConfigCache::new(),
+            worker_pool: WorkerPool::new_with_launcher(
+                WorkerLauncher::custom(fake_worker_exe, fake_worker_args, Vec::new()),
+                event_bus.clone(),
+                config_cache.clone(),
+                permissions.clone(),
+            ),
+            event_bus,
+            config_cache,
+            permissions,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2298,10 +2892,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_updates_fan_out_to_observers() -> Result<()> {
-        let (fake_worker_exe, fake_worker_args, fake_worker_script) = fake_event_worker_command()?;
+    async fn load_and_other_session_prompt_do_not_wait_for_running_prompt() -> Result<()> {
+        let (fake_worker_exe, fake_worker_args, fake_worker_script) =
+            fake_concurrent_worker_command()?;
         let profile_id = "test-profile".to_string();
         let secret = "test-secret".to_string();
+        let event_bus = Arc::new(SessionEventBus::new());
+        let config_cache = Arc::new(SessionConfigCache::new());
+        let permissions = Arc::new(SupervisorPermissionRegistry::new());
         let state = Arc::new(SupervisorState {
             config: SupervisorConfig {
                 endpoint: SupervisorEndpointConfig {
@@ -2318,13 +2916,126 @@ mod tests {
                 },
                 ..SupervisorConfig::default()
             },
-            worker_pool: WorkerPool::new_with_launcher(WorkerLauncher::custom(
-                fake_worker_exe,
-                fake_worker_args,
-                Vec::new(),
-            )),
-            event_bus: SessionEventBus::new(),
-            config_cache: SessionConfigCache::new(),
+            worker_pool: WorkerPool::new_with_launcher(
+                WorkerLauncher::custom(fake_worker_exe, fake_worker_args, Vec::new()),
+                event_bus.clone(),
+                config_cache.clone(),
+                permissions.clone(),
+            ),
+            event_bus,
+            config_cache,
+            permissions,
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server_state = state.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            handle_supervisor_connection(stream, server_state).await
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let url = format!("ws://{addr}");
+        let (mut websocket, _) = tokio_tungstenite::client_async(url, stream).await?;
+        assert!(websocket.next().await.context("missing ready")??.is_text());
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": "prompt-s1",
+                    "type": "worker.request",
+                    "secret": secret,
+                    "profile": profile_id,
+                    "method": "session/prompt",
+                    "params": { "sessionId": "s1" },
+                })
+                .to_string(),
+            ))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": "load-s1",
+                    "type": "worker.request",
+                    "secret": "test-secret",
+                    "profile": "test-profile",
+                    "method": "session/load",
+                    "params": { "sessionId": "s1" },
+                })
+                .to_string(),
+            ))
+            .await?;
+        let load = wait_supervisor_result(&mut websocket, "load-s1").await?;
+        assert_eq!(
+            load.pointer("/result/result/sessionId")
+                .and_then(Value::as_str),
+            Some("s1")
+        );
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": "prompt-s2",
+                    "type": "worker.request",
+                    "secret": "test-secret",
+                    "profile": "test-profile",
+                    "method": "session/prompt",
+                    "params": { "sessionId": "s2" },
+                })
+                .to_string(),
+            ))
+            .await?;
+        let prompt_s2 = wait_supervisor_result(&mut websocket, "prompt-s2").await?;
+        assert_eq!(
+            prompt_s2
+                .pointer("/result/result/stopReason")
+                .and_then(Value::as_str),
+            Some("end_turn")
+        );
+
+        let _ = websocket.close(None).await;
+        state.worker_pool.shutdown_all().await;
+        let _ = timeout(Duration::from_secs(1), server_task).await;
+        let _ = std::fs::remove_file(fake_worker_script);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_updates_fan_out_to_observers() -> Result<()> {
+        let (fake_worker_exe, fake_worker_args, fake_worker_script) = fake_event_worker_command()?;
+        let profile_id = "test-profile".to_string();
+        let secret = "test-secret".to_string();
+        let event_bus = Arc::new(SessionEventBus::new());
+        let config_cache = Arc::new(SessionConfigCache::new());
+        let permissions = Arc::new(SupervisorPermissionRegistry::new());
+        let state = Arc::new(SupervisorState {
+            config: SupervisorConfig {
+                endpoint: SupervisorEndpointConfig {
+                    websocket_bind_addr: "127.0.0.1:0".to_string(),
+                    secret: secret.clone(),
+                },
+                profiles: vec![SupervisorProfileConfig {
+                    id: profile_id.clone(),
+                    path: PathBuf::from("unused-profile-path"),
+                }],
+                pool: SupervisorPoolConfig {
+                    max_workers: 1,
+                    idle_seconds: 60,
+                },
+                ..SupervisorConfig::default()
+            },
+            worker_pool: WorkerPool::new_with_launcher(
+                WorkerLauncher::custom(fake_worker_exe, fake_worker_args, Vec::new()),
+                event_bus.clone(),
+                config_cache.clone(),
+                permissions.clone(),
+            ),
+            event_bus,
+            config_cache,
+            permissions,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2414,12 +3125,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_prompt_update_is_not_echoed_to_prompt_origin() -> Result<()> {
+        let event_bus = SessionEventBus::new();
+        let (origin_tx, mut origin_rx) = mpsc::unbounded_channel();
+        let (observer_tx, mut observer_rx) = mpsc::unbounded_channel();
+        let origin = SupervisorConnectionContext {
+            id: "origin".to_string(),
+            sender: origin_tx,
+        };
+        let observer = SupervisorConnectionContext {
+            id: "observer".to_string(),
+            sender: observer_tx,
+        };
+        event_bus.subscribe(&origin, "profile", "s1").await;
+        event_bus.subscribe(&observer, "profile", "s1").await;
+        let token = event_bus
+            .begin_prompt_origin(&origin, "profile", "s1")
+            .await
+            .context("prompt origin token")?;
+
+        let user_event = json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": { "type": "text", "text": "hello" },
+                },
+            },
+        });
+        event_bus
+            .broadcast_worker_message("profile", &user_event)
+            .await;
+
+        let observed = timeout(Duration::from_secs(1), observer_rx.recv())
+            .await?
+            .context("observer should receive user prompt update")?;
+        assert_eq!(
+            observed
+                .pointer("/event/params/update/content/text")
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+        assert!(
+            timeout(Duration::from_millis(100), origin_rx.recv())
+                .await
+                .is_err(),
+            "origin should not receive its own user prompt update"
+        );
+
+        let assistant_event = json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "model" },
+                },
+            },
+        });
+        event_bus
+            .broadcast_worker_message("profile", &assistant_event)
+            .await;
+        let origin_message = timeout(Duration::from_secs(1), origin_rx.recv())
+            .await?
+            .context("origin should receive assistant update")?;
+        let observer_message = timeout(Duration::from_secs(1), observer_rx.recv())
+            .await?
+            .context("observer should receive assistant update")?;
+        assert_eq!(
+            origin_message
+                .pointer("/event/params/update/content/text")
+                .and_then(Value::as_str),
+            Some("model")
+        );
+        assert_eq!(
+            observer_message
+                .pointer("/event/params/update/content/text")
+                .and_then(Value::as_str),
+            Some("model")
+        );
+
+        event_bus
+            .end_prompt_origin("profile", "s1", token.as_str())
+            .await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_registry_invalidates_pending_request_for_new_prompt() -> Result<()> {
+        let registry = SupervisorPermissionRegistry::new();
+        let event = json!({
+            "type": "client_request",
+            "id": "_dwo_worker_client_request:profile:req1",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {
+                    "toolCallId": "tool1",
+                    "title": "file_edit",
+                    "rawInput": {"path": "a.txt"}
+                },
+                "options": []
+            }
+        });
+        let pending = registry
+            .register_client_request("profile", &event)
+            .await
+            .context("permission should register")?;
+        assert_eq!(pending.session_id, "s1");
+
+        registry.invalidate_session("profile", "s1").await;
+        let should_forward = registry
+            .should_forward_client_response(&json!({
+                "jsonrpc": "2.0",
+                "id": "_dwo_worker_client_request:profile:req1",
+                "result": {
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": "allow_once"
+                    }
+                }
+            }))
+            .await;
+        assert!(!should_forward);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_registry_consumes_confirmation_and_marks_client_response_stale()
+    -> Result<()> {
+        let registry = SupervisorPermissionRegistry::new();
+        let event = json!({
+            "type": "client_request",
+            "id": "_dwo_worker_client_request:profile:req2",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {
+                    "toolCallId": "tool2",
+                    "title": "shell",
+                    "rawInput": {"command": "date"}
+                },
+                "options": []
+            }
+        });
+        let pending = registry
+            .register_client_request("profile", &event)
+            .await
+            .context("permission should register")?;
+
+        let taken = registry
+            .take_confirmation(&pending.confirmation_id)
+            .await
+            .context("confirmation should be consumable")?;
+        assert_eq!(taken.request_id, pending.request_id);
+        assert!(
+            registry
+                .is_stale_confirmation(&pending.confirmation_id)
+                .await
+        );
+        assert!(
+            registry
+                .snapshot_by_request_id(&pending.request_id)
+                .await
+                .is_none()
+        );
+
+        let should_forward = registry
+            .should_forward_client_response(&json!({
+                "jsonrpc": "2.0",
+                "id": "_dwo_worker_client_request:profile:req2",
+                "result": {
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": "allow_once"
+                    }
+                }
+            }))
+            .await;
+        assert!(!should_forward);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn config_request_is_acknowledged_with_cached_options_while_prompt_is_running()
     -> Result<()> {
         let (fake_worker_exe, fake_worker_args, fake_worker_script) =
             fake_control_worker_command()?;
         let profile_id = "test-profile".to_string();
         let secret = "test-secret".to_string();
+        let event_bus = Arc::new(SessionEventBus::new());
+        let config_cache = Arc::new(SessionConfigCache::new());
+        let permissions = Arc::new(SupervisorPermissionRegistry::new());
         let state = Arc::new(SupervisorState {
             config: SupervisorConfig {
                 endpoint: SupervisorEndpointConfig {
@@ -2436,13 +3334,15 @@ mod tests {
                 },
                 ..SupervisorConfig::default()
             },
-            worker_pool: WorkerPool::new_with_launcher(WorkerLauncher::custom(
-                fake_worker_exe,
-                fake_worker_args,
-                Vec::new(),
-            )),
-            event_bus: SessionEventBus::new(),
-            config_cache: SessionConfigCache::new(),
+            worker_pool: WorkerPool::new_with_launcher(
+                WorkerLauncher::custom(fake_worker_exe, fake_worker_args, Vec::new()),
+                event_bus.clone(),
+                config_cache.clone(),
+                permissions.clone(),
+            ),
+            event_bus,
+            config_cache,
+            permissions,
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2539,6 +3439,115 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn client_response_is_routed_back_to_worker_request_id() -> Result<()> {
+        let (fake_worker_exe, fake_worker_args, fake_worker_script) =
+            fake_client_request_worker_command()?;
+        let profile_id = "test-profile".to_string();
+        let secret = "test-secret".to_string();
+        let event_bus = Arc::new(SessionEventBus::new());
+        let config_cache = Arc::new(SessionConfigCache::new());
+        let permissions = Arc::new(SupervisorPermissionRegistry::new());
+        let state = Arc::new(SupervisorState {
+            config: SupervisorConfig {
+                endpoint: SupervisorEndpointConfig {
+                    websocket_bind_addr: "127.0.0.1:0".to_string(),
+                    secret: secret.clone(),
+                },
+                profiles: vec![SupervisorProfileConfig {
+                    id: profile_id.clone(),
+                    path: PathBuf::from("unused-profile-path"),
+                }],
+                pool: SupervisorPoolConfig {
+                    max_workers: 1,
+                    idle_seconds: 60,
+                },
+                ..SupervisorConfig::default()
+            },
+            worker_pool: WorkerPool::new_with_launcher(
+                WorkerLauncher::custom(fake_worker_exe, fake_worker_args, Vec::new()),
+                event_bus.clone(),
+                config_cache.clone(),
+                permissions.clone(),
+            ),
+            event_bus,
+            config_cache,
+            permissions,
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server_state = state.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            handle_supervisor_connection(stream, server_state).await
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let url = format!("ws://{addr}");
+        let (mut websocket, _) = tokio_tungstenite::client_async(url, stream).await?;
+        assert!(websocket.next().await.context("missing ready")??.is_text());
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": "prompt",
+                    "type": "worker.request",
+                    "secret": secret,
+                    "profile": profile_id,
+                    "method": "session/prompt",
+                    "params": { "sessionId": "s1" },
+                })
+                .to_string(),
+            ))
+            .await?;
+
+        let client_request = wait_supervisor_client_request(&mut websocket).await?;
+        assert_eq!(
+            client_request.get("method").and_then(Value::as_str),
+            Some("session/request_permission")
+        );
+        let routed_id = client_request
+            .get("id")
+            .cloned()
+            .context("supervisor client request should include id")?;
+        assert!(
+            routed_id
+                .as_str()
+                .is_some_and(|id| id.starts_with("_dwo_worker_client_request:"))
+        );
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": "client-response",
+                    "type": "client.response",
+                    "secret": "test-secret",
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "id": routed_id,
+                        "result": { "decision": "allow_once" }
+                    },
+                })
+                .to_string(),
+            ))
+            .await?;
+
+        let prompt = wait_supervisor_result(&mut websocket, "prompt").await?;
+        assert_eq!(
+            prompt
+                .pointer("/result/result/stopReason")
+                .and_then(Value::as_str),
+            Some("end_turn")
+        );
+
+        let _ = websocket.close(None).await;
+        state.worker_pool.shutdown_all().await;
+        let _ = timeout(Duration::from_secs(1), server_task).await;
+        let _ = std::fs::remove_file(fake_worker_script);
+        Ok(())
+    }
+
     async fn wait_supervisor_result(
         websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         id: &str,
@@ -2580,6 +3589,27 @@ mod tests {
                 if value.get("type").and_then(Value::as_str) == Some("supervisor.event")
                     && value.pointer("/event/method").and_then(Value::as_str) == Some(method)
                 {
+                    return Ok(value);
+                }
+            }
+        })
+        .await?
+    }
+
+    async fn wait_supervisor_client_request(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> Result<Value> {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let message = websocket
+                    .next()
+                    .await
+                    .context("websocket closed before supervisor client request")??;
+                if !message.is_text() {
+                    continue;
+                }
+                let value: Value = serde_json::from_str(message.to_text()?)?;
+                if value.get("type").and_then(Value::as_str) == Some("supervisor.client_request") {
                     return Ok(value);
                 }
             }
@@ -2681,6 +3711,160 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   }
   [Console]::Out.WriteLine(($response | ConvertTo-Json -Depth 12 -Compress))
   [Console]::Out.Flush()
+}
+"#,
+        )
+        .with_context(|| format!("write fake worker script {}", script_path.display()))?;
+        fake_worker_process(script_path)
+    }
+
+    fn fake_concurrent_worker_command() -> Result<(PathBuf, Vec<OsString>, PathBuf)> {
+        let script_path = std::env::temp_dir().join(format!(
+            "dwo-supervisor-fake-concurrent-worker-{}.ps1",
+            Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            r#"
+$pendingPrompt = $null
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  try {
+    $message = $line | ConvertFrom-Json
+  } catch {
+    continue
+  }
+
+  if ($null -eq $message.id) {
+    continue
+  }
+
+  $id = [string]$message.id
+  $method = [string]$message.method
+  $sessionId = [string]$message.params.sessionId
+
+  if ($method -eq 'session/prompt' -and $sessionId -eq 's1') {
+    $pendingPrompt = $id
+    continue
+  }
+
+  if ($method -eq 'session/load' -or $method -eq '_dwo/session/load') {
+    $result = @{ sessionId = $sessionId }
+    if ($method -eq '_dwo/session/load') {
+      $result = @{
+        response = @{ sessionId = $sessionId }
+        replayEvents = @()
+      }
+    }
+    $response = @{
+      jsonrpc = '2.0'
+      id = $id
+      result = $result
+    } | ConvertTo-Json -Depth 12 -Compress
+    [Console]::Out.WriteLine($response)
+    [Console]::Out.Flush()
+    continue
+  }
+
+  if ($method -eq 'session/prompt') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = $id
+      result = @{ sessionId = $sessionId; stopReason = 'end_turn' }
+    } | ConvertTo-Json -Depth 12 -Compress
+    [Console]::Out.WriteLine($response)
+    [Console]::Out.Flush()
+    continue
+  }
+
+  if ($method -eq '_dwo/worker/shutdown') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = $id
+      result = @{ ok = $true }
+    } | ConvertTo-Json -Depth 12 -Compress
+    [Console]::Out.WriteLine($response)
+    [Console]::Out.Flush()
+    exit 0
+  }
+
+  $response = @{
+    jsonrpc = '2.0'
+    id = $id
+    result = @{}
+  } | ConvertTo-Json -Depth 12 -Compress
+  [Console]::Out.WriteLine($response)
+  [Console]::Out.Flush()
+}
+"#,
+        )
+        .with_context(|| format!("write fake worker script {}", script_path.display()))?;
+        fake_worker_process(script_path)
+    }
+
+    fn fake_client_request_worker_command() -> Result<(PathBuf, Vec<OsString>, PathBuf)> {
+        let script_path = std::env::temp_dir().join(format!(
+            "dwo-supervisor-fake-client-request-worker-{}.ps1",
+            Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            r#"
+$promptId = $null
+$workerRequestId = 'permission-1'
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  try {
+    $message = $line | ConvertFrom-Json
+  } catch {
+    continue
+  }
+
+  if ($null -ne $message.id -and $message.method -eq 'session/prompt') {
+    $promptId = [string]$message.id
+    $request = @{
+      jsonrpc = '2.0'
+      id = $workerRequestId
+      method = 'session/request_permission'
+      params = @{
+        sessionId = 's1'
+        toolCallId = 'call-1'
+      }
+    } | ConvertTo-Json -Depth 12 -Compress
+    [Console]::Out.WriteLine($request)
+    [Console]::Out.Flush()
+    continue
+  }
+
+  if ($null -ne $message.id -and $null -eq $message.method) {
+    if ([string]$message.id -ne $workerRequestId) {
+      $response = @{
+        jsonrpc = '2.0'
+        id = $promptId
+        error = @{ code = -32000; message = "unexpected client response id: $($message.id)" }
+      } | ConvertTo-Json -Depth 12 -Compress
+      [Console]::Out.WriteLine($response)
+      [Console]::Out.Flush()
+      continue
+    }
+    $response = @{
+      jsonrpc = '2.0'
+      id = $promptId
+      result = @{ stopReason = 'end_turn' }
+    } | ConvertTo-Json -Depth 12 -Compress
+    [Console]::Out.WriteLine($response)
+    [Console]::Out.Flush()
+    continue
+  }
+
+  if ($null -ne $message.id -and $message.method -eq '_dwo/worker/shutdown') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = [string]$message.id
+      result = @{ ok = $true }
+    } | ConvertTo-Json -Depth 12 -Compress
+    [Console]::Out.WriteLine($response)
+    [Console]::Out.Flush()
+    exit 0
+  }
 }
 "#,
         )

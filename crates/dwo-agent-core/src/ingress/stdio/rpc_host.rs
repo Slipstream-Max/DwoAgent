@@ -24,7 +24,7 @@ use super::{acp_handlers, dwo_handlers};
 use crate::agent::service::AgentService;
 use crate::protocol::dwo::{
     DwoAutomationRecordDeliveryRequest, DwoAutomationRunJobRequest, DwoIngressHandleEventRequest,
-    DwoIngressNotifyEventNotification, DwoSessionContextRequest,
+    DwoIngressNotifyEventNotification, DwoSessionContextRequest, DwoSessionLoadRequest,
     DwoSessionSetConfigOptionNotification, DwoWorkerPingRequest, DwoWorkerProfileRequest,
     DwoWorkerShutdownRequest,
 };
@@ -63,6 +63,7 @@ where
     let agent_for_config = agent.clone();
     let agent_for_worker_profile = agent.clone();
     let agent_for_session_context = agent.clone();
+    let agent_for_session_load = agent.clone();
     let agent_for_ingress = agent.clone();
     let agent_for_ingress_notify = agent.clone();
     let agent_for_session_config_notify = agent.clone();
@@ -163,6 +164,14 @@ where
                         cx: ConnectionTo<Client>| {
                 dwo_handlers::session_context(agent_for_session_context.clone(), req, responder, cx)
                     .await
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: DwoSessionLoadRequest,
+                        responder: Responder<Value>,
+                        cx: ConnectionTo<Client>| {
+                dwo_handlers::session_load(agent_for_session_load.clone(), req, responder, cx).await
             },
             on_receive_request!(),
         )

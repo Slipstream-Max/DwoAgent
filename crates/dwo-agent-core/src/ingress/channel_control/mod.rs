@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
-use super::channel_recent::render_recent_session_context;
 use crate::agent::constants::{PERMISSION_ALLOW_ONCE, PERMISSION_REJECT_ONCE};
 use crate::agent::service::AgentService;
 use crate::agent::session_agent::SessionAgent;
@@ -27,8 +26,12 @@ const CONFIRM_AUDIT_FILE: &str = "confirm_audit.jsonl";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelControlState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_session_id: Option<String>,
+    #[serde(
+        default,
+        alias = "default_session_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub home_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_session_id: Option<String>,
     #[serde(default)]
@@ -252,7 +255,7 @@ pub struct ChannelControl {
     holder: String,
     state_path: PathBuf,
     cwd: String,
-    configured_default_session_id: Option<String>,
+    configured_home_session_id: Option<String>,
     override_model: Option<String>,
     override_reasoning_mode: Option<ReasoningMode>,
 }
@@ -276,7 +279,7 @@ impl ChannelControl {
             holder: holder.into(),
             state_path: state_dir.join(CHANNEL_CONTROL_STATE_FILE),
             cwd: cwd.into(),
-            configured_default_session_id: default_session_id
+            configured_home_session_id: default_session_id
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(str::to_string),
@@ -296,20 +299,16 @@ impl ChannelControl {
             DwoChannelCommand::Help => dwo::channel_command_help().to_string(),
             DwoChannelCommand::New => self.create_new_session().await?,
             DwoChannelCommand::List => self.render_session_list().await?,
-            DwoChannelCommand::Switch { session_id } => self.switch_to(&session_id).await?,
-            DwoChannelCommand::Back => self.switch_back().await?,
+            DwoChannelCommand::Load { session_ref } => self.load_topic(&session_ref).await?,
+            DwoChannelCommand::SetHome { session_ref } => self.set_home(&session_ref).await?,
+            DwoChannelCommand::Home => self.go_home().await?,
             DwoChannelCommand::Where => self.render_where().await?,
             DwoChannelCommand::Approve { confirmation_id } => {
                 self.resolve_confirmation(&confirmation_id, PERMISSION_ALLOW_ONCE, None)?
             }
-            DwoChannelCommand::Deny {
-                confirmation_id,
-                reason,
-            } => self.resolve_confirmation(
-                &confirmation_id,
-                PERMISSION_REJECT_ONCE,
-                reason.as_deref(),
-            )?,
+            DwoChannelCommand::Deny { confirmation_id } => {
+                self.resolve_confirmation(&confirmation_id, PERMISSION_REJECT_ONCE, None)?
+            }
             DwoChannelCommand::Cancel => self.cancel_current_session().await?,
             DwoChannelCommand::Usage(message) => message,
         };
@@ -318,20 +317,16 @@ impl ChannelControl {
 
     pub async fn active_session(&self) -> Result<Arc<SessionAgent>> {
         let mut state = self.read_or_init_state()?;
-        let default_session = self.ensure_default_session(&mut state).await?;
-        let default_session_id = default_session.session_id().to_string();
+        let home_session = self.ensure_home_session(&mut state).await?;
+        let home_session_id = home_session.session_id().to_string();
         self.write_state(&mut state)?;
 
         let Some(active_session_id) = state.active_session_id else {
-            return Ok(default_session);
+            return Ok(home_session);
         };
-        if active_session_id == default_session_id {
-            return Ok(default_session);
+        if active_session_id == home_session_id {
+            return Ok(home_session);
         }
-        self.leases
-            .acquire(&active_session_id, &self.holder)
-            .await
-            .with_context(|| format!("acquire session lease for {active_session_id}"))?;
         self.agent
             .load_session(&active_session_id)
             .await?
@@ -347,7 +342,9 @@ impl ChannelControl {
         request_permission: PermissionRequester,
         extra_tool_schemas: Vec<Value>,
     ) -> Result<String> {
-        self.agent
+        self.leases.acquire(session_id, &self.holder).await?;
+        let result = self
+            .agent
             .run_prompt_with_extra_tools(
                 session_id,
                 user_input,
@@ -356,29 +353,34 @@ impl ChannelControl {
                 request_permission,
                 extra_tool_schemas,
             )
-            .await
+            .await;
+        self.leases
+            .release_if_holder(session_id, &self.holder)
+            .await;
+        result
     }
 
-    async fn ensure_default_session(
+    async fn ensure_home_session(
         &self,
         state: &mut ChannelControlState,
     ) -> Result<Arc<SessionAgent>> {
-        if let Some(configured) = self.configured_default_session_id.as_deref() {
-            let session = self.agent.load_session(configured).await?.ok_or_else(|| {
-                anyhow::anyhow!("configured default session not found: {configured}")
-            })?;
-            state.default_session_id = Some(session.session_id().to_string());
-            return Ok(session);
-        }
-
-        if let Some(default_session_id) = state.default_session_id.as_deref() {
-            if let Some(session) = self.agent.load_session(default_session_id).await? {
+        if let Some(home_session_id) = state.home_session_id.clone() {
+            if let Some(session) = self.agent.load_session(&home_session_id).await? {
                 return Ok(session);
             }
             tracing::warn!(
-                session_id = default_session_id,
-                "channel default session was not found; creating a replacement"
+                session_id = home_session_id,
+                "channel home session was not found; resolving a replacement"
             );
+            state.home_session_id = None;
+        }
+
+        if let Some(configured) = self.configured_home_session_id.as_deref() {
+            let session = self.agent.load_session(configured).await?.ok_or_else(|| {
+                anyhow::anyhow!("configured home session not found: {configured}")
+            })?;
+            state.home_session_id = Some(session.session_id().to_string());
+            return Ok(session);
         }
 
         let session = self
@@ -389,19 +391,13 @@ impl ChannelControl {
                 self.override_reasoning_mode,
             )
             .await?;
-        state.default_session_id = Some(session.session_id().to_string());
+        state.home_session_id = Some(session.session_id().to_string());
         Ok(session)
     }
 
     async fn create_new_session(&self) -> Result<String> {
         let mut state = self.read_or_init_state()?;
-        let default_session = self.ensure_default_session(&mut state).await?;
-        let default_session_id = default_session.session_id().to_string();
-        if let Some(previous) = state.active_session_id.as_deref()
-            && previous != default_session_id
-        {
-            self.leases.release_if_holder(previous, &self.holder).await;
-        }
+        self.ensure_home_session(&mut state).await?;
 
         let session = self
             .agent
@@ -411,13 +407,10 @@ impl ChannelControl {
                 self.override_reasoning_mode,
             )
             .await?;
-        self.leases
-            .acquire(session.session_id(), &self.holder)
-            .await?;
         state.active_session_id = Some(session.session_id().to_string());
         self.write_state(&mut state)?;
         Ok(format!(
-            "已创建并切换到 session：{}\n返回默认会话：/back",
+            "已创建并进入新话题：{}\n返回主话题：/home",
             session.session_id()
         ))
     }
@@ -429,85 +422,89 @@ impl ChannelControl {
         Ok(format!("已请求取消当前 session：{session_id}"))
     }
 
-    async fn switch_to(&self, requested_session_id: &str) -> Result<String> {
-        let session_id = requested_session_id.trim();
-        if session_id.is_empty() {
-            bail!("session_id is required");
-        }
+    async fn load_topic(&self, requested: &str) -> Result<String> {
         let mut state = self.read_or_init_state()?;
-        let default_session = self.ensure_default_session(&mut state).await?;
-        let default_session_id = default_session.session_id().to_string();
-        if let Some(previous) = state.active_session_id.as_deref()
-            && previous != session_id
-            && previous != default_session_id
-        {
-            self.leases.release_if_holder(previous, &self.holder).await;
-        }
-
-        if session_id == "default" || session_id == default_session_id {
-            state.active_session_id = None;
-            self.write_state(&mut state)?;
-            return Ok(format!("已切回默认会话：{default_session_id}"));
-        }
-
-        let session = self
-            .agent
-            .load_session(session_id)
+        let home_session = self.ensure_home_session(&mut state).await?;
+        let home_session_id = home_session.session_id().to_string();
+        let sessions = self.agent.list_sessions(None).await;
+        let target = resolve_session_reference(&sessions, requested)?;
+        self.agent
+            .load_session(&target.session_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("找不到 session：{session_id}"))?;
-        self.leases
-            .acquire(session.session_id(), &self.holder)
-            .await?;
-        state.active_session_id = Some(session.session_id().to_string());
+            .ok_or_else(|| anyhow::anyhow!("找不到话题：{}", target.session_id))?;
+
+        if target.session_id == home_session_id {
+            state.active_session_id = None;
+        } else {
+            state.active_session_id = Some(target.session_id.clone());
+        }
         self.write_state(&mut state)?;
-        let recent_context = match render_recent_session_context(session.session_dir()) {
-            Ok(Some(context)) => format!("\n\n最近上下文：\n{context}"),
-            Ok(None) => String::new(),
-            Err(err) => {
-                tracing::warn!(
-                    session_id = session.session_id(),
-                    error = %err,
-                    "failed to render recent channel switch context"
-                );
-                String::new()
-            }
-        };
-        Ok(format!(
-            "已切换到 session：{}\n返回默认会话：/back",
-            session.session_id()
-        ) + &recent_context)
+        Ok(format!("已进入话题：{}", render_topic_label(&target)))
     }
 
-    async fn switch_back(&self) -> Result<String> {
+    async fn set_home(&self, requested: &str) -> Result<String> {
         let mut state = self.read_or_init_state()?;
-        let default_session = self.ensure_default_session(&mut state).await?;
-        let default_session_id = default_session.session_id().to_string();
-        if let Some(active) = state.active_session_id.take()
-            && active != default_session_id
-        {
-            self.leases.release_if_holder(&active, &self.holder).await;
-        }
+        let previous_home = self.ensure_home_session(&mut state).await?;
+        let current_session_id = state
+            .active_session_id
+            .clone()
+            .unwrap_or_else(|| previous_home.session_id().to_string());
+        let sessions = self.agent.list_sessions(None).await;
+        let target = resolve_session_reference(&sessions, requested)?;
+        self.agent
+            .load_session(&target.session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("找不到话题：{}", target.session_id))?;
+
+        state.home_session_id = Some(target.session_id.clone());
+        state.active_session_id = if current_session_id == target.session_id {
+            None
+        } else {
+            Some(current_session_id.clone())
+        };
         self.write_state(&mut state)?;
-        Ok(format!("已返回默认会话：{default_session_id}"))
+        let mut reply = format!("已设置主话题：{}", render_topic_label(&target));
+        if current_session_id == target.session_id {
+            reply.push_str("\n当前已在主话题。");
+        } else {
+            let current = topic_label_by_id(&sessions, &current_session_id);
+            reply.push_str(&format!("\n当前话题保持：{current}\n返回主话题：/home"));
+        }
+        Ok(reply)
+    }
+
+    async fn go_home(&self) -> Result<String> {
+        let mut state = self.read_or_init_state()?;
+        let home_session = self.ensure_home_session(&mut state).await?;
+        let home_session_id = home_session.session_id().to_string();
+        state.active_session_id = None;
+        self.write_state(&mut state)?;
+        let sessions = self.agent.list_sessions(None).await;
+        Ok(format!(
+            "已返回主话题：{}",
+            topic_label_by_id(&sessions, &home_session_id)
+        ))
     }
 
     async fn render_where(&self) -> Result<String> {
         let mut state = self.read_or_init_state()?;
-        let default_session = self.ensure_default_session(&mut state).await?;
-        let default_session_id = default_session.session_id().to_string();
+        let home_session = self.ensure_home_session(&mut state).await?;
+        let home_session_id = home_session.session_id().to_string();
         self.write_state(&mut state)?;
-        let active = state
+        let current_session_id = state
             .active_session_id
             .as_deref()
-            .unwrap_or(&default_session_id);
+            .unwrap_or(&home_session_id);
         let holder = self
             .leases
-            .holder(active)
+            .holder(current_session_id)
             .await
             .unwrap_or_else(|| "none".to_string());
+        let sessions = self.agent.list_sessions(None).await;
         Ok(format!(
-            "当前会话：{active}\n默认会话：{}\n占用者：{holder}",
-            default_session_id
+            "当前话题：{}\n主话题：{}\n运行占用：{holder}",
+            topic_label_by_id(&sessions, current_session_id),
+            topic_label_by_id(&sessions, &home_session_id)
         ))
     }
 
@@ -557,24 +554,28 @@ impl ChannelControl {
 
     async fn render_session_list(&self) -> Result<String> {
         let mut state = self.read_or_init_state()?;
-        let default_session = self.ensure_default_session(&mut state).await?;
-        let default_session_id = default_session.session_id().to_string();
+        let home_session = self.ensure_home_session(&mut state).await?;
+        let home_session_id = home_session.session_id().to_string();
         self.write_state(&mut state)?;
         let sessions = self.agent.list_sessions(None).await;
         if sessions.is_empty() {
-            return Ok("暂无 session。".to_string());
+            return Ok("暂无话题。".to_string());
         }
-        let active = state
+        let current_session_id = state
             .active_session_id
             .as_deref()
-            .unwrap_or(&default_session_id);
+            .unwrap_or(&home_session_id);
 
-        let mut lines = vec!["sessions:".to_string()];
+        let mut lines = vec!["话题列表（* 当前，h 主话题）：".to_string()];
         for session in sessions.iter().take(30) {
-            lines.push(render_session_line(session, active, &default_session_id));
+            lines.push(render_session_line(
+                session,
+                current_session_id,
+                &home_session_id,
+            ));
         }
         if sessions.len() > 30 {
-            lines.push(format!("... 还有 {} 个 session", sessions.len() - 30));
+            lines.push(format!("... 还有 {} 个话题", sessions.len() - 30));
         }
         Ok(lines.join("\n"))
     }
@@ -582,7 +583,7 @@ impl ChannelControl {
     pub fn confirmation_message(snapshot: &PendingConfirmationSnapshot) -> String {
         let args = truncate_json(&snapshot.raw_input, 320);
         format!(
-            "[confirm required]\nsession: {}\nconfirm: {}\ntool: {}\nargs: {}\n/approve {}\n/deny {} [reason]",
+            "[confirm required]\nsession: {}\nconfirm: {}\ntool: {}\nargs: {}\n/approve {}\n/deny {}",
             snapshot.session_id,
             snapshot.confirmation_id,
             snapshot.tool_name,
@@ -600,7 +601,7 @@ impl ChannelControl {
             return Ok(state);
         }
         Ok(ChannelControlState {
-            default_session_id: None,
+            home_session_id: None,
             active_session_id: None,
             updated_at: None,
         })
@@ -621,15 +622,17 @@ impl ChannelControl {
 
 fn render_session_line(
     session: &SessionMetaPayload,
-    active: &str,
-    default_session_id: &str,
+    current_session_id: &str,
+    home_session_id: &str,
 ) -> String {
-    let marker = if session.session_id == active {
-        "*"
-    } else if session.session_id == default_session_id {
-        "d"
-    } else {
-        "-"
+    let marker = match (
+        session.session_id == current_session_id,
+        session.session_id == home_session_id,
+    ) {
+        (true, true) => "*h",
+        (true, false) => "*",
+        (false, true) => "h",
+        (false, false) => "-",
     };
     let title = session
         .title
@@ -643,9 +646,66 @@ fn render_session_line(
         "no"
     };
     format!(
-        "{marker} id: {} | title: {} | running: {}",
-        session.session_id, title, running
+        "{marker} {title} | id: {} | running: {running}",
+        session.session_id
     )
+}
+
+fn resolve_session_reference(
+    sessions: &[SessionMetaPayload],
+    requested: &str,
+) -> Result<SessionMetaPayload> {
+    let requested = compact_inline_text(requested);
+    if requested.is_empty() {
+        bail!("话题名称或 id 不能为空");
+    }
+    if let Some(session) = sessions
+        .iter()
+        .find(|session| session.session_id == requested)
+    {
+        return Ok(session.clone());
+    }
+
+    let matches = sessions
+        .iter()
+        .filter(|session| {
+            session
+                .title
+                .as_deref()
+                .map(compact_inline_text)
+                .is_some_and(|title| title == requested)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [session] => Ok((*session).clone()),
+        [] => bail!("找不到话题：{requested}。使用 /list 查看名称和 id"),
+        many => {
+            let ids = many
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("话题名称不唯一：{requested}。请使用 id：{ids}")
+        }
+    }
+}
+
+fn render_topic_label(session: &SessionMetaPayload) -> String {
+    let title = session
+        .title
+        .as_deref()
+        .map(compact_inline_text)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "(untitled)".to_string());
+    format!("{title} ({})", session.session_id)
+}
+
+fn topic_label_by_id(sessions: &[SessionMetaPayload], session_id: &str) -> String {
+    sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(render_topic_label)
+        .unwrap_or_else(|| session_id.to_string())
 }
 
 fn session_is_running(state: AgentState) -> bool {
@@ -709,7 +769,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let state_path = tmp.path().join(CHANNEL_CONTROL_STATE_FILE);
         let mut state = ChannelControlState {
-            default_session_id: Some("default".to_string()),
+            home_session_id: Some("home".to_string()),
             active_session_id: Some("other".to_string()),
             updated_at: None,
         };
@@ -720,6 +780,17 @@ mod tests {
         std::fs::write(&state_path, serde_yaml::to_string(&state).unwrap()).unwrap();
         let loaded: ChannelControlState =
             serde_yaml::from_str(&read_utf8_text(&state_path).unwrap()).unwrap();
+        assert_eq!(loaded.home_session_id.as_deref(), Some("home"));
+        assert_eq!(loaded.active_session_id.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn channel_control_state_reads_legacy_default_as_home() {
+        let loaded: ChannelControlState =
+            serde_yaml::from_str("default_session_id: legacy-home\nactive_session_id: other\n")
+                .unwrap();
+
+        assert_eq!(loaded.home_session_id.as_deref(), Some("legacy-home"));
         assert_eq!(loaded.active_session_id.as_deref(), Some("other"));
     }
 
@@ -727,12 +798,60 @@ mod tests {
     fn session_list_line_shows_id_title_and_running_status() {
         let session = session_meta("s1", Some("Bug fix"), AgentState::Running);
 
-        let line = render_session_line(&session, "s1", "default");
+        let line = render_session_line(&session, "s1", "home");
 
         assert!(line.starts_with("* "));
         assert!(line.contains("id: s1"));
-        assert!(line.contains("title: Bug fix"));
+        assert!(line.contains("Bug fix"));
         assert!(line.contains("running: yes"));
+    }
+
+    #[test]
+    fn session_list_line_marks_current_home() {
+        let session = session_meta("s1", Some("Main topic"), AgentState::Idle);
+
+        let line = render_session_line(&session, "s1", "s1");
+
+        assert!(line.starts_with("*h "));
+    }
+
+    #[test]
+    fn session_reference_resolves_exact_id_or_unique_title() {
+        let sessions = vec![
+            session_meta("s1", Some("Bug fix"), AgentState::Idle),
+            session_meta("Bug fix", Some("Another topic"), AgentState::Idle),
+        ];
+
+        assert_eq!(
+            resolve_session_reference(&sessions, "s1")
+                .unwrap()
+                .session_id,
+            "s1"
+        );
+        assert_eq!(
+            resolve_session_reference(&sessions, "Another topic")
+                .unwrap()
+                .session_id,
+            "Bug fix"
+        );
+        assert_eq!(
+            resolve_session_reference(&sessions, "Bug fix")
+                .unwrap()
+                .session_id,
+            "Bug fix",
+            "an exact id wins over a title"
+        );
+    }
+
+    #[test]
+    fn session_reference_rejects_ambiguous_title() {
+        let sessions = vec![
+            session_meta("s1", Some("Same name"), AgentState::Idle),
+            session_meta("s2", Some("Same name"), AgentState::Idle),
+        ];
+
+        let err = resolve_session_reference(&sessions, "Same name").unwrap_err();
+        assert!(err.to_string().contains("s1, s2"));
     }
 
     #[tokio::test]

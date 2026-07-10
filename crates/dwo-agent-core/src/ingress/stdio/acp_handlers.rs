@@ -167,21 +167,7 @@ pub async fn load_session(
     match agent.load_session(&session_id).await {
         Ok(Some(session)) => {
             let snapshot = session.session_meta_snapshot().await;
-            let usage = session.context_usage_snapshot().await;
             let profiles = agent.model_profiles();
-
-            let transcript_path = session.session_dir().join(SESSION_CLIENT_TRANSCRIPT_FILE);
-            if let Err(err) = transcript::replay_transcript_file(&cx, &session_id, &transcript_path)
-            {
-                return responder.respond_with_error(internal_error(err));
-            }
-
-            notifications::emit_session_info_state(
-                &cx,
-                &session_id,
-                snapshot.title.as_deref(),
-                snapshot.updated_at.as_deref(),
-            );
 
             let response = LoadSessionResponse::new()
                 .modes(mapper::build_mode_state(snapshot.mode_id.as_str()))
@@ -192,7 +178,38 @@ pub async fn load_session(
                     &profiles,
                 ));
             let result = responder.respond(response);
-            notifications::emit_context_usage_state(&cx, &session_id, usage);
+            if result.is_ok() {
+                let transcript_path = session.session_dir().join(SESSION_CLIENT_TRANSCRIPT_FILE);
+                if let Err(err) =
+                    transcript::replay_transcript_file(&cx, &session_id, &transcript_path)
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %format!("{err:#}"),
+                        "failed to replay ACP transcript after session/load"
+                    );
+                }
+
+                notifications::emit_session_info_state(
+                    &cx,
+                    &session_id,
+                    snapshot.title.as_deref(),
+                    snapshot.updated_at.as_deref(),
+                );
+                match session.persisted_context_usage_snapshot() {
+                    Ok(Some(usage)) => {
+                        notifications::emit_context_usage_state(&cx, &session_id, usage)
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %format!("{err:#}"),
+                            "failed to read persisted context usage after session/load"
+                        );
+                    }
+                }
+            }
             result
         }
         Ok(None) => responder.respond_with_error(invalid_params("session not found")),

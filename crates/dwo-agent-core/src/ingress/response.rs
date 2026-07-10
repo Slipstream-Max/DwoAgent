@@ -7,7 +7,8 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
 use crate::agent::activity::event::{
-    EVENT_AGENT_MESSAGE_CHUNK, EVENT_AGENT_THOUGHT_CHUNK, EVENT_TOOL_CALL, update_type,
+    EVENT_AGENT_MESSAGE_CHUNK, EVENT_AGENT_THOUGHT_CHUNK, EVENT_TOOL_CALL,
+    EVENT_USER_MESSAGE_CHUNK, update_type,
 };
 use crate::tools::UpdateEmitter;
 
@@ -36,12 +37,12 @@ impl ChannelResponseDetail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelCollectedUpdates {
     pub detail_text: Option<String>,
-    pub response_text: String,
+    pub response_messages: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 struct ChannelUpdateState {
-    response_text: String,
+    response_messages: Vec<String>,
     thought_text: String,
     tool_calls: Vec<String>,
 }
@@ -77,12 +78,37 @@ impl ChannelUpdateCollector {
     }
 }
 
+pub fn render_update_messages(
+    detail: ChannelResponseDetail,
+    update: &Map<String, Value>,
+    include_user_messages: bool,
+) -> Vec<String> {
+    match update_type(update) {
+        EVENT_USER_MESSAGE_CHUNK if include_user_messages => update_text(update)
+            .map(|text| vec![text.to_string()])
+            .unwrap_or_default(),
+        EVENT_AGENT_MESSAGE_CHUNK => update_text(update)
+            .map(|text| vec![text.to_string()])
+            .unwrap_or_default(),
+        EVENT_AGENT_THOUGHT_CHUNK if detail.includes_process() => update_text(update)
+            .map(|text| vec![format!("[thinking]\n{}", text.trim())])
+            .unwrap_or_default(),
+        EVENT_TOOL_CALL if detail.includes_process() => render_tool_call(update)
+            .map(|text| vec![format!("[tool_call]\n{text}")])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .filter(|text| !text.trim().is_empty())
+    .collect()
+}
+
 impl ChannelUpdateState {
     fn record_update(&mut self, detail: ChannelResponseDetail, update: &Map<String, Value>) {
         match update_type(update) {
             EVENT_AGENT_MESSAGE_CHUNK => {
                 if let Some(text) = update_text(update) {
-                    self.response_text.push_str(text);
+                    self.response_messages.push(text.to_string());
                 }
             }
             EVENT_AGENT_THOUGHT_CHUNK if detail.includes_process() => {
@@ -116,7 +142,12 @@ impl ChannelUpdateState {
 
         ChannelCollectedUpdates {
             detail_text,
-            response_text: self.response_text.trim().to_string(),
+            response_messages: self
+                .response_messages
+                .iter()
+                .filter(|text| !text.trim().is_empty())
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -222,7 +253,7 @@ mod tests {
 
         let collected = collector.finish().await;
         assert_eq!(collected.detail_text, None);
-        assert_eq!(collected.response_text, "final");
+        assert_eq!(collected.response_messages, vec!["final"]);
     }
 
     #[tokio::test]
@@ -249,7 +280,41 @@ mod tests {
         assert!(detail.contains("[thinking]\nthink all of this"));
         assert!(detail.contains("[tool_call]\nfile_edit"));
         assert!(detail.contains("...<truncated>"));
-        assert_eq!(collected.response_text, "complete response");
+        assert_eq!(collected.response_messages, vec!["complete response"]);
+    }
+
+    #[test]
+    fn render_response_only_keeps_user_and_agent_but_filters_process() {
+        assert_eq!(
+            render_update_messages(
+                ChannelResponseDetail::ResponseOnly,
+                &message_update("a1"),
+                true
+            ),
+            vec!["a1"]
+        );
+        assert_eq!(
+            render_update_messages(
+                ChannelResponseDetail::ResponseOnly,
+                &thought_update("hidden"),
+                true
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            render_update_messages(
+                ChannelResponseDetail::ResponseOnly,
+                &json!({
+                    "session_update": EVENT_USER_MESSAGE_CHUNK,
+                    "content": {"type": "text", "text": "question"}
+                })
+                .as_object()
+                .cloned()
+                .unwrap(),
+                true,
+            ),
+            vec!["question"]
+        );
     }
 
     fn message_update(text: &str) -> Map<String, Value> {

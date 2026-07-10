@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::loader::write_json_utf8;
+use crate::config::loader::{read_json_model, write_json_utf8};
 use crate::config::models::{
     AgentState, AgentTools, ContextUsageSnapshot, PolicyMode, ReasoningMode, SessionMetaPayload,
     SessionModelContextPayload,
@@ -168,5 +168,14 @@ impl SessionPersistence {
         handle.write_all(line.as_bytes())?;
         handle.write_all(b"\n")?;
         Ok(())
+    }
+
+    pub fn load_context_usage(&self) -> Result<Option<ContextUsageSnapshot>> {
+        let path = self.session_dir.join(SESSION_MODEL_CONTEXT_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let payload: SessionModelContextPayload = read_json_model(&path)?;
+        Ok(payload.usage)
     }
 }

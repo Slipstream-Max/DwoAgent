@@ -1,6 +1,5 @@
 //! Supervisor-owned external activation gateway.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,6 +21,7 @@ use dwo_agent_core::ingress::channel_input::{
 use dwo_agent_core::ingress::config::{
     FeishuChannelConfig, FeishuChannelDomain, WeixinChannelConfig, load_channel_runtime_config,
 };
+use dwo_agent_core::ingress::response::{ChannelResponseDetail, render_update_messages};
 use dwo_agent_core::protocol::dwo::{
     self, DwoChannelCommand, DwoIngressAttachment, DwoIngressChannel, DwoIngressConversation,
     DwoIngressEvent, DwoIngressSource, DwoOutboundAction, DwoOutboundActionNotification,
@@ -30,14 +30,16 @@ use dwo_agent_core::protocol::dwo::{
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use serde_json::{Map, Value, json};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use weixin_agent::{
     MediaInfo, MediaType, MessageContext, MessageHandler, WeixinClient, WeixinConfig,
 };
 
-use super::{ResolvedProfile, SupervisorState};
+use super::{
+    PendingPermissionSnapshot, ResolvedProfile, SupervisorConnectionContext, SupervisorState,
+};
 
 const FEISHU_AUTH_FILE: &str = "auth.yaml";
 const FEISHU_SECRET_SUBDIR: &str = "feishu";
@@ -143,19 +145,9 @@ async fn worker_request(
     method: &str,
     params: Value,
 ) -> Result<Value> {
-    let profile_id = profile.id.clone();
     state
         .worker_pool
-        .request_with_events(profile, method, params, &state.config.pool, |event| {
-            let profile_id = profile_id.clone();
-            async move {
-                state
-                    .event_bus
-                    .broadcast_worker_event(&profile_id, &event, None)
-                    .await;
-                Ok(())
-            }
-        })
+        .request(profile, method, params, &state.config.pool)
         .await
 }
 
@@ -307,6 +299,7 @@ struct WeixinAuth {
 struct WeixinGateway {
     client: Arc<WeixinClient>,
     initial_sync_buf: Option<String>,
+    observer: Arc<WeixinSessionObserver>,
 }
 
 #[derive(Clone)]
@@ -316,8 +309,19 @@ struct WeixinGatewayHandler {
     auth: WeixinAuth,
     state_dir: PathBuf,
     media_input: bool,
+    response_detail: ChannelResponseDetail,
     client: Arc<OnceLock<Arc<WeixinClient>>>,
-    message_lock: Arc<Mutex<()>>,
+    observer: Arc<WeixinSessionObserver>,
+}
+
+struct WeixinSessionObserver {
+    state: Arc<SupervisorState>,
+    profile: ResolvedProfile,
+    target: String,
+    response_detail: ChannelResponseDetail,
+    connection: SupervisorConnectionContext,
+    receiver: Mutex<mpsc::UnboundedReceiver<Value>>,
+    client: Arc<OnceLock<Arc<WeixinClient>>>,
 }
 
 impl WeixinGateway {
@@ -334,14 +338,28 @@ impl WeixinGateway {
             .join(WEIXIN_STATE_SUBDIR);
         let auth = read_weixin_auth(&secret_dir.join(WEIXIN_AUTH_FILE))?;
         let client_ref = Arc::new(OnceLock::new());
+        let (observer_tx, observer_rx) = mpsc::unbounded_channel();
+        let observer = Arc::new(WeixinSessionObserver {
+            state: state.clone(),
+            profile: profile.clone(),
+            target: auth.bound_user_id.clone(),
+            response_detail: config.response_detail,
+            connection: SupervisorConnectionContext {
+                id: format!("weixin:{}:{}", profile.id, auth.bound_user_id),
+                sender: observer_tx,
+            },
+            receiver: Mutex::new(observer_rx),
+            client: client_ref.clone(),
+        });
         let handler = WeixinGatewayHandler {
             state,
             profile,
             auth: auth.clone(),
             state_dir: state_dir.clone(),
             media_input: config.media_input,
+            response_detail: config.response_detail,
             client: client_ref.clone(),
-            message_lock: Arc::new(Mutex::new(())),
+            observer: observer.clone(),
         };
 
         let mut builder = WeixinConfig::builder()
@@ -362,10 +380,17 @@ impl WeixinGateway {
         Ok(Self {
             client,
             initial_sync_buf,
+            observer,
         })
     }
 
     async fn run(self: Arc<Self>) -> Result<()> {
+        let observer = self.observer.clone();
+        tokio::spawn(async move {
+            if let Err(err) = observer.run().await {
+                tracing::warn!(target: "weixin", error = %format!("{err:#}"), "weixin session observer stopped");
+            }
+        });
         self.client.start(self.initial_sync_buf.clone()).await?;
         Ok(())
     }
@@ -385,6 +410,68 @@ impl WeixinGateway {
     }
 }
 
+impl WeixinSessionObserver {
+    async fn attach(&self, session_id: &str) {
+        self.state
+            .event_bus
+            .subscribe(&self.connection, &self.profile.id, session_id)
+            .await;
+    }
+
+    async fn run(&self) -> Result<()> {
+        loop {
+            let message = {
+                let mut receiver = self.receiver.lock().await;
+                receiver.recv().await
+            };
+            let Some(message) = message else {
+                return Ok(());
+            };
+            let Some(texts) = self.render_observed_message(&message).await else {
+                continue;
+            };
+            let Some(client) = self.client.get().cloned() else {
+                continue;
+            };
+            for text in texts {
+                client.send_text(&self.target, &text, None).await?;
+            }
+        }
+    }
+
+    async fn render_observed_message(&self, message: &Value) -> Option<Vec<String>> {
+        match message.get("type").and_then(Value::as_str) {
+            Some("supervisor.client_request")
+                if message.get("method").and_then(Value::as_str)
+                    == Some("session/request_permission") =>
+            {
+                let request_id = message.get("id")?;
+                let Some(snapshot) = self
+                    .state
+                    .permissions
+                    .snapshot_by_request_id(request_id)
+                    .await
+                else {
+                    return None;
+                };
+                return Some(vec![render_pending_permission(&snapshot)]);
+            }
+            Some("supervisor.event") => {}
+            _ => return None,
+        }
+        let event = message.get("event")?;
+        if event.get("method").and_then(Value::as_str) != Some("session/update") {
+            return None;
+        }
+        let update = event
+            .get("params")
+            .and_then(|params| params.get("update"))
+            .and_then(Value::as_object)?;
+        let update: Map<String, Value> = update.clone();
+        Some(render_update_messages(self.response_detail, &update, true))
+    }
+}
+
 #[async_trait::async_trait]
 impl MessageHandler for WeixinGatewayHandler {
     async fn on_message(&self, ctx: &MessageContext) -> weixin_agent::Result<()> {
@@ -394,7 +481,7 @@ impl MessageHandler for WeixinGatewayHandler {
 
         match confirmation_command(ctx.body.as_deref()) {
             Some(DwoChannelCommand::Approve { .. }) | Some(DwoChannelCommand::Deny { .. }) => {
-                let result = self.handle_confirmation_command(ctx).await;
+                let result = self.handle_permission_or_confirmation_command(ctx).await;
                 if let Err(err) = result {
                     tracing::warn!(target: "weixin", error = %format!("{err:#}"), "failed to notify weixin confirmation command");
                     let _ = ctx.reply_text(&format!("处理确认指令失败：{err:#}")).await;
@@ -408,7 +495,6 @@ impl MessageHandler for WeixinGatewayHandler {
             _ => {}
         }
 
-        let _guard = self.message_lock.lock().await;
         let _ = ctx.send_typing().await;
         let result = self.handle_message(ctx).await;
         let _ = ctx.cancel_typing().await;
@@ -430,6 +516,61 @@ impl MessageHandler for WeixinGatewayHandler {
 }
 
 impl WeixinGatewayHandler {
+    async fn handle_permission_or_confirmation_command(&self, ctx: &MessageContext) -> Result<()> {
+        if let Some(reply) = self.handle_supervisor_permission_command(ctx).await? {
+            ctx.reply_text(&reply).await?;
+            return Ok(());
+        }
+        self.handle_confirmation_command(ctx).await
+    }
+
+    async fn handle_supervisor_permission_command(
+        &self,
+        ctx: &MessageContext,
+    ) -> Result<Option<String>> {
+        let Some(command) = confirmation_command(ctx.body.as_deref()) else {
+            return Ok(None);
+        };
+        let (confirmation_id, option_id) = match command {
+            DwoChannelCommand::Approve { confirmation_id } => (confirmation_id, "allow_once"),
+            DwoChannelCommand::Deny {
+                confirmation_id, ..
+            } => (confirmation_id, "reject_once"),
+            _ => return Ok(None),
+        };
+        let Some(snapshot) = self
+            .state
+            .permissions
+            .take_confirmation(&confirmation_id)
+            .await
+        else {
+            if self
+                .state
+                .permissions
+                .is_stale_confirmation(&confirmation_id)
+                .await
+            {
+                return Ok(Some(format!(
+                    "该确认已结束或已被新的 prompt 取消：{}",
+                    confirmation_id
+                )));
+            }
+            return Ok(None);
+        };
+        let response = permission_client_response(snapshot.request_id.clone(), option_id);
+        self.state.forward_client_response_message(response).await?;
+        Ok(Some(format!(
+            "已{}确认：{}\nsession：{}",
+            if option_id == "allow_once" {
+                "批准"
+            } else {
+                "拒绝"
+            },
+            snapshot.confirmation_id,
+            snapshot.session_id
+        )))
+    }
+
     async fn handle_confirmation_command(&self, ctx: &MessageContext) -> Result<()> {
         let event = self.build_event(ctx, Vec::new());
         worker_notify(
@@ -454,6 +595,7 @@ impl WeixinGatewayHandler {
             Vec::new()
         };
         let event = self.build_event(ctx, attachments);
+        let replay_after_attach = should_replay_after_weixin_command(ctx.body.as_deref());
         let response = self
             .state
             .worker_pool
@@ -463,10 +605,6 @@ impl WeixinGatewayHandler {
                 json!({ "event": event }),
                 &self.state.config.pool,
                 |event| async move {
-                    self.state
-                        .event_bus
-                        .broadcast_worker_event(&self.profile.id, &event, None)
-                        .await;
                     match outbound_action_from_event(event) {
                         Some(Ok(action)) => {
                             if let Err(err) = self.deliver_context_action(ctx, action).await {
@@ -482,9 +620,48 @@ impl WeixinGatewayHandler {
                 },
             )
             .await?;
+        if let Some(session_id) = response
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.observer.attach(session_id).await;
+            if replay_after_attach {
+                self.replay_session(ctx, session_id).await?;
+            }
+        }
         let actions = parse_actions(response)?;
         for action in actions {
             self.deliver_context_action(ctx, action).await?;
+        }
+        Ok(())
+    }
+
+    async fn replay_session(&self, ctx: &MessageContext, session_id: &str) -> Result<()> {
+        let response = worker_request(
+            &self.state,
+            &self.profile,
+            "_dwo/session/load",
+            json!({ "sessionId": session_id }),
+        )
+        .await?;
+        let events = response
+            .get("replayEvents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for event in events {
+            let Some(update) = event
+                .get("params")
+                .and_then(|params| params.get("update"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for text in render_update_messages(self.response_detail, update, true) {
+                ctx.reply_text(&text).await?;
+            }
         }
         Ok(())
     }
@@ -690,12 +867,75 @@ fn outbound_action_from_event(event: Value) -> Option<Result<DwoOutboundAction>>
     )
 }
 
+fn render_pending_permission(snapshot: &PendingPermissionSnapshot) -> String {
+    let tool_call = snapshot.params.get("toolCall").and_then(Value::as_object);
+    let title = tool_call
+        .and_then(|tool| tool.get("title"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            tool_call
+                .and_then(|tool| tool.get("toolCallId"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("tool");
+    let input = tool_call
+        .and_then(|tool| tool.get("rawInput"))
+        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "<unrenderable>".to_string()))
+        .unwrap_or_default();
+    let input = truncate_for_weixin(&input, 600);
+    let mut message = format!(
+        "需要确认：{}\nsession：{}\n确认 id：{}\n批准：/approve {}\n拒绝：/deny {}",
+        title,
+        snapshot.session_id,
+        snapshot.confirmation_id,
+        snapshot.confirmation_id,
+        snapshot.confirmation_id
+    );
+    if !input.is_empty() {
+        message.push_str("\ninput：");
+        message.push_str(&input);
+    }
+    message
+}
+
+fn permission_client_response(request_id: Value, option_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            }
+        }
+    })
+}
+
+fn truncate_for_weixin(text: &str, limit: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= limit {
+            out.push_str("...<truncated>");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn confirmation_command(text: Option<&str>) -> Option<DwoChannelCommand> {
     let text = text?.trim();
     if !text.starts_with("/approve") && !text.starts_with("/deny") {
         return None;
     }
     dwo::parse_channel_command(text)
+}
+
+fn should_replay_after_weixin_command(text: Option<&str>) -> bool {
+    matches!(
+        text.and_then(dwo::parse_channel_command),
+        Some(DwoChannelCommand::Load { .. }) | Some(DwoChannelCommand::Home)
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -736,7 +976,6 @@ struct FeishuGateway {
     rest: Arc<FeishuRestClient>,
     config: FeishuChannelConfig,
     state_dir: PathBuf,
-    message_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 struct CachedTenantToken {
@@ -788,7 +1027,6 @@ impl FeishuGateway {
                 .join("runtime")
                 .join("channel_state")
                 .join(FEISHU_STATE_SUBDIR),
-            message_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -805,9 +1043,12 @@ impl FeishuGateway {
                     let Some(msg) = maybe_msg else {
                         return Ok(());
                     };
-                    if let Err(err) = self.handle_message(msg).await {
-                        tracing::warn!(target: "feishu", error = %format!("{err:#}"), "failed to handle feishu gateway message");
-                    }
+                    let gateway = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = gateway.handle_message(msg).await {
+                            tracing::warn!(target: "feishu", error = %format!("{err:#}"), "failed to handle feishu gateway message");
+                        }
+                    });
                 }
             }
         }
@@ -831,9 +1072,6 @@ impl FeishuGateway {
             _ => {}
         }
 
-        let session_key = format!("{}:{peer}", feishu_chat_kind_name(kind));
-        let lock = self.session_lock(&session_key).await;
-        let _guard = lock.lock().await;
         let attachments = if self.config.media_input {
             match media.as_ref() {
                 Some(media) => vec![self.download_message_media(&msg, &media).await?],
@@ -852,10 +1090,6 @@ impl FeishuGateway {
                 json!({ "event": event }),
                 &self.state.config.pool,
                 |event| async move {
-                    self.state
-                        .event_bus
-                        .broadcast_worker_event(&self.profile.id, &event, None)
-                        .await;
                     match outbound_action_from_event(event) {
                         Some(Ok(action)) => {
                             if let Err(err) = self.deliver(&action).await {
@@ -938,14 +1172,6 @@ impl FeishuGateway {
                 "has_media": has_media,
             }),
         }
-    }
-
-    async fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
-        let mut locks = self.message_locks.lock().await;
-        locks
-            .entry(session_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
     }
 
     async fn download_message_media(

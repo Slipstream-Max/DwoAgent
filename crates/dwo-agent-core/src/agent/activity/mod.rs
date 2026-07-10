@@ -187,6 +187,25 @@ impl ActivityTurnHandle {
         self.emit_update_map(event.into_update()).await
     }
 
+    pub async fn record_user_input(&self, user_input: &Value, user_blocks: &[Value]) -> Result<()> {
+        match user_input {
+            Value::String(text) => {
+                self.emit_event(ActivityEvent::user_message_text(text))
+                    .await?;
+            }
+            _ => {
+                for block in user_blocks {
+                    let Value::Object(block_obj) = block else {
+                        continue;
+                    };
+                    self.emit_event(ActivityEvent::user_message_content(block_obj))
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn emit_event_unrecorded(&self, event: ActivityEvent) -> Result<()> {
         let update = event.into_update();
         (self.emit_update)(self.session_id().to_string(), update).await

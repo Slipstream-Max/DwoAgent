@@ -1,5 +1,6 @@
 pub mod channel_control;
 pub mod channel_input;
+#[cfg(test)]
 mod channel_recent;
 pub mod config;
 pub mod feishu;

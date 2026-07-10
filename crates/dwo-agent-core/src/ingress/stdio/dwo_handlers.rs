@@ -2,22 +2,24 @@
 
 use std::sync::Arc;
 
+use agent_client_protocol::schema::LoadSessionResponse;
 use agent_client_protocol::{Client, ConnectionTo, Responder};
 use serde_json::Value;
 
 use crate::agent::service::AgentService;
+use crate::agent::session::SESSION_CLIENT_TRANSCRIPT_FILE;
 use crate::automation::{
     AutomationNotificationRecord, AutomationNotifyChannel, automation_notification_text,
     record_automation_delivery, run_automation_job_once_with_leases_and_updates,
 };
 use crate::ingress::handler::{OutboundEmitter, handle_ingress_event};
-use crate::protocol::acp::notifications;
+use crate::protocol::acp::{mapper, notifications, transcript};
 use crate::protocol::dwo::{
     self, DwoAutomationRecordDeliveryRequest, DwoAutomationRunJobRequest, DwoIngressChannel,
     DwoIngressHandleEventRequest, DwoIngressNotifyEventNotification, DwoOutboundAction,
     DwoOutboundActionNotification, DwoOutboundBody, DwoSessionContextRequest,
-    DwoSessionSetConfigOptionNotification, DwoWorkerPingRequest, DwoWorkerProfileRequest,
-    DwoWorkerShutdownRequest,
+    DwoSessionLoadRequest, DwoSessionSetConfigOptionNotification, DwoWorkerPingRequest,
+    DwoWorkerProfileRequest, DwoWorkerShutdownRequest,
 };
 use crate::tools::UpdateEmitter;
 
@@ -71,6 +73,70 @@ pub async fn session_context(
     }
 }
 
+pub async fn session_load(
+    agent: Arc<AgentService>,
+    req: DwoSessionLoadRequest,
+    responder: Responder<Value>,
+    _cx: ConnectionTo<Client>,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    let session_id = req.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return responder
+            .respond_with_error(invalid_params("_dwo/session/load requires sessionId"));
+    }
+    match agent.load_session(&session_id).await {
+        Ok(Some(session)) => {
+            let snapshot = session.session_meta_snapshot().await;
+            let profiles = agent.model_profiles();
+            let response = LoadSessionResponse::new()
+                .modes(mapper::build_mode_state(snapshot.mode_id.as_str()))
+                .config_options(mapper::build_config_options(
+                    &snapshot.model_id,
+                    snapshot.mode_id.as_str(),
+                    snapshot.reasoning_mode.as_str(),
+                    &profiles,
+                ));
+            let mut replay_events = match transcript::transcript_replay_events(
+                &session_id,
+                &session.session_dir().join(SESSION_CLIENT_TRANSCRIPT_FILE),
+            ) {
+                Ok(events) => events,
+                Err(err) => return responder.respond_with_error(internal_error(err)),
+            };
+            if let Some(event) = notifications::session_info_event(
+                &session_id,
+                snapshot.title.as_deref(),
+                snapshot.updated_at.as_deref(),
+            ) {
+                replay_events.push(event);
+            }
+            match session.persisted_context_usage_snapshot() {
+                Ok(Some(usage)) => {
+                    if let Some(event) = notifications::context_usage_event(&session_id, usage) {
+                        replay_events.push(event);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %format!("{err:#}"),
+                        "failed to read persisted context usage for _dwo/session/load"
+                    );
+                }
+            }
+            match serde_json::to_value(response) {
+                Ok(response) => {
+                    responder.respond(dwo::session_load_response(response, replay_events))
+                }
+                Err(err) => responder.respond_with_error(internal_error(err)),
+            }
+        }
+        Ok(None) => responder.respond_with_error(invalid_params("session not found")),
+        Err(err) => responder.respond_with_error(internal_error(err)),
+    }
+}
+
 pub async fn ingress_handle_event(
     agent: Arc<AgentService>,
     req: DwoIngressHandleEventRequest,
@@ -88,7 +154,10 @@ pub async fn ingress_handle_event(
         )
         .await
         {
-            Ok(actions) => responder.respond(dwo::ingress_handle_event_response(actions)),
+            Ok(result) => responder.respond(dwo::ingress_handle_event_response(
+                result.session_id,
+                result.actions,
+            )),
             Err(err) => responder.respond_with_error(invalid_params(err)),
         }
     })?;

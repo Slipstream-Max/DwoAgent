@@ -12,18 +12,12 @@ pub enum DwoChannelCommand {
     Help,
     New,
     List,
-    Switch {
-        session_id: String,
-    },
-    Back,
+    Load { session_ref: String },
+    SetHome { session_ref: String },
+    Home,
     Where,
-    Approve {
-        confirmation_id: String,
-    },
-    Deny {
-        confirmation_id: String,
-        reason: Option<String>,
-    },
+    Approve { confirmation_id: String },
+    Deny { confirmation_id: String },
     Cancel,
     Usage(String),
 }
@@ -40,47 +34,53 @@ pub fn parse_channel_command(text: &str) -> Option<DwoChannelCommand> {
         "/help" => Some(DwoChannelCommand::Help),
         "/new" => Some(DwoChannelCommand::New),
         "/list" => Some(DwoChannelCommand::List),
-        "/switch" => match parts.next() {
-            Some(session_id) => Some(DwoChannelCommand::Switch {
-                session_id: session_id.to_string(),
-            }),
-            None => Some(DwoChannelCommand::Usage(
-                "用法：/switch <session_id>".to_string(),
-            )),
-        },
-        "/back" => Some(DwoChannelCommand::Back),
+        "/load" => {
+            let session_ref = parts.collect::<Vec<_>>().join(" ");
+            if session_ref.is_empty() {
+                Some(DwoChannelCommand::Usage(
+                    "用法：/load <name_or_id>".to_string(),
+                ))
+            } else {
+                Some(DwoChannelCommand::Load { session_ref })
+            }
+        }
+        "/set-home" => {
+            let session_ref = parts.collect::<Vec<_>>().join(" ");
+            if session_ref.is_empty() {
+                Some(DwoChannelCommand::Usage(
+                    "用法：/set-home <name_or_id>".to_string(),
+                ))
+            } else {
+                Some(DwoChannelCommand::SetHome { session_ref })
+            }
+        }
+        "/home" => Some(DwoChannelCommand::Home),
         "/where" => Some(DwoChannelCommand::Where),
-        "/approve" => match parts.next() {
-            Some(confirmation_id) => Some(DwoChannelCommand::Approve {
+        "/approve" => match (parts.next(), parts.next()) {
+            (Some(confirmation_id), None) => Some(DwoChannelCommand::Approve {
                 confirmation_id: confirmation_id.to_string(),
             }),
-            None => Some(DwoChannelCommand::Usage(
+            _ => Some(DwoChannelCommand::Usage(
                 "用法：/approve <confirmation_id>".to_string(),
             )),
         },
-        "/deny" => match parts.next() {
-            Some(confirmation_id) => {
-                let reason = parts.collect::<Vec<_>>().join(" ");
-                Some(DwoChannelCommand::Deny {
-                    confirmation_id: confirmation_id.to_string(),
-                    reason: if reason.trim().is_empty() {
-                        None
-                    } else {
-                        Some(reason)
-                    },
-                })
-            }
-            None => Some(DwoChannelCommand::Usage(
-                "用法：/deny <confirmation_id> [reason]".to_string(),
+        "/deny" => match (parts.next(), parts.next()) {
+            (Some(confirmation_id), None) => Some(DwoChannelCommand::Deny {
+                confirmation_id: confirmation_id.to_string(),
+            }),
+            _ => Some(DwoChannelCommand::Usage(
+                "用法：/deny <confirmation_id>".to_string(),
             )),
         },
         "/cancel" => Some(DwoChannelCommand::Cancel),
-        _ => None,
+        _ => Some(DwoChannelCommand::Usage(format!(
+            "未知命令：{command}\n使用 /help 查看可用命令"
+        ))),
     }
 }
 
 pub fn channel_command_help() -> &'static str {
-    "可用命令：\n/new 创建并切换到新 session\n/list 查看最近 session\n/switch <session_id> 切换 session\n/back 返回默认 session\n/where 查看当前 session\n/cancel 取消当前 session 运行\n/approve <confirmation_id> 批准工具调用\n/deny <confirmation_id> [reason] 拒绝工具调用并给出原因\n/help 查看帮助"
+    "可用命令：\n/new 创建并进入新话题\n/list 查看话题列表\n/load <name_or_id> 进入指定话题\n/set-home <name_or_id> 设置主话题\n/home 返回主话题\n/where 查看当前话题和主话题\n/cancel 取消当前话题运行\n/approve <confirmation_id> 批准工具调用\n/deny <confirmation_id> 拒绝工具调用\n/help 查看帮助"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
@@ -99,6 +99,13 @@ pub struct DwoWorkerShutdownRequest {}
 #[request(method = "_dwo/session/context", response = serde_json::Value)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DwoSessionContextRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_dwo/session/load", response = serde_json::Value)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DwoSessionLoadRequest {
     pub session_id: String,
 }
 
@@ -307,8 +314,21 @@ pub fn session_context_response(snapshot: &DwoSessionContextSnapshot) -> Value {
     })
 }
 
-pub fn ingress_handle_event_response(actions: Vec<DwoOutboundAction>) -> Value {
-    json!({ "actions": actions })
+pub fn session_load_response(response: Value, replay_events: Vec<Value>) -> Value {
+    json!({
+        "response": response,
+        "replayEvents": replay_events,
+    })
+}
+
+pub fn ingress_handle_event_response(
+    session_id: Option<String>,
+    actions: Vec<DwoOutboundAction>,
+) -> Value {
+    json!({
+        "sessionId": session_id,
+        "actions": actions,
+    })
 }
 
 pub fn automation_run_job_response(record: Value, notifications: Vec<DwoOutboundAction>) -> Value {
@@ -349,39 +369,65 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_channel_command("/switch s1"),
-            Some(DwoChannelCommand::Switch {
-                session_id: "s1".to_string()
+            parse_channel_command("/load Main topic"),
+            Some(DwoChannelCommand::Load {
+                session_ref: "Main topic".to_string()
             })
+        );
+        assert_eq!(
+            parse_channel_command("/set-home s1"),
+            Some(DwoChannelCommand::SetHome {
+                session_ref: "s1".to_string()
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/home"),
+            Some(DwoChannelCommand::Home)
         );
         assert_eq!(
             parse_channel_command("/deny c1"),
             Some(DwoChannelCommand::Deny {
-                confirmation_id: "c1".to_string(),
-                reason: None
+                confirmation_id: "c1".to_string()
             })
         );
         assert_eq!(
-            parse_channel_command("/deny c1 use read-only command"),
-            Some(DwoChannelCommand::Deny {
-                confirmation_id: "c1".to_string(),
-                reason: Some("use read-only command".to_string())
-            })
+            parse_channel_command("/switch s1"),
+            Some(DwoChannelCommand::Usage(
+                "未知命令：/switch\n使用 /help 查看可用命令".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_channel_command("/back"),
+            Some(DwoChannelCommand::Usage(
+                "未知命令：/back\n使用 /help 查看可用命令".to_string()
+            ))
         );
     }
 
     #[test]
     fn channel_command_parser_reports_usage() {
         assert_eq!(
-            parse_channel_command("/switch"),
+            parse_channel_command("/load"),
             Some(DwoChannelCommand::Usage(
-                "用法：/switch <session_id>".to_string()
+                "用法：/load <name_or_id>".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_channel_command("/set-home"),
+            Some(DwoChannelCommand::Usage(
+                "用法：/set-home <name_or_id>".to_string()
             ))
         );
         assert_eq!(
             parse_channel_command("/deny"),
             Some(DwoChannelCommand::Usage(
-                "用法：/deny <confirmation_id> [reason]".to_string()
+                "用法：/deny <confirmation_id>".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_channel_command("/deny c1 reason"),
+            Some(DwoChannelCommand::Usage(
+                "用法：/deny <confirmation_id>".to_string()
             ))
         );
         assert_eq!(

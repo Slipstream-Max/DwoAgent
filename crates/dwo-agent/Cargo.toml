@@ -1,0 +1,32 @@
+[package]
+name = "dwo-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dwo"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+agent-client-protocol.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+dwo-agent-service = { path = "../dwo-agent-service" }
+dwo-context = { path = "../dwo-context" }
+dwo-mcp = { path = "../dwo-mcp" }
+dwo-tools = { path = "../dwo-tools" }
+futures.workspace = true
+libc.workspace = true
+qr2term.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+weixin-agent.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

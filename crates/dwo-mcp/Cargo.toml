@@ -1,0 +1,18 @@
+[package]
+name = "dwo-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+http = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rmcp = { version = "=1.8.0", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "which-command"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"

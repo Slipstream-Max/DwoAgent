@@ -1,0 +1,48 @@
+# Complete dwoagent rewrite profile configuration.
+# Resource files use fixed paths under this profile directory:
+#   resource/prompts/System.md   required
+#   resource/prompts/AGENTS.md   optional
+#   resource/skills/*/SKILL.md   optional
+#   resource/mcp.json            optional
+
+name: coder
+description: coding agent
+
+# full_access | confirm | watch
+policyMode: confirm
+
+model:
+  # Must match one models[*].modelName.
+  defaultModelId: deepseek-v4-pro
+
+  # Provider instances select a catalog provider and provide credentials.
+  # Transport policy, headers and request fields stay in the model catalog.
+  providers:
+    deepseek:
+      # Provider type from dwo-model-client/resources/models.yaml.
+      type: deepseek
+
+      # Optional complete Chat Completions URL override.
+      # The catalog endpoint is used when omitted.
+      baseUrl: null
+
+      # apiKey takes precedence over apiKeyEnv. Prefer apiKeyEnv.
+      apiKeyEnv: DEEPSEEK_API_KEY
+      apiKey: null
+
+  # Session-visible model aliases. Optional values override the selected
+  # catalog model. Reasoning request parameters and capabilities stay catalog-owned.
+  models:
+    - modelName: deepseek-v4-pro
+      provider: deepseek
+      modelId: deepseek-v4-pro
+
+      # Optional model-level overrides.
+      contextWindowTokens: 1000000
+      maxOutputTokens: 384000
+      compactThreshold: 0.5
+      defaultReasoningMode: high
+
+    - modelName: deepseek-v4-flash
+      provider: deepseek
+      modelId: deepseek-v4-flash

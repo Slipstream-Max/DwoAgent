@@ -1,0 +1,144 @@
+# dwo
+
+`dwo` is the long-running dwoagent host and its control CLI. One daemon owns
+the profile, sessions, channel state, model clients, and tool runtimes. CLI and
+ACP processes connect to that daemon over local IPC instead of creating their
+own `AgentService`.
+
+```text
+src/
+  main.rs              process entry point
+  cli/mod.rs           command parsing and client-side command handlers
+  host/mod.rs          daemon composition root and RPC dispatch
+  local/
+    ipc.rs             local IPC server, request client, and event subscription
+    acp.rs             ACP stdio adapter backed by local IPC
+  channels/
+    manager.rs         channel login, configuration, state, and secrets
+    gateway.rs         long-running channel runtimes and session event routing
+```
+
+Only `dwo serve` constructs the `Host` and its `AgentService`. CLI and ACP
+commands are local clients; channel runtimes live inside the daemon and call
+the shared service directly.
+
+```text
+dwo install [--start]
+dwo uninstall [--purge]
+dwo serve --config-path <profile.yaml>
+dwo daemon start|stop|status
+
+dwo session list
+dwo session new [name] [--cwd <path>]
+dwo session delete <id>
+dwo session prompt <id> <message>
+dwo session cancel <id>
+dwo session watch <id>
+dwo session model <id> <model>
+dwo session reasoning <id> [reasoning]
+dwo session approve|deny <id> <permission-id>
+
+dwo channel list
+dwo channel weixin status
+dwo channel weixin bind
+dwo channel weixin unbind
+dwo channel weixin send-message <message>
+dwo channel weixin send-file <path>
+dwo mcp list [--json]
+dwo mcp search query <query> [--json]
+dwo mcp show <server.tool> [--json]
+dwo mcp call <server.tool> --args '<json>'
+dwo mcp auth <server>
+dwo mcp auth status <server>
+dwo mcp auth logout <server>
+dwo acp
+```
+
+Windows uses a named pipe and an on-login scheduled task. macOS uses a Unix
+domain socket and a per-user launchd agent. `serve` always stays in the
+foreground; the operating-system service manager owns background lifecycle.
+
+The default profile is `~/.dwoagent`:
+
+```text
+profile.yaml
+resource/prompts/System.md
+resource/prompts/AGENTS.md
+resource/skills/
+resource/mcp.json
+sessions/
+mcp/catalog.json
+mcp/oauth/
+channels/weixin/runtime.yaml
+channels/weixin/secret.yaml
+logs/
+```
+
+Weixin user settings live in `profile.yaml` and are validated before the host
+starts:
+
+```yaml
+channels:
+  weixin:
+    enabled: true
+    streamMode: answer
+    replayTurns: 5
+    markdownFilter: true
+```
+
+`runtime.yaml` stores the selected session, `syncBuf`, and SDK context tokens.
+`secret.yaml` stores the QR-login credentials. Both files are daemon-owned;
+there is no per-channel generated configuration file.
+
+`status` reports whether the channel is configured and bound, the bound user
+ID, the selected session, and the effective stream mode. `connected` means
+that persisted credentials exist and validate; it is not a live network
+health check. `send-message` and `send-file` always target the bound user and use
+that user's current context token.
+
+When Weixin is enabled and bound, the context builder adds a concise channel
+capability block to the system prompt. Binding and unbinding changes are
+reported to existing sessions by the environment watcher. Credentials remain
+owned by the daemon and are never included in model context.
+
+MCP servers are configured in `resource/mcp.json`. Static HTTP headers and
+stdio environment variables are resolved from that file, including `${ENV}`
+references. Only servers declaring `auth.type: oauth` use the interactive
+`dwo mcp auth` flow. The daemon watches the config, rebuilds the safe catalog
+automatically, and exposes names first; complete input schemas appear only via
+`dwo mcp show`. MCP schemas are never registered as model tools.
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "github": {
+      "type": "streamableHttp",
+      "url": "https://example.test/mcp",
+      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"}
+    },
+    "notion": {
+      "type": "streamableHttp",
+      "url": "https://example.test/mcp",
+      "auth": {"type": "oauth"}
+    }
+  }
+}
+```
+
+Weixin binding uses the real `weixin-agent` QR flow. Bound channels reconnect
+inside the daemon, persist sync state, route slash commands through the shared
+`AgentService`, and support answer-only or full tool-progress streaming.
+
+The ACP command is a stdio bridge to the daemon IPC endpoint. It shares the
+same sessions and events as CLI and Weixin clients. Loading a session keeps a
+live observer attached, so idle ACP clients continue to receive prompts, tool
+events, and permission requests from other clients.
+
+External prompts use interrupt semantics: an active turn is cancelled, the
+host waits for its terminal event, and then starts the replacement turn. The
+origin endpoint does not receive its own prompt notification; every other
+observer does.

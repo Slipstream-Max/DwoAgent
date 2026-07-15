@@ -1,0 +1,30 @@
+[package]
+name = "dwo-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+portable-pty.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+filedescriptor = "0.8.3"
+lazy_static.workspace = true
+log.workspace = true
+shared_library = "0.1.9"
+winapi = { workspace = true, features = [
+    "handleapi",
+    "minwinbase",
+    "processthreadsapi",
+    "synchapi",
+    "winbase",
+    "wincon",
+    "winerror",
+    "winnt",
+] }

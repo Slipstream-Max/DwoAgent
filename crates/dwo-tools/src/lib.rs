@@ -1,0 +1,20 @@
+//! Tool execution primitives shared by every dwoagent ingress.
+
+pub mod call;
+mod exec;
+pub mod file_edit;
+pub mod manager;
+pub mod policy;
+pub mod prompt;
+pub mod result;
+pub mod schema;
+pub mod terminal;
+
+pub use call::{ParsedToolCall, ToolCall, ToolCallParseError, ToolIntent};
+pub use file_edit::FileEditManager;
+pub use manager::{
+    ConfirmationDecision, ConfirmationHandler, ConfirmationRequest, ExecutionContext, ToolManager,
+};
+pub use policy::{Authorization, CommandRule, PolicyConfig, SessionMode, ToolPolicyEngine};
+pub use result::ToolResult;
+pub use terminal::{TerminalId, TerminalManager};

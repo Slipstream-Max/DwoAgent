@@ -1,10 +1,12 @@
 [workspace]
 members = [
-    ".",
-    "crates/dwo-agent-cli",
-    "crates/dwo-agent-core",
-    "crates/dwo-agent-supervisor",
-    "crates/dwo-llm",
+    "crates/dwo-agent",
+    "crates/dwo-context",
+    "crates/dwo-model-client",
+    "crates/dwo-mcp",
+    "crates/dwo-agent-service",
+    "crates/dwo-pty",
+    "crates/dwo-tools",
 ]
 resolver = "2"
 
@@ -17,43 +19,24 @@ rust-version = "1.95"
 agent-client-protocol = { version = "0.11", features = ["unstable_session_usage"] }
 anyhow = "1"
 async-trait = "0.1"
-base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
-clawrs-feishu = { git = "https://github.com/AgenticWeb4/ZClaw-Channel-Feishu.git", rev = "5aa32ff" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eventsource-stream = "0.2"
 futures = "0.3"
+lazy_static = "1"
+libc = "0.2"
+log = "0.4"
+portable-pty = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+qr2term = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "process", "signal", "io-std", "io-util"] }
-tokio-tungstenite = { version = "0.23", default-features = false, features = ["handshake"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-tracing = "0.1"
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 uuid = { version = "1", features = ["v4"] }
 weixin-agent = "0.2"
-
-[package]
-name = "dwo-agent"
-version.workspace = true
-edition.workspace = true
-description = "Dwo Agent (赤铎) — modular multi-turn agent runtime"
-readme = "README.md"
-rust-version.workspace = true
-
-[[bin]]
-name = "dwoagent"
-path = "src/main.rs"
-
-[dependencies]
-dwo-agent-cli = { path = "crates/dwo-agent-cli" }
-anyhow.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
-tempfile.workspace = true
-tokio.workspace = true
+winapi = "0.3.9"

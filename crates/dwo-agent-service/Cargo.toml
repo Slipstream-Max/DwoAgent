@@ -1,0 +1,22 @@
+[package]
+name = "dwo-agent-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dwo-tools = { path = "../dwo-tools" }
+dwo-context = { path = "../dwo-context" }
+dwo-model-client = { path = "../dwo-model-client" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

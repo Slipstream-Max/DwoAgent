@@ -1,0 +1,170 @@
+use std::fmt;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use dwo_context::SessionContext;
+use dwo_tools::SessionMode;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+macro_rules! string_id {
+    ($name:ident, $prefix:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(format!(concat!($prefix, "{}"), Uuid::new_v4()))
+            }
+
+            pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+                let value = value.into();
+                if value.is_empty()
+                    || !value.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                    })
+                {
+                    return Err(format!("invalid {}", stringify!($name)));
+                }
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+string_id!(SessionId, "session-");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub info: SessionInfo,
+    pub llm: SessionLlmSettings,
+    pub context: SessionContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: SessionId,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub mode: SessionMode,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLlmSettings {
+    pub model: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionConfig {
+    pub mode: SessionMode,
+    pub model: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "key", content = "value", rename_all = "snake_case")]
+pub enum SessionConfigUpdate {
+    Mode(SessionMode),
+    Model(String),
+    Reasoning(Option<String>),
+}
+
+impl Default for SessionLlmSettings {
+    fn default() -> Self {
+        Self {
+            model: "scripted-test-model".to_string(),
+            reasoning: None,
+        }
+    }
+}
+
+impl SessionRecord {
+    pub fn new(
+        id: SessionId,
+        title: String,
+        cwd: PathBuf,
+        mode: SessionMode,
+        llm: SessionLlmSettings,
+    ) -> Self {
+        let now = unix_time_ms();
+        Self {
+            info: SessionInfo {
+                id,
+                title,
+                cwd,
+                mode,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            llm,
+            context: SessionContext::default(),
+        }
+    }
+
+    pub(crate) fn touch(&mut self) {
+        self.info.updated_at_ms = unix_time_ms();
+    }
+
+    pub fn config(&self) -> SessionConfig {
+        SessionConfig {
+            mode: self.info.mode,
+            model: self.llm.model.clone(),
+            reasoning: self.llm.reasoning.clone(),
+        }
+    }
+
+    pub(crate) fn apply_config(&mut self, update: SessionConfigUpdate) -> Result<(), String> {
+        match update {
+            SessionConfigUpdate::Mode(mode) => self.info.mode = mode,
+            SessionConfigUpdate::Model(model) => {
+                let model = model.trim();
+                if model.is_empty() {
+                    return Err("model must not be empty".to_string());
+                }
+                self.llm.model = model.to_string();
+            }
+            SessionConfigUpdate::Reasoning(reasoning) => {
+                self.llm.reasoning = reasoning
+                    .map(|reasoning| {
+                        let reasoning = reasoning.trim();
+                        if reasoning.is_empty() {
+                            Err("reasoning must not be empty; use null to disable it".to_string())
+                        } else {
+                            Ok(reasoning.to_string())
+                        }
+                    })
+                    .transpose()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}

@@ -1,0 +1,219 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::compaction::{CompactionPlan, CompactionPlanner};
+use crate::env_watcher::EnvWatcherState;
+use crate::prompt::{PromptBuildError, SystemPromptBlock, SystemPromptBuilder};
+use crate::{
+    ContextMessage, MessageContent, MessageKind, ToolResultRecord, TranscriptItem, TurnId,
+};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub last_turn_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionState {
+    pub count: u64,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionContext {
+    #[serde(default)]
+    pub system_prompt: SystemPromptBlock,
+    #[serde(default)]
+    pub messages: Vec<ContextMessage>,
+    #[serde(default)]
+    pub transcript: Vec<TranscriptItem>,
+    #[serde(default)]
+    pub usage: SessionUsage,
+    #[serde(default)]
+    pub compaction: CompactionState,
+    #[serde(default)]
+    pub env_watcher: EnvWatcherState,
+}
+
+impl SessionContext {
+    pub fn with_system_prompt(system_prompt: SystemPromptBlock) -> Self {
+        let baseline = system_prompt
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.dynamic());
+        Self {
+            messages: vec![ContextMessage::system(system_prompt.content.clone())],
+            env_watcher: EnvWatcherState { baseline },
+            system_prompt,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextManager {
+    context: SessionContext,
+}
+
+impl ContextManager {
+    pub fn new(context: SessionContext) -> Self {
+        let mut context = context;
+        if context.system_prompt.is_initialized()
+            && context
+                .messages
+                .first()
+                .is_none_or(|message| message.role != crate::MessageRole::System)
+        {
+            context.messages.insert(
+                0,
+                ContextMessage::system(context.system_prompt.content.clone()),
+            );
+        }
+        Self { context }
+    }
+
+    pub fn initialize(builder: &SystemPromptBuilder) -> Result<Self, PromptBuildError> {
+        Ok(Self::new(SessionContext::with_system_prompt(
+            builder.build_initial()?,
+        )))
+    }
+
+    pub fn context(&self) -> &SessionContext {
+        &self.context
+    }
+
+    pub fn into_context(self) -> SessionContext {
+        self.context
+    }
+
+    pub fn system_prompt(&self) -> &str {
+        &self.context.system_prompt.content
+    }
+
+    pub fn model_messages(&self) -> &[ContextMessage] {
+        &self.context.messages
+    }
+
+    pub fn append_user(&mut self, turn_id: TurnId, content: impl Into<MessageContent>) {
+        let content = content.into();
+        self.context
+            .messages
+            .push(ContextMessage::user(content.clone()));
+        self.context
+            .transcript
+            .push(TranscriptItem::User { turn_id, content });
+    }
+
+    pub fn append_assistant(
+        &mut self,
+        turn_id: TurnId,
+        content: impl Into<String>,
+        tool_calls: Vec<Value>,
+    ) {
+        self.append_assistant_with_reasoning(turn_id, content, None, tool_calls);
+    }
+
+    pub fn append_assistant_with_reasoning(
+        &mut self,
+        turn_id: TurnId,
+        content: impl Into<String>,
+        reasoning: Option<String>,
+        tool_calls: Vec<Value>,
+    ) {
+        let content = content.into();
+        self.context
+            .messages
+            .push(ContextMessage::assistant_with_reasoning(
+                content.clone(),
+                reasoning,
+                tool_calls,
+            ));
+        self.context
+            .transcript
+            .push(TranscriptItem::Assistant { turn_id, content });
+    }
+
+    pub fn append_tool(&mut self, turn_id: TurnId, result: ToolResultRecord) {
+        self.context.messages.push(ContextMessage::tool(&result));
+        self.context
+            .transcript
+            .push(TranscriptItem::Tool { turn_id, result });
+    }
+
+    pub fn record_turn_usage(
+        &mut self,
+        model: impl Into<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        self.add_usage(input_tokens, output_tokens);
+        self.context.usage.last_turn_input_tokens = input_tokens;
+        self.context.usage.last_model = Some(model.into());
+    }
+
+    pub fn record_auxiliary_usage(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.add_usage(input_tokens, output_tokens);
+    }
+
+    fn add_usage(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.context.usage.input_tokens =
+            self.context.usage.input_tokens.saturating_add(input_tokens);
+        self.context.usage.output_tokens = self
+            .context
+            .usage
+            .output_tokens
+            .saturating_add(output_tokens);
+    }
+
+    pub fn should_compact(&self, trigger_tokens: u64) -> bool {
+        trigger_tokens > 0 && self.context.usage.last_turn_input_tokens >= trigger_tokens
+    }
+
+    /// Scan mutable profile/environment state at a model-step boundary.
+    pub fn refresh_environment(
+        &mut self,
+        builder: &SystemPromptBuilder,
+    ) -> Result<usize, PromptBuildError> {
+        let current = builder.scan_dynamic()?;
+        let changes = self.context.env_watcher.update(current);
+        let count = changes.len();
+        self.context.messages.extend(
+            changes
+                .into_iter()
+                .map(|change| ContextMessage::internal(MessageKind::EnvWatcher, change.render())),
+        );
+        Ok(count)
+    }
+
+    pub fn plan_compaction(&self, planner: &CompactionPlanner) -> CompactionPlan {
+        planner.build(&self.context)
+    }
+
+    /// Replace only model context. The transcript and cumulative usage remain unchanged.
+    pub fn apply_compaction(
+        &mut self,
+        plan: CompactionPlan,
+        summary: impl Into<String>,
+        prompt_builder: &SystemPromptBuilder,
+    ) -> Result<(), PromptBuildError> {
+        let summary = summary.into();
+        let rebuilt_prompt = prompt_builder.rebuild()?;
+        let baseline = rebuilt_prompt
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.dynamic());
+        let replacement = plan.into_replacement(&rebuilt_prompt, summary.clone());
+        self.context.system_prompt = rebuilt_prompt;
+        self.context.messages = replacement;
+        self.context.env_watcher = EnvWatcherState { baseline };
+        self.context.compaction.count = self.context.compaction.count.saturating_add(1);
+        self.context.compaction.summary = (!summary.is_empty()).then_some(summary);
+        self.context.usage.last_turn_input_tokens = 0;
+        Ok(())
+    }
+}

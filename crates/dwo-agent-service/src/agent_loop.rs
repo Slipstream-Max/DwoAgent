@@ -29,6 +29,10 @@ pub(crate) enum TurnEvent {
         turn_id: TurnId,
         delta: String,
     },
+    AssistantReasoningDelta {
+        turn_id: TurnId,
+        delta: String,
+    },
     AssistantCompleted {
         turn_id: TurnId,
         content: String,
@@ -148,13 +152,9 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
         }
 
         for raw in &response.tool_calls {
-            let (tool_call_id, tool_name) = call_identity(raw);
             turn.emit(TurnEvent::ToolStarted {
                 turn_id: turn.turn_id.clone(),
-                call: ActiveToolCall {
-                    tool_call_id,
-                    tool_name,
-                },
+                call: active_tool_call(raw),
             });
         }
 
@@ -229,24 +229,27 @@ async fn request_model(
             biased;
             response = &mut model_call => {
                 while let Ok(event) = chunk_rx.try_recv() {
-                    if let ModelStreamEvent::TextDelta(delta) = event {
-                        turn.emit(TurnEvent::AssistantDelta {
-                            turn_id: turn.turn_id.clone(),
-                            delta,
-                        });
-                    }
+                    emit_model_delta(turn, event);
                 }
                 return response;
             }
             Some(event) = chunk_rx.recv() => {
-                if let ModelStreamEvent::TextDelta(delta) = event {
-                    turn.emit(TurnEvent::AssistantDelta {
-                        turn_id: turn.turn_id.clone(),
-                        delta,
-                    });
-                }
+                emit_model_delta(turn, event);
             }
         }
+    }
+}
+
+fn emit_model_delta(turn: &RunTurn, event: ModelStreamEvent) {
+    match event {
+        ModelStreamEvent::TextDelta(delta) => turn.emit(TurnEvent::AssistantDelta {
+            turn_id: turn.turn_id.clone(),
+            delta,
+        }),
+        ModelStreamEvent::ReasoningDelta(delta) => turn.emit(TurnEvent::AssistantReasoningDelta {
+            turn_id: turn.turn_id.clone(),
+            delta,
+        }),
     }
 }
 
@@ -324,5 +327,20 @@ fn call_identity(call: &Value) -> (String, String) {
     match ParsedToolCall::parse(call.clone()) {
         Ok(call) => (call.id, call.call.name().to_string()),
         Err(error) => (error.id, error.name),
+    }
+}
+
+fn active_tool_call(raw: &Value) -> ActiveToolCall {
+    match ParsedToolCall::parse(raw.clone()) {
+        Ok(call) => ActiveToolCall {
+            tool_call_id: call.id,
+            tool_name: call.call.name().to_string(),
+            raw_input: Value::Object(call.raw_arguments),
+        },
+        Err(error) => ActiveToolCall {
+            tool_call_id: error.id,
+            tool_name: error.name,
+            raw_input: raw.get("arguments").cloned().unwrap_or(Value::Null),
+        },
     }
 }

@@ -532,6 +532,15 @@ impl SessionActor {
                     self.emit(SessionEventPayload::AssistantDelta { turn_id, delta });
                 }
             }
+            TurnEvent::AssistantReasoningDelta { turn_id, delta } => {
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.id == turn_id)
+                {
+                    self.emit(SessionEventPayload::AssistantReasoningDelta { turn_id, delta });
+                }
+            }
             TurnEvent::AssistantCompleted { turn_id, content } => {
                 if let Some(active) = self.active.as_mut().filter(|active| active.id == turn_id) {
                     active.partial_message.clear();

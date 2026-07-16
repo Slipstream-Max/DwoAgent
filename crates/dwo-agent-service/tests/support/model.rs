@@ -34,6 +34,10 @@ pub enum ScriptedStep {
         input_tokens: u64,
         output_tokens: u64,
     },
+    ReasoningResponse {
+        reasoning: String,
+        content: String,
+    },
     ContextLengthExceeded,
 }
 
@@ -75,6 +79,13 @@ impl ScriptedStep {
             delay_ms,
             input_tokens: 0,
             output_tokens: 0,
+        }
+    }
+
+    pub fn reasoning_text(reasoning: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::ReasoningResponse {
+            reasoning: reasoning.into(),
+            content: content.into(),
         }
     }
 }
@@ -210,6 +221,17 @@ impl ModelClient for ScriptedModelGateway {
                         output_tokens,
                         total_tokens: input_tokens.saturating_add(output_tokens),
                     },
+                })
+            }
+            ScriptedStep::ReasoningResponse { reasoning, content } => {
+                let _ = events.send(ModelStreamEvent::ReasoningDelta(reasoning.clone()));
+                let _ = events.send(ModelStreamEvent::TextDelta(content.clone()));
+                Ok(ModelReply {
+                    content,
+                    reasoning: Some(reasoning),
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: ModelUsage::default(),
                 })
             }
             ScriptedStep::ContextLengthExceeded => Err(ModelClientError::ContextLengthExceeded {

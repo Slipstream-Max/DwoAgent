@@ -104,6 +104,39 @@ async fn model_tool_model_cycle_is_persisted_in_context() {
 }
 
 #[tokio::test]
+async fn reasoning_and_answer_deltas_are_broadcast_separately() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::reasoning_text("inspect first", "done")]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
+    agent.prompt(EndpointId::new(), "work").await.unwrap();
+
+    let mut reasoning = String::new();
+    let mut answer = String::new();
+    loop {
+        let event = subscription.events.recv().await.unwrap();
+        match event.payload {
+            SessionEventPayload::AssistantReasoningDelta { delta, .. } => {
+                reasoning.push_str(&delta)
+            }
+            SessionEventPayload::AssistantDelta { delta, .. } => answer.push_str(&delta),
+            SessionEventPayload::TurnCompleted { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(reasoning, "inspect first");
+    assert_eq!(answer, "done");
+}
+
+#[tokio::test]
 async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([ScriptedStep::text("done")]);

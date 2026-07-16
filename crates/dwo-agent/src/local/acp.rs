@@ -11,7 +11,8 @@ use agent_client_protocol::schema::{
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionId,
     SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
-    ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification,
@@ -375,6 +376,11 @@ fn handle_session_event(
                 send_chunk(cx, session_id, delta, false);
             }
         }
+        "assistant_reasoning_delta" => {
+            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                send_thought_chunk(cx, session_id, delta);
+            }
+        }
         "user_prompt_submitted" => {
             if let Some(content) = payload.get("content") {
                 send_chunk(cx, session_id, &content_text(content), true);
@@ -548,6 +554,44 @@ mod tests {
         assert_eq!(json[2]["id"], "policy_mode");
         assert_eq!(json[2]["currentValue"], "full_access");
     }
+
+    #[test]
+    fn terminal_tool_start_exposes_command_details() {
+        let tool = tool_started(&json!({
+            "call": {
+                "tool_call_id": "call-1",
+                "tool_name": "terminal",
+                "raw_input": { "command": "cargo test --workspace" }
+            }
+        }));
+
+        let json = serde_json::to_value(tool).unwrap();
+        assert_eq!(json["kind"], "execute");
+        assert_eq!(json["rawInput"]["command"], "cargo test --workspace");
+        assert_eq!(
+            json["content"][0]["content"]["text"],
+            "cargo test --workspace"
+        );
+    }
+
+    #[test]
+    fn terminal_tool_completion_exposes_output_details() {
+        let update = tool_completed(&json!({
+            "result": {
+                "tool_call_id": "call-1",
+                "tool_name": "terminal",
+                "output": {
+                    "status": "success",
+                    "output": "test result: ok"
+                }
+            }
+        }));
+
+        let json = serde_json::to_value(update).unwrap();
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["rawOutput"]["output"], "test result: ok");
+        assert_eq!(json["content"][0]["content"]["text"], "test result: ok");
+    }
 }
 
 fn send_terminal(
@@ -642,16 +686,19 @@ fn send_chunk(cx: &ConnectionTo<Client>, session_id: &str, text: &str, user: boo
     );
 }
 
+fn send_thought_chunk(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
+    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
+    let _ = cx.send_notification_to(
+        Client,
+        SessionNotification::new(
+            SessionId::new(session_id),
+            SessionUpdate::AgentThoughtChunk(chunk),
+        ),
+    );
+}
+
 fn send_tool_started(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
-    let call = &payload["call"];
-    let id: ToolCallId = call["tool_call_id"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string()
-        .into();
-    let tool = ToolCall::new(id, call["tool_name"].as_str().unwrap_or("tool").to_string())
-        .kind(ToolKind::Other)
-        .status(ToolCallStatus::InProgress);
+    let tool = tool_started(payload);
     let _ = cx.send_notification_to(
         Client,
         SessionNotification::new(SessionId::new(session_id), SessionUpdate::ToolCall(tool)),
@@ -659,6 +706,36 @@ fn send_tool_started(cx: &ConnectionTo<Client>, session_id: &str, payload: &Valu
 }
 
 fn send_tool_completed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let update = tool_completed(payload);
+    let _ = cx.send_notification_to(
+        Client,
+        SessionNotification::new(
+            SessionId::new(session_id),
+            SessionUpdate::ToolCallUpdate(update),
+        ),
+    );
+}
+
+fn tool_started(payload: &Value) -> ToolCall {
+    let call = &payload["call"];
+    let id: ToolCallId = call["tool_call_id"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string()
+        .into();
+    let name = call["tool_name"].as_str().unwrap_or("tool");
+    let raw_input = call.get("raw_input").cloned().unwrap_or(Value::Null);
+    let mut tool = ToolCall::new(id, name.to_string())
+        .kind(tool_kind(name))
+        .status(ToolCallStatus::InProgress)
+        .raw_input(raw_input.clone());
+    if let Some(text) = render_tool_input(name, &raw_input) {
+        tool = tool.content(text_content(text));
+    }
+    tool
+}
+
+fn tool_completed(payload: &Value) -> ToolCallUpdate {
     let result = &payload["result"];
     let id: ToolCallId = result["tool_call_id"]
         .as_str()
@@ -668,18 +745,71 @@ fn send_tool_completed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Va
     let failed = result["output"]["status"]
         .as_str()
         .is_some_and(|status| matches!(status, "error" | "cancelled" | "blocked_by_policy"));
-    let fields = ToolCallUpdateFields::new().status(if failed {
-        ToolCallStatus::Failed
-    } else {
-        ToolCallStatus::Completed
-    });
-    let _ = cx.send_notification_to(
-        Client,
-        SessionNotification::new(
-            SessionId::new(session_id),
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields)),
-        ),
-    );
+    let output = result.get("output").cloned().unwrap_or(Value::Null);
+    let mut fields = ToolCallUpdateFields::new()
+        .status(if failed {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        })
+        .raw_output(output.clone());
+    if let Some(text) = render_tool_output(&output) {
+        fields = fields.content(text_content(text));
+    }
+    ToolCallUpdate::new(id, fields)
+}
+
+fn tool_kind(name: &str) -> ToolKind {
+    match name {
+        "terminal" => ToolKind::Execute,
+        "file_edit" => ToolKind::Edit,
+        _ => ToolKind::Other,
+    }
+}
+
+fn render_tool_input(name: &str, input: &Value) -> Option<String> {
+    let preferred = match name {
+        "terminal" => input.get("command").and_then(Value::as_str),
+        "file_edit" => input.get("patch").and_then(Value::as_str),
+        _ => None,
+    };
+    preferred
+        .map(str::to_string)
+        .or_else(|| pretty_nonempty(input))
+        .map(|text| truncate_tool_text(&text))
+}
+
+fn render_tool_output(output: &Value) -> Option<String> {
+    output
+        .get("output")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .or_else(|| pretty_nonempty(output))
+        .map(|text| truncate_tool_text(&text))
+}
+
+fn pretty_nonempty(value: &Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    Some(serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
+}
+
+fn truncate_tool_text(text: &str) -> String {
+    const LIMIT: usize = 8_000;
+    if text.chars().count() <= LIMIT {
+        return text.to_string();
+    }
+    let mut truncated = text.chars().take(LIMIT).collect::<String>();
+    truncated.push_str("\n[TRUNCATED]");
+    truncated
+}
+
+fn text_content(text: String) -> Vec<ToolCallContent> {
+    vec![ToolCallContent::from(ContentBlock::Text(TextContent::new(
+        text,
+    )))]
 }
 
 fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {

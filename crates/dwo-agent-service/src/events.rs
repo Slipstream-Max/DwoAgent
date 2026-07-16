@@ -17,6 +17,7 @@ pub enum RuntimePhase {
 pub struct ActiveToolCall {
     pub tool_call_id: String,
     pub tool_name: String,
+    pub raw_input: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,10 @@ pub enum SessionEventPayload {
         turn_id: TurnId,
     },
     AssistantDelta {
+        turn_id: TurnId,
+        delta: String,
+    },
+    AssistantReasoningDelta {
         turn_id: TurnId,
         delta: String,
     },

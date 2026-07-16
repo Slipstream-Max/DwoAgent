@@ -565,8 +565,8 @@ mod tests {
             }
         }));
 
+        assert_eq!(tool.kind, ToolKind::Other);
         let json = serde_json::to_value(tool).unwrap();
-        assert_eq!(json["kind"], "execute");
         assert_eq!(json["rawInput"]["command"], "cargo test --workspace");
         assert_eq!(
             json["content"][0]["content"]["text"],
@@ -591,6 +591,21 @@ mod tests {
         assert_eq!(json["status"], "completed");
         assert_eq!(json["rawOutput"]["output"], "test result: ok");
         assert_eq!(json["content"][0]["content"]["text"], "test result: ok");
+    }
+
+    #[test]
+    fn file_edit_uses_generic_tool_card_with_raw_input() {
+        let tool = tool_started(&json!({
+            "call": {
+                "tool_call_id": "call-2",
+                "tool_name": "file_edit",
+                "raw_input": { "patch": "*** Begin Patch\n*** End Patch" }
+            }
+        }));
+
+        assert_eq!(tool.kind, ToolKind::Other);
+        let json = serde_json::to_value(tool).unwrap();
+        assert_eq!(json["rawInput"]["patch"], "*** Begin Patch\n*** End Patch");
     }
 }
 
@@ -726,7 +741,7 @@ fn tool_started(payload: &Value) -> ToolCall {
     let name = call["tool_name"].as_str().unwrap_or("tool");
     let raw_input = call.get("raw_input").cloned().unwrap_or(Value::Null);
     let mut tool = ToolCall::new(id, name.to_string())
-        .kind(tool_kind(name))
+        .kind(tool_kind())
         .status(ToolCallStatus::InProgress)
         .raw_input(raw_input.clone());
     if let Some(text) = render_tool_input(name, &raw_input) {
@@ -759,12 +774,8 @@ fn tool_completed(payload: &Value) -> ToolCallUpdate {
     ToolCallUpdate::new(id, fields)
 }
 
-fn tool_kind(name: &str) -> ToolKind {
-    match name {
-        "terminal" => ToolKind::Execute,
-        "file_edit" => ToolKind::Edit,
-        _ => ToolKind::Other,
-    }
+fn tool_kind() -> ToolKind {
+    ToolKind::Other
 }
 
 fn render_tool_input(name: &str, input: &Value) -> Option<String> {

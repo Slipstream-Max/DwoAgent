@@ -54,13 +54,13 @@ dwo mcp auth logout <server>
 dwo automation list [--json]
 dwo automation status [--json]
 dwo automation run <job> [--json]
-dwo automation history [job] [--limit 20] [--json]
 dwo acp
 ```
 
-Windows uses a named pipe and an on-login scheduled task. macOS uses a Unix
-domain socket and a per-user launchd agent. `serve` always stays in the
-foreground; the operating-system service manager owns background lifecycle.
+Windows uses a named pipe and an on-login scheduled task whose generated VBS
+launcher keeps the daemon window hidden. macOS uses a Unix domain socket and a
+per-user launchd agent. `serve` itself stays in the foreground; the
+operating-system service manager owns background lifecycle.
 
 The default profile is `~/.dwoagent`:
 
@@ -70,12 +70,12 @@ resource/prompts/System.md
 resource/prompts/AGENTS.md
 resource/skills/
 resource/mcp.json
-sessions/
-mcp/catalog.json
-mcp/oauth/
+runtime/sessions/YYYY/MM/DD/<session-id>.json
+mcp_runtime/catalog.json
+mcp_runtime/oauth/
+runtime/logs/
 channels/weixin/runtime.yaml
 channels/weixin/secret.yaml
-logs/
 ```
 
 Weixin user settings live in `profile.yaml` and are validated before the host
@@ -156,10 +156,8 @@ prompt semantics as an interactive interruption: an active turn is cancelled,
 then the automation prompt starts.
 
 Automation is unattended. Tool confirmation requests are denied automatically
-instead of waiting forever. Run records are stored under
-`runtime/automation/<job>/runs/`; they contain the selected session, turn,
-terminal status, final assistant response, and error. Channel notification is
-not part of the automation runtime.
+instead of waiting forever. Automation does not create a separate state or
+history directory; execution is persisted only through the target session.
 
 ```yaml
 automation:

@@ -175,13 +175,6 @@ enum AutomationCommand {
         #[arg(long)]
         json: bool,
     },
-    History {
-        job: Option<String>,
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -273,31 +266,6 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
                 }
                 if !record.response.is_empty() {
                     println!("\n{}", record.response);
-                }
-            }
-        }
-        AutomationCommand::History { job, limit, json } => {
-            let value = ipc::request(
-                config_path,
-                "automation.history",
-                json!({"job": job, "limit": limit}),
-            )
-            .await?;
-            if json {
-                print_value(&value)?;
-            } else {
-                let records: Vec<AutomationRunRecord> = serde_json::from_value(value)?;
-                if records.is_empty() {
-                    println!("No automation runs recorded");
-                }
-                for record in records {
-                    println!(
-                        "{}  {}  {:?}  session={}",
-                        record.started_at,
-                        record.job,
-                        record.status,
-                        record.session_id.as_deref().unwrap_or("-")
-                    );
                 }
             }
         }
@@ -649,9 +617,10 @@ fn install(config_path: &Path) -> Result<()> {
     let root = config_path.parent().context("config path has no parent")?;
     std::fs::create_dir_all(root.join("resource/prompts"))?;
     std::fs::create_dir_all(root.join("resource/skills"))?;
-    std::fs::create_dir_all(root.join("sessions"))?;
+    std::fs::create_dir_all(root.join("runtime/sessions"))?;
+    std::fs::create_dir_all(root.join("mcp_runtime"))?;
+    std::fs::create_dir_all(root.join("runtime/logs"))?;
     std::fs::create_dir_all(root.join("channels"))?;
-    std::fs::create_dir_all(root.join("logs"))?;
     write_if_missing(config_path, DEFAULT_PROFILE)?;
     write_if_missing(
         &root.join("resource/prompts/System.md"),
@@ -675,11 +644,19 @@ fn write_if_missing(path: &Path, content: &str) -> Result<()> {
 #[cfg(windows)]
 fn register_service(config_path: &Path) -> Result<()> {
     let executable = std::env::current_exe()?;
-    let task = format!(
+    let command = format!(
         "\"{}\" --config-path \"{}\" serve",
         executable.display(),
         config_path.display()
     );
+    let root = config_path.parent().context("config path has no parent")?;
+    let launcher = root.join("runtime/dwo-daemon.vbs");
+    let script = format!(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\nexitCode = shell.Run(\"{}\", 0, True)\r\nWScript.Quit exitCode\r\n",
+        command.replace('"', "\"\"")
+    );
+    std::fs::write(&launcher, script)?;
+    let task = format!("wscript.exe \"{}\"", launcher.display());
     let status = ProcessCommand::new("schtasks.exe")
         .args(["/Create", "/SC", "ONLOGON", "/TN", "dwoagent", "/TR"])
         .arg(task)
@@ -687,6 +664,16 @@ fn register_service(config_path: &Path) -> Result<()> {
         .status()?;
     if !status.success() {
         bail!("failed to register dwoagent startup task");
+    }
+    let settings = ProcessCommand::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$task = Get-ScheduledTask -TaskName 'dwoagent'; $task.Settings.DisallowStartIfOnBatteries = $false; $task.Settings.StopIfGoingOnBatteries = $false; $task.Settings.ExecutionTimeLimit = 'PT0S'; Set-ScheduledTask -InputObject $task | Out-Null",
+        ])
+        .status()?;
+    if !settings.success() {
+        bail!("failed to configure dwoagent startup task");
     }
     Ok(())
 }
@@ -853,26 +840,6 @@ mod tests {
             run.command,
             Command::Automation {
                 command: AutomationCommand::Run { ref job, json: false }
-            } if job == "daily-report"
-        ));
-
-        let history = Cli::try_parse_from([
-            "dwo",
-            "automation",
-            "history",
-            "daily-report",
-            "--limit",
-            "5",
-        ])
-        .unwrap();
-        assert!(matches!(
-            history.command,
-            Command::Automation {
-                command: AutomationCommand::History {
-                    job: Some(ref job),
-                    limit: 5,
-                    json: false,
-                }
             } if job == "daily-report"
         ));
     }

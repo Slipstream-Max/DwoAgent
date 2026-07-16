@@ -186,44 +186,6 @@ impl AutomationRuntime {
         self.run_job(job, false).await
     }
 
-    pub fn history(&self, job: Option<&str>, limit: usize) -> Result<Vec<AutomationRunRecord>> {
-        let root = self.profile_root.join("runtime/automation");
-        if !root.exists() {
-            return Ok(Vec::new());
-        }
-        let mut records: Vec<AutomationRunRecord> = Vec::new();
-        let jobs = if let Some(job) = job {
-            validate_name(job)?;
-            vec![root.join(job)]
-        } else {
-            std::fs::read_dir(&root)?
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|path| path.is_dir())
-                .collect()
-        };
-        for job_dir in jobs {
-            let runs = job_dir.join("runs");
-            if !runs.exists() {
-                continue;
-            }
-            for entry in std::fs::read_dir(runs)? {
-                let path = entry?.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path)
-                    .with_context(|| format!("read {}", path.display()))?;
-                records.push(
-                    serde_yaml::from_str(&source)
-                        .with_context(|| format!("parse {}", path.display()))?,
-                );
-            }
-        }
-        records.sort_by(|left, right| right.started_at.cmp(&left.started_at));
-        records.truncate(limit);
-        Ok(records)
-    }
-
     async fn scheduler_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
@@ -310,10 +272,6 @@ impl AutomationRuntime {
             error: None,
         };
         self.set_active(record.clone()).await;
-        if let Err(error) = self.write_record(&record) {
-            self.clear_active(&run_id).await;
-            return Err(error);
-        }
 
         let result = self.execute_job(&job, &mut record).await;
         if let Err(error) = result {
@@ -321,9 +279,7 @@ impl AutomationRuntime {
             record.error = Some(format!("{error:#}"));
         }
         record.finished_at = Some(Utc::now().to_rfc3339());
-        let write_result = self.write_record(&record);
         self.clear_active(&run_id).await;
-        write_result?;
         Ok(record)
     }
 
@@ -360,14 +316,12 @@ impl AutomationRuntime {
         };
         record.session_id = Some(agent.id().to_string());
         self.set_active(record.clone()).await;
-        self.write_record(record)?;
 
         let endpoint = EndpointId::new();
         let mut subscription = agent.attach(endpoint.clone()).await?;
         let turn_id = agent.prompt(endpoint.clone(), job.prompt.clone()).await?;
         record.turn_id = Some(turn_id.to_string());
         self.set_active(record.clone()).await;
-        self.write_record(record)?;
 
         loop {
             tokio::select! {
@@ -423,20 +377,6 @@ impl AutomationRuntime {
 
     async fn clear_active(&self, run_id: &str) {
         self.state.lock().await.active.remove(run_id);
-    }
-
-    fn write_record(&self, record: &AutomationRunRecord) -> Result<()> {
-        let path = self
-            .profile_root
-            .join("runtime/automation")
-            .join(&record.job)
-            .join("runs")
-            .join(format!("{}.yaml", record.run_id));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_yaml::to_string(record)?)
-            .with_context(|| format!("write {}", path.display()))
     }
 }
 

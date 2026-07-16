@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 dwo-tools = { path = "../dwo-tools" }
 dwo-context = { path = "../dwo-context" }
 dwo-model-client = { path = "../dwo-model-client" }

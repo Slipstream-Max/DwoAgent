@@ -20,10 +20,10 @@ pub struct McpRuntime {
 impl McpRuntime {
     pub fn new(profile_root: impl AsRef<Path>) -> Self {
         let profile_root = profile_root.as_ref();
-        let oauth_root = profile_root.join("mcp/oauth");
+        let oauth_root = profile_root.join("mcp_runtime/oauth");
         Self {
             config_path: profile_root.join("resource/mcp.json"),
-            catalog_path: profile_root.join("mcp/catalog.json"),
+            catalog_path: profile_root.join("mcp_runtime/catalog.json"),
             client: McpClient::with_file_oauth(
                 Arc::new(FileOAuthProvider::new(oauth_root.clone())),
                 oauth_root.clone(),

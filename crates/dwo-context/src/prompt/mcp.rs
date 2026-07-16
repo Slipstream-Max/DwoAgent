@@ -37,7 +37,7 @@ impl McpSnapshot {
         let catalog_path = path
             .parent()
             .and_then(Path::parent)
-            .map(|root| root.join("mcp/catalog.json"));
+            .map(|root| root.join("mcp_runtime/catalog.json"));
         let summary = catalog_path
             .as_deref()
             .and_then(|path| std::fs::read_to_string(path).ok())

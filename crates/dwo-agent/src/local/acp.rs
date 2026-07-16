@@ -3,20 +3,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate, StopReason,
-    TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+    ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification,
     on_receive_request,
 };
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -65,6 +67,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let list_config = config_path.clone();
     let load_runtime = runtime.clone();
     let prompt_runtime = runtime;
+    let set_config = config_path.clone();
     let cancel_config = config_path;
 
     Agent
@@ -107,7 +110,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 {
                     Ok(value) => {
                         let id = value["session_id"].as_str().unwrap_or_default();
-                        responder.respond(NewSessionResponse::new(SessionId::new(id)))
+                        match session_config_options(&new_config, id).await {
+                            Ok(options) => responder.respond(
+                                NewSessionResponse::new(SessionId::new(id)).config_options(options),
+                            ),
+                            Err(error) => responder.respond_with_error(internal_error(error)),
+                        }
                     }
                     Err(error) => responder.respond_with_error(internal_error(error)),
                 }
@@ -154,7 +162,16 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     match ensure_observer(&runtime, &request.session_id.to_string(), &cx, true)
                         .await
                     {
-                        Ok(_) => responder.respond(LoadSessionResponse::new()),
+                        Ok(_) => match session_config_options(
+                            &runtime.config_path,
+                            &request.session_id.to_string(),
+                        )
+                        .await
+                        {
+                            Ok(options) => responder
+                                .respond(LoadSessionResponse::new().config_options(options)),
+                            Err(error) => responder.respond_with_error(internal_error(error)),
+                        },
                         Err(error) => responder.respond_with_error(internal_error(error)),
                     }?;
                     Ok(())
@@ -173,6 +190,35 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     Ok(())
                 })?;
                 Ok(())
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: SetSessionConfigOptionRequest,
+                        responder: Responder<SetSessionConfigOptionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                let session_id = request.session_id.to_string();
+                let config_id = request.config_id.to_string();
+                let value = request.value.to_string();
+                match ipc::request(
+                    &set_config,
+                    "session.set_config_option",
+                    json!({
+                        "session_id": session_id,
+                        "config_id": config_id,
+                        "value": value,
+                    }),
+                )
+                .await
+                {
+                    Ok(_) => match session_config_options(&set_config, &session_id).await {
+                        Ok(options) => {
+                            responder.respond(SetSessionConfigOptionResponse::new(options))
+                        }
+                        Err(error) => responder.respond_with_error(internal_error(error)),
+                    },
+                    Err(error) => responder.respond_with_error(internal_error(error)),
+                }
             },
             on_receive_request!(),
         )
@@ -366,7 +412,141 @@ fn handle_session_event(
                 });
             }
         }
+        "config_changed" => {
+            let config_path = runtime.config_path.clone();
+            let cx = cx.clone();
+            let session_id = session_id.to_string();
+            let _ = cx.clone().spawn(async move {
+                match session_config_options(&config_path, &session_id).await {
+                    Ok(options) => {
+                        let _ = cx.send_notification_to(
+                            Client,
+                            SessionNotification::new(
+                                SessionId::new(session_id),
+                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                            ),
+                        );
+                    }
+                    Err(error) => eprintln!("refresh ACP config options: {error:#}"),
+                }
+                Ok(())
+            });
+        }
         _ => {}
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionOptionSnapshot {
+    config: dwo_agent_service::SessionConfig,
+    models: Vec<SessionModelOption>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionModelOption {
+    id: String,
+    reasoning: Vec<String>,
+    default_reasoning: String,
+}
+
+async fn session_config_options(
+    config_path: &Path,
+    session_id: &str,
+) -> Result<Vec<SessionConfigOption>> {
+    let value = ipc::request(
+        config_path,
+        "session.options",
+        json!({"session_id": session_id}),
+    )
+    .await?;
+    let snapshot: SessionOptionSnapshot = serde_json::from_value(value)?;
+    build_session_config_options(snapshot)
+}
+
+fn build_session_config_options(
+    snapshot: SessionOptionSnapshot,
+) -> Result<Vec<SessionConfigOption>> {
+    let model = snapshot
+        .models
+        .iter()
+        .find(|model| model.id == snapshot.config.model)
+        .with_context(|| format!("session model disappeared: {}", snapshot.config.model))?;
+    let reasoning = snapshot
+        .config
+        .reasoning
+        .clone()
+        .unwrap_or_else(|| model.default_reasoning.clone());
+    let reasoning_options = model.reasoning.clone();
+    let policy = match snapshot.config.mode {
+        dwo_tools::SessionMode::FullAccess => "full_access",
+        dwo_tools::SessionMode::Confirm => "confirm",
+        dwo_tools::SessionMode::Watch => "watch",
+    };
+
+    Ok(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            snapshot.config.model.clone(),
+            snapshot
+                .models
+                .iter()
+                .map(|model| SessionConfigSelectOption::new(model.id.clone(), model.id.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "reasoning_mode",
+            "Reasoning",
+            reasoning,
+            reasoning_options
+                .into_iter()
+                .map(|mode| SessionConfigSelectOption::new(mode.clone(), mode))
+                .collect::<Vec<_>>(),
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+        SessionConfigOption::select(
+            "policy_mode",
+            "Policy",
+            policy,
+            vec![
+                SessionConfigSelectOption::new("full_access", "Full Access"),
+                SessionConfigSelectOption::new("confirm", "Confirm"),
+                SessionConfigSelectOption::new("watch", "Watch"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Mode),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_exposes_model_reasoning_and_policy_options() {
+        let options = build_session_config_options(SessionOptionSnapshot {
+            config: dwo_agent_service::SessionConfig {
+                mode: dwo_tools::SessionMode::FullAccess,
+                model: "deepseek-v4-flash".to_string(),
+                reasoning: Some("max".to_string()),
+            },
+            models: vec![SessionModelOption {
+                id: "deepseek-v4-flash".to_string(),
+                reasoning: vec!["high".to_string(), "max".to_string()],
+                default_reasoning: "high".to_string(),
+            }],
+        })
+        .unwrap();
+        let json = serde_json::to_value(options).unwrap();
+        assert_eq!(json[0]["id"], "model");
+        assert_eq!(json[0]["currentValue"], "deepseek-v4-flash");
+        assert_eq!(json[1]["id"], "reasoning_mode");
+        assert_eq!(json[1]["currentValue"], "max");
+        assert_eq!(json[2]["id"], "policy_mode");
+        assert_eq!(json[2]["currentValue"], "full_access");
     }
 }
 

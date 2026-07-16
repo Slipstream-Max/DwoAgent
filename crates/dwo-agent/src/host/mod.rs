@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
-    AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession,
+    AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession, SessionConfig,
     SessionConfigUpdate, SessionId, SessionLlmSettings,
 };
 use dwo_mcp::{McpRuntime, ShowResult};
 use dwo_tools::{ConfirmationDecision, PolicyConfig};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +24,7 @@ pub struct Host {
     profile_root: PathBuf,
     default_model: String,
     default_mode: dwo_tools::SessionMode,
+    model_options: Vec<SessionModelOption>,
     shutdown: CancellationToken,
 }
 
@@ -54,6 +55,13 @@ struct CancelParam {
 #[derive(Deserialize)]
 struct ConfigParam {
     session_id: String,
+    value: Value,
+}
+
+#[derive(Deserialize)]
+struct SessionConfigOptionParam {
+    session_id: String,
+    config_id: String,
     value: Value,
 }
 
@@ -108,11 +116,19 @@ struct AutomationJobParam {
     job: String,
 }
 
-#[derive(Deserialize)]
-struct AutomationHistoryParam {
-    job: Option<String>,
-    #[serde(default = "default_history_limit")]
-    limit: usize,
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionModelOption {
+    id: String,
+    reasoning: Vec<String>,
+    default_reasoning: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionOptionSnapshot {
+    config: SessionConfig,
+    models: Vec<SessionModelOption>,
 }
 
 impl Host {
@@ -123,8 +139,19 @@ impl Host {
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
+        let model_options = profile
+            .models
+            .models
+            .iter()
+            .map(|(id, model)| SessionModelOption {
+                id: id.clone(),
+                reasoning: model.reasoning.keys().cloned().collect(),
+                default_reasoning: model.default_reasoning_mode.clone(),
+            })
+            .collect();
         let automation_config = parse_automation_config(profile.config.automation.clone())?;
-        let repository = Arc::new(FsSessionRepository::new(profile_root.join("sessions")).await?);
+        let repository =
+            Arc::new(FsSessionRepository::new(profile_root.join("runtime/sessions")).await?);
         let channels =
             Arc::new(ChannelManager::new(&profile_root, &profile.config.channels).await?);
         let service = Arc::new(AgentService::from_profile(
@@ -150,6 +177,7 @@ impl Host {
             profile_root,
             default_model,
             default_mode,
+            model_options,
             shutdown,
         });
         host.gateway.start_all(host.clone()).await;
@@ -226,6 +254,46 @@ impl Host {
                     .await?;
                 Ok(json!({"updated": true}))
             }
+            "session.set_config_option" => {
+                let params: SessionConfigOptionParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let update = match params.config_id.as_str() {
+                    "model" => SessionConfigUpdate::Model(
+                        params
+                            .value
+                            .as_str()
+                            .context("model config value must be a string")?
+                            .to_string(),
+                    ),
+                    "reasoning_mode" => SessionConfigUpdate::Reasoning(Some(
+                        params
+                            .value
+                            .as_str()
+                            .context("reasoning config value must be a string")?
+                            .to_string(),
+                    )),
+                    "policy_mode" => {
+                        SessionConfigUpdate::Mode(serde_json::from_value(params.value)?)
+                    }
+                    other => anyhow::bail!("unknown session config option: {other}"),
+                };
+                self.service.set_config(&id, update).await?;
+                Ok(json!({"updated": true}))
+            }
+            "session.options" => {
+                let id = parse_session(params)?;
+                let record = self
+                    .service
+                    .list()
+                    .await?
+                    .into_iter()
+                    .find(|record| record.info.id == id)
+                    .with_context(|| format!("session not found: {id}"))?;
+                Ok(serde_json::to_value(SessionOptionSnapshot {
+                    config: record.config(),
+                    models: self.model_options.clone(),
+                })?)
+            }
             "session.permission" => {
                 let params: PermissionParam = serde_json::from_value(params)?;
                 let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
@@ -252,13 +320,6 @@ impl Host {
                 Ok(serde_json::to_value(
                     self.automation.run_now(&params.job).await?,
                 )?)
-            }
-            "automation.history" => {
-                let params: AutomationHistoryParam = serde_json::from_value(params)?;
-                Ok(serde_json::to_value(self.automation.history(
-                    params.job.as_deref(),
-                    params.limit.clamp(1, 1000),
-                )?)?)
             }
             "channel.list" => Ok(serde_json::to_value(self.channels.list().await?)?),
             "channel.weixin.status" => {
@@ -405,10 +466,6 @@ impl Host {
         let endpoint = EndpointId::parse(endpoint_id.to_string()).map_err(anyhow::Error::msg)?;
         Ok(self.service.load(&id).await?.attach(endpoint).await?)
     }
-}
-
-fn default_history_limit() -> usize {
-    20
 }
 
 fn parse_session(params: Value) -> Result<SessionId> {

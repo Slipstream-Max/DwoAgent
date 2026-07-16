@@ -9,7 +9,7 @@ use agent_client_protocol::schema::{
     NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
     PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionId,
-    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
     ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind,
@@ -438,6 +438,16 @@ fn handle_session_event(
                 Ok(())
             });
         }
+        "title_changed" => {
+            if let Some(title) = payload.get("title").and_then(Value::as_str) {
+                send_session_info_update(
+                    cx,
+                    session_id,
+                    title,
+                    payload.get("updated_at_ms").and_then(Value::as_u64),
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -525,88 +535,6 @@ fn build_session_config_options(
         )
         .category(SessionConfigOptionCategory::Mode),
     ])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn acp_exposes_model_reasoning_and_policy_options() {
-        let options = build_session_config_options(SessionOptionSnapshot {
-            config: dwo_agent_service::SessionConfig {
-                mode: dwo_tools::SessionMode::FullAccess,
-                model: "deepseek-v4-flash".to_string(),
-                reasoning: Some("max".to_string()),
-            },
-            models: vec![SessionModelOption {
-                id: "deepseek-v4-flash".to_string(),
-                reasoning: vec!["high".to_string(), "max".to_string()],
-                default_reasoning: "high".to_string(),
-            }],
-        })
-        .unwrap();
-        let json = serde_json::to_value(options).unwrap();
-        assert_eq!(json[0]["id"], "model");
-        assert_eq!(json[0]["currentValue"], "deepseek-v4-flash");
-        assert_eq!(json[1]["id"], "reasoning_mode");
-        assert_eq!(json[1]["currentValue"], "max");
-        assert_eq!(json[2]["id"], "policy_mode");
-        assert_eq!(json[2]["currentValue"], "full_access");
-    }
-
-    #[test]
-    fn terminal_tool_start_exposes_command_details() {
-        let tool = tool_started(&json!({
-            "call": {
-                "tool_call_id": "call-1",
-                "tool_name": "terminal",
-                "raw_input": { "command": "cargo test --workspace" }
-            }
-        }));
-
-        assert_eq!(tool.kind, ToolKind::Other);
-        let json = serde_json::to_value(tool).unwrap();
-        assert_eq!(json["rawInput"]["command"], "cargo test --workspace");
-        assert_eq!(
-            json["content"][0]["content"]["text"],
-            "cargo test --workspace"
-        );
-    }
-
-    #[test]
-    fn terminal_tool_completion_exposes_output_details() {
-        let update = tool_completed(&json!({
-            "result": {
-                "tool_call_id": "call-1",
-                "tool_name": "terminal",
-                "output": {
-                    "status": "success",
-                    "output": "test result: ok"
-                }
-            }
-        }));
-
-        let json = serde_json::to_value(update).unwrap();
-        assert_eq!(json["status"], "completed");
-        assert_eq!(json["rawOutput"]["output"], "test result: ok");
-        assert_eq!(json["content"][0]["content"]["text"], "test result: ok");
-    }
-
-    #[test]
-    fn file_edit_uses_generic_tool_card_with_raw_input() {
-        let tool = tool_started(&json!({
-            "call": {
-                "tool_call_id": "call-2",
-                "tool_name": "file_edit",
-                "raw_input": { "patch": "*** Begin Patch\n*** End Patch" }
-            }
-        }));
-
-        assert_eq!(tool.kind, ToolKind::Other);
-        let json = serde_json::to_value(tool).unwrap();
-        assert_eq!(json["rawInput"]["patch"], "*** Begin Patch\n*** End Patch");
-    }
 }
 
 fn send_terminal(
@@ -710,6 +638,27 @@ fn send_thought_chunk(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
             SessionUpdate::AgentThoughtChunk(chunk),
         ),
     );
+}
+
+fn send_session_info_update(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    title: &str,
+    updated_at_ms: Option<u64>,
+) {
+    let update = session_info_update(title, updated_at_ms);
+    let _ = cx.send_notification_to(
+        Client,
+        SessionNotification::new(SessionId::new(session_id), update),
+    );
+}
+
+fn session_info_update(title: &str, updated_at_ms: Option<u64>) -> SessionUpdate {
+    let mut update = SessionInfoUpdate::new().title(title.to_string());
+    if let Some(updated_at_ms) = updated_at_ms {
+        update = update.updated_at(updated_at_ms.to_string());
+    }
+    SessionUpdate::SessionInfoUpdate(update)
 }
 
 fn send_tool_started(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
@@ -824,10 +773,25 @@ fn text_content(text: String) -> Vec<ToolCallContent> {
 }
 
 fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
-    let Some(transcript) = value
+    let Some(record) = value
         .get("snapshot")
         .and_then(|snapshot| snapshot.get("record"))
-        .and_then(|record| record.get("context"))
+    else {
+        return;
+    };
+    if let Some(title) = record
+        .get("info")
+        .and_then(|info| info.get("title"))
+        .and_then(Value::as_str)
+    {
+        let updated_at_ms = record
+            .get("info")
+            .and_then(|info| info.get("updated_at_ms"))
+            .and_then(Value::as_u64);
+        send_session_info_update(cx, session_id, title, updated_at_ms);
+    }
+    let Some(transcript) = record
+        .get("context")
         .and_then(|context| context.get("transcript"))
         .and_then(Value::as_array)
     else {
@@ -872,4 +836,95 @@ fn content_text(value: &Value) -> String {
 
 fn internal_error(error: impl std::fmt::Display) -> agent_client_protocol::schema::Error {
     agent_client_protocol::schema::Error::internal_error().data(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_exposes_model_reasoning_and_policy_options() {
+        let options = build_session_config_options(SessionOptionSnapshot {
+            config: dwo_agent_service::SessionConfig {
+                mode: dwo_tools::SessionMode::FullAccess,
+                model: "deepseek-v4-flash".to_string(),
+                reasoning: Some("max".to_string()),
+            },
+            models: vec![SessionModelOption {
+                id: "deepseek-v4-flash".to_string(),
+                reasoning: vec!["high".to_string(), "max".to_string()],
+                default_reasoning: "high".to_string(),
+            }],
+        })
+        .unwrap();
+        let json = serde_json::to_value(options).unwrap();
+        assert_eq!(json[0]["id"], "model");
+        assert_eq!(json[0]["currentValue"], "deepseek-v4-flash");
+        assert_eq!(json[1]["id"], "reasoning_mode");
+        assert_eq!(json[1]["currentValue"], "max");
+        assert_eq!(json[2]["id"], "policy_mode");
+        assert_eq!(json[2]["currentValue"], "full_access");
+    }
+
+    #[test]
+    fn title_change_maps_to_acp_session_info_update() {
+        let update =
+            serde_json::to_value(session_info_update("Generated title", Some(42))).unwrap();
+        assert_eq!(update["sessionUpdate"], "session_info_update");
+        assert_eq!(update["title"], "Generated title");
+        assert_eq!(update["updatedAt"], "42");
+    }
+
+    #[test]
+    fn terminal_tool_start_exposes_command_details() {
+        let tool = tool_started(&json!({
+            "call": {
+                "tool_call_id": "call-1",
+                "tool_name": "terminal",
+                "raw_input": { "command": "cargo test --workspace" }
+            }
+        }));
+
+        assert_eq!(tool.kind, ToolKind::Other);
+        let json = serde_json::to_value(tool).unwrap();
+        assert_eq!(json["rawInput"]["command"], "cargo test --workspace");
+        assert_eq!(
+            json["content"][0]["content"]["text"],
+            "cargo test --workspace"
+        );
+    }
+
+    #[test]
+    fn terminal_tool_completion_exposes_output_details() {
+        let update = tool_completed(&json!({
+            "result": {
+                "tool_call_id": "call-1",
+                "tool_name": "terminal",
+                "output": {
+                    "status": "success",
+                    "output": "test result: ok"
+                }
+            }
+        }));
+
+        let json = serde_json::to_value(update).unwrap();
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["rawOutput"]["output"], "test result: ok");
+        assert_eq!(json["content"][0]["content"]["text"], "test result: ok");
+    }
+
+    #[test]
+    fn file_edit_uses_generic_tool_card_with_raw_input() {
+        let tool = tool_started(&json!({
+            "call": {
+                "tool_call_id": "call-2",
+                "tool_name": "file_edit",
+                "raw_input": { "patch": "*** Begin Patch\n*** End Patch" }
+            }
+        }));
+
+        assert_eq!(tool.kind, ToolKind::Other);
+        let json = serde_json::to_value(tool).unwrap();
+        assert_eq!(json["rawInput"]["patch"], "*** Begin Patch\n*** End Patch");
+    }
 }

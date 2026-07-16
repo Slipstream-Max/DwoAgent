@@ -220,6 +220,43 @@ async fn summary_uses_non_streaming_request_without_tools() {
 }
 
 #[tokio::test]
+async fn completion_uses_non_streaming_request_without_tools() {
+    let payload = json!({
+        "choices":[{"message":{"role":"assistant","content":"Short title"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}
+    });
+    let body = payload.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (endpoint, request_rx) = one_response_server(response).await;
+    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let reply = client
+        .complete(
+            ModelSelection {
+                model: "chat".to_string(),
+                reasoning: None,
+            },
+            vec![
+                ContextMessage::system("Generate a title"),
+                ContextMessage::user("Investigate flaky tests"),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.content, "Short title");
+    assert_eq!(reply.usage.total_tokens, 10);
+
+    let request = request_rx.await.unwrap();
+    assert_eq!(request["stream"], false);
+    assert!(request.get("tools").is_none());
+    assert_eq!(request["messages"][0]["content"], "Generate a title");
+    assert_eq!(request["messages"][1]["content"], "Investigate flaky tests");
+}
+
+#[tokio::test]
 async fn cancellation_interrupts_an_in_flight_request() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

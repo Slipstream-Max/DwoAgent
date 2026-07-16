@@ -1,3 +1,3 @@
 mod model;
 
-pub use model::{ScriptedModelGateway, ScriptedStep, ScriptedSummaryStep};
+pub use model::{ScriptedCompletionStep, ScriptedModelGateway, ScriptedStep, ScriptedSummaryStep};

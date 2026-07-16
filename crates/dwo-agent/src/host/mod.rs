@@ -211,7 +211,7 @@ impl Host {
             }
             "session.delete" => {
                 let id = parse_session(params)?;
-                self.service.delete(&id).await?;
+                self.delete_session(&id).await?;
                 Ok(json!({"deleted": true}))
             }
             "session.prompt" => {
@@ -419,15 +419,28 @@ impl Host {
         title: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<Arc<dwo_agent_service::SessionAgent>> {
-        let cwd = cwd.unwrap_or(std::env::current_dir()?);
-        let title = title.unwrap_or_else(|| {
-            cwd.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "session".to_string())
-        });
-        Ok(self
+        let session_id = SessionId::new();
+        let uses_generated_workspace = cwd.is_none();
+        let cwd = match cwd {
+            Some(cwd) if cwd.is_absolute() => cwd,
+            Some(cwd) => self.profile_root.join(cwd),
+            None => {
+                let workspace = self
+                    .profile_root
+                    .join("runtime")
+                    .join("workspaces")
+                    .join(session_id.as_str());
+                tokio::fs::create_dir_all(&workspace)
+                    .await
+                    .with_context(|| format!("create default workspace {}", workspace.display()))?;
+                workspace
+            }
+        };
+        let cleanup_path = uses_generated_workspace.then(|| cwd.clone());
+        let created = self
             .service
             .create(NewSession {
+                id: Some(session_id),
                 title,
                 cwd,
                 mode: self.default_mode,
@@ -436,7 +449,56 @@ impl Host {
                     reasoning: None,
                 },
             })
-            .await?)
+            .await;
+        match created {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                if let Some(path) = cleanup_path
+                    && path.is_dir()
+                {
+                    let _ = tokio::fs::remove_dir_all(path).await;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
+        let record = self
+            .service
+            .list()
+            .await?
+            .into_iter()
+            .find(|record| &record.info.id == id);
+        self.service.delete(id).await?;
+
+        let generated_workspace = self
+            .profile_root
+            .join("runtime")
+            .join("workspaces")
+            .join(id.as_str());
+        let resolved_generated_workspace = std::fs::canonicalize(&generated_workspace)
+            .unwrap_or_else(|_| generated_workspace.clone());
+        if record
+            .as_ref()
+            .is_some_and(|record| record.info.cwd == resolved_generated_workspace)
+            && generated_workspace.is_dir()
+        {
+            tokio::fs::remove_dir_all(&generated_workspace).await?;
+        }
+        remove_session_attachment_dirs(
+            &self
+                .profile_root
+                .join("runtime")
+                .join("attachments")
+                .join("weixin"),
+            id.as_str(),
+        )
+        .await
+    }
+
+    pub fn profile_root_path(&self) -> &Path {
+        &self.profile_root
     }
 
     fn start_mcp_watcher(self: &Arc<Self>) {
@@ -468,6 +530,28 @@ impl Host {
     }
 }
 
+async fn remove_session_attachment_dirs(root: &Path, session_id: &str) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = tokio::fs::read_dir(&directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            if entry.file_name() == std::ffi::OsStr::new(session_id) {
+                tokio::fs::remove_dir_all(entry.path()).await?;
+            } else {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_session(params: Value) -> Result<SessionId> {
     let params: SessionIdParam = serde_json::from_value(params)?;
     SessionId::parse(params.session_id).map_err(anyhow::Error::msg)
@@ -483,4 +567,109 @@ pub fn profile_root(config_path: &Path) -> Result<PathBuf> {
             .to_path_buf()
     };
     std::fs::canonicalize(&path).with_context(|| format!("resolve profile root {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_test_profile(root: &Path) -> PathBuf {
+        std::fs::create_dir_all(root.join("resource/prompts")).unwrap();
+        std::fs::write(
+            root.join("resource/prompts/System.md"),
+            "You are a test agent.",
+        )
+        .unwrap();
+        let config = root.join("profile.yaml");
+        std::fs::write(
+            &config,
+            r#"name: test
+description: test agent
+policyMode: confirm
+model:
+  defaultModelId: deepseek-v4-pro
+  providers:
+    deepseek:
+      type: deepseek
+  models:
+    - modelName: deepseek-v4-pro
+      provider: deepseek
+      modelId: deepseek-v4-pro
+"#,
+        )
+        .unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn sessions_use_runtime_workspaces_unless_cwd_is_explicit() {
+        let profile = tempfile::tempdir().unwrap();
+        let config = write_test_profile(profile.path());
+        let host = Host::load(&config).await.unwrap();
+
+        let generated = host.create_session(None, None).await.unwrap();
+        let generated_id = generated.id().clone();
+        let generated_cwd = generated
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record
+            .info
+            .cwd;
+        assert_eq!(
+            generated_cwd,
+            std::fs::canonicalize(
+                profile
+                    .path()
+                    .join("runtime/workspaces")
+                    .join(generated_id.as_str())
+            )
+            .unwrap()
+        );
+        assert!(generated_cwd.is_dir());
+
+        let explicit = profile.path().join("projects/demo");
+        std::fs::create_dir_all(&explicit).unwrap();
+        let custom = host
+            .create_session(None, Some(PathBuf::from("projects/demo")))
+            .await
+            .unwrap();
+        let custom_id = custom.id().clone();
+        let custom_cwd = custom
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record
+            .info
+            .cwd;
+        assert_eq!(custom_cwd, std::fs::canonicalize(&explicit).unwrap());
+
+        for date in ["2026/07/15", "2026/07/16"] {
+            let attachment = profile
+                .path()
+                .join("runtime/attachments/weixin")
+                .join(date)
+                .join(generated_id.as_str())
+                .join("image.jpg");
+            std::fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+            std::fs::write(attachment, b"image").unwrap();
+        }
+
+        host.delete_session(&generated_id).await.unwrap();
+        assert!(!generated_cwd.exists());
+        assert!(
+            !profile
+                .path()
+                .join("runtime/attachments/weixin/2026/07/15")
+                .join(generated_id.as_str())
+                .exists()
+        );
+        host.delete_session(&custom_id).await.unwrap();
+        assert!(explicit.is_dir(), "an explicit cwd must never be deleted");
+
+        host.shutdown.cancel();
+        host.service.shutdown().await;
+    }
 }

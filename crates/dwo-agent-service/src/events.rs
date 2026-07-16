@@ -56,6 +56,8 @@ pub enum SessionEventPayload {
     AssistantCompleted {
         turn_id: TurnId,
         content: String,
+        reasoning: Option<String>,
+        tool_calls: Vec<ActiveToolCall>,
     },
     ToolStarted {
         turn_id: TurnId,
@@ -88,6 +90,10 @@ pub enum SessionEventPayload {
     },
     ConfigChanged {
         config: crate::SessionConfig,
+    },
+    TitleChanged {
+        title: String,
+        updated_at_ms: u64,
     },
     Closing,
 }

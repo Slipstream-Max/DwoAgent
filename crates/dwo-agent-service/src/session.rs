@@ -1,9 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use dwo_context::{ContextManager, MessageContent, SystemPromptBuilder};
-use dwo_model_client::ModelClient;
-use dwo_model_client::ModelSelection;
+use dwo_context::{
+    ContentBlock, ContextManager, ContextMessage, MessageContent, SystemPromptBuilder,
+};
+use dwo_model_client::{ModelClient, ModelReply, ModelSelection, ModelUsage};
 use dwo_tools::{ConfirmationDecision, ToolManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -89,6 +90,8 @@ impl SessionAgent {
             permission: PermissionState::default(),
             pending_prompt: None,
             closing_response: None,
+            title_cancellation: None,
+            title_usage: None,
         };
         tokio::spawn(actor.run());
         Arc::new(Self {
@@ -268,6 +271,8 @@ struct SessionActor {
     permission: PermissionState,
     pending_prompt: Option<PendingPrompt>,
     closing_response: Option<oneshot::Sender<Result<(), AgentServiceError>>>,
+    title_cancellation: Option<CancellationToken>,
+    title_usage: Option<ModelUsage>,
 }
 
 struct PendingPrompt {
@@ -301,6 +306,9 @@ impl SessionActor {
         }
         if let Some(active) = self.active.take() {
             active.cancellation.cancel();
+        }
+        if let Some(cancellation) = self.title_cancellation.take() {
+            cancellation.cancel();
         }
         self.permission.reject("session closed");
         self.tools.shutdown().await;
@@ -435,6 +443,9 @@ impl SessionActor {
                     return false;
                 }
                 self.phase = RuntimePhase::Closing;
+                if let Some(cancellation) = self.title_cancellation.take() {
+                    cancellation.cancel();
+                }
                 if let Some(pending) = self.pending_prompt.take() {
                     let _ = pending.response.send(Err(AgentServiceError::SessionClosed(
                         self.record.info.id.clone(),
@@ -471,6 +482,12 @@ impl SessionActor {
         }
         let turn_id = TurnId::new();
         let event_content = content.clone();
+        let title_generation =
+            if self.record.auto_title_pending() && self.title_cancellation.is_none() {
+                title_source(&content).map(|source| (source, self.record.info.title.clone()))
+            } else {
+                None
+            };
         let mut context = ContextManager::new(self.record.context.clone());
         context.append_user(turn_id.clone(), content);
         self.record.context = context.into_context();
@@ -484,6 +501,9 @@ impl SessionActor {
             tools: Vec::new(),
         });
         self.phase = RuntimePhase::Running;
+        if let Some((source, original_title)) = title_generation {
+            self.start_title_generation(source, original_title);
+        }
         self.emit(SessionEventPayload::UserPromptSubmitted {
             turn_id: turn_id.clone(),
             origin,
@@ -514,8 +534,19 @@ impl SessionActor {
     async fn handle_turn_message(&mut self, message: TurnActorMessage) -> bool {
         match message {
             TurnActorMessage::Event(event) => self.handle_turn_event(event).await,
+            TurnActorMessage::TitleGenerated {
+                original_title,
+                result,
+            } => {
+                self.finish_title_generation(&original_title, result).await;
+                false
+            }
             TurnActorMessage::PersistContext { context, completed } => {
-                self.record.context = *context;
+                let mut context = ContextManager::new(*context);
+                if let Some(usage) = self.title_usage {
+                    context.record_auxiliary_usage(usage.input_tokens, usage.output_tokens);
+                }
+                self.record.context = context.into_context();
                 self.record.touch();
                 let result = self.repository.save(&self.record).await;
                 let _ = completed.send(result);
@@ -541,10 +572,20 @@ impl SessionActor {
                     self.emit(SessionEventPayload::AssistantReasoningDelta { turn_id, delta });
                 }
             }
-            TurnEvent::AssistantCompleted { turn_id, content } => {
+            TurnEvent::AssistantCompleted {
+                turn_id,
+                content,
+                reasoning,
+                tool_calls,
+            } => {
                 if let Some(active) = self.active.as_mut().filter(|active| active.id == turn_id) {
                     active.partial_message.clear();
-                    self.emit(SessionEventPayload::AssistantCompleted { turn_id, content });
+                    self.emit(SessionEventPayload::AssistantCompleted {
+                        turn_id,
+                        content,
+                        reasoning,
+                        tool_calls,
+                    });
                 }
             }
             TurnEvent::ToolStarted { turn_id, call } => {
@@ -570,6 +611,7 @@ impl SessionActor {
                     return false;
                 }
                 self.active = None;
+                self.title_usage = None;
                 self.permission.reject("turn finished");
                 self.phase = RuntimePhase::Idle;
                 match outcome {
@@ -619,6 +661,67 @@ impl SessionActor {
         });
     }
 
+    fn start_title_generation(&mut self, source: String, original_title: String) {
+        let model = self.model.clone();
+        let selection = ModelSelection {
+            model: self.record.llm.model.clone(),
+            reasoning: None,
+        };
+        let actor = self.turn_tx.clone();
+        let cancellation = CancellationToken::new();
+        self.title_cancellation = Some(cancellation.clone());
+        tokio::spawn(async move {
+            let source = title_source_excerpt(&source);
+            let messages = vec![
+                ContextMessage::system(
+                    "Generate a concise conversation title. Return only the title, without quotes or explanation. Use the same language as the user. Keep it under 12 Chinese characters or 6 English words.",
+                ),
+                ContextMessage::user(format!("User message:\n{source}\n\nTitle:")),
+            ];
+            let result = model.complete(selection, messages, cancellation).await;
+            let _ = actor.send(TurnActorMessage::TitleGenerated {
+                original_title,
+                result,
+            });
+        });
+    }
+
+    async fn finish_title_generation(
+        &mut self,
+        original_title: &str,
+        result: Result<ModelReply, dwo_model_client::ModelClientError>,
+    ) {
+        self.title_cancellation = None;
+        let Ok(reply) = result else {
+            return;
+        };
+        let Some(title) = clean_generated_session_title(&reply.content) else {
+            return;
+        };
+        if self.record.info.title != original_title {
+            return;
+        }
+
+        let mut updated = self.record.clone();
+        updated.set_automatic_title(title.clone());
+        let mut context = ContextManager::new(updated.context);
+        context.record_auxiliary_usage(reply.usage.input_tokens, reply.usage.output_tokens);
+        if self.active.is_some() {
+            self.title_usage = Some(reply.usage);
+        }
+        updated.context = context.into_context();
+        updated.touch();
+        if self.repository.save(&updated).await.is_err() {
+            return;
+        }
+        let updated_at_ms = updated.info.updated_at_ms;
+        self.record = updated;
+        self.emit(SessionEventPayload::TitleChanged {
+            title,
+            updated_at_ms,
+        });
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             record: self.record.clone(),
@@ -646,5 +749,73 @@ impl SessionActor {
             session_id: self.record.info.id.clone(),
             payload,
         });
+    }
+}
+
+fn title_source(content: &MessageContent) -> Option<String> {
+    content.as_blocks().iter().find_map(|block| {
+        let ContentBlock::Text { text, .. } = block else {
+            return None;
+        };
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!normalized.is_empty()).then_some(normalized)
+    })
+}
+
+fn title_source_excerpt(source: &str) -> String {
+    const TITLE_SOURCE_CHARS: usize = 2_000;
+    source.chars().take(TITLE_SOURCE_CHARS).collect()
+}
+
+fn clean_generated_session_title(raw: &str) -> Option<String> {
+    const GENERATED_TITLE_CHARS: usize = 40;
+
+    let first_line = raw.lines().find(|line| !line.trim().is_empty())?.trim();
+    let title = first_line
+        .strip_prefix("Title:")
+        .or_else(|| first_line.strip_prefix("title:"))
+        .or_else(|| first_line.strip_prefix("标题:"))
+        .or_else(|| first_line.strip_prefix("标题："))
+        .unwrap_or(first_line)
+        .trim()
+        .trim_matches(|character| matches!(character, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'))
+        .trim()
+        .trim_end_matches(['.', '。'])
+        .trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.chars().take(GENERATED_TITLE_CHARS).collect())
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    #[test]
+    fn title_source_uses_first_non_empty_text_block() {
+        let content = MessageContent::blocks(vec![
+            ContentBlock::image("image/png", "aGVsbG8="),
+            ContentBlock::text("  investigate\n flaky tests  "),
+        ]);
+        assert_eq!(
+            title_source(&content).as_deref(),
+            Some("investigate flaky tests")
+        );
+    }
+
+    #[test]
+    fn generated_title_is_unwrapped_and_bounded() {
+        assert_eq!(
+            clean_generated_session_title("Title: \"Investigate flaky tests.\"\nextra").as_deref(),
+            Some("Investigate flaky tests")
+        );
+        assert_eq!(
+            clean_generated_session_title(&"x".repeat(80))
+                .unwrap()
+                .chars()
+                .count(),
+            40
+        );
     }
 }

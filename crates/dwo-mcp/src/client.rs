@@ -248,17 +248,17 @@ impl McpClient {
                 HeaderValue::try_from(value).map_err(|e| operation(name, e))?,
             );
         }
-        if let Some(auth) = &config.auth {
-            if let Some(value) = self.auth_provider.authorization(&AuthContext {
+        if let Some(auth) = &config.auth
+            && let Some(value) = self.auth_provider.authorization(&AuthContext {
                 server: name,
                 url: &config.url,
                 auth,
-            })? {
-                headers.insert(
-                    http::header::AUTHORIZATION,
-                    HeaderValue::try_from(value).map_err(|e| operation(name, e))?,
-                );
-            }
+            })?
+        {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::try_from(value).map_err(|e| operation(name, e))?,
+            );
         }
         Ok(StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(config.url.clone())

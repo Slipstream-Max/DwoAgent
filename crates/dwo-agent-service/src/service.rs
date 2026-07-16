@@ -14,7 +14,8 @@ use crate::repository::SessionRepository;
 use crate::session::SessionAgent;
 
 pub struct NewSession {
-    pub title: String,
+    pub id: Option<SessionId>,
+    pub title: Option<String>,
     pub cwd: PathBuf,
     pub mode: SessionMode,
     pub llm: SessionLlmSettings,
@@ -92,17 +93,26 @@ impl AgentService {
             })
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
         let cwd = std::fs::canonicalize(&new_session.cwd).map_err(anyhow::Error::from)?;
+        let explicit_title = new_session
+            .title
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty());
+        let automatic_title = explicit_title.is_none();
+        let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
         let prompt_builder = self.prompt_builder(cwd.clone());
         let context = ContextManager::initialize(&prompt_builder)
             .map_err(anyhow::Error::from)?
             .into_context();
         let mut record = SessionRecord::new(
-            SessionId::new(),
-            new_session.title,
+            new_session.id.unwrap_or_default(),
+            title,
             cwd,
             new_session.mode,
             new_session.llm,
         );
+        if automatic_title {
+            record.enable_auto_title();
+        }
         record.context = context;
         self.repository.save(&record).await?;
         self.load_record(record).await
@@ -246,4 +256,11 @@ impl AgentService {
         SystemPromptBuilder::new(self.profile_root.clone(), cwd)
             .with_tool_prompt(dwo_tools::prompt::combined())
     }
+}
+
+fn default_session_title(cwd: &std::path::Path) -> String {
+    cwd.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "session".to_string())
 }

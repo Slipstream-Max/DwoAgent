@@ -90,6 +90,13 @@ pub trait ModelClient: Send + Sync {
         cancellation: CancellationToken,
     ) -> Result<ModelReply, ModelClientError>;
 
+    async fn complete(
+        &self,
+        selection: ModelSelection,
+        messages: Vec<ContextMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<ModelReply, ModelClientError>;
+
     async fn summarize(
         &self,
         selection: ModelSelection,

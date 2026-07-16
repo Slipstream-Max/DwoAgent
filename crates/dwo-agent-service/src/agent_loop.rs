@@ -18,6 +18,10 @@ const MAX_MODEL_STEPS: usize = 100;
 
 pub(crate) enum TurnActorMessage {
     Event(TurnEvent),
+    TitleGenerated {
+        original_title: String,
+        result: Result<ModelReply, dwo_model_client::ModelClientError>,
+    },
     PersistContext {
         context: Box<SessionContext>,
         completed: oneshot::Sender<anyhow::Result<()>>,
@@ -36,6 +40,8 @@ pub(crate) enum TurnEvent {
     AssistantCompleted {
         turn_id: TurnId,
         content: String,
+        reasoning: Option<String>,
+        tool_calls: Vec<ActiveToolCall>,
     },
     ToolStarted {
         turn_id: TurnId,
@@ -134,15 +140,22 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             response.usage.input_tokens,
             response.usage.output_tokens,
         );
+        let active_tool_calls = response
+            .tool_calls
+            .iter()
+            .map(active_tool_call)
+            .collect::<Vec<_>>();
         turn.context.append_assistant_with_reasoning(
             turn.turn_id.clone(),
             response.content.clone(),
-            response.reasoning,
+            response.reasoning.clone(),
             response.tool_calls.clone(),
         );
         turn.emit(TurnEvent::AssistantCompleted {
             turn_id: turn.turn_id.clone(),
             content: response.content,
+            reasoning: response.reasoning,
+            tool_calls: active_tool_calls.clone(),
         });
         if response.tool_calls.is_empty() {
             if let Err(error) = turn.checkpoint().await {
@@ -151,10 +164,10 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             return TurnOutcome::Completed;
         }
 
-        for raw in &response.tool_calls {
+        for call in active_tool_calls {
             turn.emit(TurnEvent::ToolStarted {
                 turn_id: turn.turn_id.clone(),
-                call: active_tool_call(raw),
+                call,
             });
         }
 

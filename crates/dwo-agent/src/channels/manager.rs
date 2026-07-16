@@ -9,7 +9,6 @@ use uuid::Uuid;
 use weixin_agent::{LoginStatus, QrLoginSession, StandaloneQrLogin, WeixinConfig};
 
 const WEIXIN_CHANNEL: &str = "weixin";
-pub(crate) const WEIXIN_FLUSH_INTERVAL_MS: u64 = 500;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +24,12 @@ pub struct WeixinChannelConfig {
     pub stream_mode: StreamMode,
     pub replay_turns: usize,
     pub markdown_filter: bool,
+    #[serde(default = "default_true")]
+    pub media_input: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl WeixinChannelConfig {
@@ -365,6 +370,7 @@ markdownFilter: true
         assert_eq!(summary.len(), 1);
         assert!(summary[0].enabled);
         assert!(!summary[0].connected);
+        assert!(manager.weixin.as_ref().unwrap().media_input);
     }
 
     #[tokio::test]

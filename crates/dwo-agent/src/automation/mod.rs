@@ -297,9 +297,12 @@ impl AutomationRuntime {
                 };
                 self.service
                     .create(NewSession {
-                        title: title
-                            .clone()
-                            .unwrap_or_else(|| format!("automation/{}", job.name)),
+                        id: None,
+                        title: Some(
+                            title
+                                .clone()
+                                .unwrap_or_else(|| format!("automation/{}", job.name)),
+                        ),
                         cwd,
                         mode: self.default_mode,
                         llm: SessionLlmSettings {
@@ -335,7 +338,7 @@ impl AutomationRuntime {
                         bail!("session event stream closed before automation turn finished");
                     };
                     match event.payload {
-                        SessionEventPayload::AssistantCompleted { turn_id: event_turn, content }
+                        SessionEventPayload::AssistantCompleted { turn_id: event_turn, content, .. }
                             if event_turn == turn_id => record.response = content,
                         SessionEventPayload::PermissionRequested { turn_id: event_turn, permission }
                             if event_turn == turn_id => {

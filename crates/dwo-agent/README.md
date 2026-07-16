@@ -71,6 +71,8 @@ resource/prompts/AGENTS.md
 resource/skills/
 resource/mcp.json
 runtime/sessions/YYYY/MM/DD/<session-id>.json
+runtime/workspaces/<session-id>/
+runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 mcp_runtime/catalog.json
 mcp_runtime/oauth/
 runtime/logs/
@@ -88,6 +90,7 @@ channels:
     streamMode: answer
     replayTurns: 5
     markdownFilter: true
+    mediaInput: true
 ```
 
 `runtime.yaml` stores the selected session, `syncBuf`, and SDK context tokens.
@@ -99,6 +102,18 @@ ID, the selected session, and the effective stream mode. `connected` means
 that persisted credentials exist and validate; it is not a live network
 health check. `send-message` and `send-file` always target the bound user and use
 that user's current context token.
+
+Inbound Weixin images and files are downloaded under the selected session's
+dated `runtime/attachments/weixin/` directory and submitted as a structured
+resource link containing the local path, MIME type, name, and size. A
+media-only message is a valid prompt. Sessions created without an explicit
+cwd use `runtime/workspaces/<session-id>` instead of the daemon process cwd.
+
+The Weixin slash commands include `/new [name] [--cwd <path>]`, `/policy
+[full_access|confirm|watch]`, and `/stream answer|full`. Full mode emits
+reasoning in complete sentence chunks after at least 200 characters, renders
+terminal commands or file-edit patches with permission request IDs, and sends
+each committed assistant response as one message.
 
 When Weixin is enabled and bound, the context builder adds a concise channel
 capability block to the system prompt. Binding and unbinding changes are

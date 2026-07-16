@@ -63,13 +63,17 @@ fn push_compacted_tool_exchange(
     {
         output.push(normalized);
     }
-    output.extend(results.iter().filter_map(|result| {
-        result
-            .tool_call_id
-            .as_ref()
-            .is_some_and(|id| paired_ids.contains(id))
-            .then(|| compact_tool_result(result))
-    }));
+    output.extend(
+        results
+            .iter()
+            .filter(|result| {
+                result
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| paired_ids.contains(id))
+            })
+            .map(compact_tool_result),
+    );
 }
 
 fn compact_tool_result(result: &ContextMessage) -> ContextMessage {

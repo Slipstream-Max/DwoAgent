@@ -56,6 +56,8 @@ pub struct SessionRecord {
     pub info: SessionInfo,
     pub llm: SessionLlmSettings,
     pub context: SessionContext,
+    #[serde(default, skip_serializing_if = "is_false")]
+    auto_title_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +120,22 @@ impl SessionRecord {
             },
             llm,
             context: SessionContext::default(),
+            auto_title_pending: false,
         }
+    }
+
+    pub(crate) fn enable_auto_title(&mut self) {
+        self.auto_title_pending = true;
+    }
+
+    pub(crate) fn auto_title_pending(&self) -> bool {
+        self.auto_title_pending
+    }
+
+    pub(crate) fn set_automatic_title(&mut self, title: String) {
+        self.info.title = title;
+        self.auto_title_pending = false;
+        self.touch();
     }
 
     pub(crate) fn touch(&mut self) {
@@ -158,6 +175,10 @@ impl SessionRecord {
         }
         Ok(())
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn unix_time_ms() -> u64 {

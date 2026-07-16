@@ -121,25 +121,42 @@ impl ModelClient for ConfiguredModelClient {
             .await
     }
 
-    async fn summarize(
+    async fn complete(
         &self,
         selection: ModelSelection,
-        view: dwo_context::CompactionView,
+        messages: Vec<dwo_context::ContextMessage>,
         cancellation: CancellationToken,
-    ) -> Result<SummaryReply, ModelClientError> {
+    ) -> Result<ModelReply, ModelClientError> {
         self.validate_selection(&selection)?;
+        if messages
+            .first()
+            .is_none_or(|message| message.role != dwo_context::MessageRole::System)
+        {
+            return Err(ModelClientError::protocol(
+                "completion messages must start with the system message",
+            ));
+        }
         let (provider, model) = self.resolve(&selection.model)?;
-        let mut messages = Vec::with_capacity(view.messages.len() + 1);
-        messages.push(dwo_context::ContextMessage::system(view.instruction));
-        messages.extend(view.messages);
-        let response = provider
+        provider
             .complete(
                 model,
                 &messages,
                 selection.reasoning.as_deref(),
                 &cancellation,
             )
-            .await?;
+            .await
+    }
+
+    async fn summarize(
+        &self,
+        selection: ModelSelection,
+        view: dwo_context::CompactionView,
+        cancellation: CancellationToken,
+    ) -> Result<SummaryReply, ModelClientError> {
+        let mut messages = Vec::with_capacity(view.messages.len() + 1);
+        messages.push(dwo_context::ContextMessage::system(view.instruction));
+        messages.extend(view.messages);
+        let response = self.complete(selection, messages, cancellation).await?;
         if response.content.trim().is_empty() {
             return Err(ModelClientError::protocol(
                 "summary response content must not be empty",

@@ -10,11 +10,12 @@ use dwo_agent_service::{
 };
 use dwo_tools::PolicyConfig;
 use serde_json::json;
-use support::{ScriptedModelGateway, ScriptedStep, ScriptedSummaryStep};
+use support::{ScriptedCompletionStep, ScriptedModelGateway, ScriptedStep, ScriptedSummaryStep};
 
 fn new_session(cwd: &std::path::Path, mode: SessionMode) -> NewSession {
     NewSession {
-        title: "test".to_string(),
+        id: None,
+        title: Some("test".to_string()),
         cwd: cwd.to_path_buf(),
         mode,
         llm: SessionLlmSettings::default(),
@@ -44,6 +45,110 @@ async fn wait_for_turn_end(
 fn write(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
+}
+
+#[tokio::test]
+async fn unnamed_session_gets_model_generated_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::with_completions(
+        [ScriptedStep::text("done")],
+        [ScriptedCompletionStep {
+            content: "Title: \"Flaky websocket tests.\"".to_string(),
+            input_tokens: 7,
+            output_tokens: 3,
+        }],
+    );
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(NewSession {
+            id: None,
+            title: None,
+            cwd: dir.path().to_path_buf(),
+            mode: SessionMode::FullAccess,
+            llm: SessionLlmSettings::default(),
+        })
+        .await
+        .unwrap();
+    let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
+
+    agent
+        .prompt(
+            EndpointId::new(),
+            "Please investigate flaky websocket tests",
+        )
+        .await
+        .unwrap();
+    let mut titles = Vec::new();
+    let mut turn_completed = false;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !titles.iter().any(|title| title == "Flaky websocket tests") || !turn_completed {
+            match subscription.events.recv().await.unwrap().payload {
+                SessionEventPayload::TitleChanged { title, .. } => titles.push(title),
+                SessionEventPayload::TurnCompleted { .. } => turn_completed = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(titles, ["Flaky websocket tests"]);
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(snapshot.record.info.title, "Flaky websocket tests");
+    assert_eq!(snapshot.record.context.usage.input_tokens, 7);
+    assert_eq!(snapshot.record.context.usage.output_tokens, 3);
+    assert_eq!(
+        service.list().await.unwrap()[0].info.title,
+        "Flaky websocket tests"
+    );
+    let requests = model.completion_requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].selection.model, "scripted-test-model");
+    assert!(
+        requests[0].messages[0]
+            .content
+            .contains("concise conversation title")
+    );
+    assert!(
+        requests[0].messages[1]
+            .content
+            .contains("flaky websocket tests")
+    );
+}
+
+#[tokio::test]
+async fn explicitly_named_session_keeps_its_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::text("done")]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
+    agent.prompt(EndpointId::new(), "rename me").await.unwrap();
+    wait_for_turn_end(&mut subscription.events).await;
+
+    assert_eq!(
+        agent
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record
+            .info
+            .title,
+        "test"
+    );
+    assert!(model.completion_requests().await.is_empty());
 }
 
 #[tokio::test]
@@ -121,6 +226,7 @@ async fn reasoning_and_answer_deltas_are_broadcast_separately() {
 
     let mut reasoning = String::new();
     let mut answer = String::new();
+    let mut committed = None;
     loop {
         let event = subscription.events.recv().await.unwrap();
         match event.payload {
@@ -128,12 +234,22 @@ async fn reasoning_and_answer_deltas_are_broadcast_separately() {
                 reasoning.push_str(&delta)
             }
             SessionEventPayload::AssistantDelta { delta, .. } => answer.push_str(&delta),
+            SessionEventPayload::AssistantCompleted {
+                content,
+                reasoning,
+                tool_calls,
+                ..
+            } => committed = Some((content, reasoning, tool_calls)),
             SessionEventPayload::TurnCompleted { .. } => break,
             _ => {}
         }
     }
     assert_eq!(reasoning, "inspect first");
     assert_eq!(answer, "done");
+    let (content, committed_reasoning, tool_calls) = committed.unwrap();
+    assert_eq!(content, "done");
+    assert_eq!(committed_reasoning.as_deref(), Some("inspect first"));
+    assert!(tool_calls.is_empty());
 }
 
 #[tokio::test]
@@ -674,7 +790,8 @@ async fn prompt_is_stable_while_agents_changes_are_appended_as_watcher_messages(
     .unwrap();
     let agent = service
         .create(NewSession {
-            title: "profile test".to_string(),
+            id: None,
+            title: Some("profile test".to_string()),
             cwd: cwd.clone(),
             mode: SessionMode::FullAccess,
             llm: SessionLlmSettings::default(),

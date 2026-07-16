@@ -1,3 +1,4 @@
+mod automation;
 mod channels;
 mod cli;
 mod host;

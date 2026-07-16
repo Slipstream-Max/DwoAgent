@@ -51,6 +51,10 @@ dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
 dwo mcp auth status <server>
 dwo mcp auth logout <server>
+dwo automation list [--json]
+dwo automation status [--json]
+dwo automation run <job> [--json]
+dwo automation history [job] [--limit 20] [--json]
 dwo acp
 ```
 
@@ -142,3 +146,31 @@ External prompts use interrupt semantics: an active turn is cancelled, the
 host waits for its terminal event, and then starts the replacement turn. The
 origin endpoint does not receive its own prompt notification; every other
 observer does.
+
+## Automation
+
+The daemon watches the `automation` section in `profile.yaml`. Jobs use a
+standard five-field cron expression and either create a fresh session for every
+run or target a fixed session. A fixed-session run intentionally uses the same
+prompt semantics as an interactive interruption: an active turn is cancelled,
+then the automation prompt starts.
+
+Automation is unattended. Tool confirmation requests are denied automatically
+instead of waiting forever. Run records are stored under
+`runtime/automation/<job>/runs/`; they contain the selected session, turn,
+terminal status, final assistant response, and error. Channel notification is
+not part of the automation runtime.
+
+```yaml
+automation:
+  enabled: true
+  jobs:
+    - name: daily-report
+      schedule:
+        cron: "0 9 * * *"
+        timezone: Asia/Shanghai
+      session:
+        mode: new
+        cwd: .
+      prompt: Summarize the current project status.
+```

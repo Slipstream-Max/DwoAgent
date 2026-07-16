@@ -17,6 +17,8 @@ pub struct AgentProfileConfig {
     pub model: AgentModelConfig,
     #[serde(default)]
     pub channels: BTreeMap<String, serde_yaml::Value>,
+    #[serde(default)]
+    pub automation: serde_yaml::Value,
 }
 
 #[derive(Debug, Clone)]

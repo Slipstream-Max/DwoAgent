@@ -8,6 +8,7 @@ use dwo_mcp::{Catalog, CatalogServer, CatalogTool, SearchGroup, ShowResult};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::automation::{AutomationJobStatus, AutomationRunRecord};
 use crate::channels::{self, WeixinLoginProgress};
 use crate::host;
 use crate::local::{acp, ipc};
@@ -47,6 +48,10 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
+    },
+    Automation {
+        #[command(subcommand)]
+        command: AutomationCommand,
     },
     Acp,
 }
@@ -155,6 +160,30 @@ enum McpSearchCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum AutomationCommand {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Run {
+        job: String,
+        #[arg(long)]
+        json: bool,
+    },
+    History {
+        job: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 pub(crate) async fn run() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config_path.unwrap_or(default_config_path()?);
@@ -199,7 +228,79 @@ pub(crate) async fn run() -> Result<()> {
         Command::Session { command } => run_session(command, &config_path).await?,
         Command::Channel { command } => run_channel(command, &config_path).await?,
         Command::Mcp { command } => run_mcp(command, &config_path).await?,
+        Command::Automation { command } => run_automation(command, &config_path).await?,
         Command::Acp => acp::run(config_path).await?,
+    }
+    Ok(())
+}
+
+async fn run_automation(command: AutomationCommand, config_path: &Path) -> Result<()> {
+    match command {
+        AutomationCommand::List { json } | AutomationCommand::Status { json } => {
+            let value = ipc::request(config_path, "automation.list", json!({})).await?;
+            if json {
+                print_value(&value)?;
+            } else {
+                let jobs: Vec<AutomationJobStatus> = serde_json::from_value(value)?;
+                if jobs.is_empty() {
+                    println!("No automation jobs configured");
+                }
+                for status in jobs {
+                    let next = status.next_run_at.as_deref().unwrap_or("disabled");
+                    let active = if status.active_runs.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" active={}", status.active_runs.len())
+                    };
+                    println!("{}  next={}{}", status.job.name, next, active);
+                }
+            }
+        }
+        AutomationCommand::Run { job, json } => {
+            let value = ipc::request(config_path, "automation.run", json!({"job": job})).await?;
+            if json {
+                print_value(&value)?;
+            } else {
+                let record: AutomationRunRecord = serde_json::from_value(value)?;
+                println!(
+                    "{}  {:?}  session={}",
+                    record.job,
+                    record.status,
+                    record.session_id.as_deref().unwrap_or("-")
+                );
+                if let Some(error) = record.error {
+                    println!("error: {error}");
+                }
+                if !record.response.is_empty() {
+                    println!("\n{}", record.response);
+                }
+            }
+        }
+        AutomationCommand::History { job, limit, json } => {
+            let value = ipc::request(
+                config_path,
+                "automation.history",
+                json!({"job": job, "limit": limit}),
+            )
+            .await?;
+            if json {
+                print_value(&value)?;
+            } else {
+                let records: Vec<AutomationRunRecord> = serde_json::from_value(value)?;
+                if records.is_empty() {
+                    println!("No automation runs recorded");
+                }
+                for record in records {
+                    println!(
+                        "{}  {}  {:?}  session={}",
+                        record.started_at,
+                        record.job,
+                        record.status,
+                        record.session_id.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -673,6 +774,9 @@ channels:
     streamMode: answer
     replayTurns: 5
     markdownFilter: true
+automation:
+  enabled: false
+  jobs: []
 model:
   defaultModelId: deepseek-v4-pro
   providers:
@@ -739,6 +843,37 @@ mod tests {
                     json: false,
                 }
             } if action_or_server == "status" && server == "github"
+        ));
+    }
+
+    #[test]
+    fn parses_automation_commands() {
+        let run = Cli::try_parse_from(["dwo", "automation", "run", "daily-report"]).unwrap();
+        assert!(matches!(
+            run.command,
+            Command::Automation {
+                command: AutomationCommand::Run { ref job, json: false }
+            } if job == "daily-report"
+        ));
+
+        let history = Cli::try_parse_from([
+            "dwo",
+            "automation",
+            "history",
+            "daily-report",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            history.command,
+            Command::Automation {
+                command: AutomationCommand::History {
+                    job: Some(ref job),
+                    limit: 5,
+                    json: false,
+                }
+            } if job == "daily-report"
         ));
     }
 }

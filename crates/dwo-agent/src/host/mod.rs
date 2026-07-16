@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::automation::{AutomationRuntime, parse_config as parse_automation_config};
 use crate::channels::{ChannelManager, GatewayHub, WeixinLoginProgress};
 
 pub struct Host {
@@ -19,6 +20,7 @@ pub struct Host {
     pub channels: Arc<ChannelManager>,
     pub gateway: Arc<GatewayHub>,
     pub mcp: Arc<McpRuntime>,
+    pub automation: Arc<AutomationRuntime>,
     profile_root: PathBuf,
     default_model: String,
     default_mode: dwo_tools::SessionMode,
@@ -101,6 +103,18 @@ struct McpAuthParam {
     server: String,
 }
 
+#[derive(Deserialize)]
+struct AutomationJobParam {
+    job: String,
+}
+
+#[derive(Deserialize)]
+struct AutomationHistoryParam {
+    job: Option<String>,
+    #[serde(default = "default_history_limit")]
+    limit: usize,
+}
+
 impl Host {
     pub async fn load(config_path: &Path) -> Result<Arc<Self>> {
         let profile_root = profile_root(config_path)?;
@@ -109,6 +123,7 @@ impl Host {
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
+        let automation_config = parse_automation_config(profile.config.automation.clone())?;
         let repository = Arc::new(FsSessionRepository::new(profile_root.join("sessions")).await?);
         let channels =
             Arc::new(ChannelManager::new(&profile_root, &profile.config.channels).await?);
@@ -117,18 +132,29 @@ impl Host {
             profile,
             PolicyConfig::default(),
         )?);
+        let shutdown = CancellationToken::new();
+        let automation = AutomationRuntime::new(
+            service.clone(),
+            profile_root.clone(),
+            automation_config,
+            default_model.clone(),
+            default_mode,
+            shutdown.clone(),
+        )?;
         let host = Arc::new(Self {
             service,
             channels,
             gateway: Arc::new(GatewayHub::new()),
             mcp,
+            automation,
             profile_root,
             default_model,
             default_mode,
-            shutdown: CancellationToken::new(),
+            shutdown,
         });
         host.gateway.start_all(host.clone()).await;
         host.start_mcp_watcher();
+        host.automation.start();
         Ok(host)
     }
 
@@ -143,6 +169,7 @@ impl Host {
                 "profile_root": self.profile_root,
                 "sessions": self.service.list().await?.len(),
                 "channels": self.channels.list().await?.len(),
+                "automationJobs": self.automation.list().await.len(),
             })),
             "daemon.shutdown" => {
                 self.shutdown.cancel();
@@ -216,6 +243,22 @@ impl Host {
                     )
                     .await?;
                 Ok(json!({"resolved": true}))
+            }
+            "automation.list" | "automation.status" => {
+                Ok(serde_json::to_value(self.automation.list().await)?)
+            }
+            "automation.run" => {
+                let params: AutomationJobParam = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(
+                    self.automation.run_now(&params.job).await?,
+                )?)
+            }
+            "automation.history" => {
+                let params: AutomationHistoryParam = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(self.automation.history(
+                    params.job.as_deref(),
+                    params.limit.clamp(1, 1000),
+                )?)?)
             }
             "channel.list" => Ok(serde_json::to_value(self.channels.list().await?)?),
             "channel.weixin.status" => {
@@ -362,6 +405,10 @@ impl Host {
         let endpoint = EndpointId::parse(endpoint_id.to_string()).map_err(anyhow::Error::msg)?;
         Ok(self.service.load(&id).await?.attach(endpoint).await?)
     }
+}
+
+fn default_history_limit() -> usize {
+    20
 }
 
 fn parse_session(params: Value) -> Result<SessionId> {

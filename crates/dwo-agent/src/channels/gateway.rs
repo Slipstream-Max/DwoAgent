@@ -18,7 +18,7 @@ use weixin_agent::{
 
 use crate::host::Host;
 
-use super::manager::{ChannelState, StreamMode};
+use super::manager::ChannelState;
 
 pub struct GatewayHub {
     active: Mutex<Option<ActiveChannel>>,
@@ -64,7 +64,6 @@ impl GatewayHub {
         let handler = WeixinHandler {
             host: host.clone(),
             bound_user_id: runtime.secret.bound_user_id,
-            default_stream_mode: runtime.config.stream_mode,
             replay_turns: runtime.config.replay_turns,
             media_input: runtime.config.media_input,
             state: state.clone(),
@@ -150,7 +149,6 @@ impl GatewayHub {
 struct WeixinHandler {
     host: Arc<Host>,
     bound_user_id: String,
-    default_stream_mode: StreamMode,
     replay_turns: usize,
     media_input: bool,
     state: Arc<Mutex<ChannelState>>,
@@ -222,8 +220,7 @@ impl WeixinHandler {
                 ctx.reply_text(
                     "/list /new [name] [--cwd <path>] /use <session> /status /del <session> /cancel\n\
                      /model <name> /reasoning <level|off> /policy [full_access|confirm|watch]\n\
-                     /allow <id> /deny <id>\n\
-                     /stream answer|full",
+                     /allow <id> /deny <id>",
                 )
                 .await?;
             }
@@ -271,14 +268,23 @@ impl WeixinHandler {
                 let agent = self.host.service.load(&session_id).await?;
                 self.select_session(id).await?;
                 let subscription = agent.attach(self.endpoint(&ctx.from)).await?;
-                ctx.reply_text(&render_replay(&subscription.snapshot, self.replay_turns))
-                    .await?;
+                let replay = render_replay_turns(
+                    &subscription.snapshot.record.context.transcript,
+                    self.replay_turns,
+                );
+                if replay.is_empty() {
+                    ctx.reply_text(&render_status(&subscription.snapshot))
+                        .await?;
+                } else {
+                    for turn in replay {
+                        reply_logical_message(ctx, &turn).await?;
+                    }
+                }
             }
             "/status" => {
                 let agent = self.selected_agent().await?;
                 let snapshot = agent.attach(self.endpoint(&ctx.from)).await?.snapshot;
-                ctx.reply_text(&render_replay(&snapshot, self.replay_turns))
-                    .await?;
+                ctx.reply_text(&render_status(&snapshot)).await?;
             }
             "/del" => {
                 let id = args.next().context("usage: /del <session>")?;
@@ -354,18 +360,6 @@ impl WeixinHandler {
                         },
                     )
                     .await?;
-                ctx.reply_text("Permission resolved").await?;
-            }
-            "/stream" => {
-                let mode = match args.next() {
-                    Some("answer") => StreamMode::Answer,
-                    Some("full") => StreamMode::Full,
-                    _ => bail!("usage: /stream answer|full"),
-                };
-                let mut state = self.state.lock().await;
-                state.stream_mode = Some(mode);
-                self.host.channels.save_state(&state).await?;
-                ctx.reply_text("Stream mode updated").await?;
             }
             _ => bail!("unknown command: {command}"),
         }
@@ -495,15 +489,7 @@ impl WeixinHandler {
             .cloned()
             .context("Weixin client is not ready")?;
         let target = self.bound_user_id.clone();
-        let state = self.state.clone();
-        let default_mode = self.default_stream_mode;
-        let task = tokio::spawn(stream_session(
-            client,
-            target,
-            subscription,
-            state,
-            default_mode,
-        ));
+        let task = tokio::spawn(stream_session(client, target, subscription));
         *observer = Some(WeixinObserver { session_id, task });
         Ok(())
     }
@@ -782,46 +768,28 @@ async fn stream_session(
     client: Arc<WeixinClient>,
     target: String,
     mut subscription: dwo_agent_service::SessionSubscription,
-    state: Arc<Mutex<ChannelState>>,
-    default_mode: StreamMode,
 ) {
     let mut stream = WeixinStreamState::default();
     loop {
         let Some(event) = subscription.events.recv().await else {
             break;
         };
-        let mode = state.lock().await.stream_mode.unwrap_or(default_mode);
         match event.payload {
-            SessionEventPayload::AssistantReasoningDelta { delta, .. } => {
-                stream.reasoning.push(&delta);
-                if matches!(mode, StreamMode::Full) {
-                    for reasoning in stream.reasoning.drain_ready() {
-                        send(&client, &target, &render_reasoning(&reasoning)).await;
-                    }
-                }
-            }
             SessionEventPayload::AssistantCompleted {
                 content,
-                reasoning,
                 tool_calls,
                 ..
             } => {
-                if matches!(mode, StreamMode::Full) {
-                    if let Some(reasoning) = stream.reasoning.finish(reasoning.as_deref()) {
-                        send(&client, &target, &render_reasoning(&reasoning)).await;
-                    }
-                } else {
-                    stream.reasoning.reset();
-                }
-                if !content.trim().is_empty() {
-                    send(&client, &target, &content).await;
-                }
+                stream.remember_response(content);
                 for call in tool_calls {
                     stream.remember_tool(call);
                 }
             }
             SessionEventPayload::ToolStarted { call, .. } => stream.remember_tool(call),
             SessionEventPayload::PermissionRequested { permission, .. } => {
+                if !stream.mark_permission_sent(&permission.tool_call_id) {
+                    continue;
+                }
                 let call = stream
                     .tool(&permission.tool_call_id)
                     .cloned()
@@ -830,59 +798,61 @@ async fn stream_session(
                         tool_name: permission.tool_name.clone(),
                         raw_input: serde_json::Value::Null,
                     });
-                send(
+                send_logical_message(
                     &client,
                     &target,
                     &render_tool_call(&call, "request id", &permission.request_id),
                 )
                 .await;
-                stream.mark_tool_displayed(&permission.tool_call_id);
             }
             SessionEventPayload::ToolCompleted { result, .. } => {
-                if matches!(mode, StreamMode::Full)
-                    && let Some(call) = stream.take_undisplayed_tool(&result.tool_call_id)
-                {
-                    send(
-                        &client,
-                        &target,
-                        &render_tool_call(&call, "tool call id", &call.tool_call_id),
-                    )
-                    .await;
-                } else {
-                    stream.forget_tool(&result.tool_call_id);
-                }
+                stream.forget_tool(&result.tool_call_id);
             }
             SessionEventPayload::TurnCompleted { .. } => {
-                if matches!(mode, StreamMode::Full)
-                    && let Some(reasoning) = stream.reasoning.finish(None)
-                {
-                    send(&client, &target, &render_reasoning(&reasoning)).await;
+                if let Some(response) = stream.take_response() {
+                    send_logical_message(&client, &target, &response).await;
                 }
                 stream.finish_turn();
             }
             SessionEventPayload::TurnCancelled { .. } => {
+                stream.remember_response("Turn cancelled".to_string());
+                if let Some(response) = stream.take_response() {
+                    send_logical_message(&client, &target, &response).await;
+                }
                 stream.finish_turn();
-                send(&client, &target, "Turn cancelled").await;
             }
             SessionEventPayload::TurnFailed { error, .. } => {
+                stream.remember_response(format!("Turn failed: {error}"));
+                if let Some(response) = stream.take_response() {
+                    send_logical_message(&client, &target, &response).await;
+                }
                 stream.finish_turn();
-                send(&client, &target, &format!("Turn failed: {error}")).await;
             }
             _ => {}
         }
     }
 }
 
-const REASONING_CHUNK_CHARS: usize = 200;
-
 #[derive(Default)]
 struct WeixinStreamState {
-    reasoning: ReasoningBuffer,
+    responses: Vec<String>,
     tools: HashMap<String, dwo_agent_service::ActiveToolCall>,
-    displayed_tools: HashSet<String>,
+    permission_messages: HashSet<String>,
 }
 
 impl WeixinStreamState {
+    fn remember_response(&mut self, content: String) {
+        let content = content.trim();
+        if !content.is_empty() {
+            self.responses.push(content.to_string());
+        }
+    }
+
+    fn take_response(&mut self) -> Option<String> {
+        let response = std::mem::take(&mut self.responses).join("\n\n");
+        (!response.is_empty()).then_some(response)
+    }
+
     fn remember_tool(&mut self, call: dwo_agent_service::ActiveToolCall) {
         self.tools.entry(call.tool_call_id.clone()).or_insert(call);
     }
@@ -891,102 +861,20 @@ impl WeixinStreamState {
         self.tools.get(tool_call_id)
     }
 
-    fn mark_tool_displayed(&mut self, tool_call_id: &str) {
-        self.displayed_tools.insert(tool_call_id.to_string());
-    }
-
-    fn take_undisplayed_tool(
-        &mut self,
-        tool_call_id: &str,
-    ) -> Option<dwo_agent_service::ActiveToolCall> {
-        let call = self.tools.remove(tool_call_id);
-        (!self.displayed_tools.remove(tool_call_id))
-            .then_some(call)
-            .flatten()
+    fn mark_permission_sent(&mut self, tool_call_id: &str) -> bool {
+        self.permission_messages.insert(tool_call_id.to_string())
     }
 
     fn forget_tool(&mut self, tool_call_id: &str) {
         self.tools.remove(tool_call_id);
-        self.displayed_tools.remove(tool_call_id);
+        self.permission_messages.remove(tool_call_id);
     }
 
     fn finish_turn(&mut self) {
-        self.reasoning.reset();
+        self.responses.clear();
         self.tools.clear();
-        self.displayed_tools.clear();
+        self.permission_messages.clear();
     }
-}
-
-#[derive(Default)]
-struct ReasoningBuffer {
-    received: String,
-    pending: String,
-}
-
-impl ReasoningBuffer {
-    fn push(&mut self, delta: &str) {
-        self.received.push_str(delta);
-        self.pending.push_str(delta);
-    }
-
-    fn drain_ready(&mut self) -> Vec<String> {
-        let mut chunks = Vec::new();
-        while self.pending.chars().count() >= REASONING_CHUNK_CHARS {
-            let Some(boundary) =
-                sentence_boundary_at_or_after(&self.pending, REASONING_CHUNK_CHARS)
-            else {
-                break;
-            };
-            let tail = self.pending.split_off(boundary);
-            let chunk = std::mem::replace(&mut self.pending, tail);
-            if !chunk.trim().is_empty() {
-                chunks.push(chunk);
-            }
-        }
-        chunks
-    }
-
-    fn finish(&mut self, committed: Option<&str>) -> Option<String> {
-        if let Some(committed) = committed.filter(|text| !text.is_empty()) {
-            if self.received.is_empty() {
-                self.received.push_str(committed);
-                self.pending.push_str(committed);
-            } else if let Some(suffix) = committed.strip_prefix(&self.received) {
-                self.received.push_str(suffix);
-                self.pending.push_str(suffix);
-            }
-        }
-        let remaining = std::mem::take(&mut self.pending);
-        self.received.clear();
-        (!remaining.trim().is_empty()).then_some(remaining)
-    }
-
-    fn reset(&mut self) {
-        self.received.clear();
-        self.pending.clear();
-    }
-}
-
-fn sentence_boundary_at_or_after(text: &str, threshold: usize) -> Option<usize> {
-    let mut count = 0usize;
-    let mut chars = text.char_indices().peekable();
-    while let Some((offset, character)) = chars.next() {
-        count += 1;
-        if count < threshold {
-            continue;
-        }
-        let next = chars.peek().map(|(_, character)| *character);
-        let is_boundary = matches!(character, '。' | '！' | '？' | '\n')
-            || (matches!(character, '.' | '!' | '?') && next.is_some_and(char::is_whitespace));
-        if is_boundary {
-            return Some(offset + character.len_utf8());
-        }
-    }
-    None
-}
-
-fn render_reasoning(reasoning: &str) -> String {
-    format!("💡Reasoning:\n{}", fenced(reasoning.trim()))
 }
 
 fn render_tool_call(call: &dwo_agent_service::ActiveToolCall, id_label: &str, id: &str) -> String {
@@ -1024,6 +912,47 @@ fn fenced(content: &str) -> String {
     format!("{fence}\n{content}\n{fence}")
 }
 
+const WEIXIN_TEXT_CHUNK_CHARS: usize = 4000;
+
+fn split_logical_message(text: &str) -> Vec<String> {
+    let mut remaining = text.trim();
+    let mut chunks = Vec::new();
+    while remaining.chars().count() > WEIXIN_TEXT_CHUNK_CHARS {
+        let hard_boundary = remaining
+            .char_indices()
+            .nth(WEIXIN_TEXT_CHUNK_CHARS)
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        let preferred_boundary = remaining[..hard_boundary]
+            .rfind("\n\n")
+            .map(|index| index + 2)
+            .filter(|index| remaining[..*index].chars().count() >= WEIXIN_TEXT_CHUNK_CHARS / 2);
+        let boundary = preferred_boundary.unwrap_or(hard_boundary);
+        let chunk = remaining[..boundary].trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk.to_string());
+        }
+        remaining = remaining[boundary..].trim_start();
+    }
+    if !remaining.is_empty() {
+        chunks.push(remaining.to_string());
+    }
+    chunks
+}
+
+async fn send_logical_message(client: &WeixinClient, target: &str, text: &str) {
+    for chunk in split_logical_message(text) {
+        send(client, target, &chunk).await;
+    }
+}
+
+async fn reply_logical_message(ctx: &MessageContext, text: &str) -> Result<()> {
+    for chunk in split_logical_message(text) {
+        ctx.reply_text(&chunk).await?;
+    }
+    Ok(())
+}
+
 async fn send(client: &WeixinClient, target: &str, text: &str) {
     let context_token = client.context_tokens().get(target);
     if let Err(error) = client
@@ -1034,7 +963,7 @@ async fn send(client: &WeixinClient, target: &str, text: &str) {
     }
 }
 
-fn render_replay(snapshot: &dwo_agent_service::SessionSnapshot, turns: usize) -> String {
+fn render_status(snapshot: &dwo_agent_service::SessionSnapshot) -> String {
     let mut lines = vec![format!(
         "Session: {}\nCwd: {}\nPolicy: {}\nModel: {}\nReasoning: {}\nState: {:?}",
         snapshot.record.info.title,
@@ -1049,24 +978,6 @@ fn render_replay(snapshot: &dwo_agent_service::SessionSnapshot, turns: usize) ->
             .unwrap_or("default"),
         snapshot.phase,
     )];
-    let transcript = &snapshot.record.context.transcript;
-    let start = transcript.len().saturating_sub(turns.saturating_mul(2));
-    for item in &transcript[start..] {
-        match item {
-            TranscriptItem::User { content, .. } => lines.push(format!("You: {content}")),
-            TranscriptItem::Assistant { content, .. } => {
-                lines.push(format!("Assistant: {content}"))
-            }
-            TranscriptItem::Tool { result, .. } => {
-                let status = result
-                    .output
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("completed");
-                lines.push(format!("Tool {}: {status}", result.tool_name));
-            }
-        }
-    }
     if !snapshot.partial_message.is_empty() {
         lines.push(format!("Current: {}", snapshot.partial_message));
     }
@@ -1076,34 +987,123 @@ fn render_replay(snapshot: &dwo_agent_service::SessionSnapshot, turns: usize) ->
     lines.join("\n")
 }
 
+struct ReplayTurn {
+    turn_id: dwo_agent_service::TurnId,
+    prompts: Vec<String>,
+    responses: Vec<String>,
+}
+
+fn render_replay_turns(transcript: &[TranscriptItem], turns: usize) -> Vec<String> {
+    let mut grouped = Vec::<ReplayTurn>::new();
+    for item in transcript {
+        let turn_id = match item {
+            TranscriptItem::User { turn_id, .. }
+            | TranscriptItem::Assistant { turn_id, .. }
+            | TranscriptItem::Tool { turn_id, .. } => turn_id,
+        };
+        if grouped.last().is_none_or(|turn| turn.turn_id != *turn_id) {
+            grouped.push(ReplayTurn {
+                turn_id: turn_id.clone(),
+                prompts: Vec::new(),
+                responses: Vec::new(),
+            });
+        }
+        let turn = grouped.last_mut().expect("replay turn was just inserted");
+        match item {
+            TranscriptItem::User { content, .. } => turn.prompts.push(content.to_string()),
+            TranscriptItem::Assistant { content, .. } if !content.trim().is_empty() => {
+                turn.responses.push(content.trim().to_string());
+            }
+            TranscriptItem::Assistant { .. } | TranscriptItem::Tool { .. } => {}
+        }
+    }
+
+    let rendered = grouped
+        .into_iter()
+        .filter_map(|turn| {
+            if turn.prompts.is_empty() && turn.responses.is_empty() {
+                return None;
+            }
+            let mut sections = Vec::new();
+            if !turn.prompts.is_empty() {
+                sections.push(format!("User:\n{}", turn.prompts.join("\n\n")));
+            }
+            if !turn.responses.is_empty() {
+                sections.push(format!("Assistant:\n{}", turn.responses.join("\n\n")));
+            }
+            Some(sections.join("\n\n"))
+        })
+        .collect::<Vec<_>>();
+    rendered[rendered.len().saturating_sub(turns)..].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn reasoning_chunks_wait_for_two_hundred_chars_and_a_sentence_end() {
-        let mut buffer = ReasoningBuffer::default();
-        buffer.push(&"思".repeat(REASONING_CHUNK_CHARS));
-        assert!(buffer.drain_ready().is_empty());
+    fn responses_are_buffered_in_commit_order() {
+        let mut stream = WeixinStreamState::default();
+        stream.remember_response("先检查项目".to_string());
+        stream.remember_response("  ".to_string());
+        stream.remember_response("检查完成".to_string());
 
-        buffer.push("。后续");
-        let chunks = buffer.drain_ready();
         assert_eq!(
-            chunks,
-            vec![format!("{}。", "思".repeat(REASONING_CHUNK_CHARS))]
+            stream.take_response().as_deref(),
+            Some("先检查项目\n\n检查完成")
         );
-        assert_eq!(buffer.finish(None).as_deref(), Some("后续"));
+        assert_eq!(stream.take_response(), None);
     }
 
     #[test]
-    fn reasoning_completion_reconciles_unstreamed_suffix() {
-        let mut buffer = ReasoningBuffer::default();
-        buffer.push("已经收到");
+    fn replay_groups_user_and_responses_by_turn() {
+        let first = dwo_agent_service::TurnId::new();
+        let second = dwo_agent_service::TurnId::new();
+        let transcript = vec![
+            TranscriptItem::User {
+                turn_id: first.clone(),
+                content: MessageContent::text("first question"),
+            },
+            TranscriptItem::Assistant {
+                turn_id: first.clone(),
+                content: "intermediate".to_string(),
+            },
+            TranscriptItem::Assistant {
+                turn_id: first,
+                content: "first answer".to_string(),
+            },
+            TranscriptItem::User {
+                turn_id: second.clone(),
+                content: MessageContent::text("second question"),
+            },
+            TranscriptItem::Assistant {
+                turn_id: second,
+                content: "second answer".to_string(),
+            },
+        ];
 
         assert_eq!(
-            buffer.finish(Some("已经收到完整结尾")).as_deref(),
-            Some("已经收到完整结尾")
+            render_replay_turns(&transcript, 1),
+            vec!["User:\nsecond question\n\nAssistant:\nsecond answer"]
+        );
+        assert_eq!(
+            render_replay_turns(&transcript, 10)[0],
+            "User:\nfirst question\n\nAssistant:\nintermediate\n\nfirst answer"
+        );
+    }
+
+    #[test]
+    fn logical_messages_split_at_four_thousand_unicode_characters() {
+        let text = format!("{}\n\n{}", "前".repeat(3_000), "后".repeat(2_000));
+        let chunks = split_logical_message(&text);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), 3_000);
+        assert_eq!(chunks[1].chars().count(), 2_000);
+        assert_eq!(
+            chunks.concat(),
+            format!("{}{}", "前".repeat(3_000), "后".repeat(2_000))
         );
     }
 

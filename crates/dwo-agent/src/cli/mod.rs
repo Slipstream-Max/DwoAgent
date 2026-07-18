@@ -758,7 +758,6 @@ policyMode: confirm
 channels:
   weixin:
     enabled: true
-    streamMode: answer
     replayTurns: 5
     markdownFilter: true
 automation:

@@ -87,7 +87,6 @@ starts:
 channels:
   weixin:
     enabled: true
-    streamMode: answer
     replayTurns: 5
     markdownFilter: true
     mediaInput: true
@@ -97,8 +96,12 @@ channels:
 `secret.yaml` stores the QR-login credentials. Both files are daemon-owned;
 there is no per-channel generated configuration file.
 
+`replayTurns` is limited to 10. After `/use`, each replayed turn combines the
+user prompt and every non-empty assistant response into one message; tool
+results are omitted. `/status` reports only current session state.
+
 `status` reports whether the channel is configured and bound, the bound user
-ID, the selected session, and the effective stream mode. `connected` means
+ID, and the selected session. `connected` means
 that persisted credentials exist and validate; it is not a live network
 health check. `send-message` and `send-file` always target the bound user and use
 that user's current context token.
@@ -109,11 +112,11 @@ resource link containing the local path, MIME type, name, and size. A
 media-only message is a valid prompt. Sessions created without an explicit
 cwd use `runtime/workspaces/<session-id>` instead of the daemon process cwd.
 
-The Weixin slash commands include `/new [name] [--cwd <path>]`, `/policy
-[full_access|confirm|watch]`, and `/stream answer|full`. Full mode emits
-reasoning in complete sentence chunks after at least 200 characters, renders
-terminal commands or file-edit patches with permission request IDs, and sends
-each committed assistant response as one message.
+The Weixin slash commands include `/new [name] [--cwd <path>]` and `/policy
+[full_access|confirm|watch]`. Assistant responses are buffered for the whole
+turn, joined in commit order, and split only when the combined text exceeds
+4,000 characters. Tool calls are sent immediately only when confirmation is
+required, together with the permission request ID.
 
 When Weixin is enabled and bound, the context builder adds a concise channel
 capability block to the system prompt. Binding and unbinding changes are

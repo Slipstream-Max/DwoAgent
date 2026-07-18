@@ -10,18 +10,10 @@ use weixin_agent::{LoginStatus, QrLoginSession, StandaloneQrLogin, WeixinConfig}
 
 const WEIXIN_CHANNEL: &str = "weixin";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamMode {
-    Answer,
-    Full,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WeixinChannelConfig {
     pub enabled: bool,
-    pub stream_mode: StreamMode,
     pub replay_turns: usize,
     pub markdown_filter: bool,
     #[serde(default = "default_true")]
@@ -34,8 +26,8 @@ fn default_true() -> bool {
 
 impl WeixinChannelConfig {
     fn validate(&self) -> Result<()> {
-        if self.replay_turns > 100 {
-            bail!("channels.weixin.replayTurns must be at most 100");
+        if self.replay_turns > 10 {
+            bail!("channels.weixin.replayTurns must be at most 10");
         }
         Ok(())
     }
@@ -45,7 +37,6 @@ impl WeixinChannelConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChannelState {
     pub selected_session_id: Option<String>,
-    pub stream_mode: Option<StreamMode>,
     pub sync_buf: Option<String>,
     pub last_event_seq: u64,
     pub context_tokens: HashMap<String, String>,
@@ -88,7 +79,6 @@ pub struct ChannelSummary {
     pub enabled: bool,
     pub connected: bool,
     pub selected_session_id: Option<String>,
-    pub stream_mode: StreamMode,
     pub bound_user_id: Option<String>,
 }
 
@@ -163,7 +153,6 @@ impl ChannelManager {
             enabled: config.enabled,
             connected,
             selected_session_id: state.selected_session_id,
-            stream_mode: state.stream_mode.unwrap_or(config.stream_mode),
             bound_user_id,
         }])
     }
@@ -356,7 +345,6 @@ mod tests {
         let profile = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 enabled: true
-streamMode: answer
 replayTurns: 5
 markdownFilter: true
 "#,
@@ -378,7 +366,6 @@ markdownFilter: true
         let profile = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 enabled: true
-streamMode: answer
 replayTurns: 5
 markdownFilter: true
 flushIntervalMs: 10
@@ -396,11 +383,30 @@ flushIntervalMs: 10
     }
 
     #[tokio::test]
+    async fn replay_turns_cannot_exceed_weixin_message_budget() {
+        let profile = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+enabled: true
+replayTurns: 11
+markdownFilter: true
+"#,
+        )
+        .unwrap();
+        let channels = BTreeMap::from([(WEIXIN_CHANNEL.to_string(), profile)]);
+        let root = tempfile::tempdir().unwrap();
+        let error = ChannelManager::new(root.path(), &channels)
+            .await
+            .err()
+            .expect("replay limit should fail validation");
+
+        assert!(format!("{error:#}").contains("replayTurns must be at most 10"));
+    }
+
+    #[tokio::test]
     async fn runtime_state_is_persisted_as_yaml_with_context_tokens() {
         let profile = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 enabled: true
-streamMode: full
 replayTurns: 3
 markdownFilter: false
 "#,
@@ -423,6 +429,7 @@ markdownFilter: false
             .unwrap();
         assert!(source.contains("syncBuf: cursor"));
         assert!(source.contains("contextTokens:"));
+        assert!(!source.contains("streamMode"));
         assert!(!manager.root.join("state.json").exists());
     }
 }

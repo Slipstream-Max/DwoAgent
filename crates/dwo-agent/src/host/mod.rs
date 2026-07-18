@@ -207,7 +207,11 @@ impl Host {
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
                 let agent = self.create_session(params.title, params.cwd).await?;
-                Ok(json!({"session_id": agent.id()}))
+                let snapshot = agent.snapshot().await?;
+                Ok(json!({
+                    "session_id": agent.id(),
+                    "usage": snapshot.usage,
+                }))
             }
             "session.delete" => {
                 let id = parse_session(params)?;
@@ -240,10 +244,14 @@ impl Host {
                     .value
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("model must be a string"))?;
-                self.service
-                    .set_config(&id, SessionConfigUpdate::Model(model.to_string()))
+                let agent = self.service.load(&id).await?;
+                agent
+                    .set_config(SessionConfigUpdate::Model(model.to_string()))
                     .await?;
-                Ok(json!({"updated": true}))
+                Ok(json!({
+                    "updated": true,
+                    "usage": agent.snapshot().await?.usage,
+                }))
             }
             "session.set_reasoning" => {
                 let params: ConfigParam = serde_json::from_value(params)?;
@@ -277,8 +285,12 @@ impl Host {
                     }
                     other => anyhow::bail!("unknown session config option: {other}"),
                 };
-                self.service.set_config(&id, update).await?;
-                Ok(json!({"updated": true}))
+                let agent = self.service.load(&id).await?;
+                agent.set_config(update).await?;
+                Ok(json!({
+                    "updated": true,
+                    "usage": agent.snapshot().await?.usage,
+                }))
             }
             "session.options" => {
                 let id = parse_session(params)?;

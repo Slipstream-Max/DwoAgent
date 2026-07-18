@@ -10,10 +10,9 @@ use crate::{
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    /// Token count reported for the latest normal model response.
     #[serde(default)]
-    pub last_turn_input_tokens: u64,
+    pub current_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
 }
@@ -145,33 +144,13 @@ impl ContextManager {
             .push(TranscriptItem::Tool { turn_id, result });
     }
 
-    pub fn record_turn_usage(
-        &mut self,
-        model: impl Into<String>,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) {
-        self.add_usage(input_tokens, output_tokens);
-        self.context.usage.last_turn_input_tokens = input_tokens;
+    pub fn record_turn_usage(&mut self, model: impl Into<String>, total_tokens: u64) {
+        self.context.usage.current_tokens = total_tokens;
         self.context.usage.last_model = Some(model.into());
     }
 
-    pub fn record_auxiliary_usage(&mut self, input_tokens: u64, output_tokens: u64) {
-        self.add_usage(input_tokens, output_tokens);
-    }
-
-    fn add_usage(&mut self, input_tokens: u64, output_tokens: u64) {
-        self.context.usage.input_tokens =
-            self.context.usage.input_tokens.saturating_add(input_tokens);
-        self.context.usage.output_tokens = self
-            .context
-            .usage
-            .output_tokens
-            .saturating_add(output_tokens);
-    }
-
     pub fn should_compact(&self, trigger_tokens: u64) -> bool {
-        trigger_tokens > 0 && self.context.usage.last_turn_input_tokens >= trigger_tokens
+        trigger_tokens > 0 && self.context.usage.current_tokens >= trigger_tokens
     }
 
     /// Scan mutable profile/environment state at a model-step boundary.
@@ -194,7 +173,7 @@ impl ContextManager {
         planner.build(&self.context)
     }
 
-    /// Replace only model context. The transcript and cumulative usage remain unchanged.
+    /// Replace model context and clear the reported token count until the next model response.
     pub fn apply_compaction(
         &mut self,
         plan: CompactionPlan,
@@ -213,7 +192,7 @@ impl ContextManager {
         self.context.env_watcher = EnvWatcherState { baseline };
         self.context.compaction.count = self.context.compaction.count.saturating_add(1);
         self.context.compaction.summary = (!summary.is_empty()).then_some(summary);
-        self.context.usage.last_turn_input_tokens = 0;
+        self.context.usage.current_tokens = 0;
         Ok(())
     }
 }

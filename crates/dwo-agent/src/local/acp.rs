@@ -12,7 +12,7 @@ use agent_client_protocol::schema::{
     SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
     ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification,
@@ -67,8 +67,8 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let new_config = config_path.clone();
     let list_config = config_path.clone();
     let load_runtime = runtime.clone();
-    let prompt_runtime = runtime;
-    let set_config = config_path.clone();
+    let prompt_runtime = runtime.clone();
+    let set_runtime = runtime;
     let cancel_config = config_path;
 
     Agent
@@ -101,7 +101,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         .on_receive_request(
             async move |request: NewSessionRequest,
                         responder: Responder<NewSessionResponse>,
-                        _cx: ConnectionTo<Client>| {
+                        cx: ConnectionTo<Client>| {
                 match ipc::request(
                     &new_config,
                     "session.new",
@@ -112,9 +112,16 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                     Ok(value) => {
                         let id = value["session_id"].as_str().unwrap_or_default();
                         match session_config_options(&new_config, id).await {
-                            Ok(options) => responder.respond(
-                                NewSessionResponse::new(SessionId::new(id)).config_options(options),
-                            ),
+                            Ok(options) => {
+                                let result = responder.respond(
+                                    NewSessionResponse::new(SessionId::new(id))
+                                        .config_options(options),
+                                );
+                                if let Some((used, size)) = snapshot_usage(&value) {
+                                    send_usage_update(&cx, id, used, size);
+                                }
+                                result
+                            }
                             Err(error) => responder.respond_with_error(internal_error(error)),
                         }
                     }
@@ -197,12 +204,12 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         .on_receive_request(
             async move |request: SetSessionConfigOptionRequest,
                         responder: Responder<SetSessionConfigOptionResponse>,
-                        _cx: ConnectionTo<Client>| {
+                        cx: ConnectionTo<Client>| {
                 let session_id = request.session_id.to_string();
                 let config_id = request.config_id.to_string();
                 let value = request.value.to_string();
                 match ipc::request(
-                    &set_config,
+                    &set_runtime.config_path,
                     "session.set_config_option",
                     json!({
                         "session_id": session_id,
@@ -212,12 +219,24 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 )
                 .await
                 {
-                    Ok(_) => match session_config_options(&set_config, &session_id).await {
-                        Ok(options) => {
-                            responder.respond(SetSessionConfigOptionResponse::new(options))
+                    Ok(value) => {
+                        match session_config_options(&set_runtime.config_path, &session_id).await {
+                            Ok(options) => {
+                                let result =
+                                    responder.respond(SetSessionConfigOptionResponse::new(options));
+                                let observed =
+                                    set_runtime.observers.lock().await.contains_key(&session_id);
+                                if config_id == "model"
+                                    && !observed
+                                    && let Some((used, size)) = snapshot_usage(&value)
+                                {
+                                    send_usage_update(&cx, &session_id, used, size);
+                                }
+                                result
+                            }
+                            Err(error) => responder.respond_with_error(internal_error(error)),
                         }
-                        Err(error) => responder.respond_with_error(internal_error(error)),
-                    },
+                    }
                     Err(error) => responder.respond_with_error(internal_error(error)),
                 }
             },
@@ -437,6 +456,14 @@ fn handle_session_event(
                 }
                 Ok(())
             });
+        }
+        "usage_changed" => {
+            if let (Some(used), Some(size)) = (
+                payload.get("used").and_then(Value::as_u64),
+                payload.get("size").and_then(Value::as_u64),
+            ) {
+                send_usage_update(cx, session_id, used, size);
+            }
         }
         "title_changed" => {
             if let Some(title) = payload.get("title").and_then(Value::as_str) {
@@ -661,6 +688,17 @@ fn session_info_update(title: &str, updated_at_ms: Option<u64>) -> SessionUpdate
     SessionUpdate::SessionInfoUpdate(update)
 }
 
+fn send_usage_update(cx: &ConnectionTo<Client>, session_id: &str, used: u64, size: u64) {
+    let _ = cx.send_notification_to(
+        Client,
+        SessionNotification::new(SessionId::new(session_id), usage_update(used, size)),
+    );
+}
+
+fn usage_update(used: u64, size: u64) -> SessionUpdate {
+    SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
+}
+
 fn send_tool_started(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
     let tool = tool_started(payload);
     let _ = cx.send_notification_to(
@@ -773,10 +811,13 @@ fn text_content(text: String) -> Vec<ToolCallContent> {
 }
 
 fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
-    let Some(record) = value
-        .get("snapshot")
-        .and_then(|snapshot| snapshot.get("record"))
-    else {
+    let Some(snapshot) = value.get("snapshot") else {
+        return;
+    };
+    if let Some((used, size)) = snapshot_usage(snapshot) {
+        send_usage_update(cx, session_id, used, size);
+    }
+    let Some(record) = snapshot.get("record") else {
         return;
     };
     if let Some(title) = record
@@ -809,6 +850,11 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
             _ => {}
         }
     }
+}
+
+fn snapshot_usage(snapshot: &Value) -> Option<(u64, u64)> {
+    let usage = snapshot.get("usage")?;
+    Some((usage.get("used")?.as_u64()?, usage.get("size")?.as_u64()?))
 }
 
 fn prompt_text(prompt: &[ContentBlock]) -> String {
@@ -873,6 +919,25 @@ mod tests {
         assert_eq!(update["sessionUpdate"], "session_info_update");
         assert_eq!(update["title"], "Generated title");
         assert_eq!(update["updatedAt"], "42");
+    }
+
+    #[test]
+    fn usage_change_maps_to_acp_usage_update() {
+        let update = serde_json::to_value(usage_update(15, 200_000)).unwrap();
+        assert_eq!(update["sessionUpdate"], "usage_update");
+        assert_eq!(update["used"], 15);
+        assert_eq!(update["size"], 200_000);
+    }
+
+    #[test]
+    fn loaded_snapshot_exposes_persisted_usage() {
+        let snapshot = json!({
+            "usage": {
+                "used": 15,
+                "size": 200_000
+            }
+        });
+        assert_eq!(snapshot_usage(&snapshot), Some((15, 200_000)));
     }
 
     #[test]

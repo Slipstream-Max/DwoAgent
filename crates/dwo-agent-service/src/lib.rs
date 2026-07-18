@@ -27,7 +27,7 @@ pub use dwo_tools::{ConfirmationDecision, ConfirmationRequest, SessionMode};
 pub use error::AgentServiceError;
 pub use events::{
     ActiveToolCall, PendingPermission, RuntimePhase, SessionEvent, SessionEventPayload,
-    SessionSnapshot, SessionSubscription,
+    SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
 pub use profile::{AgentProfileConfig, LoadedAgentProfile, load_profile};
 pub use record::{

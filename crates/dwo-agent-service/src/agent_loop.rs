@@ -135,11 +135,8 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             Err(error) => return TurnOutcome::Failed(format!("{error:#}")),
         };
 
-        turn.context.record_turn_usage(
-            selection.model,
-            response.usage.input_tokens,
-            response.usage.output_tokens,
-        );
+        turn.context
+            .record_turn_usage(selection.model, response.usage.total_tokens);
         let active_tool_calls = response
             .tool_calls
             .iter()
@@ -279,8 +276,6 @@ async fn compact_context(
             .model
             .summarize(selection, plan.view.clone(), turn.cancellation.clone())
             .await?;
-        turn.context
-            .record_auxiliary_usage(summary.usage.input_tokens, summary.usage.output_tokens);
         summary.summary
     } else {
         String::new()

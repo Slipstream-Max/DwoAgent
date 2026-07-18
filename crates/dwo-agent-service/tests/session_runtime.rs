@@ -99,8 +99,7 @@ async fn unnamed_session_gets_model_generated_title() {
     assert_eq!(titles, ["Flaky websocket tests"]);
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.info.title, "Flaky websocket tests");
-    assert_eq!(snapshot.record.context.usage.input_tokens, 7);
-    assert_eq!(snapshot.record.context.usage.output_tokens, 3);
+    assert_eq!(snapshot.record.context.usage.current_tokens, 0);
     assert_eq!(
         service.list().await.unwrap()[0].info.title,
         "Flaky websocket tests"
@@ -489,17 +488,34 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
         .prompt(EndpointId::new(), "make the file")
         .await
         .unwrap();
+    let mut usage_updates = Vec::new();
+    let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await.unwrap().payload {
+                SessionEventPayload::UsageChanged { used, size } => {
+                    usage_updates.push((used, size));
+                }
+                terminal @ (SessionEventPayload::TurnCompleted { .. }
+                | SessionEventPayload::TurnCancelled { .. }
+                | SessionEventPayload::TurnFailed { .. }) => break terminal,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert!(matches!(
-        wait_for_turn_end(&mut events).await,
+        terminal,
         SessionEventPayload::TurnCompleted { .. }
     ));
 
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.context.compaction.count, 1);
     assert_eq!(snapshot.record.context.transcript.len(), 4);
-    assert_eq!(snapshot.record.context.usage.input_tokens, 100);
-    assert_eq!(snapshot.record.context.usage.output_tokens, 7);
-    assert_eq!(snapshot.record.context.usage.last_turn_input_tokens, 20);
+    assert_eq!(snapshot.record.context.usage.current_tokens, 22);
+    assert_eq!(snapshot.usage.used, 22);
+    assert_eq!(snapshot.usage.size, 100);
+    assert_eq!(usage_updates, [(85, 100), (0, 100), (22, 100)]);
     assert_eq!(model.summary_request_count().await, 0);
     let requests = model.requests().await;
     assert_eq!(requests.len(), 2);
@@ -740,11 +756,43 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
         .set_config(SessionConfigUpdate::Model("next-model".to_string()))
         .await
         .unwrap();
+    let switched_usage = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let SessionEventPayload::UsageChanged { used, size } =
+                events.recv().await.unwrap().payload
+            {
+                break (used, size);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(switched_usage, (401, 500));
     agent.prompt(EndpointId::new(), "request 5").await.unwrap();
+    let mut compacted_usage = Vec::new();
+    let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await.unwrap().payload {
+                SessionEventPayload::UsageChanged { used, size } => {
+                    compacted_usage.push((used, size));
+                }
+                terminal @ (SessionEventPayload::TurnCompleted { .. }
+                | SessionEventPayload::TurnCancelled { .. }
+                | SessionEventPayload::TurnFailed { .. }) => break terminal,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert!(matches!(
-        wait_for_turn_end(&mut events).await,
+        terminal,
         SessionEventPayload::TurnCompleted { .. }
     ));
+    assert!(
+        compacted_usage.contains(&(0, 500)),
+        "compaction should replace the old context usage: {compacted_usage:?}"
+    );
 
     let summaries = model.summary_requests().await;
     assert_eq!(summaries.len(), 1);
@@ -756,6 +804,11 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
     assert_eq!(requests[4].selection.reasoning.as_deref(), Some("high"));
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.llm.reasoning.as_deref(), Some("high"));
+    assert_eq!(snapshot.record.context.usage.current_tokens, 0);
+    assert_eq!(
+        snapshot.usage,
+        dwo_agent_service::SessionUsageSnapshot { used: 0, size: 500 }
+    );
     assert_eq!(
         snapshot.record.context.usage.last_model.as_deref(),
         Some("next-model")

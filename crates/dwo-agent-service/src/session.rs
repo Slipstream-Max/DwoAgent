@@ -4,7 +4,7 @@ use std::sync::Arc;
 use dwo_context::{
     ContentBlock, ContextManager, ContextMessage, MessageContent, SystemPromptBuilder,
 };
-use dwo_model_client::{ModelClient, ModelReply, ModelSelection, ModelUsage};
+use dwo_model_client::{ModelClient, ModelReply, ModelSelection};
 use dwo_tools::{ConfirmationDecision, ToolManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -16,7 +16,7 @@ use crate::agent_loop::{self, RunTurn, TurnActorMessage, TurnEvent, TurnOutcome}
 use crate::error::AgentServiceError;
 use crate::events::{
     ActiveToolCall, RuntimePhase, SessionEvent, SessionEventPayload, SessionSnapshot,
-    SessionSubscription,
+    SessionSubscription, SessionUsageSnapshot,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord};
@@ -91,7 +91,6 @@ impl SessionAgent {
             pending_prompt: None,
             closing_response: None,
             title_cancellation: None,
-            title_usage: None,
         };
         tokio::spawn(actor.run());
         Arc::new(Self {
@@ -102,6 +101,13 @@ impl SessionAgent {
 
     pub fn id(&self) -> &crate::SessionId {
         &self.id
+    }
+
+    pub async fn snapshot(&self) -> Result<SessionSnapshot, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::Snapshot { response }).await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))
     }
 
     pub async fn attach(
@@ -221,6 +227,9 @@ enum Control {
     Attach {
         response: oneshot::Sender<(SessionSnapshot, broadcast::Receiver<SessionEvent>)>,
     },
+    Snapshot {
+        response: oneshot::Sender<SessionSnapshot>,
+    },
     Prompt {
         origin: EndpointId,
         content: MessageContent,
@@ -272,7 +281,6 @@ struct SessionActor {
     pending_prompt: Option<PendingPrompt>,
     closing_response: Option<oneshot::Sender<Result<(), AgentServiceError>>>,
     title_cancellation: Option<CancellationToken>,
-    title_usage: Option<ModelUsage>,
 }
 
 struct PendingPrompt {
@@ -319,6 +327,9 @@ impl SessionActor {
             Control::Attach { response } => {
                 let receiver = self.events.subscribe();
                 let _ = response.send((self.snapshot(), receiver));
+            }
+            Control::Snapshot { response } => {
+                let _ = response.send(self.snapshot());
             }
             Control::Prompt {
                 origin,
@@ -383,6 +394,7 @@ impl SessionActor {
                     )));
                     return false;
                 }
+                let model_changed = matches!(&update, SessionConfigUpdate::Model(_));
                 let mut updated = self.record.clone();
                 let result = updated
                     .apply_config(update)
@@ -411,6 +423,9 @@ impl SessionActor {
                     let config = self.record.config();
                     self.config_tx.send_replace(config.clone());
                     self.emit(SessionEventPayload::ConfigChanged { config });
+                    if model_changed {
+                        self.emit_usage_changed();
+                    }
                 }
                 let _ = response.send(result);
             }
@@ -542,13 +557,13 @@ impl SessionActor {
                 false
             }
             TurnActorMessage::PersistContext { context, completed } => {
-                let mut context = ContextManager::new(*context);
-                if let Some(usage) = self.title_usage {
-                    context.record_auxiliary_usage(usage.input_tokens, usage.output_tokens);
-                }
-                self.record.context = context.into_context();
+                let previous_usage = self.usage_snapshot();
+                self.record.context = *context;
                 self.record.touch();
                 let result = self.repository.save(&self.record).await;
+                if result.is_ok() && self.usage_snapshot() != previous_usage {
+                    self.emit_usage_changed();
+                }
                 let _ = completed.send(result);
                 false
             }
@@ -611,7 +626,6 @@ impl SessionActor {
                     return false;
                 }
                 self.active = None;
-                self.title_usage = None;
                 self.permission.reject("turn finished");
                 self.phase = RuntimePhase::Idle;
                 match outcome {
@@ -704,12 +718,6 @@ impl SessionActor {
 
         let mut updated = self.record.clone();
         updated.set_automatic_title(title.clone());
-        let mut context = ContextManager::new(updated.context);
-        context.record_auxiliary_usage(reply.usage.input_tokens, reply.usage.output_tokens);
-        if self.active.is_some() {
-            self.title_usage = Some(reply.usage);
-        }
-        updated.context = context.into_context();
         updated.touch();
         if self.repository.save(&updated).await.is_err() {
             return;
@@ -725,6 +733,7 @@ impl SessionActor {
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             record: self.record.clone(),
+            usage: self.usage_snapshot(),
             phase: self.phase,
             active_turn_id: self.active.as_ref().map(|active| active.id.clone()),
             partial_message: self
@@ -740,6 +749,24 @@ impl SessionActor {
             pending_permission: self.permission.snapshot(),
             seq: self.seq,
         }
+    }
+
+    fn usage_snapshot(&self) -> SessionUsageSnapshot {
+        let used = self.record.context.usage.current_tokens;
+        let size = self
+            .model
+            .model_limits(&self.record.llm.model)
+            .map(|limits| limits.context_window_tokens)
+            .unwrap_or(used);
+        SessionUsageSnapshot { used, size }
+    }
+
+    fn emit_usage_changed(&mut self) {
+        let usage = self.usage_snapshot();
+        self.emit(SessionEventPayload::UsageChanged {
+            used: usage.used,
+            size: usage.size,
+        });
     }
 
     fn emit(&mut self, payload: SessionEventPayload) {

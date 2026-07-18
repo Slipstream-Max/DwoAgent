@@ -27,6 +27,12 @@ pub struct PendingPermission {
     pub tool_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsageSnapshot {
+    pub used: u64,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEvent {
     pub seq: u64,
@@ -91,6 +97,10 @@ pub enum SessionEventPayload {
     ConfigChanged {
         config: crate::SessionConfig,
     },
+    UsageChanged {
+        used: u64,
+        size: u64,
+    },
     TitleChanged {
         title: String,
         updated_at_ms: u64,
@@ -101,6 +111,7 @@ pub enum SessionEventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub record: SessionRecord,
+    pub usage: SessionUsageSnapshot,
     pub phase: RuntimePhase,
     pub active_turn_id: Option<TurnId>,
     pub partial_message: String,

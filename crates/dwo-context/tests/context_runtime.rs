@@ -10,6 +10,30 @@ fn write(path: &std::path::Path, content: &str) {
 }
 
 #[test]
+fn usage_tracks_the_current_context_without_cumulative_token_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let builder = SystemPromptBuilder::new(None, root.path());
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+
+    manager.record_turn_usage("first-model", 120);
+    manager.record_turn_usage("second-model", 45);
+
+    assert_eq!(manager.context().usage.current_tokens, 45);
+    assert_eq!(
+        manager.context().usage.last_model.as_deref(),
+        Some("second-model")
+    );
+    assert!(!manager.should_compact(46));
+    assert!(manager.should_compact(45));
+
+    let usage = serde_json::to_value(&manager.context().usage).unwrap();
+    assert_eq!(usage["current_tokens"], 45);
+    assert!(usage.get("input_tokens").is_none());
+    assert!(usage.get("output_tokens").is_none());
+    assert!(usage.get("last_turn_input_tokens").is_none());
+}
+
+#[test]
 fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");

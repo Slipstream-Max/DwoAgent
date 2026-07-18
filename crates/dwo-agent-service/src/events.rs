@@ -41,6 +41,27 @@ pub struct SessionEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientTranscriptEvent {
+    pub recorded_at_ms: u64,
+    pub payload: SessionEventPayload,
+}
+
+impl ClientTranscriptEvent {
+    pub fn new(payload: SessionEventPayload) -> Self {
+        let recorded_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        Self {
+            recorded_at_ms,
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventPayload {
     UserPromptSubmitted {
@@ -111,6 +132,7 @@ pub enum SessionEventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub record: SessionRecord,
+    pub transcript: Vec<ClientTranscriptEvent>,
     pub usage: SessionUsageSnapshot,
     pub phase: RuntimePhase,
     pub active_turn_id: Option<TurnId>,

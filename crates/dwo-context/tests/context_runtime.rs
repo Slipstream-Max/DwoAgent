@@ -230,8 +230,6 @@ fn compaction_keeps_tool_pairs_and_filters_reasoning_from_summary_history() {
         kind: MessageKind::Conversation,
     });
     let mut manager = ContextManager::new(context);
-    let transcript_before = manager.context().transcript.clone();
-
     let plan = manager.plan_compaction(&CompactionPlanner::new(12).with_recent_turns(0));
     assert_eq!(plan.recent_user_messages.len(), 2);
     assert_eq!(plan.recent_user_messages[0].content, "user 2");
@@ -280,7 +278,6 @@ fn compaction_keeps_tool_pairs_and_filters_reasoning_from_summary_history() {
     manager
         .apply_compaction(plan, "compact summary", &builder)
         .unwrap();
-    assert_eq!(manager.context().transcript, transcript_before);
     assert_eq!(manager.context().messages.len(), 4);
     assert_eq!(manager.context().messages[0].role, MessageRole::System);
     assert_eq!(manager.context().messages[1].content, "user 2");

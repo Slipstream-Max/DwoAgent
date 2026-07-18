@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{Datelike, Local};
 use dwo_agent_service::{
-    ContentBlock, EndpointId, MessageContent, SessionConfigUpdate, SessionEventPayload, SessionId,
-    TranscriptItem,
+    ClientTranscriptEvent, ContentBlock, EndpointId, MessageContent, SessionConfigUpdate,
+    SessionEventPayload, SessionId,
 };
 use dwo_tools::{ConfirmationDecision, SessionMode};
 use tokio::sync::Mutex;
@@ -268,10 +268,8 @@ impl WeixinHandler {
                 let agent = self.host.service.load(&session_id).await?;
                 self.select_session(id).await?;
                 let subscription = agent.attach(self.endpoint(&ctx.from)).await?;
-                let replay = render_replay_turns(
-                    &subscription.snapshot.record.context.transcript,
-                    self.replay_turns,
-                );
+                let replay =
+                    render_replay_turns(&subscription.snapshot.transcript, self.replay_turns);
                 if replay.is_empty() {
                     ctx.reply_text(&render_status(&subscription.snapshot))
                         .await?;
@@ -993,13 +991,13 @@ struct ReplayTurn {
     responses: Vec<String>,
 }
 
-fn render_replay_turns(transcript: &[TranscriptItem], turns: usize) -> Vec<String> {
+fn render_replay_turns(transcript: &[ClientTranscriptEvent], turns: usize) -> Vec<String> {
     let mut grouped = Vec::<ReplayTurn>::new();
-    for item in transcript {
-        let turn_id = match item {
-            TranscriptItem::User { turn_id, .. }
-            | TranscriptItem::Assistant { turn_id, .. }
-            | TranscriptItem::Tool { turn_id, .. } => turn_id,
+    for event in transcript {
+        let turn_id = match &event.payload {
+            SessionEventPayload::UserPromptSubmitted { turn_id, .. }
+            | SessionEventPayload::AssistantCompleted { turn_id, .. } => turn_id,
+            _ => continue,
         };
         if grouped.last().is_none_or(|turn| turn.turn_id != *turn_id) {
             grouped.push(ReplayTurn {
@@ -1009,12 +1007,16 @@ fn render_replay_turns(transcript: &[TranscriptItem], turns: usize) -> Vec<Strin
             });
         }
         let turn = grouped.last_mut().expect("replay turn was just inserted");
-        match item {
-            TranscriptItem::User { content, .. } => turn.prompts.push(content.to_string()),
-            TranscriptItem::Assistant { content, .. } if !content.trim().is_empty() => {
+        match &event.payload {
+            SessionEventPayload::UserPromptSubmitted { content, .. } => {
+                turn.prompts.push(content.to_string())
+            }
+            SessionEventPayload::AssistantCompleted { content, .. }
+                if !content.trim().is_empty() =>
+            {
                 turn.responses.push(content.trim().to_string());
             }
-            TranscriptItem::Assistant { .. } | TranscriptItem::Tool { .. } => {}
+            _ => {}
         }
     }
 
@@ -1061,26 +1063,34 @@ mod tests {
         let first = dwo_agent_service::TurnId::new();
         let second = dwo_agent_service::TurnId::new();
         let transcript = vec![
-            TranscriptItem::User {
+            ClientTranscriptEvent::new(SessionEventPayload::UserPromptSubmitted {
                 turn_id: first.clone(),
+                origin: EndpointId::new(),
                 content: MessageContent::text("first question"),
-            },
-            TranscriptItem::Assistant {
+            }),
+            ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
                 turn_id: first.clone(),
                 content: "intermediate".to_string(),
-            },
-            TranscriptItem::Assistant {
+                reasoning: None,
+                tool_calls: Vec::new(),
+            }),
+            ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
                 turn_id: first,
                 content: "first answer".to_string(),
-            },
-            TranscriptItem::User {
+                reasoning: None,
+                tool_calls: Vec::new(),
+            }),
+            ClientTranscriptEvent::new(SessionEventPayload::UserPromptSubmitted {
                 turn_id: second.clone(),
+                origin: EndpointId::new(),
                 content: MessageContent::text("second question"),
-            },
-            TranscriptItem::Assistant {
+            }),
+            ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
                 turn_id: second,
                 content: "second answer".to_string(),
-            },
+                reasoning: None,
+                tool_calls: Vec::new(),
+            }),
         ];
 
         assert_eq!(

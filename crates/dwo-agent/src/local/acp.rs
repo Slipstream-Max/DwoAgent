@@ -328,8 +328,18 @@ async fn ensure_observer(
     replay: bool,
 ) -> Result<Arc<SessionObserver>> {
     let mut observers = runtime.observers.lock().await;
-    if let Some(observer) = observers.get(session_id) {
-        return Ok(observer.clone());
+    if let Some(observer) = observers.get(session_id).cloned() {
+        drop(observers);
+        if replay {
+            let snapshot = ipc::request(
+                &runtime.config_path,
+                "session.snapshot",
+                json!({"session_id": session_id}),
+            )
+            .await?;
+            replay_snapshot(cx, session_id, &json!({"snapshot": snapshot}));
+        }
+        return Ok(observer);
     }
 
     let endpoint_id = format!("acp-{}", Uuid::new_v4());
@@ -831,22 +841,29 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
             .and_then(Value::as_u64);
         send_session_info_update(cx, session_id, title, updated_at_ms);
     }
-    let Some(transcript) = record
-        .get("context")
-        .and_then(|context| context.get("transcript"))
-        .and_then(Value::as_array)
-    else {
+    let Some(transcript) = snapshot.get("transcript").and_then(Value::as_array) else {
         return;
     };
-    for item in transcript {
-        match item.get("kind").and_then(Value::as_str) {
-            Some("user") => send_chunk(cx, session_id, &content_text(&item["content"]), true),
-            Some("assistant") => send_chunk(
-                cx,
-                session_id,
-                item["content"].as_str().unwrap_or(""),
-                false,
-            ),
+    for event in transcript {
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        match payload.get("kind").and_then(Value::as_str) {
+            Some("user_prompt_submitted") => {
+                send_chunk(cx, session_id, &content_text(&payload["content"]), true)
+            }
+            Some("assistant_delta") => {
+                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                    send_chunk(cx, session_id, delta, false);
+                }
+            }
+            Some("assistant_reasoning_delta") => {
+                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                    send_thought_chunk(cx, session_id, delta);
+                }
+            }
+            Some("tool_started") => send_tool_started(cx, session_id, payload),
+            Some("tool_completed") => send_tool_completed(cx, session_id, payload),
             _ => {}
         }
     }

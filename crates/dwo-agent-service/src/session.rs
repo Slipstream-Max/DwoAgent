@@ -15,8 +15,8 @@ use crate::TurnId;
 use crate::agent_loop::{self, RunTurn, TurnActorMessage, TurnEvent, TurnOutcome};
 use crate::error::AgentServiceError;
 use crate::events::{
-    ActiveToolCall, RuntimePhase, SessionEvent, SessionEventPayload, SessionSnapshot,
-    SessionSubscription, SessionUsageSnapshot,
+    ActiveToolCall, ClientTranscriptEvent, RuntimePhase, SessionEvent, SessionEventPayload,
+    SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord};
@@ -60,6 +60,7 @@ pub struct SessionAgent {
 impl SessionAgent {
     pub(crate) fn spawn(
         record: SessionRecord,
+        transcript: Vec<ClientTranscriptEvent>,
         repository: Arc<dyn SessionRepository>,
         model: Arc<dyn ModelClient>,
         tools: Arc<ToolManager>,
@@ -73,6 +74,7 @@ impl SessionAgent {
         let (events, _) = broadcast::channel(1024);
         let actor = SessionActor {
             record,
+            transcript,
             repository,
             model,
             tools,
@@ -263,6 +265,7 @@ struct ActiveTurn {
 
 struct SessionActor {
     record: SessionRecord,
+    transcript: Vec<ClientTranscriptEvent>,
     repository: Arc<dyn SessionRepository>,
     model: Arc<dyn ModelClient>,
     tools: Arc<ToolManager>,
@@ -519,11 +522,12 @@ impl SessionActor {
         if let Some((source, original_title)) = title_generation {
             self.start_title_generation(source, original_title);
         }
-        self.emit(SessionEventPayload::UserPromptSubmitted {
+        self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
             turn_id: turn_id.clone(),
             origin,
             content: event_content,
-        });
+        })
+        .await;
         self.emit(SessionEventPayload::TurnStarted {
             turn_id: turn_id.clone(),
         });
@@ -573,18 +577,30 @@ impl SessionActor {
     async fn handle_turn_event(&mut self, event: TurnEvent) -> bool {
         match event {
             TurnEvent::AssistantDelta { turn_id, delta } => {
-                if let Some(active) = self.active.as_mut().filter(|active| active.id == turn_id) {
+                let accepted = if let Some(active) =
+                    self.active.as_mut().filter(|active| active.id == turn_id)
+                {
                     active.partial_message.push_str(&delta);
-                    self.emit(SessionEventPayload::AssistantDelta { turn_id, delta });
+                    true
+                } else {
+                    false
+                };
+                if accepted {
+                    self.emit_client_event(SessionEventPayload::AssistantDelta { turn_id, delta })
+                        .await;
                 }
             }
             TurnEvent::AssistantReasoningDelta { turn_id, delta } => {
-                if self
+                let accepted = self
                     .active
                     .as_ref()
-                    .is_some_and(|active| active.id == turn_id)
-                {
-                    self.emit(SessionEventPayload::AssistantReasoningDelta { turn_id, delta });
+                    .is_some_and(|active| active.id == turn_id);
+                if accepted {
+                    self.emit_client_event(SessionEventPayload::AssistantReasoningDelta {
+                        turn_id,
+                        delta,
+                    })
+                    .await;
                 }
             }
             TurnEvent::AssistantCompleted {
@@ -593,28 +609,52 @@ impl SessionActor {
                 reasoning,
                 tool_calls,
             } => {
-                if let Some(active) = self.active.as_mut().filter(|active| active.id == turn_id) {
+                let accepted = if let Some(active) =
+                    self.active.as_mut().filter(|active| active.id == turn_id)
+                {
                     active.partial_message.clear();
-                    self.emit(SessionEventPayload::AssistantCompleted {
+                    true
+                } else {
+                    false
+                };
+                if accepted {
+                    self.emit_client_event(SessionEventPayload::AssistantCompleted {
                         turn_id,
                         content,
                         reasoning,
                         tool_calls,
-                    });
+                    })
+                    .await;
                 }
             }
             TurnEvent::ToolStarted { turn_id, call } => {
-                if let Some(active) = self.active.as_mut().filter(|active| active.id == turn_id) {
+                let accepted = if let Some(active) =
+                    self.active.as_mut().filter(|active| active.id == turn_id)
+                {
                     active.tools.push(call.clone());
-                    self.emit(SessionEventPayload::ToolStarted { turn_id, call });
+                    true
+                } else {
+                    false
+                };
+                if accepted {
+                    self.emit_client_event(SessionEventPayload::ToolStarted { turn_id, call })
+                        .await;
                 }
             }
             TurnEvent::ToolCompleted { turn_id, result } => {
-                if let Some(active) = self.active.as_mut().filter(|active| active.id == turn_id) {
+                let accepted = if let Some(active) =
+                    self.active.as_mut().filter(|active| active.id == turn_id)
+                {
                     active
                         .tools
                         .retain(|call| call.tool_call_id != result.tool_call_id);
-                    self.emit(SessionEventPayload::ToolCompleted { turn_id, result });
+                    true
+                } else {
+                    false
+                };
+                if accepted {
+                    self.emit_client_event(SessionEventPayload::ToolCompleted { turn_id, result })
+                        .await;
                 }
             }
             TurnEvent::Finished { turn_id, outcome } => {
@@ -733,6 +773,7 @@ impl SessionActor {
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             record: self.record.clone(),
+            transcript: self.transcript.clone(),
             usage: self.usage_snapshot(),
             phase: self.phase,
             active_turn_id: self.active.as_ref().map(|active| active.id.clone()),
@@ -767,6 +808,19 @@ impl SessionActor {
             used: usage.used,
             size: usage.size,
         });
+    }
+
+    async fn emit_client_event(&mut self, payload: SessionEventPayload) {
+        let event = ClientTranscriptEvent::new(payload.clone());
+        match self
+            .repository
+            .append_transcript_event(&self.record.info.id, &event)
+            .await
+        {
+            Ok(()) => self.transcript.push(event),
+            Err(error) => eprintln!("persist client transcript event: {error:#}"),
+        }
+        self.emit(payload);
     }
 
     fn emit(&mut self, payload: SessionEventPayload) {

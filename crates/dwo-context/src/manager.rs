@@ -4,9 +4,7 @@ use serde_json::Value;
 use crate::compaction::{CompactionPlan, CompactionPlanner};
 use crate::env_watcher::EnvWatcherState;
 use crate::prompt::{PromptBuildError, SystemPromptBlock, SystemPromptBuilder};
-use crate::{
-    ContextMessage, MessageContent, MessageKind, ToolResultRecord, TranscriptItem, TurnId,
-};
+use crate::{ContextMessage, MessageContent, MessageKind, ToolResultRecord, TurnId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsage {
@@ -29,8 +27,6 @@ pub struct SessionContext {
     pub system_prompt: SystemPromptBlock,
     #[serde(default)]
     pub messages: Vec<ContextMessage>,
-    #[serde(default)]
-    pub transcript: Vec<TranscriptItem>,
     #[serde(default)]
     pub usage: SessionUsage,
     #[serde(default)]
@@ -98,14 +94,8 @@ impl ContextManager {
         &self.context.messages
     }
 
-    pub fn append_user(&mut self, turn_id: TurnId, content: impl Into<MessageContent>) {
-        let content = content.into();
-        self.context
-            .messages
-            .push(ContextMessage::user(content.clone()));
-        self.context
-            .transcript
-            .push(TranscriptItem::User { turn_id, content });
+    pub fn append_user(&mut self, _turn_id: TurnId, content: impl Into<MessageContent>) {
+        self.context.messages.push(ContextMessage::user(content));
     }
 
     pub fn append_assistant(
@@ -119,7 +109,7 @@ impl ContextManager {
 
     pub fn append_assistant_with_reasoning(
         &mut self,
-        turn_id: TurnId,
+        _turn_id: TurnId,
         content: impl Into<String>,
         reasoning: Option<String>,
         tool_calls: Vec<Value>,
@@ -128,20 +118,12 @@ impl ContextManager {
         self.context
             .messages
             .push(ContextMessage::assistant_with_reasoning(
-                content.clone(),
-                reasoning,
-                tool_calls,
+                content, reasoning, tool_calls,
             ));
-        self.context
-            .transcript
-            .push(TranscriptItem::Assistant { turn_id, content });
     }
 
-    pub fn append_tool(&mut self, turn_id: TurnId, result: ToolResultRecord) {
+    pub fn append_tool(&mut self, _turn_id: TurnId, result: ToolResultRecord) {
         self.context.messages.push(ContextMessage::tool(&result));
-        self.context
-            .transcript
-            .push(TranscriptItem::Tool { turn_id, result });
     }
 
     pub fn record_turn_usage(&mut self, model: impl Into<String>, total_tokens: u64) {

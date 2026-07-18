@@ -3,12 +3,19 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{Datelike, Local, TimeZone};
+use dwo_context::SessionContext;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{SessionId, SessionRecord};
+use crate::{ClientTranscriptEvent, SessionId, SessionInfo, SessionLlmSettings, SessionRecord};
+
+pub const SESSION_META_FILE: &str = "session.json";
+pub const SESSION_MODEL_CONTEXT_FILE: &str = "model_context.json";
+pub const SESSION_CLIENT_TRANSCRIPT_FILE: &str = "client_transcript.jsonl";
 
 #[async_trait]
 pub trait SessionRepository: Send + Sync {
@@ -16,11 +23,18 @@ pub trait SessionRepository: Send + Sync {
     async fn load(&self, id: &SessionId) -> Result<Option<SessionRecord>>;
     async fn list(&self) -> Result<Vec<SessionRecord>>;
     async fn delete(&self, id: &SessionId) -> Result<bool>;
+    async fn append_transcript_event(
+        &self,
+        id: &SessionId,
+        event: &ClientTranscriptEvent,
+    ) -> Result<()>;
+    async fn load_transcript(&self, id: &SessionId) -> Result<Vec<ClientTranscriptEvent>>;
 }
 
 #[derive(Default)]
 pub struct MemorySessionRepository {
     records: RwLock<HashMap<SessionId, SessionRecord>>,
+    transcripts: RwLock<HashMap<SessionId, Vec<ClientTranscriptEvent>>>,
 }
 
 #[async_trait]
@@ -30,6 +44,11 @@ impl SessionRepository for MemorySessionRepository {
             .write()
             .await
             .insert(record.info.id.clone(), record.clone());
+        self.transcripts
+            .write()
+            .await
+            .entry(record.info.id.clone())
+            .or_default();
         Ok(())
     }
 
@@ -44,7 +63,57 @@ impl SessionRepository for MemorySessionRepository {
     }
 
     async fn delete(&self, id: &SessionId) -> Result<bool> {
+        self.transcripts.write().await.remove(id);
         Ok(self.records.write().await.remove(id).is_some())
+    }
+
+    async fn append_transcript_event(
+        &self,
+        id: &SessionId,
+        event: &ClientTranscriptEvent,
+    ) -> Result<()> {
+        if !self.records.read().await.contains_key(id) {
+            bail!("session {id} does not exist");
+        }
+        self.transcripts
+            .write()
+            .await
+            .entry(id.clone())
+            .or_default()
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn load_transcript(&self, id: &SessionId) -> Result<Vec<ClientTranscriptEvent>> {
+        Ok(self
+            .transcripts
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedSessionMetadata {
+    info: SessionInfo,
+    llm: SessionLlmSettings,
+    #[serde(default, skip_serializing_if = "is_false")]
+    auto_title_pending: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl PersistedSessionMetadata {
+    fn from_record(record: &SessionRecord) -> Self {
+        Self {
+            info: record.info.clone(),
+            llm: record.llm.clone(),
+            auto_title_pending: record.auto_title_pending(),
+        }
     }
 }
 
@@ -63,7 +132,7 @@ impl FsSessionRepository {
         })
     }
 
-    fn path(&self, record: &SessionRecord) -> Result<PathBuf> {
+    fn session_dir(&self, record: &SessionRecord) -> Result<PathBuf> {
         let timestamp = i64::try_from(record.info.created_at_ms)
             .context("session created_at_ms exceeds i64")?;
         let created = Local
@@ -75,15 +144,7 @@ impl FsSessionRepository {
             .join(format!("{:04}", created.year()))
             .join(format!("{:02}", created.month()))
             .join(format!("{:02}", created.day()))
-            .join(format!("{}.json", record.info.id.as_str())))
-    }
-
-    async fn read_record(path: &Path) -> Result<SessionRecord> {
-        let bytes = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("read session record {}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse session record {}", path.display()))
+            .join(record.info.id.as_str()))
     }
 
     async fn session_lock(&self, id: &SessionId) -> Arc<Mutex<()>> {
@@ -94,31 +155,71 @@ impl FsSessionRepository {
             .clone()
     }
 
-    async fn json_paths(&self) -> Result<Vec<PathBuf>> {
+    async fn session_dirs(&self) -> Result<Vec<PathBuf>> {
         let mut directories = vec![self.root.clone()];
-        let mut paths = Vec::new();
+        let mut sessions = Vec::new();
         while let Some(directory) = directories.pop() {
+            if directory != self.root
+                && tokio::fs::try_exists(directory.join(SESSION_META_FILE)).await?
+            {
+                sessions.push(directory);
+                continue;
+            }
             let mut entries = tokio::fs::read_dir(&directory).await?;
             while let Some(entry) = entries.next_entry().await? {
-                let file_type = entry.file_type().await?;
-                if file_type.is_dir() {
+                if entry.file_type().await?.is_dir() {
                     directories.push(entry.path());
-                } else if file_type.is_file()
-                    && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
-                {
-                    paths.push(entry.path());
                 }
             }
         }
-        Ok(paths)
+        Ok(sessions)
     }
 
-    async fn find_path(&self, id: &SessionId) -> Result<Option<PathBuf>> {
-        let filename = format!("{}.json", id.as_str());
-        Ok(self.json_paths().await?.into_iter().find(|path| {
-            path.file_name()
-                .is_some_and(|name| name == filename.as_str())
-        }))
+    async fn find_dir(&self, id: &SessionId) -> Result<Option<PathBuf>> {
+        Ok(self
+            .session_dirs()
+            .await?
+            .into_iter()
+            .find(|path| path.file_name().is_some_and(|name| name == id.as_str())))
+    }
+
+    async fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    }
+
+    async fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(value)?;
+        let temporary = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, bytes).await?;
+        if tokio::fs::try_exists(path).await? {
+            tokio::fs::remove_file(path).await?;
+        }
+        tokio::fs::rename(&temporary, path).await?;
+        Ok(())
+    }
+
+    async fn read_record(session_dir: &Path) -> Result<SessionRecord> {
+        let metadata: PersistedSessionMetadata =
+            Self::read_json(&session_dir.join(SESSION_META_FILE)).await?;
+        let context: SessionContext =
+            Self::read_json(&session_dir.join(SESSION_MODEL_CONTEXT_FILE)).await?;
+        Ok(SessionRecord::from_persisted_parts(
+            metadata.info,
+            metadata.llm,
+            context,
+            metadata.auto_title_pending,
+        ))
+    }
+
+    async fn ensure_transcript(session_dir: &Path) -> Result<()> {
+        let path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        if !tokio::fs::try_exists(&path).await? {
+            tokio::fs::write(path, []).await?;
+        }
+        Ok(())
     }
 
     async fn remove_empty_date_directories(&self, path: &Path) -> Result<()> {
@@ -141,35 +242,36 @@ impl FsSessionRepository {
 #[async_trait]
 impl SessionRepository for FsSessionRepository {
     async fn save(&self, record: &SessionRecord) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(record)?;
         let lock = self.session_lock(&record.info.id).await;
         let _write = lock.lock().await;
-        let path = self.path(record)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&temporary, bytes).await?;
-        if tokio::fs::try_exists(&path).await? {
-            tokio::fs::remove_file(&path).await?;
-        }
-        tokio::fs::rename(&temporary, &path).await?;
-        Ok(())
+        let session_dir = self.session_dir(record)?;
+        tokio::fs::create_dir_all(&session_dir).await?;
+        Self::write_json(
+            &session_dir.join(SESSION_MODEL_CONTEXT_FILE),
+            &record.context,
+        )
+        .await?;
+        Self::write_json(
+            &session_dir.join(SESSION_META_FILE),
+            &PersistedSessionMetadata::from_record(record),
+        )
+        .await?;
+        Self::ensure_transcript(&session_dir).await
     }
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionRecord>> {
         let lock = self.session_lock(id).await;
         let _read = lock.lock().await;
-        let Some(path) = self.find_path(id).await? else {
+        let Some(session_dir) = self.find_dir(id).await? else {
             return Ok(None);
         };
-        Self::read_record(&path).await.map(Some)
+        Self::read_record(&session_dir).await.map(Some)
     }
 
     async fn list(&self) -> Result<Vec<SessionRecord>> {
         let mut records = Vec::new();
-        for path in self.json_paths().await? {
-            records.push(Self::read_record(&path).await?);
+        for session_dir in self.session_dirs().await? {
+            records.push(Self::read_record(&session_dir).await?);
         }
         records.sort_by_key(|record| Reverse(record.info.updated_at_ms));
         Ok(records)
@@ -178,12 +280,58 @@ impl SessionRepository for FsSessionRepository {
     async fn delete(&self, id: &SessionId) -> Result<bool> {
         let lock = self.session_lock(id).await;
         let _write = lock.lock().await;
-        let Some(path) = self.find_path(id).await? else {
+        let Some(session_dir) = self.find_dir(id).await? else {
             return Ok(false);
         };
-        tokio::fs::remove_file(&path).await?;
-        self.remove_empty_date_directories(&path).await?;
+        tokio::fs::remove_dir_all(&session_dir).await?;
+        self.remove_empty_date_directories(&session_dir).await?;
         Ok(true)
+    }
+
+    async fn append_transcript_event(
+        &self,
+        id: &SessionId,
+        event: &ClientTranscriptEvent,
+    ) -> Result<()> {
+        let lock = self.session_lock(id).await;
+        let _write = lock.lock().await;
+        let session_dir = self
+            .find_dir(id)
+            .await?
+            .with_context(|| format!("session {id} does not exist"))?;
+        let path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        let mut line = serde_json::to_vec(event)?;
+        line.push(b'\n');
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("open transcript {}", path.display()))?;
+        file.write_all(&line).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    async fn load_transcript(&self, id: &SessionId) -> Result<Vec<ClientTranscriptEvent>> {
+        let lock = self.session_lock(id).await;
+        let _read = lock.lock().await;
+        let Some(session_dir) = self.find_dir(id).await? else {
+            return Ok(Vec::new());
+        };
+        let path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(Vec::new());
+        }
+        let text = tokio::fs::read_to_string(&path).await?;
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .with_context(|| format!("parse transcript event in {}", path.display()))
+            })
+            .collect()
     }
 }
 
@@ -192,6 +340,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::{SessionEventPayload, SessionLlmSettings, TurnId};
 
     #[tokio::test]
     async fn filesystem_repository_scopes_locks_per_session() {
@@ -212,7 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_repository_partitions_sessions_by_creation_date() {
+    async fn filesystem_repository_uses_three_file_session_layout() {
         let root = tempfile::tempdir().unwrap();
         let repository = FsSessionRepository::new(root.path()).await.unwrap();
         let mut record = SessionRecord::new(
@@ -220,27 +369,60 @@ mod tests {
             "dated".to_string(),
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
-            crate::SessionLlmSettings::default(),
+            SessionLlmSettings::default(),
         );
         record.info.created_at_ms = 1_768_521_600_000;
         record.context.usage.current_tokens = 321;
         record.context.usage.last_model = Some("persisted-model".to_string());
 
         repository.save(&record).await.unwrap();
+        let event = ClientTranscriptEvent::new(SessionEventPayload::AssistantDelta {
+            turn_id: TurnId::parse("turn-test").unwrap(),
+            delta: "hello".to_string(),
+        });
+        repository
+            .append_transcript_event(&record.info.id, &event)
+            .await
+            .unwrap();
 
-        let expected = root
-            .path()
-            .join("2026/01/16")
-            .join(format!("{}.json", record.info.id));
-        assert!(expected.exists(), "missing {}", expected.display());
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&expected).unwrap()).unwrap();
-        let usage = &persisted["context"]["usage"];
-        assert_eq!(usage["current_tokens"], 321);
-        assert_eq!(usage["last_model"], "persisted-model");
-        assert!(usage.get("input_tokens").is_none());
-        assert!(usage.get("output_tokens").is_none());
-        assert!(usage.get("last_turn_input_tokens").is_none());
+        let session_dir = root.path().join("2026/01/16").join(record.info.id.as_str());
+        assert!(session_dir.join(SESSION_META_FILE).is_file());
+        assert!(session_dir.join(SESSION_MODEL_CONTEXT_FILE).is_file());
+        assert!(session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE).is_file());
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(session_dir.join(SESSION_META_FILE)).unwrap())
+                .unwrap();
+        assert!(metadata.get("context").is_none());
+        let model_context: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(session_dir.join(SESSION_MODEL_CONTEXT_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(model_context.get("transcript").is_none());
+        assert_eq!(model_context["usage"]["current_tokens"], 321);
+        assert_eq!(model_context["usage"]["last_model"], "persisted-model");
+        let transcript_path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        let first_append = std::fs::read_to_string(&transcript_path).unwrap();
+        repository
+            .append_transcript_event(
+                &record.info.id,
+                &ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    turn_id: TurnId::parse("turn-test").unwrap(),
+                    delta: "reasoning".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let second_append = std::fs::read_to_string(&transcript_path).unwrap();
+        assert!(second_append.starts_with(&first_append));
+        assert_eq!(second_append.lines().count(), 2);
+        assert_eq!(
+            repository
+                .load_transcript(&record.info.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(
             repository
                 .load(&record.info.id)

@@ -222,6 +222,7 @@ impl AgentService {
         &self,
         mut record: SessionRecord,
     ) -> Result<Arc<SessionAgent>, AgentServiceError> {
+        let transcript = self.repository.load_transcript(&record.info.id).await?;
         let prompt_builder = self.prompt_builder(record.info.cwd.clone());
         if !record.context.system_prompt.is_initialized() {
             record.context = ContextManager::initialize(&prompt_builder)
@@ -243,6 +244,7 @@ impl AgentService {
         )?);
         let agent = SessionAgent::spawn(
             record.clone(),
+            transcript,
             self.repository.clone(),
             self.model.clone(),
             tools,

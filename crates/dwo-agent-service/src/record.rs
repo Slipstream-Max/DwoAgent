@@ -101,6 +101,20 @@ impl Default for SessionLlmSettings {
 }
 
 impl SessionRecord {
+    pub(crate) fn from_persisted_parts(
+        info: SessionInfo,
+        llm: SessionLlmSettings,
+        context: SessionContext,
+        auto_title_pending: bool,
+    ) -> Self {
+        Self {
+            info,
+            llm,
+            context,
+            auto_title_pending,
+        }
+    }
+
     pub fn new(
         id: SessionId,
         title: String,

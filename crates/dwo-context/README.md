@@ -6,8 +6,7 @@ Owns the model-visible context for the rewrite. It does not call a model.
 ContextManager
 |- model history (index 0 is the current system message)
 |- SystemPromptBlock source metadata + watcher baseline
-|- complete client transcript
-|- cumulative usage + last turn input-token size
+|- current usage reported by the latest model response
 `- compaction state
 ```
 
@@ -39,7 +38,7 @@ ContextManager::plan_compaction(CompactionPlanner)
 ContextManager::apply_compaction(summary)
   -> rebuild current SystemPromptBlock
   -> replace model history with system + historical users + summary + filtered latest turns
-  -> keep transcript and usage unchanged
+  -> clear current usage until the next model response
   -> reset watcher baseline
 ```
 

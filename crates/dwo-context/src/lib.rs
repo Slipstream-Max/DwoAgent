@@ -14,8 +14,7 @@ pub use env_watcher::{DynamicEnvironmentSnapshot, EnvChange, EnvWatcherState};
 pub use manager::{CompactionState, ContextManager, SessionContext, SessionUsage};
 pub use message::{
     ContentAnnotations, ContentAudienceRole, ContentBlock, ContextMessage,
-    EmbeddedResourceContents, MessageContent, MessageKind, MessageRole, ToolResultRecord,
-    TranscriptItem, TurnId,
+    EmbeddedResourceContents, MessageContent, MessageKind, MessageRole, ToolResultRecord, TurnId,
 };
 pub use prompt::{
     AgentProfilePaths, ChannelCapabilitySnapshot, EnvironmentSnapshot, McpSnapshot,

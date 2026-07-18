@@ -47,10 +47,10 @@ resources. `profile.full.yaml` documents every supported profile field.
 ## Persistent shape
 
 ```text
-SessionRecord
-|- info       identity, cwd, title, SessionMode, timestamps
-|- llm        model and reasoning settings
-`- context    SystemPromptBlock, model messages, transcript, usage, compaction state
+sessions/YYYY/MM/DD/<session-id>/
+|- session.json              identity, cwd, title, mode, timestamps, LLM settings
+|- model_context.json       system prompt, model messages, current usage, compaction state
+`- client_transcript.jsonl  append-only client-visible event stream for replay
 ```
 
 Runtime phases (`Idle`, `Running`, `WaitingPermission`, `Cancelling`, and

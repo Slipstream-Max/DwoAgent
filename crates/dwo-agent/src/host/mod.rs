@@ -204,6 +204,12 @@ impl Host {
                 Ok(json!({"stopping": true}))
             }
             "session.list" => Ok(serde_json::to_value(self.service.list().await?)?),
+            "session.snapshot" => {
+                let id = parse_session(params)?;
+                Ok(serde_json::to_value(
+                    self.service.load(&id).await?.snapshot().await?,
+                )?)
+            }
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
                 let agent = self.create_session(params.title, params.cwd).await?;

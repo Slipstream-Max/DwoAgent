@@ -395,20 +395,3 @@ pub struct ToolResultRecord {
     pub tool_name: String,
     pub output: Value,
 }
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TranscriptItem {
-    User {
-        turn_id: TurnId,
-        content: MessageContent,
-    },
-    Assistant {
-        turn_id: TurnId,
-        content: String,
-    },
-    Tool {
-        turn_id: TurnId,
-        result: ToolResultRecord,
-    },
-}

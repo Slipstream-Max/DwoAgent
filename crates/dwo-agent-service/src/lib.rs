@@ -14,7 +14,7 @@ pub use dwo_context::{
     CompactionPlan, CompactionPlanner, CompactionState, CompactionView, ContentAnnotations,
     ContentAudienceRole, ContentBlock, ContextManager, ContextMessage, EmbeddedResourceContents,
     EnvChange, MessageContent, MessageKind, MessageRole, SessionContext, SessionUsage,
-    SystemPromptBlock, SystemPromptBuilder, TranscriptItem, TurnId,
+    SystemPromptBlock, SystemPromptBuilder, TurnId,
 };
 pub use dwo_model_client::{
     AgentModelConfig, AgentModelEntry, AgentProviderConfig, ConfiguredModelClient, FinishReason,
@@ -26,8 +26,8 @@ pub use dwo_model_client::{
 pub use dwo_tools::{ConfirmationDecision, ConfirmationRequest, SessionMode};
 pub use error::AgentServiceError;
 pub use events::{
-    ActiveToolCall, PendingPermission, RuntimePhase, SessionEvent, SessionEventPayload,
-    SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
+    ActiveToolCall, ClientTranscriptEvent, PendingPermission, RuntimePhase, SessionEvent,
+    SessionEventPayload, SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
 pub use profile::{AgentProfileConfig, LoadedAgentProfile, load_profile};
 pub use record::{

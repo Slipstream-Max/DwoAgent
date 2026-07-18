@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use dwo_agent_service::{
     AgentService, ConfirmationDecision, ContentBlock, EndpointId, FsSessionRepository,
     MemorySessionRepository, MessageContent, MessageKind, ModelLimits, NewSession, RuntimePhase,
-    SessionConfigUpdate, SessionEventPayload, SessionLlmSettings, SessionMode, TranscriptItem,
+    SessionConfigUpdate, SessionEventPayload, SessionLlmSettings, SessionMode,
 };
 use dwo_tools::PolicyConfig;
 use serde_json::json;
@@ -193,10 +193,12 @@ async fn model_tool_model_cycle_is_persisted_in_context() {
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.phase, RuntimePhase::Idle);
     assert_eq!(snapshot.record.context.messages.len(), 5);
-    assert_eq!(snapshot.record.context.transcript.len(), 4);
     assert!(matches!(
-        &snapshot.record.context.transcript[0],
-        TranscriptItem::User { content, .. } if content == &prompt
+        snapshot.transcript.iter().find_map(|event| match &event.payload {
+            SessionEventPayload::UserPromptSubmitted { content, .. } => Some(content),
+            _ => None,
+        }),
+        Some(content) if content == &prompt
     ));
     assert_eq!(
         std::fs::read_to_string(dir.path().join("made.txt")).unwrap(),
@@ -511,7 +513,12 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
 
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.context.compaction.count, 1);
-    assert_eq!(snapshot.record.context.transcript.len(), 4);
+    assert!(snapshot.transcript.iter().any(|event| {
+        matches!(
+            event.payload,
+            SessionEventPayload::AssistantCompleted { .. }
+        )
+    }));
     assert_eq!(snapshot.record.context.usage.current_tokens, 22);
     assert_eq!(snapshot.usage.used, 22);
     assert_eq!(snapshot.usage.size, 100);
@@ -1351,8 +1358,11 @@ async fn close_waits_for_cancelled_tool_results_before_unloading() {
     let loaded = service.load(&id).await.unwrap();
     let snapshot = loaded.attach(EndpointId::new()).await.unwrap().snapshot;
     assert!(matches!(
-        snapshot.record.context.transcript.last(),
-        Some(TranscriptItem::Tool { result, .. }) if result.output["status"] == "cancelled"
+        snapshot.transcript.iter().rev().find_map(|event| match &event.payload {
+            SessionEventPayload::ToolCompleted { result, .. } => Some(result),
+            _ => None,
+        }),
+        Some(result) if result.output["status"] == "cancelled"
     ));
 }
 
@@ -1365,7 +1375,19 @@ async fn filesystem_repository_loads_context_after_service_restart() {
     let repository = Arc::new(FsSessionRepository::new(&sessions).await.unwrap());
     let service = AgentService::new(
         repository,
-        ScriptedModelGateway::new([ScriptedStep::text("persisted")]),
+        ScriptedModelGateway::new([
+            ScriptedStep::tools(
+                vec!["checking".to_string()],
+                vec![json!({
+                    "id": "persisted-tool",
+                    "name": "file_edit",
+                    "arguments": {
+                        "patch": "*** Begin Patch\n*** Add File: persisted.txt\n+done\n*** End Patch"
+                    }
+                })],
+            ),
+            ScriptedStep::reasoning_text("thinking", "persisted"),
+        ]),
         PolicyConfig::default(),
     );
     let agent = service
@@ -1385,8 +1407,34 @@ async fn filesystem_repository_loads_context_after_service_restart() {
     );
     let loaded = restarted.load(&id).await.unwrap();
     let snapshot = loaded.attach(EndpointId::new()).await.unwrap().snapshot;
-    assert_eq!(snapshot.record.context.messages.len(), 3);
-    assert_eq!(snapshot.record.context.messages[2].content, "persisted");
+    assert_eq!(snapshot.record.context.messages.len(), 5);
+    assert_eq!(snapshot.record.context.messages[4].content, "persisted");
+    let transcript_kinds = snapshot
+        .transcript
+        .iter()
+        .map(|event| match &event.payload {
+            SessionEventPayload::UserPromptSubmitted { .. } => "user",
+            SessionEventPayload::AssistantDelta { .. } => "assistant_delta",
+            SessionEventPayload::AssistantReasoningDelta { .. } => "reasoning_delta",
+            SessionEventPayload::AssistantCompleted { .. } => "assistant_completed",
+            SessionEventPayload::ToolStarted { .. } => "tool_started",
+            SessionEventPayload::ToolCompleted { .. } => "tool_completed",
+            _ => "other",
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        transcript_kinds,
+        [
+            "user",
+            "assistant_delta",
+            "assistant_completed",
+            "tool_started",
+            "tool_completed",
+            "reasoning_delta",
+            "assistant_delta",
+            "assistant_completed",
+        ]
+    );
     assert_eq!(snapshot.phase, RuntimePhase::Idle);
 }
 

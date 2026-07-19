@@ -12,10 +12,12 @@ ConfiguredModelClient
    `- non-streaming response normalization
 ```
 
-The public model boundary exposes model limits and two operations:
+The public model boundary exposes model limits, image capability, and the model
+operations:
 
 ```text
 model_limits(model_alias) -> context/output/input limits + compact trigger
+supports_image_input(model_alias) -> bool
 stream_turn(selection, messages, tools, event_sender, cancellation) -> ModelReply
 summarize(selection, compaction_view, cancellation)                  -> SummaryReply
 ```
@@ -24,6 +26,10 @@ User turns always request streaming output and may include tool schemas.
 Compaction summaries always use a non-streaming request and never include
 tools. Both paths resolve the session's model alias through the same model and
 provider configuration.
+
+The session runtime consults `supports_image_input` before accepting an image
+prompt or committing a model switch. Provider message shaping still validates
+the capability as a final boundary check.
 
 The model context is one message sequence. Message index 0 is the system
 message; there is no parallel `system_prompt` request field.

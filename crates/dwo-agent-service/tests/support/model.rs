@@ -112,6 +112,7 @@ pub struct ScriptedModelGateway {
     summary_requests: Mutex<Vec<RecordedSummaryRequest>>,
     default_limits: ModelLimits,
     limits_by_model: BTreeMap<String, ModelLimits>,
+    image_input_by_model: BTreeMap<String, bool>,
 }
 
 impl ScriptedModelGateway {
@@ -130,6 +131,7 @@ impl ScriptedModelGateway {
                 compact_trigger_tokens: u64::MAX,
             },
             limits_by_model: BTreeMap::new(),
+            image_input_by_model: BTreeMap::new(),
         })
     }
 
@@ -151,6 +153,7 @@ impl ScriptedModelGateway {
                 compact_trigger_tokens: u64::MAX,
             },
             limits_by_model: BTreeMap::new(),
+            image_input_by_model: BTreeMap::new(),
         })
     }
 
@@ -168,6 +171,7 @@ impl ScriptedModelGateway {
             summary_requests: Mutex::new(Vec::new()),
             default_limits: limits,
             limits_by_model: BTreeMap::new(),
+            image_input_by_model: BTreeMap::new(),
         })
     }
 
@@ -190,7 +194,21 @@ impl ScriptedModelGateway {
                 compact_trigger_tokens: u64::MAX,
             },
             limits_by_model: limits.into_iter().collect(),
+            image_input_by_model: BTreeMap::new(),
         })
+    }
+
+    pub fn with_model_limits_and_capabilities(
+        steps: impl IntoIterator<Item = ScriptedStep>,
+        summary_steps: impl IntoIterator<Item = ScriptedSummaryStep>,
+        limits: impl IntoIterator<Item = (String, ModelLimits)>,
+        image_input: impl IntoIterator<Item = (String, bool)>,
+    ) -> Arc<Self> {
+        let mut model = Self::with_model_limits(steps, summary_steps, limits);
+        Arc::get_mut(&mut model)
+            .expect("scripted model must be uniquely owned during setup")
+            .image_input_by_model = image_input.into_iter().collect();
+        model
     }
 
     pub async fn requests(&self) -> Vec<RecordedTurnRequest> {
@@ -218,6 +236,14 @@ impl ModelClient for ScriptedModelGateway {
             .get(model)
             .copied()
             .unwrap_or(self.default_limits))
+    }
+
+    fn supports_image_input(&self, model: &str) -> Result<bool, ModelClientError> {
+        Ok(self
+            .image_input_by_model
+            .get(model)
+            .copied()
+            .unwrap_or(true))
     }
 
     async fn stream_turn(

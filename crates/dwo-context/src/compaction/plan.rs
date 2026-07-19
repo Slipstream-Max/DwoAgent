@@ -6,6 +6,7 @@ use super::{COMPACT_INSTRUCTION, OMITTED_MARKER, compact_tool_exchanges};
 
 pub const DEFAULT_RECENT_USER_BYTES: usize = 20_000;
 pub const DEFAULT_RECENT_TURNS: usize = 3;
+pub const IMAGE_DOWNGRADE_INSTRUCTION: &str = r#"Convert this conversation into a precise text-only summary for a model that cannot receive images. Describe all relevant information visible in images, including text, UI state, errors, diagrams, and spatial relationships. Preserve user requirements, decisions, completed work, tool results, file paths, identifiers, unresolved problems, and next steps. Do not refer to inaccessible image data."#;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionView {
@@ -98,16 +99,36 @@ impl CompactionPlanner {
             tail_was_filtered,
         }
     }
+
+    pub fn build_image_downgrade(&self, context: &SessionContext) -> CompactionPlan {
+        let mut plan = Self {
+            recent_user_bytes: self.recent_user_bytes,
+            recent_turns: 0,
+        }
+        .build(context);
+        let tool_filtered = compact_tool_exchanges(&context.messages);
+        plan.view = CompactionView {
+            instruction: IMAGE_DOWNGRADE_INSTRUCTION.to_string(),
+            messages: filter_summary_history(&tool_filtered, false),
+        };
+        plan
+    }
 }
 
 fn filter_history(messages: &[ContextMessage]) -> Vec<ContextMessage> {
+    filter_summary_history(messages, true)
+}
+
+fn filter_summary_history(messages: &[ContextMessage], remove_images: bool) -> Vec<ContextMessage> {
     messages
         .iter()
         .filter(|message| !should_drop_from_history(message))
         .filter_map(|message| {
             let mut message = message.clone();
             message.reasoning = None;
-            message.content.remove_images();
+            if remove_images {
+                message.content.remove_images();
+            }
             (!message.content.is_empty() || !message.tool_calls.is_empty()).then_some(message)
         })
         .collect()

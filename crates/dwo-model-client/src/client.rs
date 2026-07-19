@@ -76,6 +76,10 @@ impl ModelClient for ConfiguredModelClient {
         })
     }
 
+    fn supports_image_input(&self, model: &str) -> Result<bool, ModelClientError> {
+        Ok(self.resolve(model)?.1.capabilities.image_input)
+    }
+
     fn validate_selection(&self, selection: &ModelSelection) -> Result<(), ModelClientError> {
         let (_, model) = self.resolve(&selection.model)?;
         let mode = selection

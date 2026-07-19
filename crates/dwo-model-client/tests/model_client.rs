@@ -129,6 +129,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(limits.max_input_tokens, 85_904);
     assert_eq!(limits.compact_trigger_tokens, 68_723);
     assert_eq!(client.default_model_id(), "chat");
+    assert!(client.supports_image_input("chat").unwrap());
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let reply = client
         .stream_turn(

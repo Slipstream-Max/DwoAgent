@@ -823,6 +823,285 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
 }
 
 #[tokio::test]
+async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let unlimited = ModelLimits {
+        context_window_tokens: u64::MAX,
+        max_output_tokens: u32::MAX,
+        max_input_tokens: u64::MAX,
+        compact_trigger_tokens: u64::MAX,
+    };
+    let model = ScriptedModelGateway::with_model_limits_and_capabilities(
+        [
+            ScriptedStep::text("vision answer"),
+            ScriptedStep::text("text answer"),
+        ],
+        [ScriptedSummaryStep {
+            summary: "the screenshot shows a compiler error".to_string(),
+            input_tokens: 30,
+            output_tokens: 8,
+        }],
+        [
+            ("scripted-test-model".to_string(), unlimited),
+            (
+                "text-model".to_string(),
+                ModelLimits {
+                    context_window_tokens: 500,
+                    max_output_tokens: 100,
+                    max_input_tokens: 400,
+                    compact_trigger_tokens: 300,
+                },
+            ),
+        ],
+        [
+            ("scripted-test-model".to_string(), true),
+            ("text-model".to_string(), false),
+        ],
+    );
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
+    let image_prompt = MessageContent::blocks(vec![
+        ContentBlock::text("explain this error"),
+        ContentBlock::image("image/png", "aGVsbG8="),
+    ]);
+    agent
+        .prompt_content(EndpointId::new(), image_prompt.clone())
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut subscription.events).await;
+
+    agent
+        .set_config(SessionConfigUpdate::Model("text-model".to_string()))
+        .await
+        .unwrap();
+    let migrated_usage = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let SessionEventPayload::UsageChanged { used, size } =
+                subscription.events.recv().await.unwrap().payload
+            {
+                break (used, size);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(migrated_usage, (0, 500));
+
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(snapshot.record.llm.model, "text-model");
+    assert_eq!(snapshot.record.context.usage.current_tokens, 0);
+    assert!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .all(|message| !message.content.contains_images())
+    );
+    assert_eq!(
+        snapshot.record.context.compaction.summary.as_deref(),
+        Some("the screenshot shows a compiler error")
+    );
+    assert!(matches!(
+        snapshot.transcript.iter().find_map(|event| match &event.payload {
+            SessionEventPayload::UserPromptSubmitted { content, .. }
+                if content.contains_images() => Some(content),
+            _ => None,
+        }),
+        Some(content) if content == &image_prompt
+    ));
+    let summaries = model.summary_requests().await;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].selection.model, "scripted-test-model");
+    assert!(
+        summaries[0]
+            .view
+            .messages
+            .iter()
+            .any(|message| message.content.contains_images())
+    );
+
+    agent.prompt(EndpointId::new(), "continue").await.unwrap();
+    wait_for_turn_end(&mut subscription.events).await;
+    let requests = model.requests().await;
+    assert_eq!(requests[1].selection.model, "text-model");
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .all(|message| !message.content.contains_images())
+    );
+}
+
+#[tokio::test]
+async fn failed_image_summary_leaves_model_and_context_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ModelLimits {
+        context_window_tokens: 1_000,
+        max_output_tokens: 100,
+        max_input_tokens: 900,
+        compact_trigger_tokens: 800,
+    };
+    let model = ScriptedModelGateway::with_model_limits_and_capabilities(
+        [ScriptedStep::text("vision answer")],
+        [],
+        [
+            ("scripted-test-model".to_string(), limits),
+            ("text-model".to_string(), limits),
+        ],
+        [
+            ("scripted-test-model".to_string(), true),
+            ("text-model".to_string(), false),
+        ],
+    );
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
+    agent
+        .prompt_content(
+            EndpointId::new(),
+            MessageContent::blocks(vec![ContentBlock::image("image/png", "aGVsbG8=")]),
+        )
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut subscription.events).await;
+    let before = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    let before_context = serde_json::to_value(&before.record.context).unwrap();
+
+    let error = agent
+        .set_config(SessionConfigUpdate::Model("text-model".to_string()))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("prepare image context"));
+    let after = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(after.record.llm.model, "scripted-test-model");
+    assert_eq!(
+        serde_json::to_value(&after.record.context).unwrap(),
+        before_context
+    );
+}
+
+#[tokio::test]
+async fn text_model_switch_is_rejected_while_an_image_turn_is_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ModelLimits {
+        context_window_tokens: 1_000,
+        max_output_tokens: 100,
+        max_input_tokens: 900,
+        compact_trigger_tokens: 800,
+    };
+    let model = ScriptedModelGateway::with_model_limits_and_capabilities(
+        [ScriptedStep::delayed_text("late", 5_000)],
+        [],
+        [
+            ("scripted-test-model".to_string(), limits),
+            ("text-model".to_string(), limits),
+        ],
+        [
+            ("scripted-test-model".to_string(), true),
+            ("text-model".to_string(), false),
+        ],
+    );
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
+    let turn_id = agent
+        .prompt_content(
+            EndpointId::new(),
+            MessageContent::blocks(vec![ContentBlock::image("image/png", "aGVsbG8=")]),
+        )
+        .await
+        .unwrap();
+
+    let error = agent
+        .set_config(SessionConfigUpdate::Model("text-model".to_string()))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("image turn is active"));
+    assert_eq!(
+        agent
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record
+            .llm
+            .model,
+        "scripted-test-model"
+    );
+    agent.cancel(Some(turn_id)).await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut subscription.events).await,
+        SessionEventPayload::TurnCancelled { .. }
+    ));
+}
+
+#[tokio::test]
+async fn text_model_rejects_new_images_before_persisting_the_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ModelLimits {
+        context_window_tokens: 1_000,
+        max_output_tokens: 100,
+        max_input_tokens: 900,
+        compact_trigger_tokens: 800,
+    };
+    let model = ScriptedModelGateway::with_model_limits_and_capabilities(
+        [],
+        [],
+        [("text-model".to_string(), limits)],
+        [("text-model".to_string(), false)],
+    );
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let mut session = new_session(dir.path(), SessionMode::FullAccess);
+    session.llm.model = "text-model".to_string();
+    let agent = service.create(session).await.unwrap();
+    let error = agent
+        .prompt_content(
+            EndpointId::new(),
+            MessageContent::blocks(vec![ContentBlock::image("image/png", "aGVsbG8=")]),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("does not support image input"));
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(snapshot.transcript.is_empty());
+    assert!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .all(|message| !message.content.contains_images())
+    );
+}
+
+#[tokio::test]
 async fn prompt_is_stable_while_agents_changes_are_appended_as_watcher_messages() {
     let root = tempfile::tempdir().unwrap();
     let cwd = root.path().join("workspace");

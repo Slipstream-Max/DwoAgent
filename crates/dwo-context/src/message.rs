@@ -166,6 +166,12 @@ impl MessageContent {
             })
     }
 
+    pub fn contains_images(&self) -> bool {
+        self.0
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }
+
     pub fn len(&self) -> usize {
         self.text_bytes()
     }

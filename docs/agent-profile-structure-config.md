@@ -1,381 +1,130 @@
 # Agent Profile 结构和配置
 
-`dwo-agent` 的 agent profile 现在只保留三个顶层概念：
-
-完整 `agent.yaml` 模板见 `docs/agent.full.yaml`。Supervisor 是机器级配置，见
-`docs/supervisor-config.md` 和 `docs/supervisor.full.yaml`。
+当前 rewrite 只有一个 profile host 和一个本地 daemon。profile 根目录默认是 `~/.dwoagent`，配置入口固定为 `profile.yaml`，资源入口固定为 `resource/`。
 
 ```text
-<agent-folder>/
-  agent.yaml
-  resources/
-    prompt/
-      system.md                 # 必需，系统提示词
-      AGENTS.md                 # 可选，profile 级 rule
-    skills/                     # 可选
-      <skill-name>/
-        SKILL.md
-    mcp.json                    # 可选，MCP 配置
-  runtime/                      # 运行时生成，建议整体 gitignore
-    sessions/
-    channel_state/
-    channel_secret/
-    automation_state/
+<profile-root>/
+|- profile.yaml
+|- resource/
+|  |- prompts/System.md       必需
+|  |- prompts/AGENTS.md       可选
+|  |- skills/<skill>/SKILL.md 可选
+|  `- mcp.json                可选
+|- runtime/
+|  |- sessions/YYYY/MM/DD/<session-id>/
+|  |  |- session.json
+|  |  |- model_context.json
+|  |  `- client_transcript.jsonl
+|  |- workspaces/
+|  |- attachments/
+|  |- mcp/catalog.json
+|  |- mcp/oauth/
+|  `- logs/
+`- channels/weixin/
+   |- runtime.yaml
+   `- secret.yaml
 ```
 
-- `agent.yaml`：唯一配置入口，包含 agent 元信息、模型、policy、channels 和 automation。
-- `resources/`：agent 的上下文资源。这里放 prompt、rule、skills 和 MCP 配置。
-- `runtime/`：运行产物。这里放普通 session、channel state、channel secret 和 automation sticky state。
+`session.json` 保存 session 自身配置，`model_context.json` 保存当前模型上下文，`client_transcript.jsonl` 是完整、追加式的客户端事件流。压缩只重建 model context，不删除 transcript。
 
-## agent.yaml
-
-最小可用配置：
+## profile.yaml
 
 ```yaml
-agentId: dwo-agent
-name: dwo-agent
-description: Dwo Agent runtime
+name: coder
+description: coding agent
 policyMode: confirm
-tools:
-  fileEdit: enable
-  terminal: enable
-  subagent: enable
+channels:
+  weixin:
+    enabled: false
+automation:
+  enabled: false
+  jobs: []
 model:
   defaultModelId: deepseek-v4-pro
+  providers:
+    deepseek:
+      type: deepseek
+      apiKeyEnv: DEEPSEEK_API_KEY
   models:
     - modelName: deepseek-v4-pro
       provider: deepseek
       modelId: deepseek-v4-pro
-      apiKeyEnv: DEEPSEEK_API_KEY
-      defaultReasoningMode: high
-      compactThreshold: 0.8
 ```
 
-顶层字段：
+支持的顶层字段只有：
 
-- `agentId`：必填 id，用于 session metadata 和展示。
-- `name`：必填显示名称。
-- `description`：必填简短描述。
-- `policyMode`：必填权限策略。允许 `full_access`、`confirm`、`watch`。
-- `maxRunningTurn`：可选正整数。省略时，agent loop 运行到模型停止、取消或出错。
-- `sessionStoreDir`：可选，默认 `runtime/sessions`。
-- Channel state 固定写入 `runtime/channel_state`，不提供 `agent.yaml` 配置项。
-- `externalSkillsDirs`：可选，额外 skill roots，相对路径按 agent folder 解析。
-- `externalRuleFiles`：可选，额外 rule 文件，相对路径按 agent folder 解析。
-- `tools`：可选。支持 `fileEdit`、`terminal`、`subagent`，每个值为 `enable` 或 `disable`，默认启用。
+- `name`、`description`：profile 标识和描述，不能为空。
+- `policyMode`：`full_access`、`confirm` 或 `watch`，决定 session 默认权限模式。
+- `channels`：当前支持 daemon 托管的 Weixin 配置；不配置则不启动外部 channel。
+- `automation`：daemon 托管的定时任务配置。
+- `model`：provider 实例、模型别名和 profile 级限制覆盖。
 
-运行时行为：
-
-- `tools`、`maxRunningTurn`、policy mode、model id、reasoning mode、tool schemas 会在 session 创建时快照。
-- 修改 `agent.yaml` 会影响新 session；已有 session 保留自己的持久化快照。
-- 普通 session 写入 `<sessionStoreDir>/<year>/<month>/<day>/<sessionId>/`。
+旧的 `agent.yaml`、`tools` 开关、supervisor profile registry 和额外 transport 配置不属于当前 schema，会被拒绝。
 
 ## model
 
-`model` section 定义当前 agent 可用的模型别名。
-
 ```yaml
 model:
   defaultModelId: deepseek-v4-pro
+  providers:
+    deepseek:
+      type: deepseek
+      baseUrl: null
+      apiKeyEnv: DEEPSEEK_API_KEY
   models:
     - modelName: deepseek-v4-pro
       provider: deepseek
       modelId: deepseek-v4-pro
-      apiKeyEnv: DEEPSEEK_API_KEY
+      contextWindowTokens: 1000000
+      maxOutputTokens: 384000
+      compactThreshold: 0.5
       defaultReasoningMode: high
-      compactThreshold: 0.8
 ```
 
-- `defaultModelId`：必填默认模型别名，必须匹配某个 `modelName`。
-- `models`：非空模型别名列表。
-- `modelName`：会话使用的本地模型别名。
-- `provider`：内置 provider catalog 里的 provider id。
-- `modelId`：内置 provider catalog 里的 provider model id。
-- `apiKeyEnv`：可选，读取 API key 的环境变量名。
-- `apiKey`：可选，内联 API key。
-- `apiBase`：可选，provider base URL 覆盖。
-- `temperature`、`topP`、`timeoutSeconds`、`maxTokens`：可选请求参数。
-- `defaultReasoningMode`：可选 reasoning mode，必须被所选 catalog model 支持。
-- `compactThreshold`：可选上下文压缩阈值，范围 `(0, 1]`，默认 `0.8`。
+模型 alias 必须匹配 `modelName`。`provider` 和 `modelId` 在内置 catalog 中解析；`baseUrl`、`apiKeyEnv`、`apiKey` 可以作为 profile 级 provider 设置；context/output 限制、`compactThreshold` 和默认 reasoning mode 可以由 profile 覆盖。headers、retry、request body 和 capabilities 仍由内置 model catalog 管理。
 
-运行时会把 `model` section 和内置 provider catalog 合并。catalog 提供模型能力、context window、max output tokens 和支持的 reasoning modes。
+模型响应的 `total_tokens` 代表当前 context token snapshot，不会把不同 turn 的 input/output 累加。压缩把当前值重置为 0；模型切换会立即按目标模型 context window 发送 usage update。
 
-## policy
+### 图片模型切换
 
-`policy` section 配置 terminal 命令黑白名单。它不决定当前 mode；默认 mode 仍由顶层 `policyMode` 决定。
+从支持图片的模型切换到纯文本模型时，daemon 会先使用当前或最后成功的视觉模型，把所有含图历史压缩成文字，再提交目标模型。摘要失败时 model context 和 session 配置都保持原值。图片 turn 正在运行时不能降级切换；纯文本模型也会在写入 transcript/model context 前拒绝新的图片 prompt。
 
-```yaml
-policy:
-  terminal:
-    deny:
-      - regex: '(?i)^\s*git\s+reset\s+--hard\b'
-      - regex: '(?i)\bRemove-Item\b.*\b-Recurse\b'
-    allow:
-      - exact: git status
-      - prefix: git diff
-      - prefix: rg
-      - prefix: cargo check
-    watchAllow:
-      - exact: git status
-      - prefix: git diff
-      - prefix: Get-Content
-```
+迁移完成后 model context 不再包含旧图片，但 `client_transcript.jsonl` 保留原始图片供 replay。切回视觉模型不会自动把已经压缩掉的图片恢复到 model context，用户需要重新附图。
 
-- `full_access`：`terminal_exec.command` 命中 `deny` 就拒绝，否则执行。
-- `confirm`：命中 `deny` 就拒绝；命中 `allow` 且是单条简单命令时直接执行；其他进入确认流程。
-- `watch`：只有命中 `watchAllow` 且是单条简单命令时执行；其他拒绝。
-- `fileEdit` 不读取 `policy.terminal`：`full_access` 直接执行，`confirm` 一律确认，`watch` 一律拒绝。
-- subagent 固定继承父 session 的 mode，上限不能高于父 session。
+## resource
 
-## channels
-
-`channels` section 只配置 profile host 的外部入口：Weixin 和 Feishu。ACP stdio 是 `dwoagent supervisor acp --agent-profile <path>` 的 shim/transport；桌面/UI WebSocket 属于 supervisor，不写入 agent profile。
-
-```yaml
-channels:
-  weixin:
-    enabled: false
-    workspaceDir: .
-    mediaInput: false
-    mediaOutput: false
-  feishu:
-    enabled: false
-    workspaceDir: .
-    domain: feishu
-```
-
-如果 `channels` 缺失或为空，所有外部 channel 默认禁用。`dwoagent agent run` 仍会启动 stdio JSON-RPC profile host。
-### Weixin
-
-```yaml
-channels:
-  weixin:
-    enabled: true
-    workspaceDir: .
-    markdownFilter: true
-    mediaInput: true
-    mediaOutput: true
-    overrideModel: deepseek-v4-pro
-    overrideReasoningMode: high
-    defaultSessionId: null
-```
-
-运行时文件：
-
-```text
-runtime/channel_secret/weixin/auth.yaml
-runtime/channel_state/weixin/context_tokens.json
-runtime/channel_state/weixin/sync_buf.txt
-runtime/channel_state/weixin/bridge_state.yaml
-```
-
-Weixin 不创建特殊会话目录。它通过 channel control state（兼容文件名 `bridge_state.yaml`）记录默认普通 session 和当前 `/switch` 绑定；真实对话、上下文和附件都保存在普通 session 中。附件下载到当前 active session 的 `attachments/inbox/weixin/<messageId>/`，并以 ACP `resource_link` 加入本轮输入。
-
-### Feishu
-
-```yaml
-channels:
-  feishu:
-    enabled: true
-    workspaceDir: .
-    domain: feishu
-    dmPolicy: allow_all
-    groupPolicy: white_list
-    allowFrom: ["*"]
-    groupAllowFrom: []
-    groupRequireMention: true
-    mediaInput: true
-    mediaOutput: true
-    cardOutput: true
-```
-
-运行时文件：
-
-```text
-runtime/channel_secret/feishu/auth.yaml
-runtime/channel_state/feishu/dm/<sender>/bridge_state.yaml
-runtime/channel_state/feishu/group/<chat_id>/bridge_state.yaml
-```
-
-Feishu 私聊和群聊使用独立 channel state。真实对话、上下文和附件仍然保存在普通 session 中。开启 `mediaInput` 后，入站图片和文件会下载到当前 active session 的 `attachments/inbox/feishu/<messageId>/`。
-
-Weixin 和 Feishu 支持：
-
-```text
-/help
-/new
-/list
-/switch <sessionId>
-/back
-/where
-/cancel
-/approve <confirmation_id>
-/deny <confirmation_id> [reason]
-```
-
-这些 slash commands 属于 Dwo channel control 语义；入站消息内容本身优先复用 ACP `ContentBlock`。
-
-确认审计写入：
-
-```text
-runtime/channel_secret/audit/confirm_audit.jsonl
-```
-
-## automation
-
-`automation` section 配置 `dwoagent agent run` 启动的 scheduler。Automation 不是 ingress channel；它只是按计划触发普通 agent session。
-
-```yaml
-automation:
-  enabled: true
-  jobs:
-    - id: daily_digest
-      enabled: true
-      workspaceDir: .
-      session:
-        mode: new
-      schedule:
-        type: interval
-        everySeconds: 3600
-      prompt: "总结当前项目状态。"
-      notify:
-        - channel: weixin
-```
-
-`session.mode` 支持：
-
-- `new`：每次创建新 session。
-- `fixed`：复用指定 session id。
-- `sticky`：第一次创建，后续复用同一个 session。
-
-Sticky 状态写入：
-
-```text
-runtime/automation_state/<jobId>/state.yaml
-```
-
-每次 run 记录写入普通 session：
-
-```text
-runtime/sessions/<year>/<month>/<day>/<sessionId>/automation/<jobId>/runs/<runId>/run.yaml
-```
-
-## resources/prompt
-
-系统提示词是必需文件：
-
-```text
-resources/prompt/system.md
-```
-
-它会作为 `<agent_prompt>` 插入 system context。文件必须存在且不能为空。
-
-Profile 级 rule 是可选文件：
-
-```text
-resources/prompt/AGENTS.md
-```
-
-Rules 读取顺序：
-
-```text
-resources/prompt/AGENTS.md
-agent.yaml externalRuleFiles entries
-<cwd>/.agent/AGENTS.md
-<cwd>/AGENTS.md
-<cwd>/CLAUDE.md
-```
-
-每个非空 rule 文件会被包装成 `<rule>` 内的独立 source block，包含 source path 和转义后的内容。
-
-## skills
-
-Skills 是可选的。运行时从以下位置发现：
-
-```text
-resources/skills
-agent.yaml externalSkillsDirs entries
-<cwd>/.agent/skills
-```
-
-每个 `SKILL.md` 必须以 YAML frontmatter 开头：
-
-```yaml
----
-name: code-review
-description: Review code changes and call out concrete defects.
----
-```
-
-生成的 `<available_skills>` block 只包含每个 skill 的 name、description 和 `SKILL.md` location。模型可以据此决定是否打开对应 skill 文件。
+`resource/prompts/System.md` 是固定的必需系统提示词。`resource/prompts/AGENTS.md` 是可选规则文件；`resource/skills/<name>/SKILL.md` 是可选 skill。daemon 只观察这些固定路径和当前工作目录的规则/skill 变化，并在 agent-loop 边界追加 watcher 消息。
 
 ## MCP
 
-`resources/mcp.json` 是可选的 MCP 配置入口。Host 会解析其中的 server、transport、headers 和 stdio `env`，但不会把 MCP schema 注册为 native tool 或注入额外 skill。
+`resource/mcp.json` 是可选配置：
 
-如果存在，system context 和 env block watcher snapshot 会加入：
-
-```xml
-<mcp>
-  <config>...</config>
-  <usage>...</usage>
-</mcp>
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "github": {
+      "type": "streamableHttp",
+      "url": "https://example.test/mcp",
+      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"}
+    }
+  }
+}
 ```
 
-Host 将内存 catalog 的派生快照写入 `runtime/mcp/catalog.json`，OAuth 凭据写入 `runtime/mcp/oauth/`。它们都不是用户配置：daemon 每次启动都会忽略旧连接状态，并发初始化所有 server 后覆盖 catalog。新加入或变更的 server 由 config watcher 同样初始化；成功连接由 Host 持有，失败或认证缺失会记录在 catalog 中。
+daemon 启动时并发初始化所有 server，并持续托管成功的 stdio/HTTP 连接。配置 watcher 对新增或变更 server 使用同样的初始化流程。catalog 状态为 `starting`、`ready`、`auth_required` 或 `failed`；`runtime/mcp/catalog.json` 是当前内存 catalog 的派生投影，不是活跃连接证明。MCP schema 不会注册成模型 native tool。
 
-`<usage>` 会提示模型通过 terminal 使用：
+模型通过 terminal 使用以下命令：
 
-```powershell
+```text
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
-dwo mcp auth <server>
-dwo mcp auth <server> --logout
+dwo mcp auth <server> [--logout]
 ```
 
-## Env Block Watcher
+`search` 只读取当前内存 catalog。server 命中时列出全部工具但只对直接命中的工具展开 schema；tool-only 命中时只列出匹配工具并展开 schema。输出是 YAML 风格文本，只有 `call --args` 使用 JSON payload。
 
-每个主会话都会启动一个 env block watcher。它观察这些动态上下文来源：
-
-```text
-resources/prompt/AGENTS.md
-agent.yaml externalRuleFiles entries
-<cwd>/.agent/AGENTS.md
-<cwd>/AGENTS.md
-<cwd>/CLAUDE.md
-resources/mcp.json
-resources/skills
-agent.yaml externalSkillsDirs entries
-<cwd>/.agent/skills
-```
-
-当 snapshot 变化时，它会在 agent-loop 边界追加一条 watcher system message，不会改写 stable system prefix。
-
-```xml
-<watcher_content>
-<env_block>
-  <rule>...</rule>
-  <mcp>...</mcp>
-  <available_skills>...</available_skills>
-  <env_context>...</env_context>
-</env_block>
-</watcher_content>
-```
-
-## Generated System Context
-
-新 session 的 system context 由这些 blocks 构成：
-
-```text
-<agent_context>
-  <agent_prompt>...</agent_prompt>
-  <rule>...</rule>
-  <tools>...</tools>
-  <mcp>...</mcp>
-  <available_skills>...</available_skills>
-  <env_context>...</env_context>
-</agent_context>
-```
-
-`<mcp>` 只在 `resources/mcp.json` 存在时出现。
-
+完整 CLI 参考见 [commands.md](commands.md)。

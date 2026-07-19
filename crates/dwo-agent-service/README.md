@@ -102,6 +102,15 @@ The service persists a valid update before publishing `ConfigChanged`. A mode
 change applies to the next tool batch. Model and reasoning changes apply to the
 next model request. Work already dispatched keeps its captured configuration.
 
+Switching from an image-capable model to a text-only model is a context
+migration. When the session is idle, the service first asks the current (or
+last successfully used) image-capable model to summarize every image-bearing
+turn, rebuilds `model_context.json` without image blocks, and only then persists
+the target model. The client transcript remains unchanged for replay. A failed
+summary leaves both model and context unchanged. A downgrade is rejected while
+an image turn is active, and a text-only model rejects new image prompts before
+they are persisted.
+
 ## Turn call path
 
 ```text
@@ -134,14 +143,21 @@ uses the last successfully used model for that summary, preserves the session's
 current reasoning mode, and records the target as `last_model` only after its
 first successful turn request.
 
+Image capability downgrades use a stricter plan: the summary request retains
+all image blocks so the source model can describe them, while the rebuilt model
+context retains no images at all. Switching back to an image-capable model does
+not restore compacted images; the original blocks remain available only in the
+append-only client transcript.
+
 Only an explicitly classified `ContextLengthExceeded` response enters reactive
 recovery. Authentication, rate-limit, network, and other invalid-request
 errors do not masquerade as context errors.
 
-Every provider response must include input and output usage. The context keeps
-cumulative input/output totals for accounting and the last normal turn's input
-tokens for compaction decisions. Summary usage contributes to cumulative
-totals but does not become the current conversation-size signal.
+Every normal provider response must include usage. Its reported total becomes
+the current context-token snapshot; values are never accumulated across turns.
+Compaction or an image downgrade clears the snapshot to zero until the next
+normal model response. Changing models immediately publishes that current value
+against the target model's context-window size.
 
 ## Observation and control
 

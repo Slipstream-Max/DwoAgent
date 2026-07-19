@@ -77,6 +77,10 @@ pub struct SummaryReply {
 pub trait ModelClient: Send + Sync {
     fn model_limits(&self, model: &str) -> Result<ModelLimits, ModelClientError>;
 
+    fn supports_image_input(&self, _model: &str) -> Result<bool, ModelClientError> {
+        Ok(false)
+    }
+
     fn validate_selection(&self, _selection: &ModelSelection) -> Result<(), ModelClientError> {
         Ok(())
     }

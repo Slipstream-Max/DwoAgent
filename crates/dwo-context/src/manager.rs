@@ -94,6 +94,13 @@ impl ContextManager {
         &self.context.messages
     }
 
+    pub fn contains_images(&self) -> bool {
+        self.context
+            .messages
+            .iter()
+            .any(|message| message.content.contains_images())
+    }
+
     pub fn append_user(&mut self, _turn_id: TurnId, content: impl Into<MessageContent>) {
         self.context.messages.push(ContextMessage::user(content));
     }
@@ -153,6 +160,10 @@ impl ContextManager {
 
     pub fn plan_compaction(&self, planner: &CompactionPlanner) -> CompactionPlan {
         planner.build(&self.context)
+    }
+
+    pub fn plan_image_downgrade(&self) -> CompactionPlan {
+        CompactionPlanner::default().build_image_downgrade(&self.context)
     }
 
     /// Replace model context and clear the reported token count until the next model response.

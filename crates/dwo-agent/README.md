@@ -54,6 +54,13 @@ dwo automation run <job> [--json]
 dwo acp
 ```
 
+`session model` can move an idle image-bearing session to a text-only model.
+Before committing the switch, the current image-capable model converts the
+images into a text summary; the model context is then image-free while replay
+keeps the original image events. The switch fails without changing state if
+that summary fails, and it is rejected while an image turn is active. A
+text-only model also rejects new image prompts before storing them.
+
 Windows uses a named pipe and an on-login scheduled task whose generated VBS
 launcher keeps the daemon window hidden. macOS uses a Unix domain socket and a
 per-user launchd agent. `serve` itself stays in the foreground; the
@@ -67,7 +74,10 @@ resource/prompts/System.md
 resource/prompts/AGENTS.md
 resource/skills/
 resource/mcp.json
-runtime/sessions/YYYY/MM/DD/<session-id>.json
+runtime/sessions/YYYY/MM/DD/<session-id>/
+  session.json
+  model_context.json
+  client_transcript.jsonl
 runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/mcp/catalog.json
@@ -129,6 +139,12 @@ connection stays managed by the daemon. New or changed servers are initialized
 the same way by the config watcher. Failed or unauthenticated servers remain in
 the catalog with their status and error. MCP schemas are never registered as
 model tools.
+
+`mcp search` reads only the current in-memory catalog and never starts a server.
+A server match lists all of that server's tools; directly matching tools also
+expand their input schema. A tool-only match lists only matching tools with
+schemas. CLI results are rendered as YAML-style text; `--args` remains JSON
+because it is the MCP tool argument payload.
 
 ```json
 {

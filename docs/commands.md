@@ -1,141 +1,101 @@
-# dwoagent 命令参考
+# dwo 命令参考
 
-## 总览
+`dwo` 是本地 daemon 的控制 CLI。除 `serve` 外，命令都通过 profile 的本地 IPC 连接已经运行的 daemon。默认 profile 是 `~/.dwoagent/profile.yaml`，也可以用全局 `--config-path <path>` 指定。
+
+## 生命周期
 
 ```text
-dwoagent <command>
+dwo install [--start]
+dwo uninstall [--purge]
+dwo serve
+dwo daemon start
+dwo daemon stop
+dwo daemon status
 ```
 
-核心命令分三类：
+`install` 创建固定的 profile/resource/runtime 目录并注册 daemon 自启动任务。`--start` 同时启动 daemon。`serve` 在前台运行 host；通常由系统任务或 `daemon start` 管理。`daemon status` 返回 YAML 风格的健康状态、session 数量、channel 数量和 automation 数量。
 
-- agent core：运行单个 profile host，左侧 ingress 统一转发到 `AgentService`。
-- supervisor：管理机器级桌面后端 daemon。
-- create/doctor/channel：创建配置、检查环境、登录外部 channel。
+daemon 启动 host 时会并发初始化 `resource/mcp.json` 中的全部 MCP server。每个 server 会等待到 `ready`、`auth_required` 或 `failed`；stdio/HTTP 连接由 daemon 持续托管并复用。新增或修改配置由 watcher 使用相同流程初始化。`runtime/mcp/catalog.json` 是内存 catalog 的派生投影，不是活跃连接的凭据。
 
-## Agent core
+## Session
 
-```bash
-dwoagent agent run --agent-profile <path>
+```text
+dwo session list
+dwo session new [name] [--cwd <path>]
+dwo session delete <session-id>
+dwo session prompt <session-id> <message>
+dwo session cancel <session-id>
+dwo session watch <session-id>
+dwo session model <session-id> <model>
+dwo session reasoning <session-id> [reasoning]
+dwo session approve <session-id> <permission-id>
+dwo session deny <session-id> <permission-id> [reason]
 ```
 
-运行单个 agent profile host。默认开启 stdio JSON-RPC，同时启动 `agent.yaml` 里启用的 Weixin/Feishu channels 和 automation triggers。
+`session list` 只输出 session id 和标题。`session watch` 先输出当前 snapshot，然后持续流式输出 reasoning、tool call、tool result、answer 和状态事件；它是持续订阅，使用 `Ctrl+C` 退出。
 
-没有独立的 `dwoagent acp` 或 `dwoagent worker` 顶层命令。ACP 兼容入口统一放在 supervisor 下，避免为同一个 profile 启动第二个 agent core。
+普通 CLI 输出使用适合终端阅读的 YAML 风格文本，不把 JSONL 直接打印给用户。`session prompt`、`session new` 等命令的响应也遵循这一规则。
 
-## Supervisor
+`session cancel` 只请求取消当前 turn。正在运行的 terminal/tool future 会先清理，session 等待取消结果后才恢复 idle；取消期间提交的新 prompt 会排队到旧 turn 完成之后。
 
-```bash
-dwoagent create supervisor --default
+`session model` 的模型切换应用于后续 model request。若目标模型支持图片则直接切换；若目标模型是纯文本模型且当前 context 含图片，idle session 会先使用当前或最后成功的视觉模型生成文字摘要，再重建无图 model context。摘要失败时模型和 context 都不改变；图片 turn 运行期间不允许降级切换。client transcript 始终保留原始图片用于 replay，文本模型也会在持久化前拒绝新的图片 prompt。迁移成功会将当前 context token 重置为 0，并按目标模型窗口发送新的 usage update。
+
+Session 文件布局为：
+
+```text
+runtime/sessions/YYYY/MM/DD/<session-id>/
+|- session.json
+|- model_context.json
+`- client_transcript.jsonl
 ```
 
-创建默认 supervisor 配置到 `~/.dwoagent/supervisor.yaml`。
+`session.json` 保存 session 配置，`model_context.json` 保存当前模型上下文和 usage，`client_transcript.jsonl` 是追加式的完整客户端事件流。
 
-```bash
-dwoagent create supervisor --path <path>
+## MCP
+
+```text
+dwo mcp search <query>
+dwo mcp call <server.tool> --args '<json>'
+dwo mcp auth <server> [--logout]
 ```
 
-交互式创建 supervisor 配置到指定路径。
+`search` 只查询 daemon 当前的内存 catalog，不启动或重连 server。查询按 server 名称/描述和 tool 名称/描述匹配：
 
-```bash
-dwoagent supervisor enable
+- 只命中 server：列出该 server 的全部工具，但不展开 schema。
+- 只命中 tool：只列出匹配工具，并展开其输入 schema。
+- 两者同时命中：列出 server 的全部工具，只展开直接命中的工具 schema。
+
+`call` 使用 `server.tool` selector 调用已发现的工具；daemon 会复用托管连接，连接失效时按需重连并刷新 catalog。`auth` 启动 OAuth 登录，`--logout` 删除授权并使该 server 重新进入初始化流程。
+
+MCP 命令输出为 YAML 风格文本。只有 `--args` 的工具参数使用 JSON，因为它们会原样作为 MCP 调用 payload。
+
+## Channel
+
+```text
+dwo channel list
+dwo channel weixin status
+dwo channel weixin bind
+dwo channel weixin unbind
+dwo channel weixin send-message <message>
+dwo channel weixin send-file <path>
 ```
 
-注册当前用户登录自启动。作用域是 supervisor，不是某个 agent profile。
+`weixin bind` 在终端显示 QR 登录流程；其它命令通过 daemon 读取或更新绑定 channel 状态。
 
-```bash
-dwoagent supervisor start
+## Automation
+
+```text
+dwo automation list [--json]
+dwo automation status [--json]
+dwo automation run <job> [--json]
 ```
 
-后台启动 supervisor。Windows 下通过隐藏 launcher 启动，避免弹出命令行窗口。
+默认输出为可读文本；仅指定 `--json` 时保留机器读取的 JSON 输出。
 
-```bash
-dwoagent supervisor status
+## ACP
+
+```text
+dwo acp
 ```
 
-查看自启动注册状态和正在运行的 supervisor 进程。
-
-```bash
-dwoagent supervisor acp --agent-profile <path>
-```
-
-ACP stdio 兼容入口。给编辑器或 ACP 客户端填 command 时使用。该命令只作为 shim 连接 supervisor，并由 supervisor 转发到已注册的 profile host。
-
-```bash
-dwoagent supervisor stop
-```
-
-停止当前运行的 supervisor 进程。
-
-```bash
-dwoagent supervisor disable
-```
-
-取消自启动注册。
-
-## Create
-
-```bash
-dwoagent create agent --name <name>
-```
-
-交互式创建 agent profile。默认路径为 `~/.dwoagent/profiles/<name>`。
-
-```bash
-dwoagent create agent --name <name> --path <path>
-```
-
-交互式创建 agent profile 到指定路径。
-
-## Doctor
-
-```bash
-dwoagent doctor
-```
-
-默认执行环境检查，等同于 `dwoagent doctor --check`。
-
-```bash
-dwoagent doctor --check
-```
-
-检查本地环境依赖，例如 `mcporter` 和 `rg`。
-
-```bash
-dwoagent doctor --resolve
-```
-
-交互式安装缺失的环境依赖。当前通过 npm 安装 `mcporter` 和 `ripgrep` 包；如果缺 npm，会提示先安装 Node.js/npm。
-
-```bash
-dwoagent doctor --resolve --yes
-```
-
-不询问，直接执行可自动化的修复步骤。
-
-`doctor` 不创建 agent profile，也不注册 daemon。
-
-## Channel login
-
-```bash
-dwoagent channel login weixin --agent-profile <path>
-```
-
-登录 Weixin channel，凭据写入该 profile 的 `runtime/channel_secret/`。
-
-```bash
-dwoagent channel login feishu --agent-profile <path> --app-id <id> --app-secret <secret>
-```
-
-保存 Feishu app 凭据。也可以通过 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 环境变量提供。
-
-## 推荐初始化流程
-
-```bash
-dwoagent doctor --check
-dwoagent create agent --name coder
-dwoagent create supervisor --default
-# 编辑 ~/.dwoagent/supervisor.yaml，把 coder profile 加入 profiles
-dwoagent supervisor enable
-dwoagent supervisor start
-dwoagent supervisor status
-```
+ACP 使用 stdio 连接同一个 daemon，共享 session、事件流、模型配置和 tool runtime，不会创建独立的 session 或 MCP 连接。

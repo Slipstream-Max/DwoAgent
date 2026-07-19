@@ -411,6 +411,48 @@ fn compaction_removes_historical_images_but_keeps_latest_three_turn_images() {
 }
 
 #[test]
+fn image_downgrade_summary_sees_images_and_replacement_removes_them() {
+    let root = tempfile::tempdir().unwrap();
+    let builder = SystemPromptBuilder::new(None, root.path());
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+    for index in 1..=2 {
+        let turn = TurnId::parse(format!("turn-image-{index}")).unwrap();
+        manager.append_user(
+            turn.clone(),
+            MessageContent::blocks(vec![
+                ContentBlock::text(format!("user {index}")),
+                ContentBlock::image("image/png", format!("image-{index}")),
+            ]),
+        );
+        manager.append_assistant(turn, format!("answer {index}"), Vec::new());
+    }
+
+    let plan = manager.plan_image_downgrade();
+    let summary_images = plan
+        .view
+        .messages
+        .iter()
+        .flat_map(|message| message.content.as_blocks())
+        .filter_map(|block| match block {
+            ContentBlock::Image { data, .. } => Some(data.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(summary_images, ["image-1", "image-2"]);
+    assert!(plan.recent_turn_messages.is_empty());
+
+    manager
+        .apply_compaction(plan, "text description of both images", &builder)
+        .unwrap();
+    assert!(!manager.contains_images());
+    assert_eq!(manager.context().compaction.count, 1);
+    assert_eq!(
+        manager.context().compaction.summary.as_deref(),
+        Some("text description of both images")
+    );
+}
+
+#[test]
 fn historical_and_latest_turn_users_share_one_utf8_byte_budget() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());

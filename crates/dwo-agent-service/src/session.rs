@@ -410,11 +410,21 @@ impl SessionActor {
                         };
                         match self.model.validate_selection(&selection) {
                             Ok(()) => {
-                                updated.touch();
-                                self.repository
-                                    .save(&updated)
-                                    .await
-                                    .map_err(AgentServiceError::from)
+                                let migration = if model_changed {
+                                    self.prepare_model_change(&mut updated).await
+                                } else {
+                                    Ok(())
+                                };
+                                match migration {
+                                    Ok(()) => {
+                                        updated.touch();
+                                        self.repository
+                                            .save(&updated)
+                                            .await
+                                            .map_err(AgentServiceError::from)
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             Err(error) => Err(AgentServiceError::InvalidConfig(error.to_string())),
                         }
@@ -498,6 +508,17 @@ impl SessionActor {
                 self.record.info.id.clone(),
             ));
         }
+        if content.contains_images()
+            && !self
+                .model
+                .supports_image_input(&self.record.llm.model)
+                .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?
+        {
+            return Err(AgentServiceError::InvalidConfig(format!(
+                "model {} does not support image input",
+                self.record.llm.model
+            )));
+        }
         let turn_id = TurnId::new();
         let event_content = content.clone();
         let title_generation =
@@ -548,6 +569,81 @@ impl SessionActor {
             actor: self.turn_tx.clone(),
         }));
         Ok(turn_id)
+    }
+
+    async fn prepare_model_change(
+        &self,
+        updated: &mut SessionRecord,
+    ) -> Result<(), AgentServiceError> {
+        let target_model = updated.llm.model.as_str();
+        if self
+            .model
+            .supports_image_input(target_model)
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?
+        {
+            return Ok(());
+        }
+
+        let mut context = ContextManager::new(updated.context.clone());
+        if !context.contains_images() {
+            return Ok(());
+        }
+        if self.active.is_some() {
+            return Err(AgentServiceError::InvalidConfig(
+                "cannot switch to a text-only model while an image turn is active; wait for it to finish or cancel it"
+                    .to_string(),
+            ));
+        }
+
+        let source_model = self.image_migration_model()?;
+        let selection = ModelSelection {
+            model: source_model,
+            reasoning: self.record.llm.reasoning.clone(),
+        };
+        let plan = context.plan_image_downgrade();
+        let summary = self
+            .model
+            .summarize(selection, plan.view.clone(), CancellationToken::new())
+            .await
+            .map_err(|error| {
+                AgentServiceError::InvalidConfig(format!(
+                    "prepare image context for model {target_model}: {error}"
+                ))
+            })?;
+        if summary.summary.trim().is_empty() {
+            return Err(AgentServiceError::InvalidConfig(format!(
+                "prepare image context for model {target_model}: summary is empty"
+            )));
+        }
+        context
+            .apply_compaction(plan, summary.summary, &self.prompt_builder)
+            .map_err(anyhow::Error::from)?;
+        updated.context = context.into_context();
+        Ok(())
+    }
+
+    fn image_migration_model(&self) -> Result<String, AgentServiceError> {
+        let current = self.record.llm.model.as_str();
+        if self
+            .model
+            .supports_image_input(current)
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?
+        {
+            return Ok(current.to_string());
+        }
+        if let Some(previous) = self.record.context.usage.last_model.as_deref()
+            && previous != current
+            && self
+                .model
+                .supports_image_input(previous)
+                .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?
+        {
+            return Ok(previous.to_string());
+        }
+        Err(AgentServiceError::InvalidConfig(
+            "cannot switch to a text-only model because no image-capable model is available to summarize the current context"
+                .to_string(),
+        ))
     }
 
     async fn handle_turn_message(&mut self, message: TurnActorMessage) -> bool {

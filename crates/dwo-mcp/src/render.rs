@@ -1,4 +1,9 @@
-use crate::{Catalog, SearchGroup, ServerStatus, ShowResult};
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::{Catalog, SearchGroup, ServerStatus};
 
 pub fn render_list(catalog: &Catalog) -> String {
     if catalog.servers.is_empty() {
@@ -22,74 +27,54 @@ pub fn render_list(catalog: &Catalog) -> String {
 
 pub fn render_search(groups: &[SearchGroup]) -> String {
     if groups.is_empty() {
-        return "No matching MCP tools.".into();
+        return "No matching MCP servers or tools.\n".into();
     }
-    groups
+    let output = groups
         .iter()
         .map(|group| {
             let tools = group
                 .tools
                 .iter()
-                .map(|tool| match &tool.description {
-                    Some(description) => format!("  {} - {}", tool.name, one_line(description)),
-                    None => format!("  {}", tool.name),
+                .map(|tool| SearchToolOutput {
+                    name: &tool.name,
+                    schema: tool.show_schema.then_some(&tool.input_schema),
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "{} [{}]\n{}",
-                group.server,
-                status_label(group.status),
-                tools
+                .collect();
+            (
+                group.server.as_str(),
+                SearchServerOutput {
+                    status: status_label(group.status),
+                    error: group.error.as_deref(),
+                    tools,
+                },
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<BTreeMap<_, _>>();
+    serde_yaml::to_string(&output).unwrap_or_else(|_| "value: <unrenderable>\n".to_string())
 }
 
-pub fn render_show(result: ShowResult<'_>) -> String {
-    match result {
-        ShowResult::Server(server) => {
-            let header = format!("{} [{}]", server.name, status_label(server.status));
-            let description = server
-                .description
-                .as_deref()
-                .map(|v| format!("\n{}", one_line(v)))
-                .unwrap_or_default();
-            let tools = server
-                .tools
-                .iter()
-                .map(|t| format!("\n  {}", t.name))
-                .collect::<String>();
-            format!("{header}{description}{tools}")
-        }
-        ShowResult::Tool { server, tool } => {
-            let description = tool
-                .description
-                .as_deref()
-                .map(|v| format!("\n{}", one_line(v)))
-                .unwrap_or_default();
-            let schema =
-                serde_json::to_string_pretty(&tool.input_schema).unwrap_or_else(|_| "{}".into());
-            format!(
-                "{}.{}{description}\n\nArguments:\n{schema}",
-                server.name, tool.name
-            )
-        }
-    }
+#[derive(Serialize)]
+struct SearchServerOutput<'a> {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+    tools: Vec<SearchToolOutput<'a>>,
+}
+
+#[derive(Serialize)]
+struct SearchToolOutput<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<&'a Value>,
 }
 
 fn status_label(status: ServerStatus) -> &'static str {
     match status {
-        ServerStatus::Pending => "pending",
+        ServerStatus::Starting => "starting",
         ServerStatus::Ready => "ready",
-        ServerStatus::AuthRequired => "auth required",
-        ServerStatus::Unavailable => "unavailable",
+        ServerStatus::AuthRequired => "auth_required",
+        ServerStatus::Failed => "failed",
     }
-}
-
-fn one_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -101,15 +86,16 @@ mod tests {
     fn renders_compact_stable_list() {
         assert_eq!(
             render_list(&mock_catalog()),
-            "files    2 tools    ready\ngithub    ? tools    auth required"
+            "files    2 tools    ready\ngithub    ? tools    auth_required"
         );
     }
 
     #[test]
-    fn renders_tool_schema() {
+    fn search_expands_only_directly_matching_tool_schemas() {
         let catalog = mock_catalog();
-        let text = render_show(catalog.show("files.read").unwrap());
-        assert!(text.starts_with("files.read\nRead a file"));
-        assert!(text.contains("Arguments:"));
+        let text = render_search(&catalog.search("documents"));
+        assert!(text.contains("name: read"));
+        assert!(text.contains("- name: search\n    schema:"));
+        assert_eq!(text.matches("schema:").count(), 1);
     }
 }

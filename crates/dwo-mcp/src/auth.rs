@@ -5,9 +5,7 @@ use rmcp::transport::{AuthError, CredentialStore, StoredCredentials, auth::OAuth
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::{
-    AuthContext, AuthProvider, AuthStatus, AuthType, Error, McpConfig, McpServerConfig, Result,
-};
+use crate::{AuthContext, AuthProvider, AuthType, Error, McpConfig, McpServerConfig, Result};
 
 #[derive(Debug, Clone)]
 pub struct FileOAuthProvider {
@@ -95,23 +93,6 @@ impl CredentialStore for FileCredentialStore {
             Err(error) => Err(AuthError::InternalError(error.to_string())),
         }
     }
-}
-
-pub fn oauth_status(config: &McpConfig, server: &str, root: &Path) -> Result<AuthStatus> {
-    let Some((url, auth)) = oauth_server(config, server)? else {
-        return Ok(AuthStatus::NotRequired);
-    };
-    let provider = FileOAuthProvider::new(root);
-    Ok(
-        if provider
-            .authorization(&AuthContext { server, url, auth })?
-            .is_some()
-        {
-            AuthStatus::Ready
-        } else {
-            AuthStatus::Required
-        },
-    )
 }
 
 pub async fn oauth_login(config: &McpConfig, server: &str, root: &Path) -> Result<()> {

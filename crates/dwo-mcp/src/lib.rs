@@ -7,16 +7,16 @@ mod config;
 mod render;
 mod runtime;
 
-pub use auth::{FileOAuthProvider, oauth_login, oauth_logout, oauth_status};
+pub use auth::{FileOAuthProvider, oauth_login, oauth_logout};
 pub use catalog::{
-    Catalog, CatalogCache, CatalogServer, CatalogTool, SearchGroup, ServerStatus, ShowResult,
+    Catalog, CatalogCache, CatalogServer, CatalogTool, SearchGroup, SearchTool, ServerStatus,
     ToolRef, read_catalog, read_catalog_cache, write_catalog, write_catalog_cache,
 };
 pub use client::{AuthContext, AuthProvider, AuthStatus, CallResult, McpClient, NoAuthProvider};
 pub use config::{
     AuthConfig, AuthType, McpConfig, McpServerConfig, StdioConfig, StreamableHttpConfig,
 };
-pub use render::{render_list, render_search, render_show};
+pub use render::{render_list, render_search};
 pub use runtime::McpRuntime;
 
 use thiserror::Error;
@@ -34,7 +34,7 @@ pub enum Error {
     MissingEnvironment(String),
     #[error("unknown MCP server: {0}")]
     UnknownServer(String),
-    #[error("invalid selector {0:?}; expected server or server.tool")]
+    #[error("invalid selector {0:?}; expected server.tool")]
     InvalidSelector(String),
     #[error("OAuth authorization is required for server {server}")]
     AuthRequired { server: String },

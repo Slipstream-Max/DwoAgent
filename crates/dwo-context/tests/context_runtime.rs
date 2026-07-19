@@ -142,8 +142,8 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
     );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let pending = &manager.model_messages().last().unwrap().content;
-    assert!(pending.contains("github    ? tools    pending"));
-    assert!(pending.contains("dwo mcp --help"));
+    assert!(pending.contains("github    ? tools    starting"));
+    assert!(pending.contains("dwo mcp search <query>"));
 
     let fingerprint = builder
         .build_initial()

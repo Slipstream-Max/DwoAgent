@@ -322,16 +322,15 @@ description: Review code changes and call out concrete defects.
 </mcp>
 ```
 
-Host 将派生 catalog 写入 `runtime/mcp/catalog.json`，OAuth 凭据写入 `runtime/mcp/oauth/`。它们都不是用户配置：config 指纹不匹配时会重建。新 server 先显示为 `pending`，显式执行 `dwo mcp show <server>` 或第一次 `dwo mcp call <server.tool>` 才会启动并初始化该 server；连接随后由 Host 持有。
+Host 将内存 catalog 的派生快照写入 `runtime/mcp/catalog.json`，OAuth 凭据写入 `runtime/mcp/oauth/`。它们都不是用户配置：daemon 每次启动都会忽略旧连接状态，并发初始化所有 server 后覆盖 catalog。新加入或变更的 server 由 config watcher 同样初始化；成功连接由 Host 持有，失败或认证缺失会记录在 catalog 中。
 
 `<usage>` 会提示模型通过 terminal 使用：
 
 ```powershell
-dwo mcp list
-dwo mcp show <server>
-dwo mcp search query <query>
-dwo mcp show <server.tool>
+dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
+dwo mcp auth <server>
+dwo mcp auth <server> --logout
 ```
 
 ## Env Block Watcher

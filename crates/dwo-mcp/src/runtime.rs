@@ -4,13 +4,14 @@ use std::{
     sync::Arc,
 };
 
+use futures::future::join_all;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::client::{ConnectedClient, catalog_tool, parse_tool_selector};
 use crate::{
     AuthStatus, CallResult, Catalog, CatalogServer, McpClient, McpConfig, McpServerConfig, Result,
-    ServerStatus, oauth_login, oauth_logout, oauth_status, read_catalog_cache, write_catalog_cache,
+    ServerStatus, oauth_login, oauth_logout, read_catalog_cache, write_catalog_cache,
 };
 
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -21,6 +22,7 @@ pub struct McpRuntime {
     oauth_root: PathBuf,
     client: McpClient,
     state: Mutex<RuntimeState>,
+    catalog_write: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -63,6 +65,7 @@ impl McpRuntime {
             ),
             oauth_root,
             state: Mutex::new(RuntimeState::default()),
+            catalog_write: Mutex::new(()),
         }
     }
 
@@ -74,8 +77,8 @@ impl McpRuntime {
         &self.catalog_path
     }
 
-    /// Reads changed configuration and reconciles the managed-server set. This never starts a
-    /// server by itself: a new server remains pending until an explicit call or inspection.
+    /// Reads changed configuration and reconciles the managed-server set without starting new
+    /// servers. Lifecycle boundaries use `sync_and_start` to obtain a ready catalog.
     pub async fn sync(&self) -> Result<Catalog> {
         let config = self.load_config()?;
         let (catalog, retired) = {
@@ -122,7 +125,7 @@ impl McpRuntime {
             state.servers = retained;
             (catalog, retired)
         };
-        self.persist_catalog(&catalog)?;
+        self.persist_current_catalog().await?;
         for server in retired {
             server.close().await;
         }
@@ -133,16 +136,36 @@ impl McpRuntime {
         self.sync().await
     }
 
-    /// Showing a server is an explicit request to inspect it, so it is allowed to activate that
-    /// server. `mcp list` and `mcp search` remain cache-only operations.
-    pub async fn catalog_for_show(&self, selector: &str) -> Result<Catalog> {
-        let server = if selector.contains('.') {
-            parse_tool_selector(selector)?.0
-        } else {
-            selector
+    /// Concurrently initializes every configured server that does not have a managed connection.
+    /// Individual startup errors are recorded in the catalog and do not fail the host.
+    pub async fn sync_and_start(&self) -> Result<Catalog> {
+        self.sync().await?;
+        let names = {
+            let state = self.state.lock().await;
+            let config = state
+                .config
+                .as_ref()
+                .expect("MCP runtime must have a config after synchronization");
+            config
+                .servers
+                .keys()
+                .filter(|name| !state.servers.contains_key(*name))
+                .cloned()
+                .collect::<Vec<_>>()
         };
-        self.activate(server).await?;
-        self.catalog().await
+        let attempts = names.iter().map(|name| self.activate(name));
+        let _ = join_all(attempts).await;
+        self.catalog_snapshot().await
+    }
+
+    /// Returns the current catalog without reading configuration or starting a server.
+    pub async fn catalog_snapshot(&self) -> Result<Catalog> {
+        self.state
+            .lock()
+            .await
+            .catalog
+            .clone()
+            .ok_or_else(|| crate::Error::InvalidConfig("MCP runtime is not initialized".into()))
     }
 
     pub async fn call(&self, selector: &str, arguments: Value) -> Result<CallResult> {
@@ -176,23 +199,19 @@ impl McpRuntime {
             self.set_catalog_server(
                 server_name,
                 &config,
-                unavailable_server(server_name, &config, error.to_string()),
+                failed_server(server_name, &config, error.to_string()),
             )
             .await?;
         }
         result
     }
 
-    pub async fn auth_status(&self, server: &str) -> Result<AuthStatus> {
-        self.sync().await?;
-        oauth_status(&self.current_config().await?, server, &self.oauth_root)
-    }
-
     pub async fn auth_login(&self, server: &str) -> Result<()> {
         self.sync().await?;
         let config = self.current_config().await?;
         oauth_login(&config, server, &self.oauth_root).await?;
-        self.invalidate_server(server).await
+        self.invalidate_server(server).await?;
+        self.activate(server).await
     }
 
     pub async fn auth_logout(&self, server: &str) -> Result<()> {
@@ -261,7 +280,7 @@ impl McpRuntime {
                 self.set_catalog_server(
                     name,
                     config,
-                    unavailable_server(name, config, error.to_string()),
+                    failed_server(name, config, error.to_string()),
                 )
                 .await?;
                 Err(error)
@@ -310,13 +329,13 @@ impl McpRuntime {
     ) -> Result<()> {
         let catalog = match error {
             crate::Error::AuthRequired { .. } => auth_required_server(name, config),
-            _ => unavailable_server(name, config, error.to_string()),
+            _ => failed_server(name, config, error.to_string()),
         };
         self.set_catalog_server(name, config, catalog).await
     }
 
     async fn invalidate_server(&self, name: &str) -> Result<()> {
-        let (managed, catalog) = {
+        let managed = {
             let mut state = self.state.lock().await;
             let config = state
                 .config
@@ -328,16 +347,16 @@ impl McpRuntime {
                 .ok_or_else(|| crate::Error::UnknownServer(name.to_string()))?;
             let managed = state.servers.remove(name);
             let catalog_server = initial_server(&self.client, name, &config);
-            let catalog = replace_catalog_server(
+            replace_catalog_server(
                 state
                     .catalog
                     .as_mut()
                     .expect("MCP runtime state must have a catalog after synchronization"),
                 catalog_server,
             );
-            (managed, catalog)
+            managed
         };
-        self.persist_catalog(&catalog)?;
+        self.persist_current_catalog().await?;
         if let Some(managed) = managed {
             managed.close().await;
         }
@@ -350,7 +369,7 @@ impl McpRuntime {
         expected_config: &McpServerConfig,
         server: CatalogServer,
     ) -> Result<()> {
-        let catalog = {
+        {
             let mut state = self.state.lock().await;
             let Some(current) = state
                 .config
@@ -368,9 +387,9 @@ impl McpRuntime {
                     .as_mut()
                     .expect("MCP runtime state must have a catalog after synchronization"),
                 server,
-            )
-        };
-        self.persist_catalog(&catalog)
+            );
+        }
+        self.persist_current_catalog().await
     }
 
     fn build_catalog(
@@ -427,6 +446,15 @@ impl McpRuntime {
         write_catalog_cache(&self.catalog_path, catalog)
     }
 
+    async fn persist_current_catalog(&self) -> Result<()> {
+        let _write = self.catalog_write.lock().await;
+        let catalog =
+            self.state.lock().await.catalog.clone().ok_or_else(|| {
+                crate::Error::InvalidConfig("MCP runtime is not initialized".into())
+            })?;
+        self.persist_catalog(&catalog)
+    }
+
     fn load_config(&self) -> Result<McpConfig> {
         if self.config_path.is_file() {
             McpConfig::from_path(&self.config_path)
@@ -442,12 +470,12 @@ fn initial_server(client: &McpClient, name: &str, config: &McpServerConfig) -> C
         Ok(AuthStatus::NotRequired | AuthStatus::Ready) => CatalogServer {
             name: name.to_string(),
             description: config.description().map(str::to_owned),
-            status: ServerStatus::Pending,
+            status: ServerStatus::Starting,
             tool_count: 0,
             error: None,
             tools: Vec::new(),
         },
-        Err(error) => unavailable_server(name, config, error.to_string()),
+        Err(error) => failed_server(name, config, error.to_string()),
     }
 }
 
@@ -477,18 +505,18 @@ fn ready_server(
     }
 }
 
-fn unavailable_server(name: &str, config: &McpServerConfig, error: String) -> CatalogServer {
+fn failed_server(name: &str, config: &McpServerConfig, error: String) -> CatalogServer {
     CatalogServer {
         name: name.to_string(),
         description: config.description().map(str::to_owned),
-        status: ServerStatus::Unavailable,
+        status: ServerStatus::Failed,
         tool_count: 0,
         error: Some(error),
         tools: Vec::new(),
     }
 }
 
-fn replace_catalog_server(catalog: &mut Catalog, replacement: CatalogServer) -> Catalog {
+fn replace_catalog_server(catalog: &mut Catalog, replacement: CatalogServer) {
     if let Some(existing) = catalog
         .servers
         .iter_mut()
@@ -501,7 +529,6 @@ fn replace_catalog_server(catalog: &mut Catalog, replacement: CatalogServer) -> 
             .servers
             .sort_by(|left, right| left.name.cmp(&right.name));
     }
-    catalog.clone()
 }
 
 #[cfg(test)]
@@ -509,7 +536,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn new_servers_are_pending_and_catalog_is_runtime_scoped() {
+    async fn startup_records_failed_servers_and_catalog_is_runtime_scoped() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("resource")).unwrap();
         std::fs::write(
@@ -520,7 +547,7 @@ mod tests {
 
         let runtime = McpRuntime::new(root.path());
         let catalog = runtime.catalog().await.unwrap();
-        assert_eq!(catalog.servers[0].status, ServerStatus::Pending);
+        assert_eq!(catalog.servers[0].status, ServerStatus::Starting);
         assert_eq!(
             runtime.catalog_path(),
             root.path().join("runtime/mcp/catalog.json")
@@ -528,6 +555,14 @@ mod tests {
         assert!(runtime.catalog_path().is_file());
         assert!(!root.path().join("mcp_runtime").exists());
 
+        let catalog = runtime.sync_and_start().await.unwrap();
+        assert_eq!(catalog.servers[0].status, ServerStatus::Failed);
+        assert!(
+            catalog.servers[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("definitely-not-installed-dwo-mcp"))
+        );
         let error = runtime
             .call("local.ping", serde_json::json!({}))
             .await
@@ -539,13 +574,37 @@ mod tests {
         );
         assert_eq!(
             runtime.catalog().await.unwrap().servers[0].status,
-            ServerStatus::Unavailable
+            ServerStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_snapshot_does_not_sync_new_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("resource")).unwrap();
+        std::fs::write(
+            root.path().join("resource/mcp.json"),
+            r#"{"mcpServers":{}}"#,
+        )
+        .unwrap();
+        let runtime = McpRuntime::new(root.path());
+        runtime.sync_and_start().await.unwrap();
+
+        std::fs::write(
+            root.path().join("resource/mcp.json"),
+            r#"{"mcpServers":{"new":{"command":"definitely-not-installed-dwo-mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(runtime.catalog_snapshot().await.unwrap().servers.is_empty());
+        assert_eq!(
+            runtime.sync_and_start().await.unwrap().servers[0].status,
+            ServerStatus::Failed
         );
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn calls_reuse_one_managed_stdio_server_session() {
+    async fn startup_and_calls_reuse_one_managed_stdio_server_session() {
         let root = tempfile::tempdir().unwrap();
         let resource = root.path().join("resource");
         std::fs::create_dir_all(&resource).unwrap();
@@ -576,6 +635,9 @@ mod tests {
         .unwrap();
 
         let runtime = McpRuntime::new(root.path());
+        let catalog = runtime.sync_and_start().await.unwrap();
+        assert_eq!(catalog.servers[0].status, ServerStatus::Ready);
+        assert_eq!(catalog.servers[0].tools[0].name, "ping");
         let first = runtime
             .call("local.ping", serde_json::json!({}))
             .await
@@ -602,7 +664,7 @@ mod tests {
             .call("local.ping", serde_json::json!({}))
             .await
             .unwrap();
-        let first_pid = call_result_text(&first);
+        let first_pid = call_result_text(&first).to_string();
         assert_eq!(first_pid, call_result_text(&second));
         assert_eq!(std::fs::read_to_string(pid_file).unwrap().trim(), first_pid);
         assert_eq!(
@@ -611,6 +673,16 @@ mod tests {
         );
 
         runtime.shutdown().await;
+
+        let restarted = McpRuntime::new(root.path());
+        let catalog = restarted.sync_and_start().await.unwrap();
+        assert_eq!(catalog.servers[0].status, ServerStatus::Ready);
+        let restarted_call = restarted
+            .call("local.ping", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_ne!(first_pid, call_result_text(&restarted_call));
+        restarted.shutdown().await;
     }
 
     #[cfg(windows)]

@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Error, Result, render_list};
+use crate::{Result, render_list};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -37,10 +37,10 @@ pub struct CatalogTool {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerStatus {
-    Pending,
+    Starting,
     Ready,
     AuthRequired,
-    Unavailable,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,16 +58,19 @@ pub struct ToolRef {
 pub struct SearchGroup {
     pub server: String,
     pub status: ServerStatus,
-    pub tools: Vec<CatalogTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub tools: Vec<SearchTool>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ShowResult<'a> {
-    Server(&'a CatalogServer),
-    Tool {
-        server: &'a CatalogServer,
-        tool: &'a CatalogTool,
-    },
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    pub show_schema: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,17 +100,6 @@ impl Catalog {
     /// server; a server-name/description match includes all its tools, otherwise only matching tools.
     pub fn search(&self, query: &str) -> Vec<SearchGroup> {
         let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        if terms.is_empty() {
-            return self
-                .servers
-                .iter()
-                .map(|s| SearchGroup {
-                    server: s.name.clone(),
-                    status: s.status,
-                    tools: s.tools.clone(),
-                })
-                .collect();
-        }
         self.servers
             .iter()
             .filter_map(|server| {
@@ -117,59 +109,41 @@ impl Catalog {
                     server.description.as_deref().unwrap_or("")
                 )
                 .to_lowercase();
-                let server_match = terms.iter().all(|term| server_text.contains(term));
-                let tools = if server_match {
-                    server.tools.clone()
-                } else {
-                    server
-                        .tools
-                        .iter()
-                        .filter(|tool| {
-                            let text = format!(
-                                "{} {} {}",
-                                server.name,
-                                tool.name,
-                                tool.description.as_deref().unwrap_or("")
-                            )
-                            .to_lowercase();
-                            terms.iter().all(|term| text.contains(term))
+                let server_match = terms.is_empty() || matches_terms(&terms, &server_text);
+                let tools = server
+                    .tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let tool_text = format!(
+                            "{} {}",
+                            tool.name,
+                            tool.description.as_deref().unwrap_or("")
+                        )
+                        .to_lowercase();
+                        let tool_match = !terms.is_empty() && matches_terms(&terms, &tool_text);
+                        let combined_match =
+                            matches_terms(&terms, &format!("{server_text} {tool_text}"));
+                        (server_match || combined_match).then(|| SearchTool {
+                            name: tool.name.clone(),
+                            description: tool.description.clone(),
+                            input_schema: tool.input_schema.clone(),
+                            show_schema: tool_match || !server_match,
                         })
-                        .cloned()
-                        .collect()
-                };
-                (!tools.is_empty()).then(|| SearchGroup {
+                    })
+                    .collect::<Vec<_>>();
+                (server_match || !tools.is_empty()).then(|| SearchGroup {
                     server: server.name.clone(),
                     status: server.status,
+                    error: server.error.clone(),
                     tools,
                 })
             })
             .collect()
     }
+}
 
-    pub fn show(&self, selector: &str) -> Result<ShowResult<'_>> {
-        if let Some((server_name, tool_name)) = selector.split_once('.') {
-            if server_name.is_empty() || tool_name.is_empty() {
-                return Err(Error::InvalidSelector(selector.into()));
-            }
-            let server = self
-                .servers
-                .iter()
-                .find(|s| s.name == server_name)
-                .ok_or_else(|| Error::UnknownServer(server_name.into()))?;
-            let tool = server
-                .tools
-                .iter()
-                .find(|t| t.name == tool_name)
-                .ok_or_else(|| Error::InvalidSelector(selector.into()))?;
-            Ok(ShowResult::Tool { server, tool })
-        } else {
-            self.servers
-                .iter()
-                .find(|s| s.name == selector)
-                .map(ShowResult::Server)
-                .ok_or_else(|| Error::UnknownServer(selector.into()))
-        }
-    }
+fn matches_terms(terms: &[String], text: &str) -> bool {
+    terms.iter().all(|term| text.contains(term))
 }
 
 impl CatalogCache {
@@ -241,7 +215,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn search_groups_matches_and_ands_terms() {
+    fn search_groups_match_server_and_tool_at_different_depths() {
         let catalog = mock_catalog();
         let result = catalog.search("files read");
         assert_eq!(result.len(), 1);
@@ -253,7 +227,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["read"]
         );
-        assert_eq!(catalog.search("local documents")[0].tools.len(), 2);
+        assert!(result[0].tools[0].show_schema);
+        let server_match = catalog.search("local documents");
+        assert_eq!(server_match[0].tools.len(), 2);
+        assert!(server_match[0].tools.iter().all(|tool| !tool.show_schema));
+        let both_match = catalog.search("documents");
+        assert_eq!(both_match[0].tools.len(), 2);
+        assert_eq!(
+            both_match[0]
+                .tools
+                .iter()
+                .filter(|tool| tool.show_schema)
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["search"]
+        );
         assert!(catalog.search("read missing").is_empty());
     }
 

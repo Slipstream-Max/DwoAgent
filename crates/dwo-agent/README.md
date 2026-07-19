@@ -44,13 +44,10 @@ dwo channel weixin bind
 dwo channel weixin unbind
 dwo channel weixin send-message <message>
 dwo channel weixin send-file <path>
-dwo mcp list [--json]
-dwo mcp search query <query> [--json]
-dwo mcp show <server|server.tool> [--json]
+dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
-dwo mcp auth status <server>
-dwo mcp auth logout <server>
+dwo mcp auth <server> --logout
 dwo automation list [--json]
 dwo automation status [--json]
 dwo automation run <job> [--json]
@@ -126,11 +123,12 @@ owned by the daemon and are never included in model context.
 MCP servers are configured in `resource/mcp.json`. Static HTTP headers and
 stdio environment variables are resolved from that file, including `${ENV}`
 references. Only servers declaring `auth.type: oauth` use the interactive
-`dwo mcp auth` flow. The daemon watches the config and stores its derived catalog
-under `runtime/mcp/`. New or changed servers remain pending until an explicit
-`dwo mcp show <server>` or first call initializes them. That connection stays
-managed by the daemon and its discovered schemas are then written to the catalog.
-MCP schemas are never registered as model tools.
+`dwo mcp auth` flow. The daemon initializes configured servers concurrently at
+startup and stores the resulting catalog under `runtime/mcp/`; each successful
+connection stays managed by the daemon. New or changed servers are initialized
+the same way by the config watcher. Failed or unauthenticated servers remain in
+the catalog with their status and error. MCP schemas are never registered as
+model tools.
 
 ```json
 {

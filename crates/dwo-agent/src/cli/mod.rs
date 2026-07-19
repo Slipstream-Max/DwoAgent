@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use dwo_mcp::{Catalog, CatalogServer, CatalogTool, SearchGroup, ShowResult};
+use dwo_mcp::SearchGroup;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -125,40 +125,22 @@ enum WeixinCommand {
 
 #[derive(Subcommand)]
 enum McpCommand {
-    List {
-        #[arg(long)]
-        json: bool,
-    },
+    /// Search configured MCP servers and tools.
     Search {
-        #[command(subcommand)]
-        command: McpSearchCommand,
+        /// Case-insensitive terms matched against server and tool metadata.
+        query: String,
     },
-    Show {
-        selector: String,
-        #[arg(long)]
-        json: bool,
-    },
+    /// Call one MCP tool using a server.tool selector.
     Call {
         selector: String,
         #[arg(long, default_value = "{}")]
         args: String,
-        #[arg(long)]
-        json: bool,
     },
+    /// Authorize a server, or remove its stored authorization.
     Auth {
-        action_or_server: String,
-        server: Option<String>,
+        server: String,
         #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum McpSearchCommand {
-    Query {
-        query: String,
-        #[arg(long)]
-        json: bool,
+        logout: bool,
     },
 }
 
@@ -277,51 +259,12 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
 
 async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
     match command {
-        McpCommand::List { json } => {
-            let value = ipc::request(config_path, "mcp.list", json!({})).await?;
-            if json {
-                print_value(&value)?;
-            } else {
-                let catalog: Catalog = serde_json::from_value(value)?;
-                println!("{}", dwo_mcp::render_list(&catalog));
-            }
-        }
-        McpCommand::Search {
-            command: McpSearchCommand::Query { query, json },
-        } => {
+        McpCommand::Search { query } => {
             let value = ipc::request(config_path, "mcp.search", json!({"query": query})).await?;
-            if json {
-                print_value(&value)?;
-            } else {
-                let groups: Vec<SearchGroup> = serde_json::from_value(value)?;
-                println!("{}", dwo_mcp::render_search(&groups));
-            }
+            let groups: Vec<SearchGroup> = serde_json::from_value(value)?;
+            print!("{}", dwo_mcp::render_search(&groups));
         }
-        McpCommand::Show { selector, json } => {
-            let value =
-                ipc::request(config_path, "mcp.show", json!({"selector": selector})).await?;
-            if json {
-                print_value(&value)?;
-            } else if value["kind"] == "server" {
-                let server: CatalogServer = serde_json::from_value(value["server"].clone())?;
-                println!("{}", dwo_mcp::render_show(ShowResult::Server(&server)));
-            } else {
-                let server: CatalogServer = serde_json::from_value(value["server"].clone())?;
-                let tool: CatalogTool = serde_json::from_value(value["tool"].clone())?;
-                println!(
-                    "{}",
-                    dwo_mcp::render_show(ShowResult::Tool {
-                        server: &server,
-                        tool: &tool,
-                    })
-                );
-            }
-        }
-        McpCommand::Call {
-            selector,
-            args,
-            json: _,
-        } => {
+        McpCommand::Call { selector, args } => {
             let arguments: Value = serde_json::from_str(&args).context("parse --args JSON")?;
             let value = ipc::request(
                 config_path,
@@ -331,33 +274,18 @@ async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
             .await?;
             print_value(&value)?;
         }
-        McpCommand::Auth {
-            action_or_server,
-            server,
-            json,
-        } => {
-            let (method, server) = match (action_or_server.as_str(), server) {
-                ("status", Some(server)) => ("mcp.auth.status", server),
-                ("logout", Some(server)) => ("mcp.auth.logout", server),
-                ("status" | "logout", None) => {
-                    bail!("usage: dwo mcp auth {} <server>", action_or_server)
-                }
-                (_, Some(_)) => {
-                    bail!("usage: dwo mcp auth <server>|status <server>|logout <server>")
-                }
-                (server, None) => {
-                    println!("Opening the authorization page for {server}...");
-                    ("mcp.auth.login", server.to_string())
-                }
-            };
-            let value = ipc::request(config_path, method, json!({"server": server})).await?;
-            if json {
-                print_value(&value)?;
-            } else if method == "mcp.auth.status" {
-                println!("{}", value.as_str().unwrap_or("unknown"));
+        McpCommand::Auth { server, logout } => {
+            let method = if logout {
+                "mcp.auth.logout"
             } else {
-                println!("Authorization updated");
-            }
+                println!("Opening the authorization page for {server}...");
+                "mcp.auth.login"
+            };
+            ipc::request(config_path, method, json!({"server": server})).await?;
+            println!(
+                "Authorization {}",
+                if logout { "removed" } else { "updated" }
+            );
         }
     }
     Ok(())
@@ -567,7 +495,8 @@ async fn daemon_start(config_path: &Path) -> Result<()> {
         }
         command.spawn()?;
     }
-    for _ in 0..50 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+    while tokio::time::Instant::now() < deadline {
         if ipc::request(config_path, "daemon.status", json!({}))
             .await
             .is_ok()
@@ -808,32 +737,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_progressive_mcp_commands() {
-        let search =
-            Cli::try_parse_from(["dwo", "mcp", "search", "query", "install", "--json"]).unwrap();
+    fn parses_minimal_mcp_commands() {
+        let search = Cli::try_parse_from(["dwo", "mcp", "search", "install"]).unwrap();
         assert!(matches!(
             search.command,
             Command::Mcp {
-                command: McpCommand::Search {
-                    command: McpSearchCommand::Query {
-                        ref query,
-                        json: true,
-                    }
-                }
+                command: McpCommand::Search { ref query }
             } if query == "install"
         ));
 
-        let auth = Cli::try_parse_from(["dwo", "mcp", "auth", "status", "github"]).unwrap();
+        let auth = Cli::try_parse_from(["dwo", "mcp", "auth", "github", "--logout"]).unwrap();
         assert!(matches!(
             auth.command,
             Command::Mcp {
                 command: McpCommand::Auth {
-                    ref action_or_server,
-                    server: Some(ref server),
-                    json: false,
+                    ref server,
+                    logout: true,
                 }
-            } if action_or_server == "status" && server == "github"
+            } if server == "github"
         ));
+
+        assert!(Cli::try_parse_from(["dwo", "mcp", "list"]).is_err());
+        assert!(Cli::try_parse_from(["dwo", "mcp", "show", "github"]).is_err());
     }
 
     #[test]

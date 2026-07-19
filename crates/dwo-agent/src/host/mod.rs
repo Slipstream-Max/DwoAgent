@@ -6,7 +6,7 @@ use dwo_agent_service::{
     AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession, SessionConfig,
     SessionConfigUpdate, SessionId, SessionLlmSettings,
 };
-use dwo_mcp::{McpRuntime, ShowResult};
+use dwo_mcp::McpRuntime;
 use dwo_tools::{ConfirmationDecision, PolicyConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -96,11 +96,6 @@ struct McpSearchParam {
 }
 
 #[derive(Deserialize)]
-struct McpSelectorParam {
-    selector: String,
-}
-
-#[derive(Deserialize)]
 struct McpCallParam {
     selector: String,
     arguments: Value,
@@ -135,7 +130,7 @@ impl Host {
     pub async fn load(config_path: &Path) -> Result<Arc<Self>> {
         let profile_root = profile_root(config_path)?;
         let mcp = Arc::new(McpRuntime::new(&profile_root));
-        mcp.sync().await?;
+        mcp.sync_and_start().await?;
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
@@ -390,37 +385,15 @@ impl Host {
                 }
                 Ok(serde_json::to_value(progress)?)
             }
-            "mcp.list" => Ok(serde_json::to_value(self.mcp.catalog().await?)?),
             "mcp.search" => {
                 let params: McpSearchParam = serde_json::from_value(params)?;
-                let catalog = self.mcp.catalog().await?;
+                let catalog = self.mcp.catalog_snapshot().await?;
                 Ok(serde_json::to_value(catalog.search(&params.query))?)
-            }
-            "mcp.show" => {
-                let params: McpSelectorParam = serde_json::from_value(params)?;
-                let catalog = self.mcp.catalog_for_show(&params.selector).await?;
-                match catalog.show(&params.selector)? {
-                    ShowResult::Server(server) => Ok(json!({
-                        "kind": "server",
-                        "server": server,
-                    })),
-                    ShowResult::Tool { server, tool } => Ok(json!({
-                        "kind": "tool",
-                        "server": server,
-                        "tool": tool,
-                    })),
-                }
             }
             "mcp.call" => {
                 let params: McpCallParam = serde_json::from_value(params)?;
                 Ok(serde_json::to_value(
                     self.mcp.call(&params.selector, params.arguments).await?,
-                )?)
-            }
-            "mcp.auth.status" => {
-                let params: McpAuthParam = serde_json::from_value(params)?;
-                Ok(serde_json::to_value(
-                    self.mcp.auth_status(&params.server).await?,
                 )?)
             }
             "mcp.auth.login" => {
@@ -533,7 +506,7 @@ impl Host {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        if let Err(error) = runtime.sync().await {
+                        if let Err(error) = runtime.sync_and_start().await {
                             eprintln!("synchronize MCP configuration: {error:#}");
                         }
                     }

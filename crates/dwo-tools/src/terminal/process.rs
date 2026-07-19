@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -8,7 +7,7 @@ use dwo_pty::{ProcessHandle, SpawnedProcess, TerminalSize};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
-use super::{OutputBuffer, TerminalId};
+use super::{OutputBuffer, TerminalId, environment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProcessStatus {
@@ -44,7 +43,7 @@ impl TerminalProcess {
         tty: bool,
     ) -> Result<Arc<Self>> {
         let (program, args) = shell_command(&command);
-        let env: HashMap<String, String> = std::env::vars().collect();
+        let env = environment::current();
         let spawned = if tty {
             dwo_pty::spawn_pty_process(
                 &program,

@@ -623,7 +623,7 @@ fn install(config_path: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("resource/prompts"))?;
     std::fs::create_dir_all(root.join("resource/skills"))?;
     std::fs::create_dir_all(root.join("runtime/sessions"))?;
-    std::fs::create_dir_all(root.join("mcp_runtime"))?;
+    std::fs::create_dir_all(root.join("runtime/mcp"))?;
     std::fs::create_dir_all(root.join("runtime/logs"))?;
     std::fs::create_dir_all(root.join("channels"))?;
     write_if_missing(config_path, DEFAULT_PROFILE)?;

@@ -311,7 +311,7 @@ description: Review code changes and call out concrete defects.
 
 ## MCP
 
-`resources/mcp.json` 是可选的 MCP 配置入口。运行时只检查这个文件是否存在，不解析、不读取文件内容，也不会自动注册 native MCP tool 或注入额外 skill。
+`resources/mcp.json` 是可选的 MCP 配置入口。Host 会解析其中的 server、transport、headers 和 stdio `env`，但不会把 MCP schema 注册为 native tool 或注入额外 skill。
 
 如果存在，system context 和 env block watcher snapshot 会加入：
 
@@ -322,12 +322,16 @@ description: Review code changes and call out concrete defects.
 </mcp>
 ```
 
-`<usage>` 会提示模型通过 terminal 检查或安装 `mcporter`，并使用：
+Host 将派生 catalog 写入 `runtime/mcp/catalog.json`，OAuth 凭据写入 `runtime/mcp/oauth/`。它们都不是用户配置：config 指纹不匹配时会重建。新 server 先显示为 `pending`，显式执行 `dwo mcp show <server>` 或第一次 `dwo mcp call <server.tool>` 才会启动并初始化该 server；连接随后由 Host 持有。
+
+`<usage>` 会提示模型通过 terminal 使用：
 
 ```powershell
-mcporter --config "<config-path>" list --json
-mcporter --config "<config-path>" list <server> --schema --json
-mcporter --config "<config-path>" call <server.tool> --args '<json>' --output json
+dwo mcp list
+dwo mcp show <server>
+dwo mcp search query <query>
+dwo mcp show <server.tool>
+dwo mcp call <server.tool> --args '<json>'
 ```
 
 ## Env Block Watcher

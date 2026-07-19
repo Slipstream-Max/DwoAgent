@@ -78,7 +78,7 @@ async fn serve_windows(host: Arc<Host>, endpoint: &str) -> Result<()> {
             }
         });
     }
-    host.service.shutdown().await;
+    host.shutdown().await;
     Ok(())
 }
 
@@ -107,7 +107,7 @@ async fn serve_unix(host: Arc<Host>, endpoint: &Path) -> Result<()> {
         }
     }
     let _ = std::fs::remove_file(endpoint);
-    host.service.shutdown().await;
+    host.shutdown().await;
     Ok(())
 }
 
@@ -257,11 +257,11 @@ where
 {
     let (read, mut write) = tokio::io::split(stream);
     write_json_line(&mut write, request).await?;
-    let mut lines = BufReader::new(read).lines();
-    let first = lines
-        .next_line()
-        .await?
-        .context("daemon closed watch before snapshot")?;
+    let mut reader = BufReader::new(read);
+    let mut first = String::new();
+    if reader.read_line(&mut first).await? == 0 {
+        bail!("daemon closed watch before snapshot");
+    }
     let response: RpcResponse = serde_json::from_str(&first)?;
     if let Some(error) = response.error {
         bail!(error);
@@ -269,11 +269,18 @@ where
     let snapshot = response.result.unwrap_or(Value::Null);
     let (events, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(value) = serde_json::from_str(&line) else {
-                continue;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let Ok(length) = reader.read_line(&mut line).await else {
+                break;
             };
-            if events.send(value).is_err() {
+            if length == 0 {
+                break;
+            }
+            if let Ok(value) = serde_json::from_str(&line)
+                && events.send(value).is_err()
+            {
                 break;
             }
         }
@@ -294,4 +301,71 @@ async fn write_json_line<W: AsyncWrite + Unpin>(
     write.write_all(&bytes).await?;
     write.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_test_profile(root: &Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(root.join("resource/prompts")).unwrap();
+        std::fs::write(
+            root.join("resource/prompts/System.md"),
+            "You are a test agent.",
+        )
+        .unwrap();
+        let config = root.join("profile.yaml");
+        std::fs::write(
+            &config,
+            r#"name: test
+description: test agent
+policyMode: confirm
+model:
+  defaultModelId: deepseek-v4-pro
+  providers:
+    deepseek:
+      type: deepseek
+  models:
+    - modelName: deepseek-v4-pro
+      provider: deepseek
+      modelId: deepseek-v4-pro
+"#,
+        )
+        .unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn watch_writes_snapshot_before_waiting_for_events() {
+        let profile = tempfile::tempdir().unwrap();
+        let host = Host::load(&write_test_profile(profile.path()))
+            .await
+            .unwrap();
+        let session = host
+            .create_session(Some("watch test".to_string()), None)
+            .await
+            .unwrap();
+        let session_id = session.id().to_string();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(handle_connection(server, host.clone()));
+        let request = RpcRequest {
+            id: 7,
+            method: "session.watch".to_string(),
+            params: json!({"session_id": session_id, "endpoint_id": "test-watch"}),
+        };
+        let (snapshot, events) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            subscribe_stream(client, &request),
+        )
+        .await
+        .expect("watch must write its snapshot promptly")
+        .unwrap();
+        assert_eq!(snapshot["snapshot"]["record"]["info"]["id"], session_id);
+
+        drop(events);
+        server_task.abort();
+        let _ = server_task.await;
+        host.shutdown_token().cancel();
+        host.shutdown().await;
+    }
 }

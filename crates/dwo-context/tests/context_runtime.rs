@@ -154,7 +154,7 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
         .unwrap()
         .fingerprint;
     write(
-        &profile.join("mcp_runtime/catalog.json"),
+        &profile.join("runtime/mcp/catalog.json"),
         &serde_json::json!({
             "configFingerprint": fingerprint,
             "summary": "github    18 tools    ready"

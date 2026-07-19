@@ -135,7 +135,7 @@ impl Host {
     pub async fn load(config_path: &Path) -> Result<Arc<Self>> {
         let profile_root = profile_root(config_path)?;
         let mcp = Arc::new(McpRuntime::new(&profile_root));
-        mcp.refresh().await?;
+        mcp.sync().await?;
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
@@ -188,6 +188,11 @@ impl Host {
 
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
+    }
+
+    pub async fn shutdown(&self) {
+        self.mcp.shutdown().await;
+        self.service.shutdown().await;
     }
 
     pub async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
@@ -393,7 +398,7 @@ impl Host {
             }
             "mcp.show" => {
                 let params: McpSelectorParam = serde_json::from_value(params)?;
-                let catalog = self.mcp.catalog().await?;
+                let catalog = self.mcp.catalog_for_show(&params.selector).await?;
                 match catalog.show(&params.selector)? {
                     ShowResult::Server(server) => Ok(json!({
                         "kind": "server",
@@ -528,8 +533,8 @@ impl Host {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        if let Err(error) = runtime.refresh_if_changed().await {
-                            eprintln!("reload MCP configuration: {error:#}");
+                        if let Err(error) = runtime.sync().await {
+                            eprintln!("synchronize MCP configuration: {error:#}");
                         }
                     }
                 }

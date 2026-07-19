@@ -1,3 +1,4 @@
+mod environment;
 mod manager;
 mod output_buffer;
 mod process;

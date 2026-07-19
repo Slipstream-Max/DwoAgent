@@ -1,4 +1,4 @@
-//! Stateless MCP discovery and tool execution.
+//! Host-managed MCP discovery and tool execution.
 
 mod auth;
 mod catalog;
@@ -12,9 +12,7 @@ pub use catalog::{
     Catalog, CatalogCache, CatalogServer, CatalogTool, SearchGroup, ServerStatus, ShowResult,
     ToolRef, read_catalog, read_catalog_cache, write_catalog, write_catalog_cache,
 };
-pub use client::{
-    AuthContext, AuthProvider, AuthStatus, CallResult, McpClient, NoAuthProvider, discover,
-};
+pub use client::{AuthContext, AuthProvider, AuthStatus, CallResult, McpClient, NoAuthProvider};
 pub use config::{
     AuthConfig, AuthType, McpConfig, McpServerConfig, StdioConfig, StreamableHttpConfig,
 };

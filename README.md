@@ -164,7 +164,7 @@ Agent behaviour is driven by YAML files under the agent profile folder.
 | `resources/prompt/system.md` | Required system prompt |
 | `resources/prompt/AGENTS.md` | Optional profile-level rule prompt |
 | `resources/skills/` | Optional agent-profile skills exposed through `<available_skills>` |
-| `resources/mcp.json` | Optional MCP config marker; adds an `<mcp>` context block with mcporter guidance |
+| `resources/mcp.json` | Optional MCP server configuration; its derived discovery cache lives in `runtime/mcp/catalog.json` |
 
 Supervisor configuration defaults to `~/.dwoagent/supervisor.yaml` and contains
 machine-level settings: WebSocket endpoint, secret, profile registry, default

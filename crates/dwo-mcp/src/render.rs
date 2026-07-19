@@ -81,6 +81,7 @@ pub fn render_show(result: ShowResult<'_>) -> String {
 
 fn status_label(status: ServerStatus) -> &'static str {
     match status {
+        ServerStatus::Pending => "pending",
         ServerStatus::Ready => "ready",
         ServerStatus::AuthRequired => "auth required",
         ServerStatus::Unavailable => "unavailable",

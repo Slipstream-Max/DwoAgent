@@ -37,7 +37,7 @@ impl McpSnapshot {
         let catalog_path = path
             .parent()
             .and_then(Path::parent)
-            .map(|root| root.join("mcp_runtime/catalog.json"));
+            .map(|root| root.join("runtime/mcp/catalog.json"));
         let summary = catalog_path
             .as_deref()
             .and_then(|path| std::fs::read_to_string(path).ok())
@@ -70,7 +70,7 @@ impl McpSnapshot {
 
     pub(crate) fn render(&self) -> String {
         format!(
-            "<mcp>\nconfig: {}\n\nservers:\n{}\n\nMCP servers are available through the dwo CLI. Use `dwo mcp --help` to discover, inspect, authenticate, and call them. Search before showing a schema, and show a tool before calling it.\n</mcp>",
+            "<mcp>\nconfig: {}\n\nservers:\n{}\n\nMCP servers are available through the dwo CLI. Use `dwo mcp --help` to inspect, authenticate, and call them. A pending server is activated by `dwo mcp show <server>` or its first call; then search its tools, show a tool schema, and call it.\n</mcp>",
             xml_escape(&self.path.display().to_string()),
             xml_escape(&self.summary)
         )

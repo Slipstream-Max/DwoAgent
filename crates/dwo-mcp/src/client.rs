@@ -1,9 +1,14 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use http::{HeaderName, HeaderValue};
 use rmcp::{
-    ServiceExt,
+    RoleClient, ServiceExt,
     model::{CallToolRequestParams, ClientInfo, Tool},
+    service::RunningService,
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -13,12 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::auth::authorized_http_client;
-use crate::{
-    AuthConfig, Catalog, CatalogServer, CatalogTool, Error, McpConfig, McpServerConfig, Result,
-    ServerStatus, StdioConfig, StreamableHttpConfig,
-};
+use crate::{AuthConfig, Error, McpServerConfig, Result, StdioConfig, StreamableHttpConfig};
 
 const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) type ConnectedClient = RunningService<RoleClient, ClientInfo>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -106,132 +110,79 @@ impl McpClient {
         )
     }
 
-    pub async fn discover(&self, config: &McpConfig) -> Catalog {
-        let mut servers = Vec::with_capacity(config.servers.len());
-        for (name, server_config) in &config.servers {
-            let description = server_config.description().map(str::to_owned);
-            let server = match self.auth_status(name, server_config) {
-                Ok(AuthStatus::Required) => CatalogServer {
-                    name: name.clone(),
-                    description,
-                    status: ServerStatus::AuthRequired,
-                    tool_count: 0,
-                    error: Some("authorization required".into()),
-                    tools: vec![],
-                },
-                Err(error) => unavailable(name, description, error.to_string()),
-                _ => match tokio::time::timeout(
-                    OPERATION_TIMEOUT,
-                    self.discover_server(name, server_config),
-                )
-                .await
-                .map_err(|_| Error::Operation {
-                    server: name.clone(),
-                    message: "operation timed out".to_string(),
-                })
-                .and_then(|result| result)
-                {
-                    Ok(tools) => CatalogServer {
-                        name: name.clone(),
-                        description,
-                        status: ServerStatus::Ready,
-                        tool_count: tools.len(),
-                        error: None,
-                        tools: tools.into_iter().map(catalog_tool).collect(),
-                    },
-                    Err(error) => unavailable(name, description, error.to_string()),
-                },
-            };
-            servers.push(server);
-        }
-        Catalog {
-            config_fingerprint: config.fingerprint.clone(),
-            servers,
-        }
-    }
-
-    pub async fn call(
-        &self,
-        config: &McpConfig,
-        selector: &str,
-        arguments: Value,
-    ) -> Result<CallResult> {
-        let (server_name, tool_name) = parse_tool_selector(selector)?;
-        let server = config
-            .servers
-            .get(server_name)
-            .ok_or_else(|| Error::UnknownServer(server_name.into()))?;
-        if self.auth_status(server_name, server)? == AuthStatus::Required {
-            return Err(Error::AuthRequired {
-                server: server_name.into(),
-            });
-        }
-        let arguments = arguments
-            .as_object()
-            .cloned()
-            .ok_or_else(|| Error::InvalidConfig("tool arguments must be a JSON object".into()))?;
-        tokio::time::timeout(
-            OPERATION_TIMEOUT,
-            self.call_server(server_name, server, tool_name, arguments),
-        )
-        .await
-        .map_err(|_| Error::Operation {
-            server: server_name.to_string(),
-            message: "operation timed out".to_string(),
-        })?
-    }
-
-    async fn discover_server(&self, name: &str, config: &McpServerConfig) -> Result<Vec<Tool>> {
-        match config {
-            McpServerConfig::Stdio(stdio) => discover_stdio(name, stdio).await,
-            McpServerConfig::StreamableHttp(http) => {
-                if http.auth.is_some()
-                    && let Some(root) = &self.oauth_root
-                {
-                    return discover_oauth_http(name, http, root).await;
-                }
-                let client = ClientInfo::default()
-                    .serve(self.http_transport(name, http)?)
-                    .await
-                    .map_err(|e| operation(name, e))?;
-                let result = client
-                    .list_all_tools()
-                    .await
-                    .map_err(|e| operation(name, e));
-                let _ = client.cancel().await;
-                result
-            }
-        }
-    }
-
-    async fn call_server(
+    /// Connects and initializes one MCP server. The returned service owns its transport and must
+    /// be retained by the host for the server session to remain alive.
+    pub(crate) async fn connect(
         &self,
         name: &str,
         config: &McpServerConfig,
+    ) -> Result<ConnectedClient> {
+        if self.auth_status(name, config)? == AuthStatus::Required {
+            return Err(Error::AuthRequired {
+                server: name.to_string(),
+            });
+        }
+        tokio::time::timeout(OPERATION_TIMEOUT, self.connect_server(name, config))
+            .await
+            .map_err(|_| timeout_error(name))?
+    }
+
+    pub(crate) async fn list_tools(
+        &self,
+        name: &str,
+        client: &ConnectedClient,
+    ) -> Result<Vec<Tool>> {
+        tokio::time::timeout(OPERATION_TIMEOUT, client.list_all_tools())
+            .await
+            .map_err(|_| timeout_error(name))?
+            .map_err(|error| operation(name, error))
+    }
+
+    pub(crate) async fn call(
+        &self,
+        name: &str,
+        client: &ConnectedClient,
         tool: &str,
         arguments: Map<String, Value>,
     ) -> Result<CallResult> {
+        tokio::time::timeout(
+            OPERATION_TIMEOUT,
+            client.call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments)),
+        )
+        .await
+        .map_err(|_| timeout_error(name))?
+        .map(CallResult::from)
+        .map_err(|error| operation(name, error))
+    }
+
+    async fn connect_server(
+        &self,
+        name: &str,
+        config: &McpServerConfig,
+    ) -> Result<ConnectedClient> {
         match config {
-            McpServerConfig::Stdio(stdio) => call_stdio(name, stdio, tool, arguments).await,
+            McpServerConfig::Stdio(stdio) => ClientInfo::default()
+                .serve(stdio_transport(name, stdio)?)
+                .await
+                .map_err(|error| operation(name, error)),
             McpServerConfig::StreamableHttp(http) => {
                 if http.auth.is_some()
                     && let Some(root) = &self.oauth_root
                 {
-                    return call_oauth_http(name, http, root, tool, arguments).await;
+                    let auth_client = authorized_http_client(name, &http.url, root).await?;
+                    let transport = StreamableHttpClientTransport::with_client(
+                        auth_client,
+                        http_transport_config(name, http)?,
+                    );
+                    return ClientInfo::default()
+                        .serve(transport)
+                        .await
+                        .map_err(|error| operation(name, error));
                 }
-                let client = ClientInfo::default()
+                ClientInfo::default()
                     .serve(self.http_transport(name, http)?)
                     .await
-                    .map_err(|e| operation(name, e))?;
-                let result = client
-                    .call_tool(
-                        CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments),
-                    )
-                    .await
-                    .map(CallResult::from)
-                    .map_err(|e| operation(name, e));
-                let _ = client.cancel().await;
-                result
+                    .map_err(|error| operation(name, error))
             }
         }
     }
@@ -244,8 +195,8 @@ impl McpClient {
         let mut headers = HashMap::new();
         for (key, value) in &config.headers {
             headers.insert(
-                HeaderName::try_from(key).map_err(|e| operation(name, e))?,
-                HeaderValue::try_from(value).map_err(|e| operation(name, e))?,
+                HeaderName::try_from(key).map_err(|error| operation(name, error))?,
+                HeaderValue::try_from(value).map_err(|error| operation(name, error))?,
             );
         }
         if let Some(auth) = &config.auth
@@ -257,7 +208,7 @@ impl McpClient {
         {
             headers.insert(
                 http::header::AUTHORIZATION,
-                HeaderValue::try_from(value).map_err(|e| operation(name, e))?,
+                HeaderValue::try_from(value).map_err(|error| operation(name, error))?,
             );
         }
         Ok(StreamableHttpClientTransport::from_config(
@@ -265,53 +216,6 @@ impl McpClient {
                 .custom_headers(headers),
         ))
     }
-}
-
-async fn discover_oauth_http(
-    name: &str,
-    config: &StreamableHttpConfig,
-    root: &std::path::Path,
-) -> Result<Vec<Tool>> {
-    let auth_client = authorized_http_client(name, &config.url, root).await?;
-    let transport = StreamableHttpClientTransport::with_client(
-        auth_client,
-        http_transport_config(name, config)?,
-    );
-    let client = ClientInfo::default()
-        .serve(transport)
-        .await
-        .map_err(|error| operation(name, error))?;
-    let result = client
-        .list_all_tools()
-        .await
-        .map_err(|error| operation(name, error));
-    let _ = client.cancel().await;
-    result
-}
-
-async fn call_oauth_http(
-    name: &str,
-    config: &StreamableHttpConfig,
-    root: &std::path::Path,
-    tool: &str,
-    arguments: Map<String, Value>,
-) -> Result<CallResult> {
-    let auth_client = authorized_http_client(name, &config.url, root).await?;
-    let transport = StreamableHttpClientTransport::with_client(
-        auth_client,
-        http_transport_config(name, config)?,
-    );
-    let client = ClientInfo::default()
-        .serve(transport)
-        .await
-        .map_err(|error| operation(name, error))?;
-    let result = client
-        .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments))
-        .await
-        .map(CallResult::from)
-        .map_err(|error| operation(name, error));
-    let _ = client.cancel().await;
-    result
 }
 
 fn http_transport_config(
@@ -326,10 +230,6 @@ fn http_transport_config(
         );
     }
     Ok(StreamableHttpClientTransportConfig::with_uri(config.url.clone()).custom_headers(headers))
-}
-
-pub async fn discover(config: &McpConfig) -> Catalog {
-    McpClient::new().discover(config).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -348,7 +248,7 @@ impl From<rmcp::model::CallToolResult> for CallResult {
             content: value
                 .content
                 .into_iter()
-                .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
                 .collect(),
             structured_content: value.structured_content,
             is_error: value.is_error,
@@ -356,64 +256,115 @@ impl From<rmcp::model::CallToolResult> for CallResult {
     }
 }
 
-async fn discover_stdio(name: &str, config: &StdioConfig) -> Result<Vec<Tool>> {
-    let client = ClientInfo::default()
-        .serve(stdio_transport(name, config)?)
-        .await
-        .map_err(|e| operation(name, e))?;
-    let result = client
-        .list_all_tools()
-        .await
-        .map_err(|e| operation(name, e));
-    let _ = client.cancel().await;
-    result
-}
-
-async fn call_stdio(
-    name: &str,
-    config: &StdioConfig,
-    tool: &str,
-    arguments: Map<String, Value>,
-) -> Result<CallResult> {
-    let client = ClientInfo::default()
-        .serve(stdio_transport(name, config)?)
-        .await
-        .map_err(|e| operation(name, e))?;
-    let result = client
-        .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments))
-        .await
-        .map(CallResult::from)
-        .map_err(|e| operation(name, e));
-    let _ = client.cancel().await;
-    result
-}
-
 fn stdio_transport(name: &str, config: &StdioConfig) -> Result<TokioChildProcess> {
-    let mut command =
-        rmcp::transport::which_command(&config.command).map_err(|error| operation(name, error))?;
-    command.args(&config.args).envs(&config.env);
+    let executable =
+        resolve_executable(&config.command, &config.process_env, config.cwd.as_deref())
+            .map_err(|error| operation(name, error))?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(&config.args)
+        .env_clear()
+        .envs(&config.process_env);
     if let Some(cwd) = &config.cwd {
         command.current_dir(cwd);
     }
-    TokioChildProcess::new(command).map_err(|e| operation(name, e))
+    TokioChildProcess::new(command).map_err(|error| operation(name, error))
 }
 
-fn catalog_tool(tool: Tool) -> CatalogTool {
-    CatalogTool {
+fn resolve_executable(
+    command: &str,
+    environment: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let path = Path::new(command);
+    if path.is_absolute() || command.contains('/') || command.contains('\\') {
+        let path = if path.is_relative() {
+            cwd.unwrap_or_else(|| Path::new(".")).join(path)
+        } else {
+            path.to_path_buf()
+        };
+        return executable_candidate(path, environment).ok_or_else(|| not_found(command));
+    }
+
+    let Some(path_value) = environment_value(environment, "PATH") else {
+        return Err(not_found(command));
+    };
+    for directory in std::env::split_paths(path_value) {
+        if let Some(candidate) = executable_candidate(directory.join(command), environment) {
+            return Ok(candidate);
+        }
+    }
+    Err(not_found(command))
+}
+
+fn executable_candidate(path: PathBuf, environment: &BTreeMap<String, String>) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    {
+        if path.extension().is_none() {
+            let extensions = environment_value(environment, "PATHEXT")
+                .unwrap_or(".COM;.EXE;.BAT;.CMD")
+                .split(';');
+            for extension in extensions {
+                let extension = extension.trim().trim_start_matches('.');
+                if extension.is_empty() {
+                    continue;
+                }
+                let candidate = path.with_extension(extension);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn environment_value<'a>(environment: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+    #[cfg(windows)]
+    {
+        environment
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    }
+    #[cfg(not(windows))]
+    {
+        environment.get(key).map(String::as_str)
+    }
+}
+
+fn not_found(command: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("MCP command {command:?} was not found on PATH"),
+    )
+}
+
+pub(crate) fn catalog_tool(tool: Tool) -> crate::CatalogTool {
+    crate::CatalogTool {
         name: tool.name.into_owned(),
-        description: tool.description.map(|v| v.into_owned()),
+        description: tool.description.map(|value| value.into_owned()),
         input_schema: Value::Object((*tool.input_schema).clone()),
     }
 }
 
-fn unavailable(name: &str, description: Option<String>, error: String) -> CatalogServer {
-    CatalogServer {
-        name: name.into(),
-        description,
-        status: ServerStatus::Unavailable,
-        tool_count: 0,
-        error: Some(error),
-        tools: vec![],
+pub(crate) fn parse_tool_selector(selector: &str) -> Result<(&str, &str)> {
+    let Some((server, tool)) = selector.split_once('.') else {
+        return Err(Error::InvalidSelector(selector.into()));
+    };
+    if server.is_empty() || tool.is_empty() {
+        return Err(Error::InvalidSelector(selector.into()));
+    }
+    Ok((server, tool))
+}
+
+fn timeout_error(server: &str) -> Error {
+    Error::Operation {
+        server: server.into(),
+        message: "operation timed out".to_string(),
     }
 }
 
@@ -422,16 +373,6 @@ fn operation(server: &str, error: impl std::fmt::Display) -> Error {
         server: server.into(),
         message: error.to_string(),
     }
-}
-
-fn parse_tool_selector(selector: &str) -> Result<(&str, &str)> {
-    let Some((server, tool)) = selector.split_once('.') else {
-        return Err(Error::InvalidSelector(selector.into()));
-    };
-    if server.is_empty() || tool.is_empty() {
-        return Err(Error::InvalidSelector(selector.into()));
-    }
-    Ok((server, tool))
 }
 
 #[cfg(test)]
@@ -455,6 +396,24 @@ mod tests {
         assert_eq!(
             parse_tool_selector("server.tool.with.dots").unwrap(),
             ("server", "tool.with.dots")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_windows_shims_from_the_supplied_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("uvx.exe");
+        std::fs::write(&executable, b"").unwrap();
+        let environment = BTreeMap::from([
+            ("PATH".to_string(), directory.path().display().to_string()),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        let resolved = resolve_executable("uvx", &environment, None).unwrap();
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&executable.to_string_lossy())
         );
     }
 }

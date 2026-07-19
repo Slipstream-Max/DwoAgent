@@ -37,6 +37,7 @@ pub struct CatalogTool {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerStatus {
+    Pending,
     Ready,
     AuthRequired,
     Unavailable,

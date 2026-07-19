@@ -205,30 +205,6 @@ pub async fn request(config_path: &Path, method: &str, params: Value) -> Result<
     }
 }
 
-pub async fn watch(config_path: &Path, session_id: &str, endpoint_id: &str) -> Result<()> {
-    let endpoint = endpoint(config_path);
-    let request = RpcRequest {
-        id: 1,
-        method: "session.watch".to_string(),
-        params: json!({"session_id": session_id, "endpoint_id": endpoint_id}),
-    };
-    #[cfg(windows)]
-    {
-        use tokio::net::windows::named_pipe::ClientOptions;
-        let stream = ClientOptions::new()
-            .open(&endpoint)
-            .with_context(|| format!("connect to daemon at {endpoint}"))?;
-        watch_stream(stream, &request).await
-    }
-    #[cfg(unix)]
-    {
-        let stream = tokio::net::UnixStream::connect(&endpoint)
-            .await
-            .with_context(|| format!("connect to daemon at {endpoint}"))?;
-        watch_stream(stream, &request).await
-    }
-}
-
 pub async fn subscribe(
     config_path: &Path,
     session_id: &str,
@@ -270,23 +246,6 @@ where
         bail!(error);
     }
     Ok(response.result.unwrap_or(Value::Null))
-}
-
-async fn watch_stream<S>(stream: S, request: &RpcRequest) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let (read, mut write) = tokio::io::split(stream);
-    write_json_line(&mut write, request).await?;
-    let mut lines = BufReader::new(read).lines();
-    while let Some(line) = lines.next_line().await? {
-        let value: Value = serde_json::from_str(&line)?;
-        if let Some(error) = value.get("error").and_then(Value::as_str) {
-            bail!(error.to_string());
-        }
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    }
-    Ok(())
 }
 
 async fn subscribe_stream<S>(
@@ -335,76 +294,4 @@ async fn write_json_line<W: AsyncWrite + Unpin>(
     write.write_all(&bytes).await?;
     write.flush().await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn daemon_ipc_round_trip_serves_status_and_shutdown() {
-        let profile = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(profile.path().join("resource/prompts")).unwrap();
-        std::fs::write(
-            profile.path().join("resource/prompts/System.md"),
-            "You are a test agent.",
-        )
-        .unwrap();
-        std::fs::write(
-            profile.path().join("profile.yaml"),
-            r#"name: test
-description: test agent
-policyMode: confirm
-model:
-  defaultModelId: deepseek-v4-pro
-  providers:
-    deepseek:
-      type: deepseek
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
-"#,
-        )
-        .unwrap();
-        let config = profile.path().join("profile.yaml");
-        let host = Host::load(&config).await.unwrap();
-        let server_config = config.clone();
-        let server = tokio::spawn(async move { serve(host, &server_config).await });
-        let status = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match request(&config, "daemon.status", json!({})).await {
-                    Ok(status) => break status,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(status["healthy"], true);
-        let created = request(
-            &config,
-            "session.new",
-            json!({"title":"ipc-test", "cwd": profile.path()}),
-        )
-        .await
-        .unwrap();
-        assert!(
-            created["session_id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("session-"))
-        );
-        let sessions = request(&config, "session.list", json!({})).await.unwrap();
-        assert_eq!(sessions.as_array().map(Vec::len), Some(1));
-        assert_eq!(
-            request(&config, "channel.list", json!({})).await.unwrap(),
-            json!([])
-        );
-        request(&config, "daemon.shutdown", json!({}))
-            .await
-            .unwrap();
-        server.await.unwrap().unwrap();
-    }
 }

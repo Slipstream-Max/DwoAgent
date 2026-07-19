@@ -13,6 +13,8 @@ use crate::channels::{self, WeixinLoginProgress};
 use crate::host;
 use crate::local::{acp, ipc};
 
+mod render;
+
 #[derive(Parser)]
 #[command(name = "dwo", version, about = "dwoagent host and control CLI")]
 struct Cli {
@@ -366,7 +368,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
     match command {
         SessionCommand::List => {
             let value = ipc::request(config_path, "session.list", json!({})).await?;
-            print_value(&value)?;
+            render::print_session_list(&value)?;
         }
         SessionCommand::New { name, cwd } => {
             let value = ipc::request(
@@ -398,7 +400,10 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             ipc::request(config_path, "session.cancel", json!({"session_id": id})).await?;
             println!("Cancellation requested");
         }
-        SessionCommand::Watch { id } => ipc::watch(config_path, &id, &endpoint_id).await?,
+        SessionCommand::Watch { id } => {
+            let (snapshot, events) = ipc::subscribe(config_path, &id, &endpoint_id).await?;
+            render::stream_watch(std::io::stdout(), snapshot, events).await?;
+        }
         SessionCommand::Model { id, model } => {
             ipc::request(
                 config_path,
@@ -748,8 +753,7 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn print_value(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
+    render::print_value(value)
 }
 
 const DEFAULT_PROFILE: &str = r#"name: coder

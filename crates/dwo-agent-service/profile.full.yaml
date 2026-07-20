@@ -11,6 +11,24 @@ description: coding agent
 # full_access | confirm | watch
 policyMode: confirm
 
+# Channel credentials and mutable state are daemon-owned files under
+# channels/<name>/{secret,runtime}.yaml and never belong in profile.yaml.
+channels:
+  weixin:
+    # The configured channel is listed even when disabled, but its gateway only
+    # starts when enabled and valid QR-login credentials have been persisted.
+    enabled: false
+
+    # Number of completed turns replayed after selecting an existing session.
+    # Valid range: 0..=10.
+    replayTurns: 5
+
+    # Apply the Weixin markdown compatibility filter to assistant responses.
+    markdownFilter: true
+
+    # Download inbound images/files and submit structured content blocks.
+    mediaInput: true
+
 # The daemon watches this section and reschedules valid changes automatically.
 # Cron uses the standard five fields: minute hour day-of-month month weekday.
 automation:

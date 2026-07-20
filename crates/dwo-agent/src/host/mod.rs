@@ -569,6 +569,94 @@ pub fn profile_root(config_path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn yaml_keys(value: &serde_yaml::Value) -> Vec<&str> {
+        let mut keys = value
+            .as_mapping()
+            .expect("profile section must be a mapping")
+            .keys()
+            .map(|key| key.as_str().expect("profile keys must be strings"))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[tokio::test]
+    async fn complete_profile_template_loads_every_host_section() {
+        let source = include_str!("../../../dwo-agent-service/profile.full.yaml");
+        let document: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+        assert_eq!(
+            yaml_keys(&document),
+            [
+                "automation",
+                "channels",
+                "description",
+                "model",
+                "name",
+                "policyMode",
+            ]
+        );
+        assert_eq!(
+            yaml_keys(&document["channels"]["weixin"]),
+            ["enabled", "markdownFilter", "mediaInput", "replayTurns"]
+        );
+        assert_eq!(yaml_keys(&document["automation"]), ["enabled", "jobs"]);
+        assert_eq!(
+            yaml_keys(&document["automation"]["jobs"][0]),
+            ["enabled", "name", "prompt", "schedule", "session"]
+        );
+        assert_eq!(
+            yaml_keys(&document["automation"]["jobs"][0]["schedule"]),
+            ["cron", "timezone"]
+        );
+        assert_eq!(
+            yaml_keys(&document["automation"]["jobs"][0]["session"]),
+            ["cwd", "mode", "title"]
+        );
+        assert_eq!(
+            yaml_keys(&document["automation"]["jobs"][1]["session"]),
+            ["mode", "sessionId"]
+        );
+        assert_eq!(
+            yaml_keys(&document["model"]),
+            ["defaultModelId", "models", "providers"]
+        );
+        assert_eq!(
+            yaml_keys(&document["model"]["providers"]["deepseek"]),
+            ["apiKey", "apiKeyEnv", "baseUrl", "type"]
+        );
+        assert_eq!(
+            yaml_keys(&document["model"]["models"][0]),
+            [
+                "compactThreshold",
+                "contextWindowTokens",
+                "defaultReasoningMode",
+                "maxOutputTokens",
+                "modelId",
+                "modelName",
+                "provider",
+            ]
+        );
+
+        let profile = dwo_agent_service::AgentProfileConfig::from_yaml(source).unwrap();
+        let models = profile
+            .resolve_models(&dwo_agent_service::ModelCatalog::builtin().unwrap())
+            .unwrap();
+        assert_eq!(models.models.len(), 2);
+
+        let root = tempfile::tempdir().unwrap();
+        let channels = ChannelManager::new(root.path(), &profile.channels)
+            .await
+            .unwrap();
+        let channel = channels.list().await.unwrap();
+        assert_eq!(channel.len(), 1);
+        assert_eq!(channel[0].name, "weixin");
+        assert!(!channel[0].enabled);
+
+        let automation = parse_automation_config(profile.automation).unwrap();
+        assert!(!automation.enabled);
+        assert_eq!(automation.jobs.len(), 2);
+    }
+
     fn write_test_profile(root: &Path) -> PathBuf {
         std::fs::create_dir_all(root.join("resource/prompts")).unwrap();
         std::fs::write(

@@ -6,7 +6,7 @@ Owns the model-visible context for the rewrite. It does not call a model.
 ContextManager
 |- model history (index 0 is the current system message)
 |- SystemPromptBlock source metadata + watcher baseline
-|- current usage reported by the latest model response
+|- current token estimate for the complete model request
 `- compaction state
 ```
 
@@ -30,15 +30,17 @@ owns the non-streaming summary request:
 
 ```text
 ContextManager::plan_compaction(CompactionPlanner)
-  -> compact tool-call arguments while preserving call/result pairs
-  -> split history before the latest three real user turns
-  -> remove reasoning/internal messages from the older summary view
-  -> allocate one shared 20K UTF-8 user-message budget across history and latest turns
+  -> estimate message, reasoning, image, tool-call, result, and schema tokens
+  -> reserve approximately 20K newest context tokens, cutting inside a turn when needed
+  -> keep the split turn's user question with the retained agent suffix
+  -> pass the complete summary prefix to the summary model without history filtering
+  -> allocate a shared 5K raw-user-token budget across front users and the reserve
+  -> filter only tool content in the retained reserve while preserving call/result pairs
   -> ModelClient summarizes the view
 ContextManager::apply_compaction(summary)
   -> rebuild current SystemPromptBlock
-  -> replace model history with system + historical users + summary + filtered latest turns
-  -> clear current usage until the next model response
+  -> replace model history with system + front users + summary + filtered reserve
+  -> immediately re-estimate the complete replacement context
   -> reset watcher baseline
 ```
 
@@ -46,18 +48,19 @@ Tool exchanges retain their standard assistant `tool_calls` plus paired tool
 result messages. File-edit patches are replaced with bounded omission markers.
 Terminal commands remain unchanged, while terminal result `output` values are
 replaced with the shared content-omission marker; status and other small result
-fields remain.
-The older summary view then removes reasoning, watcher, permission, config, and
-runtime messages.
+fields remain. This filtering is applied only to the retained reserve; the
+summary input is the unfiltered model-visible history. Images and reasoning are
+preserved by normal compaction. Text is estimated in tokens rather than UTF-8
+bytes, with a conservative non-ASCII estimate and a fixed image estimate.
 
-The latest three turns retain assistant reasoning and text after watcher and
-runtime messages are removed. Images in these turns are preserved and do not
-consume the UTF-8 text budget. Historical images are removed before both the
-summary request and historical-user retention. Recent real user messages
-consume the shared 20K budget first, newest to oldest; only the remaining bytes
-can retain historical user messages before the summary. When there is no older
-history, argument-only filtering does not call the summary model.
+The initial system message is excluded while finding the split and is rebuilt
+from the current profile when replacement is applied. The final model context
+is always `system + front user messages + summary + reserve`. A split turn is
+represented in the summary as its user question plus the removed agent prefix,
+and in the reserve as the same user question plus the newest agent suffix.
 
-Live tool calls and results are stored unchanged. Terminal output is already
-capped at 20K UTF-8 bytes by the tool before it reaches model context; the
-compaction view applies the tool-specific omission rules above.
+Live tool calls and results are stored unchanged. Current usage is recomputed
+from the complete context and tool schemas after each message checkpoint; model
+provider input/output usage is not accumulated or used as the session context
+counter. The model trigger is based on `contextWindowTokens - maxOutputTokens`
+and `compactThreshold`, with no additional fixed 10K headroom.

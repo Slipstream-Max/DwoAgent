@@ -190,29 +190,6 @@ impl MessageContent {
     pub fn ends_with(&self, pattern: &str) -> bool {
         self.as_text().is_some_and(|text| text.ends_with(pattern))
     }
-
-    pub(crate) fn cap_text_bytes(&mut self, limit: usize, cap: impl Fn(&str, usize) -> String) {
-        let mut remaining_blocks = self
-            .0
-            .iter()
-            .filter(|block| matches!(block, ContentBlock::Text { .. }))
-            .count();
-        let mut remaining_bytes = limit;
-        for block in &mut self.0 {
-            let ContentBlock::Text { text, .. } = block else {
-                continue;
-            };
-            let block_budget = remaining_bytes.checked_div(remaining_blocks).unwrap_or(0);
-            *text = cap(text, block_budget);
-            remaining_bytes = remaining_bytes.saturating_sub(text.len());
-            remaining_blocks = remaining_blocks.saturating_sub(1);
-        }
-    }
-
-    pub(crate) fn remove_images(&mut self) {
-        self.0
-            .retain(|block| !matches!(block, ContentBlock::Image { .. }));
-    }
 }
 
 impl From<String> for MessageContent {

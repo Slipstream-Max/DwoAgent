@@ -126,8 +126,8 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     let limits = client.model_limits("chat").unwrap();
     assert_eq!(limits.context_window_tokens, 100_000);
     assert_eq!(limits.max_output_tokens, 4_096);
-    assert_eq!(limits.max_input_tokens, 85_904);
-    assert_eq!(limits.compact_trigger_tokens, 68_723);
+    assert_eq!(limits.max_input_tokens, 95_904);
+    assert_eq!(limits.compact_trigger_tokens, 76_723);
     assert_eq!(client.default_model_id(), "chat");
     assert!(client.supports_image_input("chat").unwrap());
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -337,12 +337,12 @@ models:
     let model = &resolved.models["deepseek-v4-pro"];
     assert_eq!(model.context_window_tokens, 1_000_000);
     assert_eq!(model.max_output_tokens, 384_000);
-    assert_eq!(model.max_input_tokens().unwrap(), 606_000);
+    assert_eq!(model.max_input_tokens().unwrap(), 616_000);
 
     let client = ConfiguredModelClient::new(&catalog, &agent).unwrap();
     let limits = client.model_limits("deepseek-v4-pro").unwrap();
-    assert_eq!(limits.max_input_tokens, 606_000);
-    assert_eq!(limits.compact_trigger_tokens, 303_000);
+    assert_eq!(limits.max_input_tokens, 616_000);
+    assert_eq!(limits.compact_trigger_tokens, 308_000);
     client
         .validate_selection(&ModelSelection {
             model: "deepseek-v4-flash".to_string(),
@@ -386,7 +386,7 @@ models:
     let model = &resolved.models["custom-pro"];
     assert_eq!(model.context_window_tokens, 800_000);
     assert_eq!(model.max_output_tokens, 200_000);
-    assert_eq!(model.max_input_tokens().unwrap(), 590_000);
+    assert_eq!(model.max_input_tokens().unwrap(), 600_000);
     assert_eq!(model.compact_threshold, 0.6);
     assert_eq!(model.default_reasoning_mode, "max");
 }

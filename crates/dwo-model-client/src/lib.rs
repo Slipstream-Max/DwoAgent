@@ -12,7 +12,7 @@ pub use client::ConfiguredModelClient;
 pub use config::{
     AgentModelConfig, AgentModelEntry, AgentProviderConfig, ModelCapabilities, ModelCatalog,
     ModelClientConfig, ModelConfig, ModelSpec, ProviderConfig, ProviderProtocol, ProviderSpec,
-    RequestPolicy, TOOL_RESULT_HEADROOM_TOKENS,
+    RequestPolicy,
 };
 pub use error::ModelClientError;
 pub use types::{

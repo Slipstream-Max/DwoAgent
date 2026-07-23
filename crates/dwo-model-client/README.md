@@ -71,11 +71,13 @@ deep-merged in that order. Reasoning never changes the model output limit.
 The model input budget is derived rather than configured separately:
 
 ```text
-max input = context window - max output - 10,000 tool-result headroom
+max input = context window - max output
 compact trigger = max input * compact threshold
 ```
 
-The 10,000-token headroom is an internal constant and is not exposed in YAML.
+Context usage is estimated from the complete model request, including messages,
+tool calls, tool results, and tool schemas. Provider response usage is optional
+transport metadata and is not used for session context accounting.
 Transport-owned fields (`model`, `messages`, `tools`, `stream`, and
 `stream_options`) cannot be overridden by configuration.
 

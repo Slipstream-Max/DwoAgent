@@ -5,10 +5,11 @@ pub mod env_watcher;
 mod manager;
 mod message;
 pub mod prompt;
+mod token;
 
 pub use compaction::{
-    COMPACT_INSTRUCTION, CompactionPlan, CompactionPlanner, CompactionView, DEFAULT_RECENT_TURNS,
-    DEFAULT_RECENT_USER_BYTES, IMAGE_DOWNGRADE_INSTRUCTION,
+    COMPACT_INSTRUCTION, CompactionPlan, CompactionPlanner, CompactionView,
+    DEFAULT_RECENT_CONTEXT_TOKENS, DEFAULT_RECENT_USER_TOKENS, IMAGE_DOWNGRADE_INSTRUCTION,
 };
 pub use env_watcher::{DynamicEnvironmentSnapshot, EnvChange, EnvWatcherState};
 pub use manager::{CompactionState, ContextManager, SessionContext, SessionUsage};
@@ -20,4 +21,7 @@ pub use prompt::{
     AgentProfilePaths, ChannelCapabilitySnapshot, EnvironmentSnapshot, McpSnapshot,
     PromptBuildError, PromptSnapshot, RuleSnapshot, SkillSnapshot, SystemPromptBlock,
     SystemPromptBuilder,
+};
+pub use token::{
+    estimate_content_tokens, estimate_context_tokens, estimate_message_tokens, estimate_text_tokens,
 };

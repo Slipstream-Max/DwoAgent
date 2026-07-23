@@ -55,7 +55,9 @@ sessions/YYYY/MM/DD/<session-id>/
 
 Runtime phases (`Idle`, `Running`, `WaitingPermission`, `Cancelling`, and
 `Closing`) are actor state and are never persisted as authoritative session
-state.
+state. If a persisted title is empty, list/load repairs it from the first user
+prompt in the transcript, normalized and capped at 10 Unicode characters. A
+session with no history applies the same rule when its next prompt arrives.
 
 ## Runtime ownership
 
@@ -135,10 +137,12 @@ SessionAgent::prompt(origin, user_message)
 deterministic tests. User turns use streaming requests; compaction summaries
 use the non-streaming `ModelClient::summarize` path.
 
-Compaction keeps the latest three user turns after filtering watcher/runtime
-messages. Tool calls and results remain paired in their provider-compatible
-shape; large call arguments are replaced with bounded omission markers while
-stored results remain unchanged. Older history is summarized. A model switch
+Compaction estimates the complete model request and keeps approximately the
+newest 20K tokens. It can split a turn: the user question is retained with the
+newest agent suffix while the removed prefix is summarized. The summary input
+is unfiltered; only retained tool content is reduced, while tool calls and
+results remain paired. A shared 5K token budget covers raw user messages in the
+front section and reserve. A model switch
 uses the last successfully used model for that summary, preserves the session's
 current reasoning mode, and records the target as `last_model` only after its
 first successful turn request.
@@ -153,11 +157,12 @@ Only an explicitly classified `ContextLengthExceeded` response enters reactive
 recovery. Authentication, rate-limit, network, and other invalid-request
 errors do not masquerade as context errors.
 
-Every normal provider response must include usage. Its reported total becomes
-the current context-token snapshot; values are never accumulated across turns.
-Compaction or an image downgrade clears the snapshot to zero until the next
-normal model response. Changing models immediately publishes that current value
-against the target model's context-window size.
+Context usage is recomputed from system prompt, messages, reasoning, images,
+tool calls/results, and tool schemas after each checkpoint. Provider input and
+output usage is optional transport metadata and is not accumulated. The model
+trigger uses `contextWindowTokens - maxOutputTokens`, multiplied by
+`compactThreshold`; changing models immediately publishes the estimate against
+the target model's context-window size.
 
 ## Observation and control
 

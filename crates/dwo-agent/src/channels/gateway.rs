@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{Datelike, Local};
+use clap::{CommandFactory, Parser, Subcommand};
 use dwo_agent_service::{
     ClientTranscriptEvent, ContentBlock, EndpointId, MessageContent, SessionConfigUpdate,
     SessionEventPayload, SessionId,
@@ -161,6 +162,73 @@ struct WeixinObserver {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "weixin",
+    about = "These commands are supported:",
+    disable_help_flag = true,
+    disable_help_subcommand = true,
+    disable_version_flag = true
+)]
+struct WeixinCommandLine {
+    #[command(subcommand)]
+    command: WeixinCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WeixinCommand {
+    #[command(about = "Display this command list.")]
+    Help,
+    #[command(about = "List sessions and show the selected session.")]
+    List,
+    #[command(about = "Create and select a session.")]
+    New {
+        #[arg(value_name = "NAME", num_args = 0..)]
+        name: Vec<String>,
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+    },
+    #[command(about = "Select a session and replay its recent turns.")]
+    Use {
+        #[arg(value_name = "SESSION")]
+        session: String,
+    },
+    #[command(about = "Show the selected session state.")]
+    Status,
+    #[command(about = "Delete a session.")]
+    Del {
+        #[arg(value_name = "SESSION")]
+        session: String,
+    },
+    #[command(about = "Cancel the active turn.")]
+    Cancel,
+    #[command(about = "Change the selected session model.")]
+    Model {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    #[command(about = "Change reasoning effort, or disable reasoning.")]
+    Reasoning {
+        #[arg(value_name = "LEVEL|off")]
+        level: String,
+    },
+    #[command(about = "Show or change the tool permission policy.")]
+    Policy {
+        #[arg(value_name = "full_access|confirm|watch")]
+        mode: Option<String>,
+    },
+    #[command(about = "Allow a pending permission request.")]
+    Allow {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    #[command(about = "Deny a pending permission request.")]
+    Deny {
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+}
+
 #[async_trait]
 impl MessageHandler for WeixinHandler {
     async fn on_message(&self, ctx: &MessageContext) -> weixin_agent::Result<()> {
@@ -212,19 +280,12 @@ impl WeixinHandler {
     }
 
     async fn handle_command(&self, ctx: &MessageContext, text: &str) -> Result<()> {
-        let tokens = split_command_line(text)?;
-        let command = tokens.first().map(String::as_str).unwrap_or("/help");
-        let mut args = tokens.iter().skip(1).map(String::as_str);
+        let command = parse_weixin_command(text)?;
         match command {
-            "/help" => {
-                ctx.reply_text(
-                    "/list /new [name] [--cwd <path>] /use <session> /status /del <session> /cancel\n\
-                     /model <name> /reasoning <level|off> /policy [full_access|confirm|watch]\n\
-                     /allow <id> /deny <id>",
-                )
-                .await?;
+            WeixinCommand::Help => {
+                ctx.reply_text(&render_weixin_command_help()).await?;
             }
-            "/list" => {
+            WeixinCommand::List => {
                 let records = self.host.service.list().await?;
                 let selected = self.state.lock().await.selected_session_id.clone();
                 let text = records
@@ -250,8 +311,8 @@ impl WeixinHandler {
                 })
                 .await?;
             }
-            "/new" => {
-                let (title, cwd) = parse_new_args(&tokens[1..])?;
+            WeixinCommand::New { name, cwd } => {
+                let title = (!name.is_empty()).then(|| name.join(" "));
                 let session = self.host.create_session(title, cwd).await?;
                 self.select_session(session.id().as_str()).await?;
                 let snapshot = session.attach(self.endpoint(&ctx.from)).await?.snapshot;
@@ -262,11 +323,10 @@ impl WeixinHandler {
                 ))
                 .await?;
             }
-            "/use" => {
-                let id = args.next().context("usage: /use <session>")?;
-                let session_id = SessionId::parse(id.to_string()).map_err(anyhow::Error::msg)?;
+            WeixinCommand::Use { session: id } => {
+                let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
                 let agent = self.host.service.load(&session_id).await?;
-                self.select_session(id).await?;
+                self.select_session(&id).await?;
                 let subscription = agent.attach(self.endpoint(&ctx.from)).await?;
                 let replay =
                     render_replay_turns(&subscription.snapshot.transcript, self.replay_turns);
@@ -279,38 +339,35 @@ impl WeixinHandler {
                     }
                 }
             }
-            "/status" => {
+            WeixinCommand::Status => {
                 let agent = self.selected_agent().await?;
                 let snapshot = agent.attach(self.endpoint(&ctx.from)).await?.snapshot;
                 ctx.reply_text(&render_status(&snapshot)).await?;
             }
-            "/del" => {
-                let id = args.next().context("usage: /del <session>")?;
-                let session_id = SessionId::parse(id.to_string()).map_err(anyhow::Error::msg)?;
+            WeixinCommand::Del { session: id } => {
+                let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
                 self.host.delete_session(&session_id).await?;
                 let mut state = self.state.lock().await;
-                if state.selected_session_id.as_deref() == Some(id) {
+                if state.selected_session_id.as_deref() == Some(id.as_str()) {
                     state.selected_session_id = None;
                     self.host.channels.save_state(&state).await?;
                 }
                 ctx.reply_text("Session deleted").await?;
             }
-            "/cancel" => {
+            WeixinCommand::Cancel => {
                 self.selected_agent().await?.cancel(None).await?;
                 ctx.reply_text("Cancellation requested").await?;
             }
-            "/model" => {
-                let model = args.next().context("usage: /model <name>")?;
+            WeixinCommand::Model { name: model } => {
                 let id = self.selected_session_id().await?;
                 self.host
                     .service
-                    .set_config(&id, SessionConfigUpdate::Model(model.to_string()))
+                    .set_config(&id, SessionConfigUpdate::Model(model))
                     .await?;
                 ctx.reply_text("Model updated").await?;
             }
-            "/reasoning" => {
-                let value = args.next().context("usage: /reasoning <level|off>")?;
-                let reasoning = (value != "off").then(|| value.to_string());
+            WeixinCommand::Reasoning { level } => {
+                let reasoning = (level != "off").then_some(level);
                 let id = self.selected_session_id().await?;
                 self.host
                     .service
@@ -318,10 +375,10 @@ impl WeixinHandler {
                     .await?;
                 ctx.reply_text("Reasoning updated").await?;
             }
-            "/policy" => {
+            WeixinCommand::Policy { mode } => {
                 let id = self.selected_session_id().await?;
-                if let Some(value) = args.next() {
-                    let mode = SessionMode::parse(value).map_err(anyhow::Error::msg)?;
+                if let Some(value) = mode {
+                    let mode = SessionMode::parse(&value).map_err(anyhow::Error::msg)?;
                     self.host
                         .service
                         .set_config(&id, SessionConfigUpdate::Mode(mode))
@@ -344,22 +401,32 @@ impl WeixinHandler {
                     .await?;
                 }
             }
-            "/allow" | "/deny" => {
-                let request_id = args.next().context("permission id is required")?;
-                let allowed = command == "/allow";
+            WeixinCommand::Allow { id } => {
                 self.selected_agent()
                     .await?
                     .respond_permission(
                         self.endpoint(&ctx.from),
-                        request_id.to_string(),
+                        id,
                         ConfirmationDecision {
-                            allowed,
-                            reason: (!allowed).then(|| "denied from Weixin".to_string()),
+                            allowed: true,
+                            reason: None,
                         },
                     )
                     .await?;
             }
-            _ => bail!("unknown command: {command}"),
+            WeixinCommand::Deny { id } => {
+                self.selected_agent()
+                    .await?
+                    .respond_permission(
+                        self.endpoint(&ctx.from),
+                        id,
+                        ConfirmationDecision {
+                            allowed: false,
+                            reason: Some("denied from Weixin".to_string()),
+                        },
+                    )
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -548,36 +615,46 @@ fn split_command_line(input: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-fn parse_new_args(args: &[String]) -> Result<(Option<String>, Option<PathBuf>)> {
-    let mut title = Vec::new();
-    let mut cwd = None;
-    let mut index = 0usize;
-    while index < args.len() {
-        let value = &args[index];
-        if value == "--cwd" {
-            index += 1;
-            let path = args
-                .get(index)
-                .context("usage: /new [name] [--cwd <path>]")?;
-            if cwd.replace(PathBuf::from(path)).is_some() {
-                bail!("--cwd may only be specified once");
-            }
-        } else if let Some(path) = value.strip_prefix("--cwd=") {
-            if path.is_empty() {
-                bail!("usage: /new [name] [--cwd <path>]");
-            }
-            if cwd.replace(PathBuf::from(path)).is_some() {
-                bail!("--cwd may only be specified once");
-            }
-        } else if value.starts_with("--") {
-            bail!("unknown /new option: {value}");
-        } else {
-            title.push(value.as_str());
-        }
-        index += 1;
-    }
-    let title = (!title.is_empty()).then(|| title.join(" "));
-    Ok((title, cwd))
+fn parse_weixin_command(input: &str) -> Result<WeixinCommand> {
+    let mut tokens = split_command_line(input)?;
+    let command = tokens.first_mut().context("command is required")?;
+    *command = command
+        .strip_prefix('/')
+        .unwrap_or(command.as_str())
+        .to_string();
+    WeixinCommandLine::try_parse_from(std::iter::once("weixin".to_string()).chain(tokens))
+        .map(|line| line.command)
+        .map_err(|error| anyhow::Error::msg(render_weixin_command_error(error)))
+}
+
+fn render_weixin_command_help() -> String {
+    let mut command = WeixinCommandLine::command();
+    command.build();
+    let heading = command
+        .get_about()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "Commands:".to_string());
+    let commands = command
+        .get_subcommands()
+        .map(|command| {
+            let description = command
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            format!("/{} - {description}", command.get_name())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{heading}\n\n{commands}")
+}
+
+fn render_weixin_command_error(error: clap::Error) -> String {
+    error
+        .to_string()
+        .replace("Usage: weixin ", "Usage: /")
+        .replace("Usage: weixin", "Usage: /help")
+        .trim()
+        .to_string()
 }
 
 fn policy_name(mode: SessionMode) -> &'static str {
@@ -773,6 +850,11 @@ async fn stream_session(
             break;
         };
         match event.payload {
+            SessionEventPayload::UserPromptSubmitted { content, .. } => {
+                if let Some(prompt) = render_live_user_prompt(&content) {
+                    send_logical_message(&client, &target, &prompt).await;
+                }
+            }
             SessionEventPayload::AssistantCompleted {
                 content,
                 tool_calls,
@@ -829,6 +911,12 @@ async fn stream_session(
             _ => {}
         }
     }
+}
+
+fn render_live_user_prompt(content: &MessageContent) -> Option<String> {
+    let content = content.to_string();
+    let content = content.trim();
+    (!content.is_empty()).then(|| content.to_string())
 }
 
 #[derive(Default)]
@@ -1059,6 +1147,15 @@ mod tests {
     }
 
     #[test]
+    fn live_user_prompt_is_forwarded_without_extra_wrapping() {
+        assert_eq!(
+            render_live_user_prompt(&MessageContent::text("  inspect the project  ")).as_deref(),
+            Some("inspect the project")
+        );
+        assert_eq!(render_live_user_prompt(&MessageContent::text("  ")), None);
+    }
+
+    #[test]
     fn replay_groups_user_and_responses_by_turn() {
         let first = dwo_agent_service::TurnId::new();
         let second = dwo_agent_service::TurnId::new();
@@ -1141,17 +1238,37 @@ mod tests {
 
     #[test]
     fn new_command_supports_quoted_windows_cwd_and_multiword_title() {
-        let tokens = split_command_line(
+        let command = parse_weixin_command(
             r#"/new Project review --cwd "C:\Users\Example User\Documents\repo""#,
         )
         .unwrap();
-        let (title, cwd) = parse_new_args(&tokens[1..]).unwrap();
+        let WeixinCommand::New { name, cwd } = command else {
+            panic!("expected /new command");
+        };
 
-        assert_eq!(title.as_deref(), Some("Project review"));
+        assert_eq!(name, ["Project", "review"]);
         assert_eq!(
             cwd.as_deref(),
             Some(Path::new(r"C:\Users\Example User\Documents\repo"))
         );
+    }
+
+    #[test]
+    fn command_help_is_generated_from_clap_metadata() {
+        let help = render_weixin_command_help();
+
+        assert!(help.starts_with("These commands are supported:\n\n"));
+        assert!(help.contains("/help - Display this command list."));
+        assert!(help.contains("/new - Create and select a session."));
+        assert!(help.contains("/policy - Show or change the tool permission policy."));
+        assert!(help.contains("/deny - Deny a pending permission request."));
+    }
+
+    #[test]
+    fn command_parse_errors_use_slash_command_usage() {
+        let error = parse_weixin_command("/model").unwrap_err().to_string();
+
+        assert!(error.contains("Usage: /model <NAME>"), "{error}");
     }
 
     #[test]

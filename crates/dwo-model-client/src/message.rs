@@ -268,27 +268,29 @@ fn normalize_arguments(arguments: &str) -> Value {
     }
 }
 
-pub(crate) fn usage(value: Option<&Value>) -> Result<ModelUsage, ModelClientError> {
-    let value = value.ok_or_else(|| ModelClientError::protocol("missing response usage"))?;
+pub(crate) fn usage(value: Option<&Value>) -> ModelUsage {
+    let Some(value) = value else {
+        return ModelUsage::default();
+    };
     let input_tokens = value
         .get("prompt_tokens")
         .or_else(|| value.get("input_tokens"))
         .and_then(Value::as_u64)
-        .ok_or_else(|| ModelClientError::protocol("missing usage input tokens"))?;
+        .unwrap_or_default();
     let output_tokens = value
         .get("completion_tokens")
         .or_else(|| value.get("output_tokens"))
         .and_then(Value::as_u64)
-        .ok_or_else(|| ModelClientError::protocol("missing usage output tokens"))?;
+        .unwrap_or_default();
     let total_tokens = value
         .get("total_tokens")
         .and_then(Value::as_u64)
         .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
-    Ok(ModelUsage {
+    ModelUsage {
         input_tokens,
         output_tokens,
         total_tokens,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -341,15 +343,14 @@ mod tests {
     }
 
     #[test]
-    fn response_usage_is_required_for_context_accounting() {
-        assert!(usage(None).is_err());
-        assert!(usage(Some(&json!({"prompt_tokens": 1}))).is_err());
+    fn response_usage_is_optional_because_context_is_estimated_locally() {
+        assert_eq!(usage(None), ModelUsage::default());
+        assert_eq!(usage(Some(&json!({"prompt_tokens": 1}))).total_tokens, 1);
         assert_eq!(
             usage(Some(&json!({
                 "prompt_tokens": 2,
                 "completion_tokens": 3
             })))
-            .unwrap()
             .total_tokens,
             5
         );

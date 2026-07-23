@@ -8,8 +8,11 @@ use dwo_tools::{FileEditManager, PolicyConfig, SessionMode, ToolManager, ToolPol
 use tokio::sync::Mutex;
 
 use crate::error::AgentServiceError;
+use crate::events::{ClientTranscriptEvent, SessionEventPayload};
 use crate::profile::LoadedAgentProfile;
-use crate::record::{SessionConfigUpdate, SessionId, SessionLlmSettings, SessionRecord};
+use crate::record::{
+    SessionConfigUpdate, SessionId, SessionLlmSettings, SessionRecord, title_from_user_content,
+};
 use crate::repository::SessionRepository;
 use crate::session::SessionAgent;
 
@@ -140,6 +143,15 @@ impl AgentService {
         let deleting = self.loaded.lock().await.deleting.clone();
         let mut records = self.repository.list().await?;
         records.retain(|record| !deleting.contains(&record.info.id));
+        for record in &mut records {
+            if !record.info.title.trim().is_empty() {
+                continue;
+            }
+            let transcript = self.repository.load_transcript(&record.info.id).await?;
+            if repair_empty_title(record, &transcript) {
+                self.repository.save(record).await?;
+            }
+        }
         Ok(records)
     }
 
@@ -224,11 +236,12 @@ impl AgentService {
     ) -> Result<Arc<SessionAgent>, AgentServiceError> {
         let transcript = self.repository.load_transcript(&record.info.id).await?;
         let prompt_builder = self.prompt_builder(record.info.cwd.clone());
+        let mut record_changed = repair_empty_title(&mut record, &transcript);
         if !record.context.system_prompt.is_initialized() {
             record.context = ContextManager::initialize(&prompt_builder)
                 .map_err(anyhow::Error::from)?
                 .into_context();
-            self.repository.save(&record).await?;
+            record_changed = true;
         }
         let mut loaded = self.loaded.lock().await;
         if loaded.deleting.contains(&record.info.id) {
@@ -242,6 +255,16 @@ impl AgentService {
             self.policy.clone(),
             self.file_edit.clone(),
         )?);
+        let previous_tokens = record.context.usage.current_tokens;
+        let mut context = ContextManager::new(record.context.clone());
+        let current_tokens = context.refresh_usage(&tools.schemas());
+        record.context = context.into_context();
+        if current_tokens != previous_tokens {
+            record_changed = true;
+        }
+        if record_changed {
+            self.repository.save(&record).await?;
+        }
         let agent = SessionAgent::spawn(
             record.clone(),
             transcript,
@@ -265,4 +288,20 @@ fn default_session_title(cwd: &std::path::Path) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "session".to_string())
+}
+
+fn repair_empty_title(record: &mut SessionRecord, transcript: &[ClientTranscriptEvent]) -> bool {
+    if !record.info.title.trim().is_empty() {
+        return false;
+    }
+    let Some(title) = transcript.iter().find_map(|event| match &event.payload {
+        SessionEventPayload::UserPromptSubmitted { content, .. } => {
+            title_from_user_content(content)
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+    record.set_automatic_title(title);
+    true
 }

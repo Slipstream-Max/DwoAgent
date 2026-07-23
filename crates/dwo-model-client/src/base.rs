@@ -122,9 +122,6 @@ impl BaseClient {
             body.insert("tools".to_string(), Value::Array(tools.to_vec()));
         }
         body.insert("stream".to_string(), Value::Bool(stream));
-        if stream {
-            body.insert("stream_options".to_string(), json!({"include_usage":true}));
-        }
         Ok(Value::Object(body))
     }
 
@@ -194,7 +191,7 @@ impl BaseClient {
                 ModelClientError::protocol(format!("invalid SSE JSON: {error}"))
             })?;
             if let Some(value) = payload.get("usage").filter(|value| !value.is_null()) {
-                accumulated.usage = Some(usage(Some(value))?);
+                accumulated.usage = Some(usage(Some(value)));
             }
             let Some(choice) = payload
                 .get("choices")
@@ -243,8 +240,7 @@ impl BaseClient {
             ..StreamAccumulator::default()
         }
         .normalized_tool_calls();
-        let usage = usage
-            .ok_or_else(|| ModelClientError::protocol("stream ended without response usage"))?;
+        let usage = usage.unwrap_or_default();
         Ok(ModelReply {
             content,
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
@@ -292,7 +288,7 @@ fn parse_completion(payload: &Value) -> Result<ModelReply, ModelClientError> {
             !tool_calls.is_empty(),
         ),
         tool_calls,
-        usage: usage(payload.get("usage"))?,
+        usage: usage(payload.get("usage")),
     })
 }
 

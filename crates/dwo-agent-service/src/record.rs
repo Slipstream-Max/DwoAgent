@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dwo_context::SessionContext;
+use dwo_context::{ContentBlock, MessageContent, SessionContext};
 use dwo_tools::SessionMode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -189,6 +189,16 @@ impl SessionRecord {
         }
         Ok(())
     }
+}
+
+pub(crate) fn title_from_user_content(content: &MessageContent) -> Option<String> {
+    content.as_blocks().iter().find_map(|block| {
+        let ContentBlock::Text { text, .. } = block else {
+            return None;
+        };
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!normalized.is_empty()).then(|| normalized.chars().take(10).collect())
+    })
 }
 
 fn is_false(value: &bool) -> bool {

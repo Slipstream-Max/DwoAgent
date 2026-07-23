@@ -119,11 +119,14 @@ resource link containing the local path, MIME type, name, and size. A
 media-only message is a valid prompt. Sessions created without an explicit
 cwd use `runtime/workspaces/<session-id>` instead of the daemon process cwd.
 
-The Weixin slash commands include `/new [name] [--cwd <path>]` and `/policy
-[full_access|confirm|watch]`. Assistant responses are buffered for the whole
-turn, joined in commit order, and split only when the combined text exceeds
-4,000 characters. Tool calls are sent immediately only when confirmation is
-required, together with the permission request ID.
+Weixin slash commands are declared as a clap-derived command enum. Parsing,
+argument validation, and `/help` descriptions therefore come from one command
+definition instead of separate handwritten lists. The commands include `/new
+[name] [--cwd <path>]` and `/policy [full_access|confirm|watch]`. Assistant
+responses are buffered for the whole turn, joined in commit order, and split
+only when the combined text exceeds 4,000 characters. Tool calls are sent
+immediately only when confirmation is required, together with the permission
+request ID.
 
 When Weixin is enabled and bound, the context builder adds a concise channel
 capability block to the system prompt. Binding and unbinding changes are
@@ -169,7 +172,9 @@ because it is the MCP tool argument payload.
 
 Weixin binding uses the real `weixin-agent` QR flow. Bound channels reconnect
 inside the daemon, persist sync state, route slash commands through the shared
-`AgentService`, and support answer-only or full tool-progress streaming.
+`AgentService`, and support answer-only or full tool-progress streaming. A user
+prompt submitted by ACP is mirrored to the bound Weixin observer; a prompt that
+originates from Weixin is not echoed back to the same endpoint.
 
 The ACP command is a stdio bridge to the daemon IPC endpoint. It shares the
 same sessions and events as CLI and Weixin clients. Loading a session keeps a

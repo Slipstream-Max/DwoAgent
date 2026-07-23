@@ -2,8 +2,8 @@ mod plan;
 mod tools;
 
 pub use plan::{
-    CompactionPlan, CompactionPlanner, CompactionView, DEFAULT_RECENT_TURNS,
-    DEFAULT_RECENT_USER_BYTES, IMAGE_DOWNGRADE_INSTRUCTION,
+    CompactionPlan, CompactionPlanner, CompactionView, DEFAULT_RECENT_CONTEXT_TOKENS,
+    DEFAULT_RECENT_USER_TOKENS, IMAGE_DOWNGRADE_INSTRUCTION,
 };
 
 use tools::compact_tool_exchanges;

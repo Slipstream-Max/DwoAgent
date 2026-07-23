@@ -8,8 +8,6 @@ use serde_json::{Map, Value};
 
 use crate::ModelClientError;
 
-pub const TOOL_RESULT_HEADROOM_TOKENS: u64 = 10_000;
-
 const BUILTIN_MODEL_CATALOG_YAML: &str = include_str!("../resources/models.yaml");
 const RESERVED_BODY_FIELDS: &[&str] = &[
     "model",
@@ -528,11 +526,10 @@ fn available_input_tokens(
     }
     context_window_tokens
         .checked_sub(u64::from(max_output_tokens))
-        .and_then(|tokens| tokens.checked_sub(TOOL_RESULT_HEADROOM_TOKENS))
         .filter(|tokens| *tokens > 0)
         .ok_or_else(|| {
             ModelClientError::config(format!(
-                "{source} must leave input capacity after max output and tool-result headroom"
+                "{source} must leave input capacity after max output"
             ))
         })
 }

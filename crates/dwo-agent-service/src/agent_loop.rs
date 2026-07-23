@@ -110,6 +110,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
         if let Err(error) = turn.context.refresh_environment(&turn.prompt_builder) {
             return TurnOutcome::Failed(format!("refresh environment: {error:#}"));
         }
+        refresh_context_usage(turn);
 
         let desired = current_selection(turn);
         let limits = match turn.model.model_limits(&desired.model) {
@@ -135,8 +136,6 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             Err(error) => return TurnOutcome::Failed(format!("{error:#}")),
         };
 
-        turn.context
-            .record_turn_usage(selection.model, response.usage.total_tokens);
         let active_tool_calls = response
             .tool_calls
             .iter()
@@ -148,6 +147,8 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             response.reasoning.clone(),
             response.tool_calls.clone(),
         );
+        turn.context.record_model_success(selection.model);
+        refresh_context_usage(turn);
         turn.emit(TurnEvent::AssistantCompleted {
             turn_id: turn.turn_id.clone(),
             content: response.content,
@@ -192,6 +193,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             turn.context
                 .append_tool(turn.turn_id.clone(), context_result);
         }
+        refresh_context_usage(turn);
         if let Err(error) = turn.checkpoint().await {
             return TurnOutcome::Failed(format!("persist tool checkpoint: {error:#}"));
         }
@@ -211,7 +213,9 @@ async fn request_with_context_recovery(
         Ok(response) => Ok(response),
         Err(error) if error.is_context_length_exceeded() => {
             let recovery = recovery_selection(turn, selection);
-            let plan = turn.context.plan_compaction(&CompactionPlanner::default());
+            let plan = turn
+                .context
+                .plan_recovery_compaction(&CompactionPlanner::default());
             if !compact_context(turn, plan, recovery).await? {
                 return Err(error.into());
             }
@@ -281,9 +285,13 @@ async fn compact_context(
         String::new()
     };
     turn.context
-        .apply_compaction(plan, summary, &turn.prompt_builder)?;
+        .apply_compaction(plan, summary, &turn.prompt_builder, &turn.tools.schemas())?;
     turn.checkpoint().await?;
     Ok(true)
+}
+
+fn refresh_context_usage(turn: &mut RunTurn) {
+    turn.context.refresh_usage(&turn.tools.schemas());
 }
 
 fn current_selection(turn: &RunTurn) -> ModelSelection {

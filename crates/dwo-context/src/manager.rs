@@ -4,11 +4,13 @@ use serde_json::Value;
 use crate::compaction::{CompactionPlan, CompactionPlanner};
 use crate::env_watcher::EnvWatcherState;
 use crate::prompt::{PromptBuildError, SystemPromptBlock, SystemPromptBuilder};
-use crate::{ContextMessage, MessageContent, MessageKind, ToolResultRecord, TurnId};
+use crate::{
+    ContextMessage, MessageContent, MessageKind, ToolResultRecord, TurnId, estimate_context_tokens,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsage {
-    /// Token count reported for the latest normal model response.
+    /// Estimated tokens in the complete model request context.
     #[serde(default)]
     pub current_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,9 +135,14 @@ impl ContextManager {
         self.context.messages.push(ContextMessage::tool(&result));
     }
 
-    pub fn record_turn_usage(&mut self, model: impl Into<String>, total_tokens: u64) {
-        self.context.usage.current_tokens = total_tokens;
+    pub fn record_model_success(&mut self, model: impl Into<String>) {
         self.context.usage.last_model = Some(model.into());
+    }
+
+    pub fn refresh_usage(&mut self, tools: &[Value]) -> u64 {
+        let tokens = estimate_context_tokens(&self.context.messages, tools);
+        self.context.usage.current_tokens = tokens;
+        tokens
     }
 
     pub fn should_compact(&self, trigger_tokens: u64) -> bool {
@@ -162,16 +169,21 @@ impl ContextManager {
         planner.build(&self.context)
     }
 
+    pub fn plan_recovery_compaction(&self, planner: &CompactionPlanner) -> CompactionPlan {
+        planner.build_recovery(&self.context)
+    }
+
     pub fn plan_image_downgrade(&self) -> CompactionPlan {
         CompactionPlanner::default().build_image_downgrade(&self.context)
     }
 
-    /// Replace model context and clear the reported token count until the next model response.
+    /// Replace model context and estimate the complete rebuilt request.
     pub fn apply_compaction(
         &mut self,
         plan: CompactionPlan,
         summary: impl Into<String>,
         prompt_builder: &SystemPromptBuilder,
+        tools: &[Value],
     ) -> Result<(), PromptBuildError> {
         let summary = summary.into();
         let rebuilt_prompt = prompt_builder.rebuild()?;
@@ -185,7 +197,7 @@ impl ContextManager {
         self.context.env_watcher = EnvWatcherState { baseline };
         self.context.compaction.count = self.context.compaction.count.saturating_add(1);
         self.context.compaction.summary = (!summary.is_empty()).then_some(summary);
-        self.context.usage.current_tokens = 0;
+        self.refresh_usage(tools);
         Ok(())
     }
 }

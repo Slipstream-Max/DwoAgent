@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use dwo_agent_service::{
     AgentService, ConfirmationDecision, ContentBlock, EndpointId, FsSessionRepository,
     MemorySessionRepository, MessageContent, MessageKind, ModelLimits, NewSession, RuntimePhase,
-    SessionConfigUpdate, SessionEventPayload, SessionLlmSettings, SessionMode,
+    SessionConfigUpdate, SessionEventPayload, SessionLlmSettings, SessionMode, SessionRepository,
 };
 use dwo_tools::PolicyConfig;
 use serde_json::json;
@@ -99,7 +99,11 @@ async fn unnamed_session_gets_model_generated_title() {
     assert_eq!(titles, ["Flaky websocket tests"]);
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.info.title, "Flaky websocket tests");
-    assert_eq!(snapshot.record.context.usage.current_tokens, 0);
+    assert!(snapshot.record.context.usage.current_tokens > 0);
+    assert_eq!(
+        snapshot.record.context.usage.current_tokens,
+        snapshot.usage.used
+    );
     assert_eq!(
         service.list().await.unwrap()[0].info.title,
         "Flaky websocket tests"
@@ -148,6 +152,101 @@ async fn explicitly_named_session_keeps_its_title() {
         "test"
     );
     assert!(model.completion_requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn empty_persisted_title_is_repaired_from_the_first_user_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let repository = Arc::new(FsSessionRepository::new(&sessions).await.unwrap());
+    let service = AgentService::new(
+        repository.clone(),
+        ScriptedModelGateway::new([ScriptedStep::text("done")]),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(&workspace, SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let id = agent.id().clone();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent
+        .prompt(EndpointId::new(), "这是一个用于恢复标题的问题")
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    service.shutdown().await;
+
+    let mut persisted = repository.load(&id).await.unwrap().unwrap();
+    persisted.info.title = "   ".to_string();
+    repository.save(&persisted).await.unwrap();
+
+    let restarted = AgentService::new(
+        repository.clone(),
+        ScriptedModelGateway::new([]),
+        PolicyConfig::default(),
+    );
+    let listed = restarted.list().await.unwrap();
+    assert_eq!(listed[0].info.title, "这是一个用于恢复标题");
+    assert_eq!(
+        repository.load(&id).await.unwrap().unwrap().info.title,
+        "这是一个用于恢复标题"
+    );
+}
+
+#[tokio::test]
+async fn empty_title_without_history_is_filled_by_the_next_user_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let repository = Arc::new(FsSessionRepository::new(&sessions).await.unwrap());
+    let service = AgentService::new(
+        repository.clone(),
+        ScriptedModelGateway::new([]),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(&workspace, SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let id = agent.id().clone();
+    service.shutdown().await;
+
+    let mut persisted = repository.load(&id).await.unwrap().unwrap();
+    persisted.info.title.clear();
+    repository.save(&persisted).await.unwrap();
+
+    let restarted = AgentService::new(
+        repository.clone(),
+        ScriptedModelGateway::new([ScriptedStep::text("done")]),
+        PolicyConfig::default(),
+    );
+    let loaded = restarted.load(&id).await.unwrap();
+    let mut events = loaded.attach(EndpointId::new()).await.unwrap().events;
+    loaded
+        .prompt(EndpointId::new(), "please investigate this failure")
+        .await
+        .unwrap();
+    let title = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let SessionEventPayload::TitleChanged { title, .. } =
+                events.recv().await.unwrap().payload
+            {
+                break title;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(title, "please inv");
+    assert_eq!(
+        repository.load(&id).await.unwrap().unwrap().info.title,
+        title
+    );
 }
 
 #[tokio::test]
@@ -470,10 +569,10 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
         ],
         [],
         ModelLimits {
-            context_window_tokens: 100,
-            max_output_tokens: 10,
-            max_input_tokens: 80,
-            compact_trigger_tokens: 80,
+            context_window_tokens: 3_000,
+            max_output_tokens: 500,
+            max_input_tokens: 2_500,
+            compact_trigger_tokens: 2_000,
         },
     );
     let service = AgentService::new(
@@ -519,10 +618,23 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
             SessionEventPayload::AssistantCompleted { .. }
         )
     }));
-    assert_eq!(snapshot.record.context.usage.current_tokens, 22);
-    assert_eq!(snapshot.usage.used, 22);
-    assert_eq!(snapshot.usage.size, 100);
-    assert_eq!(usage_updates, [(85, 100), (0, 100), (22, 100)]);
+    assert!(snapshot.record.context.usage.current_tokens > 0);
+    assert_eq!(
+        snapshot.usage.used,
+        snapshot.record.context.usage.current_tokens
+    );
+    assert_eq!(snapshot.usage.size, 3_000);
+    assert!(
+        usage_updates
+            .iter()
+            .all(|(used, size)| *used > 0 && *size == 3_000)
+    );
+    assert!(
+        usage_updates
+            .windows(2)
+            .any(|updates| updates[1].0 < updates[0].0),
+        "tool filtering should reduce the estimated context: {usage_updates:?}"
+    );
     assert_eq!(model.summary_request_count().await, 0);
     let requests = model.requests().await;
     assert_eq!(requests.len(), 2);
@@ -671,7 +783,7 @@ async fn context_error_summarizes_old_history_and_retries_with_filtered_recent_t
             .view
             .messages
             .iter()
-            .any(|message| message.content == "request 3")
+            .any(|message| message.content == "run the edit")
     );
 }
 
@@ -730,10 +842,10 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
             (
                 "next-model".to_string(),
                 ModelLimits {
-                    context_window_tokens: 500,
-                    max_output_tokens: 100,
-                    max_input_tokens: 390,
-                    compact_trigger_tokens: 300,
+                    context_window_tokens: 60_000,
+                    max_output_tokens: 10_000,
+                    max_input_tokens: 50_000,
+                    compact_trigger_tokens: 25_000,
                 },
             ),
         ],
@@ -750,7 +862,10 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
     for index in 1..=4 {
         agent
-            .prompt(EndpointId::new(), format!("request {index}"))
+            .prompt(
+                EndpointId::new(),
+                format!("request {index} {}", "x".repeat(25_000)),
+            )
             .await
             .unwrap();
         wait_for_turn_end(&mut events).await;
@@ -774,7 +889,8 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
     })
     .await
     .unwrap();
-    assert_eq!(switched_usage, (401, 500));
+    assert!(switched_usage.0 >= 25_000);
+    assert_eq!(switched_usage.1, 60_000);
     agent.prompt(EndpointId::new(), "request 5").await.unwrap();
     let mut compacted_usage = Vec::new();
     let terminal = tokio::time::timeout(Duration::from_secs(10), async {
@@ -797,8 +913,10 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
         SessionEventPayload::TurnCompleted { .. }
     ));
     assert!(
-        compacted_usage.contains(&(0, 500)),
-        "compaction should replace the old context usage: {compacted_usage:?}"
+        compacted_usage
+            .iter()
+            .any(|(used, size)| *used < switched_usage.0 && *size == 60_000),
+        "compaction should reduce the estimated context: {compacted_usage:?}"
     );
 
     let summaries = model.summary_requests().await;
@@ -811,11 +929,12 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
     assert_eq!(requests[4].selection.reasoning.as_deref(), Some("high"));
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.llm.reasoning.as_deref(), Some("high"));
-    assert_eq!(snapshot.record.context.usage.current_tokens, 0);
+    assert!(snapshot.record.context.usage.current_tokens > 0);
     assert_eq!(
-        snapshot.usage,
-        dwo_agent_service::SessionUsageSnapshot { used: 0, size: 500 }
+        snapshot.usage.used,
+        snapshot.record.context.usage.current_tokens
     );
+    assert_eq!(snapshot.usage.size, 60_000);
     assert_eq!(
         snapshot.record.context.usage.last_model.as_deref(),
         Some("next-model")
@@ -846,10 +965,10 @@ async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
             (
                 "text-model".to_string(),
                 ModelLimits {
-                    context_window_tokens: 500,
-                    max_output_tokens: 100,
-                    max_input_tokens: 400,
-                    compact_trigger_tokens: 300,
+                    context_window_tokens: 5_000,
+                    max_output_tokens: 1_000,
+                    max_input_tokens: 4_000,
+                    compact_trigger_tokens: 3_000,
                 },
             ),
         ],
@@ -893,11 +1012,15 @@ async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
     })
     .await
     .unwrap();
-    assert_eq!(migrated_usage, (0, 500));
+    assert!(migrated_usage.0 > 0);
+    assert_eq!(migrated_usage.1, 5_000);
 
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.llm.model, "text-model");
-    assert_eq!(snapshot.record.context.usage.current_tokens, 0);
+    assert_eq!(
+        snapshot.record.context.usage.current_tokens,
+        migrated_usage.0
+    );
     assert!(
         snapshot
             .record

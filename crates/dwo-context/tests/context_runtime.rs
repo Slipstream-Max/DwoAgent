@@ -1,6 +1,6 @@
 use dwo_context::{
-    CompactionPlanner, ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind,
-    MessageRole, SystemPromptBuilder, ToolResultRecord, TurnId,
+    CompactionPlanner, ContentBlock, ContextManager, MessageContent, MessageKind, MessageRole,
+    SystemPromptBuilder, ToolResultRecord, TurnId, estimate_content_tokens,
 };
 use serde_json::json;
 
@@ -10,27 +10,31 @@ fn write(path: &std::path::Path, content: &str) {
 }
 
 #[test]
-fn usage_tracks_the_current_context_without_cumulative_token_fields() {
+fn usage_estimates_the_complete_context_without_provider_token_fields() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
+    let tools = vec![json!({"type":"function","function":{"name":"terminal"}})];
 
-    manager.record_turn_usage("first-model", 120);
-    manager.record_turn_usage("second-model", 45);
+    let initial = manager.refresh_usage(&tools);
+    manager.append_user(TurnId::parse("turn-1").unwrap(), "hello world");
+    let with_user = manager.refresh_usage(&tools);
+    manager.record_model_success("second-model");
 
-    assert_eq!(manager.context().usage.current_tokens, 45);
+    assert!(initial > 0);
+    assert!(with_user > initial);
+    assert_eq!(manager.context().usage.current_tokens, with_user);
     assert_eq!(
         manager.context().usage.last_model.as_deref(),
         Some("second-model")
     );
-    assert!(!manager.should_compact(46));
-    assert!(manager.should_compact(45));
+    assert!(!manager.should_compact(with_user + 1));
+    assert!(manager.should_compact(with_user));
 
     let usage = serde_json::to_value(&manager.context().usage).unwrap();
-    assert_eq!(usage["current_tokens"], 45);
     assert!(usage.get("input_tokens").is_none());
     assert!(usage.get("output_tokens").is_none());
-    assert!(usage.get("last_turn_input_tokens").is_none());
+    assert!(usage.get("total_tokens").is_none());
 }
 
 #[test]
@@ -184,147 +188,10 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
 }
 
 #[test]
-fn compaction_keeps_tool_pairs_and_filters_reasoning_from_summary_history() {
-    let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
-    let mut manager = ContextManager::initialize(&builder).unwrap();
-
-    for index in 1..=3 {
-        manager.append_user(
-            TurnId::parse(format!("turn-{index}")).unwrap(),
-            format!("user {index}"),
-        );
-    }
-    manager.append_assistant_with_reasoning(
-        TurnId::parse("turn-3").unwrap(),
-        "reasoned answer",
-        Some("embedded private reasoning".to_string()),
-        Vec::new(),
-    );
-    let long_command = "echo terminal-command ".repeat(300);
-    let calls = vec![
-        json!({"id":"paired", "name":"terminal", "arguments":{"action":"run", "command":long_command}}),
-        json!({"id":"missing", "name":"terminal", "arguments":{"action":"run"}}),
-    ];
-    manager.append_assistant(TurnId::parse("turn-3").unwrap(), "running", calls);
-    manager.append_tool(
-        TurnId::parse("turn-3").unwrap(),
-        ToolResultRecord {
-            tool_call_id: "paired".to_string(),
-            tool_name: "terminal".to_string(),
-            output: json!({"status":"completed", "output": "x".repeat(500)}),
-        },
-    );
-    let mut context = manager.into_context();
-    context.messages.push(ContextMessage::internal(
-        MessageKind::Permission,
-        "permission request",
-    ));
-    context.messages.push(ContextMessage {
-        role: MessageRole::Tool,
-        content: "orphan".into(),
-        reasoning: None,
-        tool_calls: Vec::new(),
-        tool_call_id: Some("orphan".to_string()),
-        tool_name: Some("terminal".to_string()),
-        kind: MessageKind::Conversation,
-    });
-    let mut manager = ContextManager::new(context);
-    let plan = manager.plan_compaction(&CompactionPlanner::new(12).with_recent_turns(0));
-    assert_eq!(plan.recent_user_messages.len(), 2);
-    assert_eq!(plan.recent_user_messages[0].content, "user 2");
-    assert!(
-        plan.view
-            .messages
-            .iter()
-            .all(|message| message.kind != MessageKind::Permission)
-    );
-    assert!(
-        plan.view
-            .messages
-            .iter()
-            .all(|message| message.reasoning.is_none())
-    );
-    let assistant = plan
-        .view
-        .messages
-        .iter()
-        .find(|message| !message.tool_calls.is_empty())
-        .unwrap();
-    assert_eq!(assistant.tool_calls.len(), 1);
-    assert_eq!(assistant.tool_calls[0]["id"], "paired");
-    assert_eq!(
-        assistant.tool_calls[0]["arguments"]["command"],
-        long_command
-    );
-    let tool_result = plan
-        .view
-        .messages
-        .iter()
-        .find(|message| message.role == MessageRole::Tool)
-        .unwrap();
-    assert_eq!(tool_result.tool_call_id.as_deref(), Some("paired"));
-    assert!(tool_result.content.contains("completed"));
-    assert!(tool_result.content.contains("content omitted"));
-    assert!(!tool_result.content.contains(&"x".repeat(500)));
-    assert!(
-        !plan
-            .view
-            .messages
-            .iter()
-            .any(|message| message.tool_call_id.as_deref() == Some("orphan"))
-    );
-
-    manager
-        .apply_compaction(plan, "compact summary", &builder)
-        .unwrap();
-    assert_eq!(manager.context().messages.len(), 4);
-    assert_eq!(manager.context().messages[0].role, MessageRole::System);
-    assert_eq!(manager.context().messages[1].content, "user 2");
-    assert_eq!(manager.context().messages[2].content, "user 3");
-    assert_eq!(
-        manager.context().messages[3].kind,
-        MessageKind::CompactionSummary
-    );
-    assert_eq!(manager.context().compaction.count, 1);
-    assert_eq!(manager.refresh_environment(&builder).unwrap(), 0);
-}
-
-#[test]
-fn recent_users_use_a_total_utf8_byte_budget_instead_of_a_message_count() {
-    let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
-    let mut manager = ContextManager::initialize(&builder).unwrap();
-    for index in 0..100 {
-        manager.append_user(
-            TurnId::parse(format!("turn-{index}")).unwrap(),
-            format!("message-{index:03}"),
-        );
-    }
-    let plan = manager.plan_compaction(&CompactionPlanner::default().with_recent_turns(0));
-    assert_eq!(plan.recent_user_messages.len(), 100);
-
-    let long = format!("HEAD{}TAIL", "你".repeat(10_000));
-    manager.append_user(TurnId::parse("turn-long").unwrap(), long);
-    let plan = manager.plan_compaction(&CompactionPlanner::default().with_recent_turns(0));
-    let retained = plan.recent_user_messages.last().unwrap();
-    assert!(retained.content.starts_with("HEAD"));
-    assert!(retained.content.ends_with("TAIL"));
-    assert!(retained.content.contains("content omitted"));
-    assert!(
-        plan.recent_user_messages
-            .iter()
-            .map(|message| message.content.len())
-            .sum::<usize>()
-            <= 20_000
-    );
-}
-
-#[test]
-fn acp_content_blocks_round_trip_without_provider_shaping() {
+fn content_blocks_round_trip_through_context_storage() {
     let value = json!([
-        {"type":"text", "text":"describe this", "annotations":{"audience":["user"], "priority":0.5, "_meta":{"source":"test"}}},
-        {"type":"image", "mimeType":"image/png", "data":"aGVsbG8=", "uri":"file:///shot.png"},
+        {"type":"text", "text":"inspect"},
+        {"type":"image", "mimeType":"image/png", "data":"iVBORw0KGgo=", "uri":"file:///shot.png"},
         {"type":"audio", "mimeType":"audio/wav", "data":"UklGRg=="},
         {"type":"resource", "resource":{"uri":"file:///main.rs", "mimeType":"text/rust", "text":"fn main() {}"}},
         {"type":"resource_link", "uri":"file:///guide.pdf", "name":"guide.pdf", "mimeType":"application/pdf", "size":42}
@@ -335,175 +202,16 @@ fn acp_content_blocks_round_trip_without_provider_shaping() {
 }
 
 #[test]
-fn recent_user_compaction_caps_text_without_touching_image_data() {
+fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
-    let image_data = "a".repeat(10_000);
-    manager.append_user(
-        TurnId::parse("turn-image").unwrap(),
-        MessageContent::blocks(vec![
-            ContentBlock::text(format!("HEAD{}TAIL", "你".repeat(100))),
-            ContentBlock::image("image/png", image_data.clone()),
-        ]),
-    );
-
-    let plan = manager.plan_compaction(&CompactionPlanner::new(80));
-    let retained = &plan.recent_turn_messages[0].content;
-    assert!(retained.text_bytes() <= 80);
-    assert!(retained.contains("content omitted"));
-    assert!(matches!(
-        &retained.as_blocks()[1],
-        ContentBlock::Image { data, .. } if data == &image_data
-    ));
-}
-
-#[test]
-fn compaction_removes_historical_images_but_keeps_latest_three_turn_images() {
-    let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
-    let mut manager = ContextManager::initialize(&builder).unwrap();
-    for index in 1..=4 {
-        let turn = TurnId::parse(format!("turn-{index}")).unwrap();
-        manager.append_user(
-            turn.clone(),
-            MessageContent::blocks(vec![
-                ContentBlock::text(format!("user {index}")),
-                ContentBlock::image("image/png", format!("image-{index}")),
-            ]),
-        );
-        manager.append_assistant(turn, format!("answer {index}"), Vec::new());
-    }
-
-    let plan = manager.plan_compaction(&CompactionPlanner::default());
-    let historical_user = plan
-        .view
-        .messages
-        .iter()
-        .find(|message| message.content.contains("user 1"))
-        .unwrap();
-    assert!(
-        historical_user
-            .content
-            .as_blocks()
-            .iter()
-            .all(|block| !matches!(block, ContentBlock::Image { .. }))
-    );
-    assert!(
-        plan.recent_user_messages[0]
-            .content
-            .as_blocks()
-            .iter()
-            .all(|block| !matches!(block, ContentBlock::Image { .. }))
-    );
-
-    let latest_images = plan
-        .recent_turn_messages
-        .iter()
-        .filter(|message| message.is_real_user())
-        .flat_map(|message| message.content.as_blocks())
-        .filter_map(|block| match block {
-            ContentBlock::Image { data, .. } => Some(data.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(latest_images, ["image-2", "image-3", "image-4"]);
-}
-
-#[test]
-fn image_downgrade_summary_sees_images_and_replacement_removes_them() {
-    let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
-    let mut manager = ContextManager::initialize(&builder).unwrap();
-    for index in 1..=2 {
-        let turn = TurnId::parse(format!("turn-image-{index}")).unwrap();
-        manager.append_user(
-            turn.clone(),
-            MessageContent::blocks(vec![
-                ContentBlock::text(format!("user {index}")),
-                ContentBlock::image("image/png", format!("image-{index}")),
-            ]),
-        );
-        manager.append_assistant(turn, format!("answer {index}"), Vec::new());
-    }
-
-    let plan = manager.plan_image_downgrade();
-    let summary_images = plan
-        .view
-        .messages
-        .iter()
-        .flat_map(|message| message.content.as_blocks())
-        .filter_map(|block| match block {
-            ContentBlock::Image { data, .. } => Some(data.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(summary_images, ["image-1", "image-2"]);
-    assert!(plan.recent_turn_messages.is_empty());
-
-    manager
-        .apply_compaction(plan, "text description of both images", &builder)
-        .unwrap();
-    assert!(!manager.contains_images());
-    assert_eq!(manager.context().compaction.count, 1);
-    assert_eq!(
-        manager.context().compaction.summary.as_deref(),
-        Some("text description of both images")
-    );
-}
-
-#[test]
-fn historical_and_latest_turn_users_share_one_utf8_byte_budget() {
-    let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
-    let mut manager = ContextManager::initialize(&builder).unwrap();
-    for index in 1..=5 {
-        let turn = TurnId::parse(format!("turn-{index}")).unwrap();
-        manager.append_user(
-            turn.clone(),
-            format!("HEAD-{index}-{}-TAIL-{index}", "x".repeat(5_980)),
-        );
-        manager.append_assistant(turn, format!("answer {index}"), Vec::new());
-    }
-
-    let plan = manager.plan_compaction(&CompactionPlanner::default());
-    let retained_user_bytes = plan
-        .recent_user_messages
-        .iter()
-        .chain(
-            plan.recent_turn_messages
-                .iter()
-                .filter(|message| message.is_real_user()),
-        )
-        .map(|message| message.content.text_bytes())
-        .sum::<usize>();
-
-    assert!(retained_user_bytes <= 20_000);
-    assert_eq!(plan.recent_turn_messages[0].content.text_bytes(), 5_994);
-    assert_eq!(plan.recent_user_messages.len(), 1);
-    assert!(
-        plan.recent_user_messages[0]
-            .content
-            .contains("content omitted")
-    );
-}
-
-#[test]
-fn compaction_summarizes_history_and_filters_the_latest_three_turns() {
-    let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
-    let mut manager = ContextManager::initialize(&builder).unwrap();
-    for index in 1..=2 {
-        let turn = TurnId::parse(format!("turn-{index}")).unwrap();
-        manager.append_user(turn.clone(), format!("history user {index}"));
-        manager.append_assistant(turn, format!("history answer {index}"), Vec::new());
-    }
-    let tool_turn = TurnId::parse("turn-3").unwrap();
-    manager.append_user(tool_turn.clone(), "inspect the project");
+    let first = TurnId::parse("turn-1").unwrap();
+    manager.append_user(first.clone(), "inspect the project");
     manager.append_assistant_with_reasoning(
-        tool_turn.clone(),
+        first.clone(),
         "checking",
-        Some("look for TODO markers".to_string()),
+        Some("keep this reasoning in summary input".to_string()),
         vec![json!({
             "id":"call-1",
             "name":"terminal",
@@ -511,85 +219,75 @@ fn compaction_summarizes_history_and_filters_the_latest_three_turns() {
         })],
     );
     manager.append_tool(
-        tool_turn,
+        first,
         ToolResultRecord {
             tool_call_id: "call-1".to_string(),
             tool_name: "terminal".to_string(),
             output: json!({"output":"src/main.rs:1:TODO"}),
         },
     );
-    for index in 4..=5 {
-        let turn = TurnId::parse(format!("turn-{index}")).unwrap();
-        manager.append_user(turn.clone(), format!("recent user {index}"));
-        manager.append_assistant(turn, format!("recent answer {index}"), Vec::new());
-    }
+    let second = TurnId::parse("turn-2").unwrap();
+    manager.append_user(second.clone(), "continue");
+    manager.append_assistant(second, "done", Vec::new());
 
-    let plan = manager.plan_compaction(&CompactionPlanner::default());
-    assert!(plan.has_compactable_history());
-    assert_eq!(plan.recent_user_messages.len(), 2);
-    assert_eq!(plan.recent_turn_messages.len(), 7);
-    assert_eq!(plan.recent_turn_messages[0].content, "inspect the project");
-    let filtered_tool_call = &plan.recent_turn_messages[1];
-    assert_eq!(filtered_tool_call.role, MessageRole::Assistant);
-    assert_eq!(
-        filtered_tool_call.reasoning.as_deref(),
-        Some("look for TODO markers")
-    );
-    assert!(filtered_tool_call.content.contains("checking"));
-    assert_eq!(filtered_tool_call.tool_calls.len(), 1);
-    assert_eq!(filtered_tool_call.tool_calls[0]["id"], "call-1");
-    assert_eq!(plan.recent_turn_messages[2].role, MessageRole::Tool);
-    assert_eq!(
-        plan.recent_turn_messages[2].tool_call_id.as_deref(),
-        Some("call-1")
-    );
-    assert!(
-        plan.recent_turn_messages[2]
-            .content
-            .contains("content omitted")
-    );
-    assert!(!plan.recent_turn_messages[2].content.contains("TODO"));
+    let plan = manager.plan_compaction(&CompactionPlanner::new(20, 5_000));
+    let historical_assistant = plan
+        .view
+        .messages
+        .iter()
+        .find(|message| !message.tool_calls.is_empty())
+        .unwrap();
+    let historical_result = plan
+        .view
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .unwrap();
 
-    manager.apply_compaction(plan, "summary", &builder).unwrap();
-    let messages = manager.model_messages();
-    assert_eq!(messages[0].role, MessageRole::System);
-    assert_eq!(messages[1].content, "history user 1");
-    assert_eq!(messages[2].content, "history user 2");
-    assert_eq!(messages[3].kind, MessageKind::CompactionSummary);
-    assert_eq!(messages[4].content, "inspect the project");
-    assert_eq!(messages[5].tool_calls[0]["id"], "call-1");
-    assert_eq!(messages[6].role, MessageRole::Tool);
+    assert_eq!(
+        historical_assistant.reasoning.as_deref(),
+        Some("keep this reasoning in summary input")
+    );
+    assert_eq!(
+        historical_assistant.tool_calls[0]["arguments"]["command"],
+        "rg TODO"
+    );
+    assert!(historical_result.content.contains("src/main.rs:1:TODO"));
+    assert_eq!(plan.reserved_messages[0].content, "continue");
 }
 
 #[test]
-fn compaction_without_tools_keeps_the_latest_three_turns() {
+fn historical_and_reserved_users_share_one_token_budget() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     for index in 1..=4 {
         let turn = TurnId::parse(format!("turn-{index}")).unwrap();
-        manager.append_user(turn.clone(), format!("user {index}"));
+        manager.append_user(
+            turn.clone(),
+            format!("HEAD-{index}-{}-TAIL-{index}", "you".repeat(40)),
+        );
         manager.append_assistant(turn, format!("answer {index}"), Vec::new());
     }
 
-    let plan = manager.plan_compaction(&CompactionPlanner::default());
-    assert!(plan.has_compactable_history());
-    assert_eq!(plan.recent_turn_messages.len(), 6);
-    assert_eq!(plan.recent_turn_messages[0].content, "user 2");
-    manager.apply_compaction(plan, "summary", &builder).unwrap();
+    let plan = manager.plan_compaction(&CompactionPlanner::new(50, 40));
+    let retained_user_tokens = plan
+        .front_user_messages
+        .iter()
+        .chain(
+            plan.reserved_messages
+                .iter()
+                .filter(|message| message.is_real_user()),
+        )
+        .map(|message| estimate_content_tokens(&message.content))
+        .sum::<u64>();
 
-    assert_eq!(manager.model_messages().len(), 9);
-    assert_eq!(manager.model_messages()[1].content, "user 1");
-    assert_eq!(
-        manager.model_messages()[2].kind,
-        MessageKind::CompactionSummary
-    );
-    assert_eq!(manager.model_messages()[3].content, "user 2");
-    assert_eq!(manager.model_messages()[8].content, "answer 4");
+    assert!(retained_user_tokens <= 40);
+    assert!(plan.front_user_messages.len() <= 4);
 }
 
 #[test]
-fn recent_tool_filter_can_reduce_context_without_requesting_a_summary() {
+fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
@@ -613,26 +311,66 @@ fn recent_tool_filter_can_reduce_context_without_requesting_a_summary() {
         },
     );
 
-    let plan = manager.plan_compaction(&CompactionPlanner::default());
+    let plan = manager.plan_compaction(&CompactionPlanner::new(10_000, 5_000));
     assert!(!plan.has_compactable_history());
     assert!(plan.needs_replacement());
-    manager.apply_compaction(plan, "", &builder).unwrap();
-
-    assert_eq!(manager.model_messages().len(), 4);
-    assert_eq!(manager.model_messages()[1].content, "inspect");
     assert!(
-        manager.model_messages()[2].tool_calls[0]["arguments"]["patch"]
+        plan.reserved_messages[1].tool_calls[0]["arguments"]["patch"]
             .as_str()
             .unwrap()
             .contains("file patch omitted")
     );
-    assert_eq!(manager.model_messages()[3].role, MessageRole::Tool);
-    assert!(manager.model_messages()[3].content.contains("completed"));
-    assert_eq!(manager.context().compaction.summary, None);
+
+    manager.apply_compaction(plan, "", &builder, &[]).unwrap();
+    assert!(manager.context().usage.current_tokens > 0);
 }
 
 #[test]
-fn compaction_rebuild_absorbs_current_rules() {
+fn normal_summary_preserves_images_and_image_downgrade_removes_them() {
+    let root = tempfile::tempdir().unwrap();
+    let builder = SystemPromptBuilder::new(None, root.path());
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+    for index in 1..=2 {
+        let turn = TurnId::parse(format!("turn-image-{index}")).unwrap();
+        manager.append_user(
+            turn.clone(),
+            MessageContent::blocks(vec![
+                ContentBlock::text(format!("user {index}")),
+                ContentBlock::image("image/png", format!("image-{index}")),
+            ]),
+        );
+        manager.append_assistant(turn, format!("answer {index}"), Vec::new());
+    }
+
+    let normal = manager.plan_compaction(&CompactionPlanner::new(10, 5_000));
+    assert!(normal.view.messages.iter().any(|message| {
+        message
+            .content
+            .as_blocks()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }));
+
+    let downgrade = manager.plan_image_downgrade();
+    let summary_images = downgrade
+        .view
+        .messages
+        .iter()
+        .flat_map(|message| message.content.as_blocks())
+        .filter(|block| matches!(block, ContentBlock::Image { .. }))
+        .count();
+    assert_eq!(summary_images, 2);
+    assert!(downgrade.reserved_messages.is_empty());
+
+    manager
+        .apply_compaction(downgrade, "text description of both images", &builder, &[])
+        .unwrap();
+    assert!(!manager.contains_images());
+    assert!(manager.context().usage.current_tokens > 0);
+}
+
+#[test]
+fn compaction_rebuild_absorbs_current_rules_and_reestimates_usage() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
     let cwd = root.path().join("cwd");
@@ -646,11 +384,14 @@ fn compaction_rebuild_absorbs_current_rules() {
     write(&profile.join("resource/prompts/System.md"), "system v2");
     write(&cwd.join("AGENTS.md"), "cwd rules v2");
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 2);
-    let plan = manager.plan_compaction(&CompactionPlanner::default());
-    manager.apply_compaction(plan, "summary", &builder).unwrap();
+    let plan = manager.plan_compaction(&CompactionPlanner::new(1, 5_000));
+    manager
+        .apply_compaction(plan, "summary", &builder, &[])
+        .unwrap();
 
     assert!(manager.system_prompt().contains("system v2"));
     assert!(manager.system_prompt().contains("cwd rules v2"));
     assert!(!manager.system_prompt().contains("cwd rules v1"));
+    assert!(manager.context().usage.current_tokens > 0);
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 0);
 }

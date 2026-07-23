@@ -83,7 +83,7 @@ model:
 
 模型 alias 必须匹配 `modelName`。`provider` 和 `modelId` 在内置 catalog 中解析；`baseUrl`、`apiKeyEnv`、`apiKey` 可以作为 profile 级 provider 设置；context/output 限制、`compactThreshold` 和默认 reasoning mode 可以由 profile 覆盖。headers、retry、request body 和 capabilities 仍由内置 model catalog 管理。
 
-模型响应的 `total_tokens` 代表当前 context token snapshot，不会把不同 turn 的 input/output 累加。压缩把当前值重置为 0；模型切换会立即按目标模型 context window 发送 usage update。
+context token 由 daemon 根据完整的 system prompt、消息、reasoning、图片、tool call/result 和 tool schema 直接估算，不使用 provider 的 input/output 累加。触发阈值为 `(contextWindowTokens - maxOutputTokens) * compactThreshold`。压缩完成后立即重新估算并发送 `usage_update`；模型切换也会按目标模型的 context window 发送新的 usage update。
 
 ### 图片模型切换
 

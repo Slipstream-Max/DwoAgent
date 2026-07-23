@@ -19,7 +19,7 @@ use crate::events::{
     SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
-use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord};
+use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord, title_from_user_content};
 use crate::repository::SessionRepository;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -519,16 +519,31 @@ impl SessionActor {
                 self.record.llm.model
             )));
         }
+        let previous_usage = self.usage_snapshot();
         let turn_id = TurnId::new();
         let event_content = content.clone();
-        let title_generation =
-            if self.record.auto_title_pending() && self.title_cancellation.is_none() {
-                title_source(&content).map(|source| (source, self.record.info.title.clone()))
-            } else {
-                None
-            };
+        let repaired_title = self
+            .record
+            .info
+            .title
+            .trim()
+            .is_empty()
+            .then(|| title_from_user_content(&content))
+            .flatten();
+        if let Some(title) = &repaired_title {
+            self.record.set_automatic_title(title.clone());
+        }
+        let title_generation = if repaired_title.is_none()
+            && self.record.auto_title_pending()
+            && self.title_cancellation.is_none()
+        {
+            title_source(&content).map(|source| (source, self.record.info.title.clone()))
+        } else {
+            None
+        };
         let mut context = ContextManager::new(self.record.context.clone());
         context.append_user(turn_id.clone(), content);
+        context.refresh_usage(&self.tools.schemas());
         self.record.context = context.into_context();
         self.record.touch();
         self.repository.save(&self.record).await?;
@@ -549,6 +564,15 @@ impl SessionActor {
             content: event_content,
         })
         .await;
+        if let Some(title) = repaired_title {
+            self.emit(SessionEventPayload::TitleChanged {
+                title,
+                updated_at_ms: self.record.info.updated_at_ms,
+            });
+        }
+        if self.usage_snapshot() != previous_usage {
+            self.emit_usage_changed();
+        }
         self.emit(SessionEventPayload::TurnStarted {
             turn_id: turn_id.clone(),
         });
@@ -616,7 +640,12 @@ impl SessionActor {
             )));
         }
         context
-            .apply_compaction(plan, summary.summary, &self.prompt_builder)
+            .apply_compaction(
+                plan,
+                summary.summary,
+                &self.prompt_builder,
+                &self.tools.schemas(),
+            )
             .map_err(anyhow::Error::from)?;
         updated.context = context.into_context();
         Ok(())

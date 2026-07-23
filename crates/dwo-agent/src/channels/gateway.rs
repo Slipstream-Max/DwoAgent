@@ -328,14 +328,13 @@ impl WeixinHandler {
                 let agent = self.host.service.load(&session_id).await?;
                 self.select_session(&id).await?;
                 let subscription = agent.attach(self.endpoint(&ctx.from)).await?;
-                let replay =
-                    render_replay_turns(&subscription.snapshot.transcript, self.replay_turns);
+                let replay = render_session_replay(&subscription.snapshot, self.replay_turns);
                 if replay.is_empty() {
                     ctx.reply_text(&render_status(&subscription.snapshot))
                         .await?;
                 } else {
-                    for turn in replay {
-                        reply_logical_message(ctx, &turn).await?;
+                    for message in replay {
+                        reply_logical_message(ctx, &message).await?;
                     }
                 }
             }
@@ -1079,7 +1078,74 @@ struct ReplayTurn {
     responses: Vec<String>,
 }
 
-fn render_replay_turns(transcript: &[ClientTranscriptEvent], turns: usize) -> Vec<String> {
+fn render_session_replay(
+    snapshot: &dwo_agent_service::SessionSnapshot,
+    turns: usize,
+) -> Vec<String> {
+    let running = render_running_turn_replay(snapshot);
+    let history_turns = turns.saturating_sub(usize::from(running.is_some()));
+    let mut replay = render_replay_turns(
+        &snapshot.transcript,
+        history_turns,
+        snapshot.active_turn_id.as_ref(),
+    );
+    replay.extend(running);
+    replay
+}
+
+fn render_running_turn_replay(snapshot: &dwo_agent_service::SessionSnapshot) -> Option<String> {
+    let active_turn_id = snapshot.active_turn_id.as_ref()?;
+    let mut prompt = None;
+    let mut latest_reasoning = None;
+    let mut current_reasoning = String::new();
+    for event in &snapshot.transcript {
+        match &event.payload {
+            SessionEventPayload::UserPromptSubmitted {
+                turn_id, content, ..
+            } if turn_id == active_turn_id && prompt.is_none() => {
+                prompt = Some(content.to_string());
+            }
+            SessionEventPayload::AssistantReasoningDelta { turn_id, delta }
+                if turn_id == active_turn_id =>
+            {
+                current_reasoning.push_str(delta);
+            }
+            SessionEventPayload::AssistantCompleted {
+                turn_id, reasoning, ..
+            } if turn_id == active_turn_id => {
+                let reasoning = if current_reasoning.trim().is_empty() {
+                    reasoning.as_deref().unwrap_or("")
+                } else {
+                    current_reasoning.as_str()
+                };
+                if !reasoning.trim().is_empty() {
+                    latest_reasoning = Some(reasoning.trim().to_string());
+                }
+                current_reasoning.clear();
+            }
+            _ => {}
+        }
+    }
+    if !current_reasoning.trim().is_empty() {
+        latest_reasoning = Some(current_reasoning.trim().to_string());
+    }
+
+    let mut sections = Vec::new();
+    if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        sections.push(format!("User:\n{}", prompt.trim()));
+    }
+    if let Some(reasoning) = latest_reasoning {
+        sections.push(format!("Reasoning:\n{reasoning}"));
+    }
+    sections.push("Prompt turn is running".to_string());
+    Some(sections.join("\n\n"))
+}
+
+fn render_replay_turns(
+    transcript: &[ClientTranscriptEvent],
+    turns: usize,
+    excluded_turn_id: Option<&dwo_agent_service::TurnId>,
+) -> Vec<String> {
     let mut grouped = Vec::<ReplayTurn>::new();
     for event in transcript {
         let turn_id = match &event.payload {
@@ -1110,6 +1176,7 @@ fn render_replay_turns(transcript: &[ClientTranscriptEvent], turns: usize) -> Ve
 
     let rendered = grouped
         .into_iter()
+        .filter(|turn| excluded_turn_id.is_none_or(|excluded| turn.turn_id != *excluded))
         .filter_map(|turn| {
             if turn.prompts.is_empty() && turn.responses.is_empty() {
                 return None;
@@ -1191,12 +1258,66 @@ mod tests {
         ];
 
         assert_eq!(
-            render_replay_turns(&transcript, 1),
+            render_replay_turns(&transcript, 1, None),
             vec!["User:\nsecond question\n\nAssistant:\nsecond answer"]
         );
         assert_eq!(
-            render_replay_turns(&transcript, 10)[0],
+            render_replay_turns(&transcript, 10, None)[0],
             "User:\nfirst question\n\nAssistant:\nintermediate\n\nfirst answer"
+        );
+    }
+
+    #[test]
+    fn replay_replaces_the_active_turn_with_prompt_latest_reasoning_and_running_notice() {
+        let session_id = dwo_agent_service::SessionId::parse("session-test").unwrap();
+        let turn_id = dwo_agent_service::TurnId::parse("turn-test").unwrap();
+        let snapshot = dwo_agent_service::SessionSnapshot {
+            record: dwo_agent_service::SessionRecord::new(
+                session_id,
+                "Test".to_string(),
+                PathBuf::from("."),
+                SessionMode::Confirm,
+                dwo_agent_service::SessionLlmSettings::default(),
+            ),
+            transcript: vec![
+                ClientTranscriptEvent::new(SessionEventPayload::UserPromptSubmitted {
+                    turn_id: turn_id.clone(),
+                    origin: EndpointId::new(),
+                    content: MessageContent::text("inspect the project"),
+                }),
+                ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    turn_id: turn_id.clone(),
+                    delta: "old reasoning".to_string(),
+                }),
+                ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
+                    turn_id: turn_id.clone(),
+                    content: String::new(),
+                    reasoning: Some("duplicated old reasoning".to_string()),
+                    tool_calls: Vec::new(),
+                }),
+                ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    turn_id: turn_id.clone(),
+                    delta: "latest ".to_string(),
+                }),
+                ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    turn_id: turn_id.clone(),
+                    delta: "reasoning".to_string(),
+                }),
+            ],
+            usage: dwo_agent_service::SessionUsageSnapshot { used: 1, size: 2 },
+            phase: dwo_agent_service::RuntimePhase::Running,
+            active_turn_id: Some(turn_id),
+            partial_message: "ignored partial answer".to_string(),
+            active_tool_calls: Vec::new(),
+            pending_permission: None,
+            seq: 1,
+        };
+
+        assert_eq!(
+            render_session_replay(&snapshot, 5),
+            vec![
+                "User:\ninspect the project\n\nReasoning:\nlatest reasoning\n\nPrompt turn is running"
+            ]
         );
     }
 

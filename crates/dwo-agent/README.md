@@ -105,7 +105,9 @@ there is no per-channel generated configuration file.
 
 `replayTurns` is limited to 10. After `/use`, each replayed turn combines the
 user prompt and every non-empty assistant response into one message; tool
-results are omitted. `/status` reports only current session state.
+results are omitted. If the last turn is still active, its normal replay is
+replaced with the user prompt, the most recent reasoning round, and a `Prompt
+turn is running` notice. `/status` reports only current session state.
 
 `status` reports whether the channel is configured and bound, the bound user
 ID, and the selected session. `connected` means

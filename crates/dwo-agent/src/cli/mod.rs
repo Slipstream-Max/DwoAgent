@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::automation::{AutomationJobStatus, AutomationRunRecord};
-use crate::channels::{self, WeixinLoginProgress};
+use crate::channels::{self, TelegramBindProgress, WeixinLoginProgress};
 use crate::host;
 use crate::local::{acp, ipc};
 
@@ -112,6 +112,10 @@ enum ChannelCommand {
         #[command(subcommand)]
         command: WeixinCommand,
     },
+    Telegram {
+        #[command(subcommand)]
+        command: TelegramCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -142,6 +146,15 @@ enum McpCommand {
         #[arg(long)]
         logout: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum TelegramCommand {
+    Status,
+    Bind,
+    Unbind,
+    SendMessage { message: String },
+    SendFile { path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -395,6 +408,7 @@ async fn run_channel(command: ChannelCommand, config_path: &Path) -> Result<()> 
             print_value(&value)?;
         }
         ChannelCommand::Weixin { command } => run_weixin(command, config_path).await?,
+        ChannelCommand::Telegram { command } => run_telegram(command, config_path).await?,
     }
     Ok(())
 }
@@ -685,6 +699,68 @@ fn print_value(value: &Value) -> Result<()> {
     render::print_value(value)
 }
 
+async fn run_telegram(command: TelegramCommand, config_path: &Path) -> Result<()> {
+    match command {
+        TelegramCommand::Status => {
+            let value = ipc::request(config_path, "channel.telegram.status", json!({})).await?;
+            print_value(&value)?;
+        }
+        TelegramCommand::Unbind => {
+            let value = ipc::request(config_path, "channel.telegram.remove", json!({})).await?;
+            print_value(&value)?;
+        }
+        TelegramCommand::SendMessage { message } => {
+            let value = ipc::request(
+                config_path,
+                "channel.telegram.send_message",
+                json!({"text": message}),
+            )
+            .await?;
+            print_value(&value)?;
+        }
+        TelegramCommand::SendFile { path } => {
+            let value = ipc::request(
+                config_path,
+                "channel.telegram.send_file",
+                json!({"path": path}),
+            )
+            .await?;
+            print_value(&value)?;
+        }
+        TelegramCommand::Bind => {
+            let start = ipc::request(config_path, "channel.telegram.begin", json!({})).await?;
+            let binding_id = start["binding_id"]
+                .as_str()
+                .context("daemon omitted binding_id")?;
+            let code = start["code"].as_str().context("daemon omitted bind code")?;
+            let bot_username = start["bot_username"]
+                .as_str()
+                .context("daemon omitted bot_username")?;
+            println!("Open @{bot_username} in Telegram and send this private message:\n");
+            println!("/bind {code}\n");
+            println!("Waiting for Telegram binding confirmation...");
+            loop {
+                channels::wait_before_poll().await;
+                let progress = ipc::request(
+                    config_path,
+                    "channel.telegram.poll",
+                    json!({"binding_id": binding_id}),
+                )
+                .await?;
+                match serde_json::from_value::<TelegramBindProgress>(progress)? {
+                    TelegramBindProgress::Waiting => {}
+                    TelegramBindProgress::Confirmed { channel } => {
+                        println!("Channel {} connected", channel.name);
+                        break;
+                    }
+                    TelegramBindProgress::Expired => bail!("Telegram binding code expired"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 const DEFAULT_PROFILE: &str = r#"name: coder
 description: coding agent
 policyMode: confirm
@@ -693,6 +769,12 @@ channels:
     enabled: true
     replayTurns: 5
     markdownFilter: true
+  telegram:
+    enabled: false
+    replayTurns: 5
+    botTokenEnv: TELEGRAM_BOT_TOKEN
+    tgProxy: null
+    mediaInput: true
 automation:
   enabled: false
   jobs: []
@@ -733,6 +815,30 @@ mod tests {
                     command: WeixinCommand::SendFile { ref path }
                 }
             } if path == &PathBuf::from("report.pdf")
+        ));
+    }
+
+    #[test]
+    fn parses_telegram_commands() {
+        let status = Cli::try_parse_from(["dwo", "channel", "telegram", "status"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Command::Channel {
+                command: ChannelCommand::Telegram {
+                    command: TelegramCommand::Status
+                }
+            }
+        ));
+
+        let send =
+            Cli::try_parse_from(["dwo", "channel", "telegram", "send-file", "clip.mp4"]).unwrap();
+        assert!(matches!(
+            send.command,
+            Command::Channel {
+                command: ChannelCommand::Telegram {
+                    command: TelegramCommand::SendFile { ref path }
+                }
+            } if path == &PathBuf::from("clip.mp4")
         ));
     }
 

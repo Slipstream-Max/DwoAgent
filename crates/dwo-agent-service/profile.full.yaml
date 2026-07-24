@@ -29,6 +29,24 @@ channels:
     # Download inbound images/files and submit structured content blocks.
     mediaInput: true
 
+  telegram:
+    # Telegram support is private-chat only. The daemon owns one long-polling
+    # runtime when enabled, bound, and the token environment variable exists.
+    enabled: false
+
+    # Number of completed turns replayed after selecting an existing session.
+    # Valid range: 0..=10.
+    replayTurns: 5
+
+    # Environment variable containing the BotFather token.
+    botTokenEnv: TELEGRAM_BOT_TOKEN
+
+    # Optional HTTP proxy used only for Telegram Bot API and media downloads.
+    tgProxy: null
+
+    # Download inbound photos, documents, and videos as structured resources.
+    mediaInput: true
+
 # The daemon watches this section and reschedules valid changes automatically.
 # Cron uses the standard five fields: minute hour day-of-month month weekday.
 automation:

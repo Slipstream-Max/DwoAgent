@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use chrono::{Datelike, Local};
 use dwo_agent_service::{ContentBlock, MessageContent, SessionId};
 use tokio::sync::Mutex;
 use weixin_agent::{
@@ -13,10 +12,15 @@ use weixin_agent::{
 
 use crate::host::Host;
 
+#[cfg(test)]
+use super::attachments::file_uri_from_path;
+use super::attachments::{
+    attachment_directory, local_file_resource, media_mime_type, sanitize_filename,
+    unique_attachment_path,
+};
 use super::bridge::{ConversationId, ConversationTransport, SessionBridge};
 use super::command::parse_command;
-use super::manager::ChannelState;
-use super::render::display_path;
+use super::manager::WeixinChannelState;
 
 pub(crate) struct RunningWeixin {
     client: Arc<WeixinClient>,
@@ -113,7 +117,7 @@ impl RunningWeixin {
 struct WeixinConversation {
     host: Arc<Host>,
     target: String,
-    state: Arc<Mutex<ChannelState>>,
+    state: Arc<Mutex<WeixinChannelState>>,
     client: Arc<OnceLock<Arc<WeixinClient>>>,
 }
 
@@ -136,7 +140,7 @@ impl WeixinConversation {
             }
             state.clone()
         };
-        self.host.channels.save_state(&snapshot).await
+        self.host.channels.save_weixin_state(&snapshot).await
     }
 }
 
@@ -167,7 +171,7 @@ impl ConversationTransport for WeixinConversation {
             state.selected_session_id = session_id.map(str::to_string);
             state.clone()
         };
-        self.host.channels.save_state(&snapshot).await
+        self.host.channels.save_weixin_state(&snapshot).await
     }
 }
 
@@ -256,17 +260,7 @@ impl WeixinHandler {
         media: &MediaInfo,
         session_id: &SessionId,
     ) -> Result<PathBuf> {
-        let now = Local::now();
-        let directory = self
-            .host
-            .profile_root_path()
-            .join("runtime")
-            .join("attachments")
-            .join("weixin")
-            .join(format!("{:04}", now.year()))
-            .join(format!("{:02}", now.month()))
-            .join(format!("{:02}", now.day()))
-            .join(session_id.as_str());
+        let directory = attachment_directory(self.host.profile_root_path(), "weixin", session_id);
         tokio::fs::create_dir_all(&directory).await?;
         let filename = media
             .file_name
@@ -277,83 +271,6 @@ impl WeixinHandler {
         let destination = unique_attachment_path(&directory, &filename).await?;
         Ok(ctx.download_media(media, &destination).await?)
     }
-}
-
-async fn unique_attachment_path(directory: &Path, filename: &str) -> Result<PathBuf> {
-    let original = directory.join(filename);
-    if !tokio::fs::try_exists(&original).await? {
-        return Ok(original);
-    }
-    let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("file");
-    let extension = path.extension().and_then(|value| value.to_str());
-    for index in 2..=u32::MAX {
-        let candidate = match extension {
-            Some(extension) => directory.join(format!("{stem}-{index}.{extension}")),
-            None => directory.join(format!("{stem}-{index}")),
-        };
-        if !tokio::fs::try_exists(&candidate).await? {
-            return Ok(candidate);
-        }
-    }
-    bail!("could not allocate a unique attachment filename")
-}
-
-fn sanitize_filename(raw: &str) -> String {
-    let mut sanitized = raw
-        .chars()
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-                )
-            {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    sanitized = sanitized
-        .trim_matches(|character| matches!(character, '.' | ' '))
-        .to_string();
-    let stem = Path::new(&sanitized)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    if matches!(
-        stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    ) {
-        sanitized.insert(0, '_');
-    }
-    sanitized
 }
 
 fn default_media_filename(media_type: MediaType) -> String {
@@ -367,79 +284,14 @@ fn default_media_filename(media_type: MediaType) -> String {
 }
 
 fn resource_link_for_media(path: &Path, media_type: MediaType) -> Result<ContentBlock> {
-    let path = std::fs::canonicalize(path)
-        .with_context(|| format!("resolve downloaded media {}", path.display()))?;
-    let metadata = std::fs::metadata(&path)?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("attachment")
-        .to_string();
-    let mime_type = media_mime_type(&path, media_type).to_string();
-    let size = i64::try_from(metadata.len()).ok();
-    Ok(ContentBlock::ResourceLink {
-        uri: file_uri_from_path(&path),
-        name,
-        mime_type: Some(mime_type),
-        title: None,
-        description: Some(format!("Local path: {}", display_path(&path))),
-        size,
-        annotations: None,
-        meta: None,
-    })
-}
-
-fn media_mime_type(path: &Path, media_type: MediaType) -> &'static str {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("png") => "image/png",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("pdf") => "application/pdf",
-        Some("txt") => "text/plain",
-        Some("md") | Some("markdown") => "text/markdown",
-        Some("json") => "application/json",
-        Some("yaml") | Some("yml") => "application/yaml",
-        Some("mp3") => "audio/mpeg",
-        Some("wav") => "audio/wav",
-        Some("ogg") => "audio/ogg",
-        Some("m4a") => "audio/mp4",
-        Some("mp4") => "video/mp4",
-        Some("mov") => "video/quicktime",
-        Some("webm") => "video/webm",
-        _ => match media_type {
-            MediaType::Image => "image/jpeg",
-            MediaType::Voice => "audio/mpeg",
-            MediaType::Video => "video/mp4",
-            MediaType::File => "application/octet-stream",
-        },
-    }
-}
-
-fn file_uri_from_path(path: &Path) -> String {
-    let normalized = display_path(path).replace('\\', "/");
-    let encoded = normalized
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'.' | b'-' | b'_' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect::<String>();
-    if encoded.starts_with("//") {
-        format!("file:{encoded}")
-    } else if encoded.starts_with('/') {
-        format!("file://{encoded}")
-    } else {
-        format!("file:///{encoded}")
-    }
+    let fallback = match media_type {
+        MediaType::Image => "image/jpeg",
+        MediaType::Voice => "audio/mpeg",
+        MediaType::Video => "video/mp4",
+        MediaType::File => "application/octet-stream",
+    };
+    let mime_type = media_mime_type(path, fallback);
+    local_file_resource(path, &mime_type)
 }
 
 const WEIXIN_TEXT_CHUNK_CHARS: usize = 4000;

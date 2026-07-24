@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::automation::{AutomationRuntime, parse_config as parse_automation_config};
-use crate::channels::{ChannelHub, ChannelManager, WeixinLoginProgress};
+use crate::channels::{ChannelHub, ChannelManager, TelegramBindProgress, WeixinLoginProgress};
 
 pub struct Host {
     pub service: Arc<AgentService>,
@@ -78,6 +78,11 @@ struct PermissionParam {
 struct PollBindParam {
     binding_id: String,
     verify_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TelegramPollBindParam {
+    binding_id: String,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +191,7 @@ impl Host {
     }
 
     pub async fn shutdown(&self) {
+        self.channel_hub.stop_all().await;
         self.mcp.shutdown().await;
         self.service.shutdown().await;
     }
@@ -350,6 +356,16 @@ impl Host {
                     .context("channels.weixin is not configured")?;
                 Ok(serde_json::to_value(channel)?)
             }
+            "channel.telegram.status" => {
+                let channel = self
+                    .channels
+                    .list()
+                    .await?
+                    .into_iter()
+                    .find(|channel| channel.name == "telegram")
+                    .context("channels.telegram is not configured")?;
+                Ok(serde_json::to_value(channel)?)
+            }
             "channel.weixin.send_message" => {
                 let params: SendMessageParam = serde_json::from_value(params)?;
                 let target = self.channels.bound_weixin_user().await?;
@@ -367,7 +383,7 @@ impl Host {
                 Ok(json!({"sent": true, "to": target, "path": params.path}))
             }
             "channel.weixin.remove" => {
-                self.channel_hub.stop().await;
+                self.channel_hub.stop_weixin().await;
                 Ok(json!({"removed": self.channels.remove_weixin().await?}))
             }
             "channel.weixin.begin" => Ok(serde_json::to_value(
@@ -380,10 +396,41 @@ impl Host {
                     .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
                     .await?;
                 if let WeixinLoginProgress::Confirmed { channel } = &progress {
-                    self.channel_hub.stop().await;
+                    self.channel_hub.stop_weixin().await;
                     if channel.enabled {
                         self.channel_hub.start_weixin(self.clone()).await?;
                     }
+                }
+                Ok(serde_json::to_value(progress)?)
+            }
+            "channel.telegram.send_message" => {
+                let params: SendMessageParam = serde_json::from_value(params)?;
+                let target = self.channels.bound_telegram_chat().await?;
+                self.channel_hub.send_telegram_message(&params.text).await?;
+                Ok(json!({"sent": true, "to": target}))
+            }
+            "channel.telegram.send_file" => {
+                let params: SendFileParam = serde_json::from_value(params)?;
+                let target = self.channels.bound_telegram_chat().await?;
+                self.channel_hub.send_telegram_file(&params.path).await?;
+                Ok(json!({"sent": true, "to": target, "path": params.path}))
+            }
+            "channel.telegram.remove" => {
+                self.channel_hub.stop_telegram().await;
+                Ok(json!({"removed": self.channels.remove_telegram().await?}))
+            }
+            "channel.telegram.begin" => {
+                let start = self.channels.begin_telegram_bind().await?;
+                self.channel_hub.stop_telegram().await;
+                Ok(serde_json::to_value(start)?)
+            }
+            "channel.telegram.poll" => {
+                let params: TelegramPollBindParam = serde_json::from_value(params)?;
+                let progress = self.channels.poll_telegram_bind(&params.binding_id).await?;
+                if let TelegramBindProgress::Confirmed { channel } = &progress
+                    && channel.enabled
+                {
+                    self.channel_hub.start_telegram(self.clone()).await?;
                 }
                 Ok(serde_json::to_value(progress)?)
             }
@@ -490,6 +537,15 @@ impl Host {
                 .join("runtime")
                 .join("attachments")
                 .join("weixin"),
+            id.as_str(),
+        )
+        .await?;
+        remove_session_attachment_dirs(
+            &self
+                .profile_root
+                .join("runtime")
+                .join("attachments")
+                .join("telegram"),
             id.as_str(),
         )
         .await
@@ -601,6 +657,16 @@ mod tests {
             yaml_keys(&document["channels"]["weixin"]),
             ["enabled", "markdownFilter", "mediaInput", "replayTurns"]
         );
+        assert_eq!(
+            yaml_keys(&document["channels"]["telegram"]),
+            [
+                "botTokenEnv",
+                "enabled",
+                "mediaInput",
+                "replayTurns",
+                "tgProxy"
+            ]
+        );
         assert_eq!(yaml_keys(&document["automation"]), ["enabled", "jobs"]);
         assert_eq!(
             yaml_keys(&document["automation"]["jobs"][0]),
@@ -650,9 +716,11 @@ mod tests {
             .await
             .unwrap();
         let channel = channels.list().await.unwrap();
-        assert_eq!(channel.len(), 1);
+        assert_eq!(channel.len(), 2);
         assert_eq!(channel[0].name, "weixin");
         assert!(!channel[0].enabled);
+        assert_eq!(channel[1].name, "telegram");
+        assert!(!channel[1].enabled);
 
         let automation = parse_automation_config(profile.automation).unwrap();
         assert!(!automation.enabled);

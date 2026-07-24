@@ -20,9 +20,13 @@
 |  |- mcp/catalog.json
 |  |- mcp/oauth/
 |  `- logs/
-`- channels/weixin/
-   |- runtime.yaml
-   `- secret.yaml
+`- channels/
+   |- weixin/
+   |  |- runtime.yaml
+   |  `- secret.yaml
+   `- telegram/
+      |- runtime.yaml
+      `- secret.yaml
 ```
 
 `session.json` 保存 session 自身配置，`model_context.json` 保存当前模型上下文，`client_transcript.jsonl` 是完整、追加式的客户端事件流。压缩只重建 model context，不删除 transcript。
@@ -36,6 +40,12 @@ policyMode: confirm
 channels:
   weixin:
     enabled: false
+  telegram:
+    enabled: false
+    replayTurns: 5
+    botTokenEnv: TELEGRAM_BOT_TOKEN
+    tgProxy: null
+    mediaInput: true
 automation:
   enabled: false
   jobs: []
@@ -55,11 +65,13 @@ model:
 
 - `name`、`description`：profile 标识和描述，不能为空。
 - `policyMode`：`full_access`、`confirm` 或 `watch`，决定 session 默认权限模式。
-- `channels`：当前支持 daemon 托管的 Weixin 配置；不配置则不启动外部 channel。
+- `channels`：支持 daemon 托管的 Weixin 和 Telegram 私聊配置；不配置则不启动对应 channel。Telegram token 只从 `botTokenEnv` 指向的环境变量读取，`tgProxy` 是仅用于 Telegram 的可选 HTTP 代理，`mediaInput` 控制 photo、document、video 输入。
 - `automation`：daemon 托管的定时任务配置。
 - `model`：provider 实例、模型别名和 profile 级限制覆盖。
 
 旧的 `agent.yaml`、`tools` 开关、supervisor profile registry 和额外 transport 配置不属于当前 schema，会被拒绝。
+
+Telegram 通过 `dwo channel telegram bind` 创建一次性验证码，并在 bot 私聊中用 `/bind <code>` 绑定唯一用户。`channels/telegram/secret.yaml` 保存 bot ID/username 和绑定 user/chat，不保存 token；`runtime.yaml` 只保存当前选中的 session。Telegram 和 Weixin 可以选择同一个全局 session。
 
 ## model
 

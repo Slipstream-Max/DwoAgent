@@ -23,9 +23,11 @@ dwo-tools = { path = "../dwo-tools" }
 futures.workspace = true
 libc.workspace = true
 qr2term.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+teloxide.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true

@@ -11,7 +11,7 @@ dwo daemon
 |- provider-configured model clients
 |- terminal and file-edit tools
 |- managed MCP runtime
-|- Weixin channel runtime
+|- Weixin and Telegram channel runtimes
 `- automation scheduler
 
 clients
@@ -52,6 +52,7 @@ The complete command and behavior reference is [docs/commands.md](docs/commands.
 dwo daemon start|stop|status
 dwo session list|new|delete|prompt|cancel|watch|model|reasoning
 dwo channel weixin status|bind|unbind|send-message|send-file
+dwo channel telegram status|bind|unbind|send-message|send-file
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server> [--logout]
@@ -83,9 +84,13 @@ The default layout is:
 |  |- mcp/catalog.json
 |  |- mcp/oauth/
 |  `- logs/
-`- channels/weixin/
-   |- runtime.yaml
-   `- secret.yaml
+`- channels/
+   |- weixin/
+   |  |- runtime.yaml
+   |  `- secret.yaml
+   `- telegram/
+      |- runtime.yaml
+      `- secret.yaml
 ```
 
 `model_context.json` is the current provider-facing context. `client_transcript.jsonl` is an append-only, complete replay stream and is not shortened by model compaction. `session.json` stores identity, cwd, title, mode, and model settings.

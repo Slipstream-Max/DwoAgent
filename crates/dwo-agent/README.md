@@ -19,7 +19,9 @@ src/
     command.rs         shared slash command definition and parsing
     bridge.rs          session selection, prompt routing, observers, and replay
     render.rs          channel-neutral session event rendering
+    attachments.rs     shared inbound attachment storage and resource links
     weixin.rs          Weixin SDK, media, context tokens, and message limits
+    telegram.rs        Telegram polling, binding enforcement, media, and sends
 ```
 
 Only `dwo serve` constructs the `Host` and its `AgentService`. CLI and ACP
@@ -50,6 +52,11 @@ dwo channel weixin bind
 dwo channel weixin unbind
 dwo channel weixin send-message <message>
 dwo channel weixin send-file <path>
+dwo channel telegram status
+dwo channel telegram bind
+dwo channel telegram unbind
+dwo channel telegram send-message <message>
+dwo channel telegram send-file <path>
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
@@ -86,11 +93,14 @@ runtime/sessions/YYYY/MM/DD/<session-id>/
   client_transcript.jsonl
 runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
+runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
 runtime/mcp/catalog.json
 runtime/mcp/oauth/
 runtime/logs/
 channels/weixin/runtime.yaml
 channels/weixin/secret.yaml
+channels/telegram/runtime.yaml
+channels/telegram/secret.yaml
 ```
 
 Weixin user settings live in `profile.yaml` and are validated before the host
@@ -103,11 +113,24 @@ channels:
     replayTurns: 5
     markdownFilter: true
     mediaInput: true
+  telegram:
+    enabled: false
+    replayTurns: 5
+    botTokenEnv: TELEGRAM_BOT_TOKEN
+    tgProxy: null
+    mediaInput: true
 ```
 
-`runtime.yaml` stores the selected session, `syncBuf`, and SDK context tokens.
-`secret.yaml` stores the QR-login credentials. Both files are daemon-owned;
-there is no per-channel generated configuration file.
+Weixin `runtime.yaml` stores the selected session, `syncBuf`, and SDK context
+tokens; its `secret.yaml` stores QR-login credentials. Telegram `runtime.yaml`
+stores one selected session; its `secret.yaml` stores the bot identity and the
+single bound private user/chat. These files are daemon-owned.
+
+Telegram is private-chat only. The token is read from `botTokenEnv`, never
+persisted. `dwo channel telegram bind` prints a one-time code that must be sent
+as `/bind <code>` in the bot private chat. `tgProxy` is an optional HTTP proxy
+used only by Telegram. The command menu is generated from the same clap
+metadata as Weixin `/help`.
 
 `replayTurns` is limited to 10. After `/use`, each replayed turn combines the
 user prompt and every non-empty assistant response into one message; tool
@@ -116,16 +139,18 @@ replaced with the user prompt, the most recent reasoning round, and a `Prompt
 turn is running` notice. `/status` reports only current session state.
 
 `status` reports whether the channel is configured and bound, the bound user
-ID, and the selected session. `connected` means
-that persisted credentials exist and validate; it is not a live network
-health check. `send-message` and `send-file` always target the bound user and use
-that user's current context token.
+ID, and the selected session. `connected` means persisted credentials validate;
+Telegram additionally requires its token environment variable to resolve. It
+is not a live network health check. `send-message` and `send-file` always
+target the bound private conversation.
 
-Inbound Weixin images and files are downloaded under the selected session's
-dated `runtime/attachments/weixin/` directory and submitted as a structured
-resource link containing the local path, MIME type, name, and size. A
-media-only message is a valid prompt. Sessions created without an explicit
-cwd use `runtime/workspaces/<session-id>` instead of the daemon process cwd.
+Inbound Weixin media and Telegram photo/document/video are downloaded under
+the selected session's dated channel attachment directory and submitted as a
+structured resource link containing the local path, MIME type, name, and size.
+A media-only message is a valid prompt. Telegram sends model output as plain
+text without parse mode or markdown rewriting. Sessions created without an
+explicit cwd use `runtime/workspaces/<session-id>` instead of the daemon
+process cwd.
 
 Channel slash commands are declared as one clap-derived command enum shared by
 platform adapters. Parsing, argument validation, and `/help` descriptions

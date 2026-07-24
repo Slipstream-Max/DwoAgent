@@ -73,9 +73,11 @@ pub(crate) enum ChannelCommand {
 pub(crate) fn parse_command(input: &str) -> Result<ChannelCommand> {
     let mut tokens = split_command_line(input)?;
     let command = tokens.first_mut().context("command is required")?;
-    *command = command
-        .strip_prefix('/')
-        .unwrap_or(command.as_str())
+    let normalized = command.strip_prefix('/').unwrap_or(command.as_str());
+    *command = normalized
+        .split_once('@')
+        .map(|(name, _)| name)
+        .unwrap_or(normalized)
         .to_string();
     ChannelCommandLine::try_parse_from(std::iter::once("channel".to_string()).chain(tokens))
         .map(|line| line.command)
@@ -101,6 +103,23 @@ pub(crate) fn render_command_help() -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{heading}\n\n{commands}")
+}
+
+pub(crate) fn command_descriptions() -> Vec<(String, String)> {
+    let mut command = ChannelCommandLine::command();
+    command.build();
+    command
+        .get_subcommands()
+        .map(|command| {
+            (
+                command.get_name().to_string(),
+                command
+                    .get_about()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 fn split_command_line(input: &str) -> Result<Vec<String>> {
@@ -190,5 +209,21 @@ mod tests {
         let error = parse_command("/model").unwrap_err().to_string();
 
         assert!(error.contains("Usage: /model <NAME>"), "{error}");
+    }
+
+    #[test]
+    fn telegram_bot_suffix_is_ignored() {
+        assert!(matches!(
+            parse_command("/status@dwoagent_bot").unwrap(),
+            ChannelCommand::Status
+        ));
+    }
+
+    #[test]
+    fn platform_command_menu_uses_the_same_metadata_as_help() {
+        assert!(command_descriptions().contains(&(
+            "new".to_string(),
+            "Create and select a session.".to_string()
+        )));
     }
 }

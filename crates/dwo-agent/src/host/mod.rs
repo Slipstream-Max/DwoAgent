@@ -13,12 +13,12 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::automation::{AutomationRuntime, parse_config as parse_automation_config};
-use crate::channels::{ChannelManager, GatewayHub, WeixinLoginProgress};
+use crate::channels::{ChannelHub, ChannelManager, WeixinLoginProgress};
 
 pub struct Host {
     pub service: Arc<AgentService>,
     pub channels: Arc<ChannelManager>,
-    pub gateway: Arc<GatewayHub>,
+    pub channel_hub: Arc<ChannelHub>,
     pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
     profile_root: PathBuf,
@@ -166,7 +166,7 @@ impl Host {
         let host = Arc::new(Self {
             service,
             channels,
-            gateway: Arc::new(GatewayHub::new()),
+            channel_hub: Arc::new(ChannelHub::new()),
             mcp,
             automation,
             profile_root,
@@ -175,7 +175,7 @@ impl Host {
             model_options,
             shutdown,
         });
-        host.gateway.start_all(host.clone()).await;
+        host.channel_hub.start_all(host.clone()).await;
         host.start_mcp_watcher();
         host.automation.start();
         Ok(host)
@@ -353,7 +353,7 @@ impl Host {
             "channel.weixin.send_message" => {
                 let params: SendMessageParam = serde_json::from_value(params)?;
                 let target = self.channels.bound_weixin_user().await?;
-                self.gateway
+                self.channel_hub
                     .send_weixin_message(&target, &params.text)
                     .await?;
                 Ok(json!({"sent": true, "to": target}))
@@ -361,11 +361,13 @@ impl Host {
             "channel.weixin.send_file" => {
                 let params: SendFileParam = serde_json::from_value(params)?;
                 let target = self.channels.bound_weixin_user().await?;
-                self.gateway.send_weixin_file(&target, &params.path).await?;
+                self.channel_hub
+                    .send_weixin_file(&target, &params.path)
+                    .await?;
                 Ok(json!({"sent": true, "to": target, "path": params.path}))
             }
             "channel.weixin.remove" => {
-                self.gateway.stop().await;
+                self.channel_hub.stop().await;
                 Ok(json!({"removed": self.channels.remove_weixin().await?}))
             }
             "channel.weixin.begin" => Ok(serde_json::to_value(
@@ -378,9 +380,9 @@ impl Host {
                     .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
                     .await?;
                 if let WeixinLoginProgress::Confirmed { channel } = &progress {
-                    self.gateway.stop().await;
+                    self.channel_hub.stop().await;
                     if channel.enabled {
-                        self.gateway.start_weixin(self.clone()).await?;
+                        self.channel_hub.start_weixin(self.clone()).await?;
                     }
                 }
                 Ok(serde_json::to_value(progress)?)

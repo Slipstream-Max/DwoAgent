@@ -1,0 +1,499 @@
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use dwo_agent_service::{
+    ActiveToolCall, EndpointId, MessageContent, SessionConfigUpdate, SessionEventPayload, SessionId,
+};
+use dwo_tools::{ConfirmationDecision, SessionMode};
+use tokio::sync::Mutex;
+
+use crate::host::Host;
+
+use super::command::{ChannelCommand, render_command_help};
+use super::render::{
+    SessionStreamState, display_path, policy_name, render_live_user_prompt, render_session_replay,
+    render_status, render_tool_call,
+};
+
+#[async_trait]
+pub(crate) trait ConversationTransport: Send + Sync {
+    async fn send_text(&self, text: &str) -> Result<()>;
+    async fn save_selected_session(&self, session_id: Option<&str>) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ConversationId {
+    channel: String,
+    peer_id: String,
+}
+
+impl ConversationId {
+    pub(crate) fn new(channel: impl Into<String>, peer_id: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            peer_id: peer_id.into(),
+        }
+    }
+
+    fn endpoint(&self) -> EndpointId {
+        let safe = format!("{}-{}", self.channel, self.peer_id)
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        EndpointId::parse(safe).expect("sanitized channel endpoint")
+    }
+
+    fn denial_source(&self) -> &str {
+        match self.channel.as_str() {
+            "weixin" => "Weixin",
+            other => other,
+        }
+    }
+}
+
+struct SessionObserver {
+    session_id: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+pub(crate) struct SessionBridge {
+    host: Arc<Host>,
+    conversation: ConversationId,
+    endpoint: EndpointId,
+    replay_turns: usize,
+    selected_session_id: Mutex<Option<String>>,
+    transport: Arc<dyn ConversationTransport>,
+    observer: Mutex<Option<SessionObserver>>,
+}
+
+impl SessionBridge {
+    pub(crate) fn new(
+        host: Arc<Host>,
+        conversation: ConversationId,
+        replay_turns: usize,
+        selected_session_id: Option<String>,
+        transport: Arc<dyn ConversationTransport>,
+    ) -> Self {
+        let endpoint = conversation.endpoint();
+        Self {
+            host,
+            conversation,
+            endpoint,
+            replay_turns,
+            selected_session_id: Mutex::new(selected_session_id),
+            transport,
+            observer: Mutex::new(None),
+        }
+    }
+
+    pub(crate) async fn execute(&self, command: ChannelCommand) -> Result<Vec<String>> {
+        let messages = match command {
+            ChannelCommand::Help => vec![render_command_help()],
+            ChannelCommand::List => {
+                let records = self.host.service.list().await?;
+                let selected = self.selected_session_id.lock().await.clone();
+                let text = records
+                    .into_iter()
+                    .map(|record| {
+                        format!(
+                            "{} {} {}",
+                            if selected.as_deref() == Some(record.info.id.as_str()) {
+                                "*"
+                            } else {
+                                "-"
+                            },
+                            record.info.id,
+                            record.info.title
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                vec![if text.is_empty() {
+                    "No sessions".to_string()
+                } else {
+                    text
+                }]
+            }
+            ChannelCommand::New { name, cwd } => {
+                let title = (!name.is_empty()).then(|| name.join(" "));
+                let session = self.host.create_session(title, cwd).await?;
+                self.select_session(session.id().as_str()).await?;
+                let snapshot = session.attach(self.endpoint.clone()).await?.snapshot;
+                vec![format!(
+                    "Selected new session {}\nCwd: {}",
+                    session.id(),
+                    display_path(&snapshot.record.info.cwd)
+                )]
+            }
+            ChannelCommand::Use { session: id } => {
+                let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
+                let agent = self.host.service.load(&session_id).await?;
+                self.select_session(&id).await?;
+                let subscription = agent.attach(self.endpoint.clone()).await?;
+                let replay = render_session_replay(&subscription.snapshot, self.replay_turns);
+                if replay.is_empty() {
+                    vec![render_status(&subscription.snapshot)]
+                } else {
+                    replay
+                }
+            }
+            ChannelCommand::Status => {
+                let snapshot = self
+                    .selected_agent()
+                    .await?
+                    .attach(self.endpoint.clone())
+                    .await?
+                    .snapshot;
+                vec![render_status(&snapshot)]
+            }
+            ChannelCommand::Del { session: id } => {
+                let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
+                self.host.delete_session(&session_id).await?;
+                if self.selected_session_id.lock().await.as_deref() == Some(id.as_str()) {
+                    self.set_selected_session(None).await?;
+                }
+                vec!["Session deleted".to_string()]
+            }
+            ChannelCommand::Cancel => {
+                self.selected_agent().await?.cancel(None).await?;
+                vec!["Cancellation requested".to_string()]
+            }
+            ChannelCommand::Model { name: model } => {
+                let id = self.selected_session_id().await?;
+                self.host
+                    .service
+                    .set_config(&id, SessionConfigUpdate::Model(model))
+                    .await?;
+                vec!["Model updated".to_string()]
+            }
+            ChannelCommand::Reasoning { level } => {
+                let reasoning = (level != "off").then_some(level);
+                let id = self.selected_session_id().await?;
+                self.host
+                    .service
+                    .set_config(&id, SessionConfigUpdate::Reasoning(reasoning))
+                    .await?;
+                vec!["Reasoning updated".to_string()]
+            }
+            ChannelCommand::Policy { mode } => {
+                let id = self.selected_session_id().await?;
+                if let Some(value) = mode {
+                    let mode = SessionMode::parse(&value).map_err(anyhow::Error::msg)?;
+                    self.host
+                        .service
+                        .set_config(&id, SessionConfigUpdate::Mode(mode))
+                        .await?;
+                    vec![format!("Policy updated: {}", policy_name(mode))]
+                } else {
+                    let snapshot = self
+                        .host
+                        .service
+                        .load(&id)
+                        .await?
+                        .attach(self.endpoint.clone())
+                        .await?
+                        .snapshot;
+                    vec![format!(
+                        "Policy: {}\nOptions: full_access | confirm | watch",
+                        policy_name(snapshot.record.info.mode)
+                    )]
+                }
+            }
+            ChannelCommand::Allow { id } => {
+                self.selected_agent()
+                    .await?
+                    .respond_permission(
+                        self.endpoint.clone(),
+                        id,
+                        ConfirmationDecision {
+                            allowed: true,
+                            reason: None,
+                        },
+                    )
+                    .await?;
+                Vec::new()
+            }
+            ChannelCommand::Deny { id } => {
+                self.selected_agent()
+                    .await?
+                    .respond_permission(
+                        self.endpoint.clone(),
+                        id,
+                        ConfirmationDecision {
+                            allowed: false,
+                            reason: Some(format!(
+                                "denied from {}",
+                                self.conversation.denial_source()
+                            )),
+                        },
+                    )
+                    .await?;
+                Vec::new()
+            }
+        };
+        Ok(messages)
+    }
+
+    pub(crate) async fn submit_prompt(&self, content: MessageContent) -> Result<()> {
+        let session_id = self.ensure_prompt_session().await?;
+        let agent = self.host.service.load(&session_id).await?;
+        self.ensure_observer(agent.clone()).await?;
+        agent.prompt_content(self.endpoint.clone(), content).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_prompt_session(&self) -> Result<SessionId> {
+        if let Some(id) = self.selected_session_id.lock().await.clone() {
+            return SessionId::parse(id).map_err(anyhow::Error::msg);
+        }
+        let session_id = {
+            let agent = self.host.create_session(None, None).await?;
+            self.select_session(agent.id().as_str()).await?;
+            agent.id().clone()
+        };
+        Ok(session_id)
+    }
+
+    pub(crate) async fn resume_observer(&self) -> Result<()> {
+        let Some(id) = self.selected_session_id.lock().await.clone() else {
+            return Ok(());
+        };
+        let session_id = SessionId::parse(id).map_err(anyhow::Error::msg)?;
+        let agent = self.host.service.load(&session_id).await?;
+        self.ensure_observer(agent).await
+    }
+
+    pub(crate) async fn stop(&self) {
+        if let Some(observer) = self.observer.lock().await.take() {
+            observer.task.abort();
+        }
+    }
+
+    async fn selected_session_id(&self) -> Result<SessionId> {
+        let id = self
+            .selected_session_id
+            .lock()
+            .await
+            .clone()
+            .context("No session selected. Use /new or /use")?;
+        SessionId::parse(id).map_err(anyhow::Error::msg)
+    }
+
+    async fn selected_agent(&self) -> Result<Arc<dwo_agent_service::SessionAgent>> {
+        Ok(self
+            .host
+            .service
+            .load(&self.selected_session_id().await?)
+            .await?)
+    }
+
+    async fn select_session(&self, id: &str) -> Result<()> {
+        self.set_selected_session(Some(id)).await?;
+        let session_id = SessionId::parse(id.to_string()).map_err(anyhow::Error::msg)?;
+        let agent = self.host.service.load(&session_id).await?;
+        self.ensure_observer(agent).await
+    }
+
+    async fn set_selected_session(&self, id: Option<&str>) -> Result<()> {
+        *self.selected_session_id.lock().await = id.map(str::to_string);
+        self.transport.save_selected_session(id).await
+    }
+
+    async fn ensure_observer(&self, agent: Arc<dwo_agent_service::SessionAgent>) -> Result<()> {
+        let session_id = agent.id().to_string();
+        let mut observer = self.observer.lock().await;
+        if observer
+            .as_ref()
+            .is_some_and(|current| current.session_id == session_id && !current.task.is_finished())
+        {
+            return Ok(());
+        }
+        if let Some(current) = observer.take() {
+            current.task.abort();
+        }
+        let subscription = agent.attach(self.endpoint.clone()).await?;
+        let transport = self.transport.clone();
+        let task = tokio::spawn(stream_session(transport, subscription));
+        *observer = Some(SessionObserver { session_id, task });
+        Ok(())
+    }
+}
+
+async fn stream_session(
+    transport: Arc<dyn ConversationTransport>,
+    mut subscription: dwo_agent_service::SessionSubscription,
+) {
+    let mut stream = SessionStreamState::default();
+    loop {
+        let Some(event) = subscription.events.recv().await else {
+            break;
+        };
+        match event.payload {
+            SessionEventPayload::UserPromptSubmitted { content, .. } => {
+                if let Some(prompt) = render_live_user_prompt(&content) {
+                    send(&transport, &prompt).await;
+                }
+            }
+            SessionEventPayload::AssistantCompleted {
+                content,
+                tool_calls,
+                ..
+            } => {
+                stream.remember_response(content);
+                for call in tool_calls {
+                    stream.remember_tool(call);
+                }
+            }
+            SessionEventPayload::ToolStarted { call, .. } => stream.remember_tool(call),
+            SessionEventPayload::PermissionRequested { permission, .. } => {
+                if !stream.mark_permission_sent(&permission.tool_call_id) {
+                    continue;
+                }
+                let call = stream
+                    .tool(&permission.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| ActiveToolCall {
+                        tool_call_id: permission.tool_call_id.clone(),
+                        tool_name: permission.tool_name.clone(),
+                        raw_input: serde_json::Value::Null,
+                    });
+                send(
+                    &transport,
+                    &render_tool_call(&call, "request id", &permission.request_id),
+                )
+                .await;
+            }
+            SessionEventPayload::ToolCompleted { result, .. } => {
+                stream.forget_tool(&result.tool_call_id);
+            }
+            SessionEventPayload::TurnCompleted { .. } => {
+                if let Some(response) = stream.take_response() {
+                    send(&transport, &response).await;
+                }
+                stream.finish_turn();
+            }
+            SessionEventPayload::TurnCancelled { .. } => {
+                stream.remember_response("Turn cancelled".to_string());
+                if let Some(response) = stream.take_response() {
+                    send(&transport, &response).await;
+                }
+                stream.finish_turn();
+            }
+            SessionEventPayload::TurnFailed { error, .. } => {
+                stream.remember_response(format!("Turn failed: {error}"));
+                if let Some(response) = stream.take_response() {
+                    send(&transport, &response).await;
+                }
+                stream.finish_turn();
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn send(transport: &Arc<dyn ConversationTransport>, text: &str) {
+    if let Err(error) = transport.send_text(text).await {
+        eprintln!("send channel message: {error:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dwo_agent_service::{
+        ClientTranscriptEvent, RuntimePhase, SessionLlmSettings, SessionRecord, SessionSnapshot,
+        SessionSubscription, SessionUsageSnapshot, TurnId,
+    };
+    use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct FakeTransport {
+        messages: Mutex<Vec<String>>,
+        selected: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl ConversationTransport for FakeTransport {
+        async fn send_text(&self, text: &str) -> Result<()> {
+            self.messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn save_selected_session(&self, session_id: Option<&str>) -> Result<()> {
+            *self.selected.lock().await = session_id.map(str::to_string);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn conversation_endpoint_is_stable_and_sanitized() {
+        let conversation = ConversationId::new("telegram", "user +123");
+        assert_eq!(conversation.endpoint().to_string(), "telegram-user--123");
+    }
+
+    #[tokio::test]
+    async fn session_stream_forwards_prompt_and_completed_answer_through_transport() {
+        let transport = Arc::new(FakeTransport::default());
+        let session_id = SessionId::parse("session-test").unwrap();
+        let turn_id = TurnId::parse("turn-test").unwrap();
+        let record = SessionRecord::new(
+            session_id.clone(),
+            "Test".to_string(),
+            PathBuf::from("."),
+            SessionMode::Confirm,
+            SessionLlmSettings::default(),
+        );
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let subscription = SessionSubscription {
+            snapshot: SessionSnapshot {
+                record,
+                transcript: Vec::<ClientTranscriptEvent>::new(),
+                usage: SessionUsageSnapshot { used: 1, size: 2 },
+                phase: RuntimePhase::Running,
+                active_turn_id: Some(turn_id.clone()),
+                partial_message: String::new(),
+                active_tool_calls: Vec::new(),
+                pending_permission: None,
+                seq: 0,
+            },
+            events,
+        };
+        let task = tokio::spawn(stream_session(transport.clone(), subscription));
+        for (seq, payload) in [
+            SessionEventPayload::UserPromptSubmitted {
+                turn_id: turn_id.clone(),
+                origin: EndpointId::new(),
+                content: MessageContent::text("question"),
+            },
+            SessionEventPayload::AssistantCompleted {
+                turn_id: turn_id.clone(),
+                content: "answer".to_string(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            SessionEventPayload::TurnCompleted { turn_id },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            events_tx
+                .send(dwo_agent_service::SessionEvent {
+                    seq: seq as u64 + 1,
+                    session_id: session_id.clone(),
+                    payload,
+                })
+                .unwrap();
+        }
+        drop(events_tx);
+        task.await.unwrap();
+
+        assert_eq!(*transport.messages.lock().await, ["question", "answer"]);
+    }
+}

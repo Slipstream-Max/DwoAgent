@@ -15,12 +15,18 @@ src/
     acp.rs             ACP stdio adapter backed by local IPC
   channels/
     manager.rs         channel login, configuration, state, and secrets
-    gateway.rs         long-running channel runtimes and session event routing
+    hub.rs             running channel adapter lifecycle
+    command.rs         shared slash command definition and parsing
+    bridge.rs          session selection, prompt routing, observers, and replay
+    render.rs          channel-neutral session event rendering
+    weixin.rs          Weixin SDK, media, context tokens, and message limits
 ```
 
 Only `dwo serve` constructs the `Host` and its `AgentService`. CLI and ACP
 commands are local clients; channel runtimes live inside the daemon and call
-the shared service directly.
+the shared service directly. Platform adapters normalize inbound messages and
+perform final network sends. `SessionBridge` owns the shared command and
+session behavior, while rendering remains independent from channel SDK types.
 
 ```text
 dwo install [--start]
@@ -121,14 +127,14 @@ resource link containing the local path, MIME type, name, and size. A
 media-only message is a valid prompt. Sessions created without an explicit
 cwd use `runtime/workspaces/<session-id>` instead of the daemon process cwd.
 
-Weixin slash commands are declared as a clap-derived command enum. Parsing,
-argument validation, and `/help` descriptions therefore come from one command
-definition instead of separate handwritten lists. The commands include `/new
-[name] [--cwd <path>]` and `/policy [full_access|confirm|watch]`. Assistant
-responses are buffered for the whole turn, joined in commit order, and split
-only when the combined text exceeds 4,000 characters. Tool calls are sent
-immediately only when confirmation is required, together with the permission
-request ID.
+Channel slash commands are declared as one clap-derived command enum shared by
+platform adapters. Parsing, argument validation, and `/help` descriptions
+therefore come from one command definition instead of separate handwritten
+lists. The commands include `/new [name] [--cwd <path>]` and `/policy
+[full_access|confirm|watch]`. Assistant responses are buffered for the whole
+turn, joined in commit order, and split only when the combined text exceeds
+4,000 characters. Tool calls are sent immediately only when confirmation is
+required, together with the permission request ID.
 
 When Weixin is enabled and bound, the context builder adds a concise channel
 capability block to the system prompt. Binding and unbinding changes are

@@ -84,23 +84,17 @@ fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
 }
 
 #[test]
-fn prompt_adds_and_removes_bound_weixin_capability_without_exposing_secrets() {
+fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
     let cwd = root.path().join("workspace");
     std::fs::create_dir_all(profile.join("resource/prompts")).unwrap();
-    std::fs::create_dir_all(profile.join("channels/weixin")).unwrap();
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::write(
         profile.join("resource/prompts/System.md"),
         "You are an agent.",
     )
     .unwrap();
-    write(
-        &profile.join("profile.yaml"),
-        "channels:\n  weixin:\n    enabled: true\n",
-    );
-
     let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd);
     let mut manager = ContextManager::initialize(&builder).unwrap();
     assert!(
@@ -110,19 +104,25 @@ fn prompt_adds_and_removes_bound_weixin_capability_without_exposing_secrets() {
     );
 
     write(
-        &profile.join("channels/weixin/secret.yaml"),
-        "botToken: super-secret-token\nbaseUrl: https://example.test\nilinkBotId: bot\nboundUserId: user\n",
+        &profile.join("runtime/channel-capabilities/weixin.md"),
+        "Use `dwo channel weixin send-message` and `send-file`.",
+    );
+    write(
+        &profile.join("runtime/channel-capabilities/telegram.md"),
+        "Use `dwo channel telegram send-message` and `send-file`.",
     );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let added = &manager.model_messages().last().unwrap().content;
     assert!(added.contains("<channel name=\"weixin\">"));
     assert!(added.contains("dwo channel weixin send-message"));
-    assert!(!added.contains("super-secret-token"));
+    assert!(added.contains("<channel name=\"telegram\">"));
+    assert!(added.contains("dwo channel telegram send-message"));
 
-    std::fs::remove_file(profile.join("channels/weixin/secret.yaml")).unwrap();
+    std::fs::remove_file(profile.join("runtime/channel-capabilities/weixin.md")).unwrap();
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let removed = &manager.model_messages().last().unwrap().content;
-    assert!(removed.contains("state=\"removed\""));
+    assert!(removed.contains("<channel name=\"weixin\" state=\"removed\">"));
+    assert!(removed.contains("<channel name=\"telegram\">"));
 }
 
 #[test]

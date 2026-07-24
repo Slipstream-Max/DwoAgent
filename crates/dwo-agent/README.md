@@ -94,6 +94,7 @@ runtime/sessions/YYYY/MM/DD/<session-id>/
 runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
+runtime/channel-capabilities/<channel>.md
 runtime/mcp/catalog.json
 runtime/mcp/oauth/
 runtime/logs/
@@ -161,10 +162,11 @@ turn, joined in commit order, and split only when the combined text exceeds
 4,000 characters. Tool calls are sent immediately only when confirmation is
 required, together with the permission request ID.
 
-When Weixin is enabled and bound, the context builder adds a concise channel
-capability block to the system prompt. Binding and unbinding changes are
-reported to existing sessions by the environment watcher. Credentials remain
-owned by the daemon and are never included in model context.
+When Weixin or Telegram is enabled and bound, its adapter publishes a concise,
+secret-free prompt under `runtime/channel-capabilities/`. Each adapter owns its
+own wording, including the proactive `send-message` and `send-file` commands;
+the context builder only discovers generic projections. Binding and unbinding
+changes are reported to existing sessions by the environment watcher.
 
 MCP servers are configured in `resource/mcp.json`. Static HTTP headers and
 stdio environment variables are resolved from that file, including `${ENV}`

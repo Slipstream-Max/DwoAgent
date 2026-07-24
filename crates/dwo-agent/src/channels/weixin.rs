@@ -22,6 +22,14 @@ use super::bridge::{ConversationId, ConversationTransport, SessionBridge};
 use super::command::parse_command;
 use super::manager::WeixinChannelState;
 
+pub(super) const CAPABILITY_PROMPT: &str = r#"A Weixin channel is bound. Your normal reasoning and responses are already streamed to the user through Weixin.
+
+Do not use the proactive messaging commands for normal replies.
+Only use `dwo channel weixin send-message <message>` when the user explicitly asks you to proactively send a specific message.
+Only use `dwo channel weixin send-file <path>` when the user explicitly asks you to send a file.
+
+Use `dwo channel weixin --help` to inspect the available commands."#;
+
 pub(crate) struct RunningWeixin {
     client: Arc<WeixinClient>,
     client_task: tokio::task::JoinHandle<()>,

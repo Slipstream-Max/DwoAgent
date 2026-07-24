@@ -17,6 +17,7 @@
 |  |  `- client_transcript.jsonl
 |  |- workspaces/
 |  |- attachments/
+|  |- channel-capabilities/<channel>.md
 |  |- mcp/catalog.json
 |  |- mcp/oauth/
 |  `- logs/
@@ -72,6 +73,8 @@ model:
 旧的 `agent.yaml`、`tools` 开关、supervisor profile registry 和额外 transport 配置不属于当前 schema，会被拒绝。
 
 Telegram 通过 `dwo channel telegram bind` 创建一次性验证码，并在 bot 私聊中用 `/bind <code>` 绑定唯一用户。`channels/telegram/secret.yaml` 保存 bot ID/username 和绑定 user/chat，不保存 token；`runtime.yaml` 只保存当前选中的 session。Telegram 和 Weixin 可以选择同一个全局 session。
+
+已启用且绑定的 channel adapter 各自维护 system prompt 文案，并把无 secret 的派生投影写入 `runtime/channel-capabilities/<channel>.md`。context builder 只通用扫描这些投影，不包含任何微信或 Telegram 专用判断；绑定和解绑会通过 environment watcher 更新已有 session。
 
 ## model
 

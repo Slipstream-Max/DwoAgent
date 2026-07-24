@@ -210,6 +210,7 @@ struct PendingTelegramBind {
 
 pub struct ChannelManager {
     root: PathBuf,
+    capability_root: PathBuf,
     weixin: Option<WeixinChannelConfig>,
     telegram: Option<TelegramChannelConfig>,
     pending_weixin: Mutex<HashMap<String, PendingLogin>>,
@@ -246,14 +247,19 @@ impl ChannelManager {
             config.validate()?;
         }
         let root = profile_root.join("channels");
+        let capability_root = profile_root.join("runtime/channel-capabilities");
         tokio::fs::create_dir_all(&root).await?;
-        Ok(Self {
+        tokio::fs::create_dir_all(&capability_root).await?;
+        let manager = Self {
             root,
+            capability_root,
             weixin,
             telegram,
             pending_weixin: Mutex::new(HashMap::new()),
             pending_telegram: Mutex::new(HashMap::new()),
-        })
+        };
+        manager.sync_capabilities().await?;
+        Ok(manager)
     }
 
     pub async fn list(&self) -> Result<Vec<ChannelSummary>> {
@@ -311,6 +317,7 @@ impl ChannelManager {
                 tokio::fs::remove_file(path).await?;
             }
         }
+        self.sync_weixin_capability().await?;
         Ok(existed)
     }
 
@@ -364,6 +371,7 @@ impl ChannelManager {
                 tokio::fs::remove_file(path).await?;
             }
         }
+        self.sync_telegram_capability().await?;
         Ok(existed)
     }
 
@@ -560,7 +568,7 @@ impl ChannelManager {
         let secret_path = self.weixin_secret_path();
         write_yaml(&secret_path, &secret).await?;
         set_private_permissions(&secret_path).await?;
-        Ok(())
+        self.sync_weixin_capability().await
     }
 
     async fn save_telegram(&self, secret: TelegramSecret) -> Result<()> {
@@ -570,7 +578,8 @@ impl ChannelManager {
             .await?;
         let secret_path = self.telegram_secret_path();
         write_yaml(&secret_path, &secret).await?;
-        set_private_permissions(&secret_path).await
+        set_private_permissions(&secret_path).await?;
+        self.sync_telegram_capability().await
     }
 
     async fn existing_weixin_tokens(&self) -> Result<Vec<String>> {
@@ -580,6 +589,51 @@ impl ChannelManager {
         let secret: WeixinSecret = read_yaml(&self.weixin_secret_path()).await?;
         secret.validate()?;
         Ok(vec![secret.bot_token])
+    }
+
+    async fn sync_capabilities(&self) -> Result<()> {
+        self.sync_weixin_capability().await?;
+        self.sync_telegram_capability().await
+    }
+
+    async fn sync_weixin_capability(&self) -> Result<()> {
+        let available = if self.weixin.as_ref().is_some_and(|config| config.enabled) {
+            read_yaml::<WeixinSecret>(&self.weixin_secret_path())
+                .await
+                .is_ok_and(|secret| secret.validate().is_ok())
+        } else {
+            false
+        };
+        self.sync_capability(WEIXIN_CHANNEL, available, super::weixin::CAPABILITY_PROMPT)
+            .await
+    }
+
+    async fn sync_telegram_capability(&self) -> Result<()> {
+        let available = if self.telegram.as_ref().is_some_and(|config| config.enabled) {
+            read_yaml::<TelegramSecret>(&self.telegram_secret_path())
+                .await
+                .is_ok_and(|secret| secret.validate().is_ok())
+        } else {
+            false
+        };
+        self.sync_capability(
+            TELEGRAM_CHANNEL,
+            available,
+            super::telegram::CAPABILITY_PROMPT,
+        )
+        .await
+    }
+
+    async fn sync_capability(&self, name: &str, available: bool, content: &str) -> Result<()> {
+        let path = self.capability_path(name);
+        if available {
+            write_text(&path, content).await
+        } else if path.is_file() {
+            tokio::fs::remove_file(path).await?;
+            Ok(())
+        } else {
+            Ok(())
+        }
     }
 
     fn weixin_root(&self) -> PathBuf {
@@ -604,6 +658,10 @@ impl ChannelManager {
 
     fn telegram_secret_path(&self) -> PathBuf {
         self.telegram_root().join("secret.yaml")
+    }
+
+    fn capability_path(&self, name: &str) -> PathBuf {
+        self.capability_root.join(format!("{name}.md"))
     }
 }
 
@@ -659,6 +717,13 @@ async fn read_yaml_or_default<T: serde::de::DeserializeOwned + Default>(path: &P
 
 async fn write_yaml(path: &Path, value: &impl Serialize) -> Result<()> {
     let source = serde_yaml::to_string(value)?;
+    write_text(path, &source).await
+}
+
+async fn write_text(path: &Path, source: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
     tokio::fs::write(&temporary, source).await?;
     if path.is_file() {
@@ -780,13 +845,30 @@ markdownFilter: false
         assert!(source.contains("contextTokens:"));
         assert!(!source.contains("streamMode"));
         assert!(!manager.root.join("state.json").exists());
+
+        manager
+            .save_weixin(WeixinSecret {
+                bot_token: "secret-token".to_string(),
+                base_url: "https://example.test".to_string(),
+                ilink_bot_id: "bot".to_string(),
+                bound_user_id: "user".to_string(),
+            })
+            .await
+            .unwrap();
+        let capability = tokio::fs::read_to_string(manager.capability_path(WEIXIN_CHANNEL))
+            .await
+            .unwrap();
+        assert!(capability.contains("dwo channel weixin send-file"));
+        assert!(!capability.contains("secret-token"));
+        manager.remove_weixin().await.unwrap();
+        assert!(!manager.capability_path(WEIXIN_CHANNEL).exists());
     }
 
     #[tokio::test]
     async fn telegram_private_chat_secret_and_state_are_persisted_separately() {
         let profile = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
-enabled: false
+enabled: true
 replayTurns: 4
 botTokenEnv: DWO_TEST_MISSING_TELEGRAM_TOKEN
 tgProxy: http://127.0.0.1:7890
@@ -829,6 +911,13 @@ mediaInput: true
         let summary = manager.list().await.unwrap();
         assert_eq!(summary[0].bound_user_id.as_deref(), Some("12345"));
         assert!(!summary[0].connected, "the token environment is absent");
+        let capability = tokio::fs::read_to_string(manager.capability_path(TELEGRAM_CHANNEL))
+            .await
+            .unwrap();
+        assert!(capability.contains("dwo channel telegram send-file"));
+        assert!(!capability.contains("DWO_TEST_MISSING_TELEGRAM_TOKEN"));
+        manager.remove_telegram().await.unwrap();
+        assert!(!manager.capability_path(TELEGRAM_CHANNEL).exists());
     }
 
     #[tokio::test]

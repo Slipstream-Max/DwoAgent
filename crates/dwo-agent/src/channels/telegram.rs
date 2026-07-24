@@ -20,6 +20,14 @@ use super::bridge::{ConversationId, ConversationTransport, SessionBridge};
 use super::command::{command_descriptions, parse_command};
 use super::manager::{TelegramChannelState, telegram_bot};
 
+pub(super) const CAPABILITY_PROMPT: &str = r#"A Telegram channel is bound. Your normal reasoning and responses are already streamed to the user through Telegram.
+
+Do not use the proactive messaging commands for normal replies.
+Only use `dwo channel telegram send-message <message>` when the user explicitly asks you to proactively send a specific message.
+Only use `dwo channel telegram send-file <path>` when the user explicitly asks you to send a file.
+
+Use `dwo channel telegram --help` to inspect the available commands."#;
+
 type TelegramHandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub(crate) struct RunningTelegram {

@@ -81,6 +81,7 @@ The default layout is:
 |  |  `- client_transcript.jsonl
 |  |- workspaces/
 |  |- attachments/
+|  |- channel-capabilities/
 |  |- mcp/catalog.json
 |  |- mcp/oauth/
 |  `- logs/

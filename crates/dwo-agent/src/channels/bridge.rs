@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use dwo_agent_service::{
-    ActiveToolCall, EndpointId, MessageContent, SessionConfigUpdate, SessionEventPayload, SessionId,
+    ActiveToolCall, EndpointId, MessageContent, PendingPermission, SessionConfigUpdate,
+    SessionEventPayload, SessionId,
 };
 use dwo_tools::{ConfirmationDecision, SessionMode};
 use tokio::sync::Mutex;
@@ -207,8 +208,8 @@ impl SessionBridge {
                 }
             }
             ChannelCommand::Allow { id } => {
-                self.selected_agent()
-                    .await?
+                let (agent, id) = self.permission_request(id).await?;
+                agent
                     .respond_permission(
                         self.endpoint.clone(),
                         id,
@@ -221,8 +222,8 @@ impl SessionBridge {
                 Vec::new()
             }
             ChannelCommand::Deny { id } => {
-                self.selected_agent()
-                    .await?
+                let (agent, id) = self.permission_request(id).await?;
+                agent
                     .respond_permission(
                         self.endpoint.clone(),
                         id,
@@ -294,6 +295,20 @@ impl SessionBridge {
             .await?)
     }
 
+    async fn permission_request(
+        &self,
+        requested: Option<String>,
+    ) -> Result<(Arc<dwo_agent_service::SessionAgent>, String)> {
+        let agent = self.selected_agent().await?;
+        let id = if requested.is_some() {
+            resolve_permission_request_id(requested, None)?
+        } else {
+            let subscription = agent.attach(self.endpoint.clone()).await?;
+            resolve_permission_request_id(None, subscription.snapshot.pending_permission.as_ref())?
+        };
+        Ok((agent, id))
+    }
+
     async fn select_session(&self, id: &str) -> Result<()> {
         self.set_selected_session(Some(id)).await?;
         let session_id = SessionId::parse(id.to_string()).map_err(anyhow::Error::msg)?;
@@ -324,6 +339,15 @@ impl SessionBridge {
         *observer = Some(SessionObserver { session_id, task });
         Ok(())
     }
+}
+
+fn resolve_permission_request_id(
+    requested: Option<String>,
+    pending: Option<&PendingPermission>,
+) -> Result<String> {
+    requested
+        .or_else(|| pending.map(|permission| permission.request_id.clone()))
+        .context("No pending permission request")
 }
 
 async fn stream_session(
@@ -436,6 +460,31 @@ mod tests {
     fn conversation_endpoint_is_stable_and_sanitized() {
         let conversation = ConversationId::new("telegram", "user +123");
         assert_eq!(conversation.endpoint().to_string(), "telegram-user--123");
+    }
+
+    #[test]
+    fn permission_command_uses_the_current_pending_request_when_id_is_omitted() {
+        let pending = PendingPermission {
+            request_id: "permission-7".to_string(),
+            tool_call_id: "tool-7".to_string(),
+            tool_name: "terminal".to_string(),
+        };
+
+        assert_eq!(
+            resolve_permission_request_id(None, Some(&pending)).unwrap(),
+            "permission-7"
+        );
+        assert_eq!(
+            resolve_permission_request_id(Some("permission-8".to_string()), Some(&pending))
+                .unwrap(),
+            "permission-8"
+        );
+        assert_eq!(
+            resolve_permission_request_id(None, None)
+                .unwrap_err()
+                .to_string(),
+            "No pending permission request"
+        );
     }
 
     #[tokio::test]

@@ -157,10 +157,12 @@ Channel slash commands are declared as one clap-derived command enum shared by
 platform adapters. Parsing, argument validation, and `/help` descriptions
 therefore come from one command definition instead of separate handwritten
 lists. The commands include `/new [name] [--cwd <path>]` and `/policy
-[full_access|confirm|watch]`. Assistant responses are buffered for the whole
-turn, joined in commit order, and split only when the combined text exceeds
-4,000 characters. Tool calls are sent immediately only when confirmation is
-required, together with the permission request ID.
+[full_access|confirm|watch]`. In confirm mode, `/allow` and `/deny` act on the
+current pending permission; an optional request ID can still be supplied.
+Assistant responses are buffered for the whole turn, joined in commit order,
+and split only when the combined text exceeds 4,000 characters. Tool calls are
+sent immediately only when confirmation is required, together with the
+permission request ID.
 
 When Weixin or Telegram is enabled and bound, its adapter publishes a concise,
 secret-free prompt under `runtime/channel-capabilities/`. Each adapter owns its

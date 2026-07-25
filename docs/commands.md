@@ -91,6 +91,8 @@ Telegram 使用 long polling，不需要 webhook 或公网地址。`tgProxy` 是
 
 两个 channel 可以 `/use` 同一个全局 session，也各自在自己的 `runtime.yaml` 中保持当前选择。绑定、解绑或重绑某个 channel 只重启该 channel，不影响另一个 channel。
 
+在 `confirm` 模式下，收到授权请求后直接发送 `/allow` 或 `/deny` 即可处理当前 pending permission，不需要复制 request ID。仍可使用 `/allow <id>`、`/deny <id>` 显式指定请求。
+
 ## Automation
 
 ```text

@@ -58,15 +58,15 @@ pub(crate) enum ChannelCommand {
         #[arg(value_name = "full_access|confirm|watch")]
         mode: Option<String>,
     },
-    #[command(about = "Allow a pending permission request.")]
+    #[command(about = "Allow the current or specified permission request.")]
     Allow {
         #[arg(value_name = "ID")]
-        id: String,
+        id: Option<String>,
     },
-    #[command(about = "Deny a pending permission request.")]
+    #[command(about = "Deny the current or specified permission request.")]
     Deny {
         #[arg(value_name = "ID")]
-        id: String,
+        id: Option<String>,
     },
 }
 
@@ -201,7 +201,7 @@ mod tests {
         assert!(help.contains("/help - Display this command list."));
         assert!(help.contains("/new - Create and select a session."));
         assert!(help.contains("/policy - Show or change the tool permission policy."));
-        assert!(help.contains("/deny - Deny a pending permission request."));
+        assert!(help.contains("/deny - Deny the current or specified permission request."));
     }
 
     #[test]
@@ -216,6 +216,20 @@ mod tests {
         assert!(matches!(
             parse_command("/status@dwoagent_bot").unwrap(),
             ChannelCommand::Status
+        ));
+    }
+
+    #[test]
+    fn permission_commands_default_to_the_current_request() {
+        assert!(matches!(
+            parse_command("/allow").unwrap(),
+            ChannelCommand::Allow { id: None }
+        ));
+        assert!(matches!(
+            parse_command("/deny request-7").unwrap(),
+            ChannelCommand::Deny {
+                id: Some(ref id)
+            } if id == "request-7"
         ));
     }
 

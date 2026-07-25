@@ -28,6 +28,7 @@ futures = "0.3"
 lazy_static = "1"
 libc = "0.2"
 log = "0.4"
+openlark = { version = "0.18", default-features = false, features = ["communication", "websocket"] }
 portable-pty = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }

@@ -194,10 +194,10 @@ impl<W: Write> WatchRenderer<W> {
                 ..
             } => {
                 let turn_id = turn_id.to_string();
-                if !self.reasoning_delta_turns.contains(&turn_id) {
-                    if let Some(reasoning) = reasoning.as_deref().filter(|text| !text.is_empty()) {
-                        self.write_section_text(Section::Reasoning, reasoning)?;
-                    }
+                if !self.reasoning_delta_turns.contains(&turn_id)
+                    && let Some(reasoning) = reasoning.as_deref().filter(|text| !text.is_empty())
+                {
+                    self.write_section_text(Section::Reasoning, reasoning)?;
                 }
                 if !self.assistant_delta_turns.contains(&turn_id) {
                     self.write_section_text(Section::Answer, content)?;

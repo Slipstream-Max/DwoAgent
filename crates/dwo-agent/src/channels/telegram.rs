@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::host::Host;
 
+use super::ChannelKind;
 use super::attachments::{
     attachment_directory, local_file_resource, media_mime_type, sanitize_filename,
     unique_attachment_path,
@@ -312,7 +313,10 @@ impl ConversationTransport for TelegramConversation {
             state.selected_session_id = session_id.map(str::to_string);
             state.clone()
         };
-        self.host.channels.save_telegram_state(&snapshot).await
+        self.host
+            .channels
+            .save_state(ChannelKind::Telegram, &snapshot)
+            .await
     }
 }
 
@@ -380,6 +384,7 @@ mod tests {
     fn telegram_runtime_has_one_selected_session() {
         let state = TelegramChannelState {
             selected_session_id: Some("session-test".to_string()),
+            ..Default::default()
         };
         assert_eq!(state.selected_session_id.as_deref(), Some("session-test"));
     }

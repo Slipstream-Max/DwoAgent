@@ -22,6 +22,7 @@ dwo-mcp = { path = "../dwo-mcp" }
 dwo-tools = { path = "../dwo-tools" }
 futures.workspace = true
 libc.workspace = true
+openlark.workspace = true
 qr2term.workspace = true
 reqwest.workspace = true
 serde.workspace = true

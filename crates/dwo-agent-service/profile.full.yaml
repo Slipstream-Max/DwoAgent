@@ -47,6 +47,26 @@ channels:
     # Download inbound photos, documents, and videos as structured resources.
     mediaInput: true
 
+  feishu:
+    # Feishu/Lark support uses the platform WebSocket long connection and is
+    # restricted to the single private user established by `dwo channel
+    # feishu bind`.
+    enabled: false
+
+    # Number of completed turns replayed after selecting an existing session.
+    # Valid range: 0..=10.
+    replayTurns: 5
+
+    # Environment variables containing enterprise application credentials.
+    appIdEnv: FEISHU_APP_ID
+    appSecretEnv: FEISHU_APP_SECRET
+
+    # feishu uses open.feishu.cn; lark uses open.larksuite.com.
+    platform: feishu
+
+    # Download inbound images and files as structured resources.
+    mediaInput: true
+
 # The daemon watches this section and reschedules valid changes automatically.
 # Cron uses the standard five fields: minute hour day-of-month month weekday.
 automation:

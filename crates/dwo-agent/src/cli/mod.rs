@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::automation::{AutomationJobStatus, AutomationRunRecord};
-use crate::channels::{self, TelegramBindProgress, WeixinLoginProgress};
+use crate::channels::{
+    self, ChannelKind, FeishuBindProgress, TelegramBindProgress, WeixinLoginProgress,
+};
 use crate::host;
 use crate::local::{acp, ipc};
 
@@ -110,16 +112,20 @@ enum ChannelCommand {
     List,
     Weixin {
         #[command(subcommand)]
-        command: WeixinCommand,
+        command: ManagedChannelCommand,
     },
     Telegram {
         #[command(subcommand)]
-        command: TelegramCommand,
+        command: ManagedChannelCommand,
+    },
+    Feishu {
+        #[command(subcommand)]
+        command: ManagedChannelCommand,
     },
 }
 
 #[derive(Subcommand)]
-enum WeixinCommand {
+enum ManagedChannelCommand {
     Status,
     Bind,
     Unbind,
@@ -146,15 +152,6 @@ enum McpCommand {
         #[arg(long)]
         logout: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum TelegramCommand {
-    Status,
-    Bind,
-    Unbind,
-    SendMessage { message: String },
-    SendFile { path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -407,78 +404,93 @@ async fn run_channel(command: ChannelCommand, config_path: &Path) -> Result<()> 
             let value = ipc::request(config_path, "channel.list", json!({})).await?;
             print_value(&value)?;
         }
-        ChannelCommand::Weixin { command } => run_weixin(command, config_path).await?,
-        ChannelCommand::Telegram { command } => run_telegram(command, config_path).await?,
+        ChannelCommand::Weixin { command } => {
+            run_managed_channel(ChannelKind::Weixin, command, config_path).await?
+        }
+        ChannelCommand::Telegram { command } => {
+            run_managed_channel(ChannelKind::Telegram, command, config_path).await?
+        }
+        ChannelCommand::Feishu { command } => {
+            run_managed_channel(ChannelKind::Feishu, command, config_path).await?
+        }
     }
     Ok(())
 }
 
-async fn run_weixin(command: WeixinCommand, config_path: &Path) -> Result<()> {
+async fn run_managed_channel(
+    channel: ChannelKind,
+    command: ManagedChannelCommand,
+    config_path: &Path,
+) -> Result<()> {
+    let method = |action| format!("channel.{}.{action}", channel.as_str());
     match command {
-        WeixinCommand::Status => {
-            let value = ipc::request(config_path, "channel.weixin.status", json!({})).await?;
+        ManagedChannelCommand::Status => {
+            let value = ipc::request(config_path, &method("status"), json!({})).await?;
             print_value(&value)?;
         }
-        WeixinCommand::Unbind => {
-            let value = ipc::request(config_path, "channel.weixin.remove", json!({})).await?;
+        ManagedChannelCommand::Unbind => {
+            let value = ipc::request(config_path, &method("remove"), json!({})).await?;
             print_value(&value)?;
         }
-        WeixinCommand::SendMessage { message } => {
+        ManagedChannelCommand::SendMessage { message } => {
             let value = ipc::request(
                 config_path,
-                "channel.weixin.send_message",
+                &method("send_message"),
                 json!({"text": message}),
             )
             .await?;
             print_value(&value)?;
         }
-        WeixinCommand::SendFile { path } => {
-            let value = ipc::request(
-                config_path,
-                "channel.weixin.send_file",
-                json!({"path": path}),
-            )
-            .await?;
+        ManagedChannelCommand::SendFile { path } => {
+            let value =
+                ipc::request(config_path, &method("send_file"), json!({"path": path})).await?;
             print_value(&value)?;
         }
-        WeixinCommand::Bind => {
-            let start = ipc::request(config_path, "channel.weixin.begin", json!({})).await?;
-            let binding_id = start["binding_id"]
-                .as_str()
-                .context("daemon omitted binding_id")?;
-            let qrcode = start["qrcode"].as_str().context("daemon omitted qrcode")?;
-            println!("Scan this QR code with Weixin:\n");
-            if let Err(error) = qr2term::print_qr(qrcode) {
-                eprintln!("Could not render terminal QR: {error}");
-                println!("{qrcode}");
+        ManagedChannelCommand::Bind => match channel {
+            ChannelKind::Weixin => bind_weixin(config_path).await?,
+            ChannelKind::Telegram => bind_telegram(config_path).await?,
+            ChannelKind::Feishu => bind_feishu(config_path).await?,
+        },
+    }
+    Ok(())
+}
+
+async fn bind_weixin(config_path: &Path) -> Result<()> {
+    let start = ipc::request(config_path, "channel.weixin.begin", json!({})).await?;
+    let binding_id = start["binding_id"]
+        .as_str()
+        .context("daemon omitted binding_id")?;
+    let qrcode = start["qrcode"].as_str().context("daemon omitted qrcode")?;
+    println!("Scan this QR code with Weixin:\n");
+    if let Err(error) = qr2term::print_qr(qrcode) {
+        eprintln!("Could not render terminal QR: {error}");
+        println!("{qrcode}");
+    }
+    let mut verify_code: Option<String> = None;
+    loop {
+        channels::wait_before_poll().await;
+        let progress = ipc::request(
+            config_path,
+            "channel.weixin.poll",
+            json!({"binding_id": binding_id, "verify_code": verify_code.take()}),
+        )
+        .await?;
+        let progress: WeixinLoginProgress = serde_json::from_value(progress)?;
+        match progress {
+            WeixinLoginProgress::Waiting => {}
+            WeixinLoginProgress::Scanned => println!("Scanned; confirm on your phone"),
+            WeixinLoginProgress::Confirmed { channel } => {
+                println!("Channel {} connected", channel.name);
+                break;
             }
-            let mut verify_code: Option<String> = None;
-            loop {
-                channels::wait_before_poll().await;
-                let progress = ipc::request(
-                    config_path,
-                    "channel.weixin.poll",
-                    json!({"binding_id": binding_id, "verify_code": verify_code.take()}),
-                )
-                .await?;
-                let progress: WeixinLoginProgress = serde_json::from_value(progress)?;
-                match progress {
-                    WeixinLoginProgress::Waiting => {}
-                    WeixinLoginProgress::Scanned => println!("Scanned; confirm on your phone"),
-                    WeixinLoginProgress::Confirmed { channel } => {
-                        println!("Channel {} connected", channel.name);
-                        break;
-                    }
-                    WeixinLoginProgress::NeedVerifyCode => {
-                        println!("Enter the verification code shown on your phone:");
-                        let mut code = String::new();
-                        std::io::stdin().read_line(&mut code)?;
-                        verify_code = Some(code.trim().to_string());
-                    }
-                    WeixinLoginProgress::Expired => bail!("QR code expired"),
-                    WeixinLoginProgress::Failed { message } => bail!(message),
-                }
+            WeixinLoginProgress::NeedVerifyCode => {
+                println!("Enter the verification code shown on your phone:");
+                let mut code = String::new();
+                std::io::stdin().read_line(&mut code)?;
+                verify_code = Some(code.trim().to_string());
             }
+            WeixinLoginProgress::Expired => bail!("QR code expired"),
+            WeixinLoginProgress::Failed { message } => bail!(message),
         }
     }
     Ok(())
@@ -699,63 +711,67 @@ fn print_value(value: &Value) -> Result<()> {
     render::print_value(value)
 }
 
-async fn run_telegram(command: TelegramCommand, config_path: &Path) -> Result<()> {
-    match command {
-        TelegramCommand::Status => {
-            let value = ipc::request(config_path, "channel.telegram.status", json!({})).await?;
-            print_value(&value)?;
-        }
-        TelegramCommand::Unbind => {
-            let value = ipc::request(config_path, "channel.telegram.remove", json!({})).await?;
-            print_value(&value)?;
-        }
-        TelegramCommand::SendMessage { message } => {
-            let value = ipc::request(
-                config_path,
-                "channel.telegram.send_message",
-                json!({"text": message}),
-            )
-            .await?;
-            print_value(&value)?;
-        }
-        TelegramCommand::SendFile { path } => {
-            let value = ipc::request(
-                config_path,
-                "channel.telegram.send_file",
-                json!({"path": path}),
-            )
-            .await?;
-            print_value(&value)?;
-        }
-        TelegramCommand::Bind => {
-            let start = ipc::request(config_path, "channel.telegram.begin", json!({})).await?;
-            let binding_id = start["binding_id"]
-                .as_str()
-                .context("daemon omitted binding_id")?;
-            let code = start["code"].as_str().context("daemon omitted bind code")?;
-            let bot_username = start["bot_username"]
-                .as_str()
-                .context("daemon omitted bot_username")?;
-            println!("Open @{bot_username} in Telegram and send this private message:\n");
-            println!("/bind {code}\n");
-            println!("Waiting for Telegram binding confirmation...");
-            loop {
-                channels::wait_before_poll().await;
-                let progress = ipc::request(
-                    config_path,
-                    "channel.telegram.poll",
-                    json!({"binding_id": binding_id}),
-                )
-                .await?;
-                match serde_json::from_value::<TelegramBindProgress>(progress)? {
-                    TelegramBindProgress::Waiting => {}
-                    TelegramBindProgress::Confirmed { channel } => {
-                        println!("Channel {} connected", channel.name);
-                        break;
-                    }
-                    TelegramBindProgress::Expired => bail!("Telegram binding code expired"),
-                }
+async fn bind_telegram(config_path: &Path) -> Result<()> {
+    let start = ipc::request(config_path, "channel.telegram.begin", json!({})).await?;
+    let binding_id = start["binding_id"]
+        .as_str()
+        .context("daemon omitted binding_id")?;
+    let code = start["code"].as_str().context("daemon omitted bind code")?;
+    let bot_username = start["bot_username"]
+        .as_str()
+        .context("daemon omitted bot_username")?;
+    println!("Open @{bot_username} in Telegram and send this private message:\n");
+    println!("/bind {code}\n");
+    println!("Waiting for Telegram binding confirmation...");
+    loop {
+        channels::wait_before_poll().await;
+        let progress = ipc::request(
+            config_path,
+            "channel.telegram.poll",
+            json!({"binding_id": binding_id}),
+        )
+        .await?;
+        match serde_json::from_value::<TelegramBindProgress>(progress)? {
+            TelegramBindProgress::Waiting => {}
+            TelegramBindProgress::Confirmed { channel } => {
+                println!("Channel {} connected", channel.name);
+                break;
             }
+            TelegramBindProgress::Expired => bail!("Telegram binding code expired"),
+        }
+    }
+    Ok(())
+}
+
+async fn bind_feishu(config_path: &Path) -> Result<()> {
+    let start = ipc::request(config_path, "channel.feishu.begin", json!({})).await?;
+    let binding_id = start["binding_id"]
+        .as_str()
+        .context("daemon omitted binding_id")?;
+    let code = start["code"].as_str().context("daemon omitted bind code")?;
+    let platform = start["platform"]
+        .as_str()
+        .context("daemon omitted Feishu platform")?;
+    let product = if platform == "lark" { "Lark" } else { "Feishu" };
+    println!("Open the application bot in {product} and send this private message:\n");
+    println!("/bind {code}\n");
+    println!("Waiting for {product} binding confirmation...");
+    loop {
+        channels::wait_before_poll().await;
+        let progress = ipc::request(
+            config_path,
+            "channel.feishu.poll",
+            json!({"binding_id": binding_id}),
+        )
+        .await?;
+        match serde_json::from_value::<FeishuBindProgress>(progress)? {
+            FeishuBindProgress::Waiting => {}
+            FeishuBindProgress::Confirmed { channel } => {
+                println!("Channel {} connected", channel.name);
+                break;
+            }
+            FeishuBindProgress::Expired => bail!("Feishu binding code expired"),
+            FeishuBindProgress::Failed { message } => bail!(message),
         }
     }
     Ok(())
@@ -774,6 +790,13 @@ channels:
     replayTurns: 5
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
+    mediaInput: true
+  feishu:
+    enabled: false
+    replayTurns: 5
+    appIdEnv: FEISHU_APP_ID
+    appSecretEnv: FEISHU_APP_SECRET
+    platform: feishu
     mediaInput: true
 automation:
   enabled: false
@@ -801,7 +824,7 @@ mod tests {
             status.command,
             Command::Channel {
                 command: ChannelCommand::Weixin {
-                    command: WeixinCommand::Status
+                    command: ManagedChannelCommand::Status
                 }
             }
         ));
@@ -812,7 +835,7 @@ mod tests {
             send.command,
             Command::Channel {
                 command: ChannelCommand::Weixin {
-                    command: WeixinCommand::SendFile { ref path }
+                    command: ManagedChannelCommand::SendFile { ref path }
                 }
             } if path == &PathBuf::from("report.pdf")
         ));
@@ -825,7 +848,7 @@ mod tests {
             status.command,
             Command::Channel {
                 command: ChannelCommand::Telegram {
-                    command: TelegramCommand::Status
+                    command: ManagedChannelCommand::Status
                 }
             }
         ));
@@ -836,9 +859,33 @@ mod tests {
             send.command,
             Command::Channel {
                 command: ChannelCommand::Telegram {
-                    command: TelegramCommand::SendFile { ref path }
+                    command: ManagedChannelCommand::SendFile { ref path }
                 }
             } if path == &PathBuf::from("clip.mp4")
+        ));
+    }
+
+    #[test]
+    fn parses_feishu_commands() {
+        let status = Cli::try_parse_from(["dwo", "channel", "feishu", "status"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Command::Channel {
+                command: ChannelCommand::Feishu {
+                    command: ManagedChannelCommand::Status
+                }
+            }
+        ));
+
+        let send =
+            Cli::try_parse_from(["dwo", "channel", "feishu", "send-file", "report.pdf"]).unwrap();
+        assert!(matches!(
+            send.command,
+            Command::Channel {
+                command: ChannelCommand::Feishu {
+                    command: ManagedChannelCommand::SendFile { ref path }
+                }
+            } if path == &PathBuf::from("report.pdf")
         ));
     }
 

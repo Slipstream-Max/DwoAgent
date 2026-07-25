@@ -12,6 +12,7 @@ use weixin_agent::{
 
 use crate::host::Host;
 
+use super::ChannelKind;
 #[cfg(test)]
 use super::attachments::file_uri_from_path;
 use super::attachments::{
@@ -32,6 +33,7 @@ Use `dwo channel weixin --help` to inspect the available commands."#;
 
 pub(crate) struct RunningWeixin {
     client: Arc<WeixinClient>,
+    target: String,
     client_task: tokio::task::JoinHandle<()>,
     bridge: Arc<SessionBridge>,
 }
@@ -39,25 +41,26 @@ pub(crate) struct RunningWeixin {
 impl RunningWeixin {
     pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
         let runtime = host.channels.load_weixin().await?;
+        let target = runtime.secret.bound_user_id.clone();
         let state = Arc::new(Mutex::new(runtime.state));
         let selected_session_id = state.lock().await.selected_session_id.clone();
         let client_ref = Arc::new(OnceLock::new());
         let conversation = Arc::new(WeixinConversation {
             host: host.clone(),
-            target: runtime.secret.bound_user_id.clone(),
+            target: target.clone(),
             state: state.clone(),
             client: client_ref.clone(),
         });
         let bridge = Arc::new(SessionBridge::new(
             host.clone(),
-            ConversationId::new("weixin", runtime.secret.bound_user_id.clone()),
+            ConversationId::new("weixin", target.clone()),
             runtime.config.replay_turns,
             selected_session_id,
             conversation.clone(),
         ));
         let handler = WeixinHandler {
             host,
-            bound_user_id: runtime.secret.bound_user_id,
+            bound_user_id: target.clone(),
             media_input: runtime.config.media_input,
             bridge: bridge.clone(),
             conversation: conversation.clone(),
@@ -70,7 +73,7 @@ impl RunningWeixin {
         let client = Arc::new(WeixinClient::builder(config).on_message(handler).build()?);
         client
             .context_tokens()
-            .import(state.lock().await.context_tokens.clone());
+            .import(state.lock().await.adapter.context_tokens.clone());
         let _ = client_ref.set(client.clone());
         if let Err(error) = bridge.resume_observer().await {
             eprintln!("restore Weixin session observer: {error:#}");
@@ -78,13 +81,14 @@ impl RunningWeixin {
         let running_client = client.clone();
         let task_state = state.clone();
         let client_task = tokio::spawn(async move {
-            let sync_buf = task_state.lock().await.sync_buf.clone();
+            let sync_buf = task_state.lock().await.adapter.sync_buf.clone();
             if let Err(error) = running_client.start(sync_buf).await {
                 eprintln!("Weixin channel stopped: {error}");
             }
         });
         Ok(Self {
             client,
+            target,
             client_task,
             bridge,
         })
@@ -102,21 +106,21 @@ impl RunningWeixin {
         }
     }
 
-    pub(crate) async fn send_message(&self, to: &str, text: &str) -> Result<()> {
-        let context_token = self.client.context_tokens().get(to);
+    pub(crate) async fn send_message(&self, text: &str) -> Result<()> {
+        let context_token = self.client.context_tokens().get(&self.target);
         self.client
-            .send_text(to, text, context_token.as_deref())
+            .send_text(&self.target, text, context_token.as_deref())
             .await?;
         Ok(())
     }
 
-    pub(crate) async fn send_file(&self, to: &str, path: &Path) -> Result<()> {
+    pub(crate) async fn send_file(&self, path: &Path) -> Result<()> {
         if !path.is_file() {
             bail!("file does not exist: {}", path.display());
         }
-        let context_token = self.client.context_tokens().get(to);
+        let context_token = self.client.context_tokens().get(&self.target);
         self.client
-            .send_media(to, path, context_token.as_deref())
+            .send_media(&self.target, path, context_token.as_deref())
             .await?;
         Ok(())
     }
@@ -141,14 +145,17 @@ impl WeixinConversation {
         let snapshot = {
             let mut state = self.state.lock().await;
             if let Some(sync_buf) = sync_buf {
-                state.sync_buf = Some(sync_buf.to_string());
+                state.adapter.sync_buf = Some(sync_buf.to_string());
             }
             if let Some(client) = self.client.get() {
-                state.context_tokens = client.context_tokens().export_all();
+                state.adapter.context_tokens = client.context_tokens().export_all();
             }
             state.clone()
         };
-        self.host.channels.save_weixin_state(&snapshot).await
+        self.host
+            .channels
+            .save_state(ChannelKind::Weixin, &snapshot)
+            .await
     }
 }
 
@@ -179,7 +186,10 @@ impl ConversationTransport for WeixinConversation {
             state.selected_session_id = session_id.map(str::to_string);
             state.clone()
         };
-        self.host.channels.save_weixin_state(&snapshot).await
+        self.host
+            .channels
+            .save_state(ChannelKind::Weixin, &snapshot)
+            .await
     }
 }
 

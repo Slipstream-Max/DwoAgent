@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -6,19 +7,59 @@ use tokio::sync::Mutex;
 
 use crate::host::Host;
 
+use super::ChannelKind;
+use super::feishu::RunningFeishu;
 use super::telegram::RunningTelegram;
 use super::weixin::RunningWeixin;
 
+enum RunningChannel {
+    Weixin(RunningWeixin),
+    Telegram(RunningTelegram),
+    Feishu(RunningFeishu),
+}
+
+impl RunningChannel {
+    async fn start(channel: ChannelKind, host: Arc<Host>) -> Result<Self> {
+        match channel {
+            ChannelKind::Weixin => Ok(Self::Weixin(RunningWeixin::start(host).await?)),
+            ChannelKind::Telegram => Ok(Self::Telegram(RunningTelegram::start(host).await?)),
+            ChannelKind::Feishu => Ok(Self::Feishu(RunningFeishu::start(host).await?)),
+        }
+    }
+
+    async fn stop(self) {
+        match self {
+            Self::Weixin(channel) => channel.stop().await,
+            Self::Telegram(channel) => channel.stop().await,
+            Self::Feishu(channel) => channel.stop().await,
+        }
+    }
+
+    async fn send_message(&self, text: &str) -> Result<()> {
+        match self {
+            Self::Weixin(channel) => channel.send_message(text).await,
+            Self::Telegram(channel) => channel.send_message(text).await,
+            Self::Feishu(channel) => channel.send_message(text).await,
+        }
+    }
+
+    async fn send_file(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Weixin(channel) => channel.send_file(path).await,
+            Self::Telegram(channel) => channel.send_file(path).await,
+            Self::Feishu(channel) => channel.send_file(path).await,
+        }
+    }
+}
+
 pub struct ChannelHub {
-    weixin: Mutex<Option<RunningWeixin>>,
-    telegram: Mutex<Option<RunningTelegram>>,
+    active: Mutex<HashMap<ChannelKind, RunningChannel>>,
 }
 
 impl ChannelHub {
     pub fn new() -> Self {
         Self {
-            weixin: Mutex::new(None),
-            telegram: Mutex::new(None),
+            active: Mutex::new(HashMap::new()),
         }
     }
 
@@ -30,85 +71,61 @@ impl ChannelHub {
                 return;
             }
         };
-        let should_start = channels
-            .iter()
-            .any(|channel| channel.name == "weixin" && channel.enabled && channel.connected);
-        if should_start && let Err(error) = self.start_weixin(host.clone()).await {
-            eprintln!("start Weixin channel: {error:#}");
-        }
-        let should_start = channels
-            .iter()
-            .any(|channel| channel.name == "telegram" && channel.enabled && channel.connected);
-        if should_start && let Err(error) = self.start_telegram(host).await {
-            eprintln!("start Telegram channel: {error:#}");
+        for summary in channels
+            .into_iter()
+            .filter(|channel| channel.enabled && channel.connected)
+        {
+            let Some(channel) = ChannelKind::parse(&summary.name) else {
+                continue;
+            };
+            if let Err(error) = self.start(channel, host.clone()).await {
+                eprintln!("start {} channel: {error:#}", channel.display_name());
+            }
         }
     }
 
-    pub async fn start_weixin(self: &Arc<Self>, host: Arc<Host>) -> Result<()> {
-        let mut active = self.weixin.lock().await;
-        if active.is_none() {
-            *active = Some(RunningWeixin::start(host).await?);
+    pub async fn start(self: &Arc<Self>, channel: ChannelKind, host: Arc<Host>) -> Result<()> {
+        let mut active = self.active.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(entry) = active.entry(channel) {
+            entry.insert(RunningChannel::start(channel, host).await?);
         }
         Ok(())
     }
 
-    pub async fn start_telegram(self: &Arc<Self>, host: Arc<Host>) -> Result<()> {
-        let mut active = self.telegram.lock().await;
-        if active.is_none() {
-            *active = Some(RunningTelegram::start(host).await?);
-        }
-        Ok(())
-    }
-
-    pub async fn stop_weixin(&self) {
-        if let Some(active) = self.weixin.lock().await.take() {
-            active.stop().await;
-        }
-    }
-
-    pub async fn stop_telegram(&self) {
-        if let Some(active) = self.telegram.lock().await.take() {
-            active.stop().await;
+    pub async fn stop(&self, channel: ChannelKind) {
+        let running = self.active.lock().await.remove(&channel);
+        if let Some(running) = running {
+            running.stop().await;
         }
     }
 
     pub async fn stop_all(&self) {
-        self.stop_weixin().await;
-        self.stop_telegram().await;
-    }
-
-    pub async fn send_weixin_message(&self, to: &str, text: &str) -> Result<()> {
-        let active = self.weixin.lock().await;
-        active
-            .as_ref()
-            .context("Weixin channel is not running")?
-            .send_message(to, text)
+        let running = self
+            .active
+            .lock()
             .await
+            .drain()
+            .map(|(_, channel)| channel)
+            .collect::<Vec<_>>();
+        for channel in running {
+            channel.stop().await;
+        }
     }
 
-    pub async fn send_weixin_file(&self, to: &str, path: &Path) -> Result<()> {
-        let active = self.weixin.lock().await;
+    pub async fn send_message(&self, channel: ChannelKind, text: &str) -> Result<()> {
+        let active = self.active.lock().await;
         active
-            .as_ref()
-            .context("Weixin channel is not running")?
-            .send_file(to, path)
-            .await
-    }
-
-    pub async fn send_telegram_message(&self, text: &str) -> Result<()> {
-        let active = self.telegram.lock().await;
-        active
-            .as_ref()
-            .context("Telegram channel is not running")?
+            .get(&channel)
+            .with_context(|| format!("{} channel is not running", channel.display_name()))?
             .send_message(text)
             .await
     }
 
-    pub async fn send_telegram_file(&self, path: &Path) -> Result<()> {
-        let active = self.telegram.lock().await;
+    pub async fn send_file(&self, channel: ChannelKind, path: &Path) -> Result<()> {
+        let active = self.active.lock().await;
         active
-            .as_ref()
-            .context("Telegram channel is not running")?
+            .get(&channel)
+            .with_context(|| format!("{} channel is not running", channel.display_name()))?
             .send_file(path)
             .await
     }

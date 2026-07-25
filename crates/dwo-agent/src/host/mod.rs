@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::automation::{AutomationRuntime, parse_config as parse_automation_config};
-use crate::channels::{ChannelHub, ChannelManager, TelegramBindProgress, WeixinLoginProgress};
+use crate::channels::{
+    ChannelHub, ChannelKind, ChannelManager, FeishuBindProgress, TelegramBindProgress,
+    WeixinLoginProgress,
+};
 
 pub struct Host {
     pub service: Arc<AgentService>,
@@ -93,6 +96,14 @@ struct SendMessageParam {
 #[derive(Deserialize)]
 struct SendFileParam {
     path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum ManagedChannelAction {
+    Status,
+    SendMessage,
+    SendFile,
+    Remove,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +208,9 @@ impl Host {
     }
 
     pub async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
+        if let Some((channel, action)) = managed_channel_action(method) {
+            return self.dispatch_channel(channel, action, params).await;
+        }
         match method {
             "daemon.status" => Ok(json!({
                 "healthy": true,
@@ -346,46 +360,6 @@ impl Host {
                 )?)
             }
             "channel.list" => Ok(serde_json::to_value(self.channels.list().await?)?),
-            "channel.weixin.status" => {
-                let channel = self
-                    .channels
-                    .list()
-                    .await?
-                    .into_iter()
-                    .find(|channel| channel.name == "weixin")
-                    .context("channels.weixin is not configured")?;
-                Ok(serde_json::to_value(channel)?)
-            }
-            "channel.telegram.status" => {
-                let channel = self
-                    .channels
-                    .list()
-                    .await?
-                    .into_iter()
-                    .find(|channel| channel.name == "telegram")
-                    .context("channels.telegram is not configured")?;
-                Ok(serde_json::to_value(channel)?)
-            }
-            "channel.weixin.send_message" => {
-                let params: SendMessageParam = serde_json::from_value(params)?;
-                let target = self.channels.bound_weixin_user().await?;
-                self.channel_hub
-                    .send_weixin_message(&target, &params.text)
-                    .await?;
-                Ok(json!({"sent": true, "to": target}))
-            }
-            "channel.weixin.send_file" => {
-                let params: SendFileParam = serde_json::from_value(params)?;
-                let target = self.channels.bound_weixin_user().await?;
-                self.channel_hub
-                    .send_weixin_file(&target, &params.path)
-                    .await?;
-                Ok(json!({"sent": true, "to": target, "path": params.path}))
-            }
-            "channel.weixin.remove" => {
-                self.channel_hub.stop_weixin().await;
-                Ok(json!({"removed": self.channels.remove_weixin().await?}))
-            }
             "channel.weixin.begin" => Ok(serde_json::to_value(
                 self.channels.begin_weixin_login().await?,
             )?),
@@ -396,32 +370,18 @@ impl Host {
                     .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
                     .await?;
                 if let WeixinLoginProgress::Confirmed { channel } = &progress {
-                    self.channel_hub.stop_weixin().await;
+                    self.channel_hub.stop(ChannelKind::Weixin).await;
                     if channel.enabled {
-                        self.channel_hub.start_weixin(self.clone()).await?;
+                        self.channel_hub
+                            .start(ChannelKind::Weixin, self.clone())
+                            .await?;
                     }
                 }
                 Ok(serde_json::to_value(progress)?)
             }
-            "channel.telegram.send_message" => {
-                let params: SendMessageParam = serde_json::from_value(params)?;
-                let target = self.channels.bound_telegram_chat().await?;
-                self.channel_hub.send_telegram_message(&params.text).await?;
-                Ok(json!({"sent": true, "to": target}))
-            }
-            "channel.telegram.send_file" => {
-                let params: SendFileParam = serde_json::from_value(params)?;
-                let target = self.channels.bound_telegram_chat().await?;
-                self.channel_hub.send_telegram_file(&params.path).await?;
-                Ok(json!({"sent": true, "to": target, "path": params.path}))
-            }
-            "channel.telegram.remove" => {
-                self.channel_hub.stop_telegram().await;
-                Ok(json!({"removed": self.channels.remove_telegram().await?}))
-            }
             "channel.telegram.begin" => {
                 let start = self.channels.begin_telegram_bind().await?;
-                self.channel_hub.stop_telegram().await;
+                self.channel_hub.stop(ChannelKind::Telegram).await;
                 Ok(serde_json::to_value(start)?)
             }
             "channel.telegram.poll" => {
@@ -430,7 +390,27 @@ impl Host {
                 if let TelegramBindProgress::Confirmed { channel } = &progress
                     && channel.enabled
                 {
-                    self.channel_hub.start_telegram(self.clone()).await?;
+                    self.channel_hub
+                        .start(ChannelKind::Telegram, self.clone())
+                        .await?;
+                }
+                Ok(serde_json::to_value(progress)?)
+            }
+            "channel.feishu.begin" => {
+                self.channel_hub.stop(ChannelKind::Feishu).await;
+                Ok(serde_json::to_value(
+                    self.channels.begin_feishu_bind().await?,
+                )?)
+            }
+            "channel.feishu.poll" => {
+                let params: TelegramPollBindParam = serde_json::from_value(params)?;
+                let progress = self.channels.poll_feishu_bind(&params.binding_id).await?;
+                if let FeishuBindProgress::Confirmed { channel } = &progress
+                    && channel.enabled
+                {
+                    self.channel_hub
+                        .start(ChannelKind::Feishu, self.clone())
+                        .await?;
                 }
                 Ok(serde_json::to_value(progress)?)
             }
@@ -456,6 +436,35 @@ impl Host {
                 Ok(json!({"authorized": false, "server": params.server}))
             }
             other => anyhow::bail!("unknown RPC method: {other}"),
+        }
+    }
+
+    async fn dispatch_channel(
+        &self,
+        channel: ChannelKind,
+        action: ManagedChannelAction,
+        params: Value,
+    ) -> Result<Value> {
+        match action {
+            ManagedChannelAction::Status => {
+                Ok(serde_json::to_value(self.channels.summary(channel).await?)?)
+            }
+            ManagedChannelAction::SendMessage => {
+                let params: SendMessageParam = serde_json::from_value(params)?;
+                let target = self.channels.bound_target(channel).await?;
+                self.channel_hub.send_message(channel, &params.text).await?;
+                Ok(json!({"sent": true, "to": target}))
+            }
+            ManagedChannelAction::SendFile => {
+                let params: SendFileParam = serde_json::from_value(params)?;
+                let target = self.channels.bound_target(channel).await?;
+                self.channel_hub.send_file(channel, &params.path).await?;
+                Ok(json!({"sent": true, "to": target, "path": params.path}))
+            }
+            ManagedChannelAction::Remove => {
+                self.channel_hub.stop(channel).await;
+                Ok(json!({"removed": self.channels.remove(channel).await?}))
+            }
         }
     }
 
@@ -548,6 +557,15 @@ impl Host {
                 .join("telegram"),
             id.as_str(),
         )
+        .await?;
+        remove_session_attachment_dirs(
+            &self
+                .profile_root
+                .join("runtime")
+                .join("attachments")
+                .join("feishu"),
+            id.as_str(),
+        )
         .await
     }
 
@@ -606,6 +624,19 @@ async fn remove_session_attachment_dirs(root: &Path, session_id: &str) -> Result
     Ok(())
 }
 
+fn managed_channel_action(method: &str) -> Option<(ChannelKind, ManagedChannelAction)> {
+    let (channel, action) = method.strip_prefix("channel.")?.split_once('.')?;
+    let channel = ChannelKind::parse(channel)?;
+    let action = match action {
+        "status" => ManagedChannelAction::Status,
+        "send_message" => ManagedChannelAction::SendMessage,
+        "send_file" => ManagedChannelAction::SendFile,
+        "remove" => ManagedChannelAction::Remove,
+        _ => return None,
+    };
+    Some((channel, action))
+}
+
 fn parse_session(params: Value) -> Result<SessionId> {
     let params: SessionIdParam = serde_json::from_value(params)?;
     SessionId::parse(params.session_id).map_err(anyhow::Error::msg)
@@ -626,6 +657,30 @@ pub fn profile_root(config_path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_channel_actions_share_one_rpc_route() {
+        for channel in ChannelKind::ALL {
+            let method = |action| format!("channel.{}.{action}", channel.as_str());
+            assert!(matches!(
+                managed_channel_action(&method("status")),
+                Some((found, ManagedChannelAction::Status)) if found == channel
+            ));
+            assert!(matches!(
+                managed_channel_action(&method("send_message")),
+                Some((found, ManagedChannelAction::SendMessage)) if found == channel
+            ));
+            assert!(matches!(
+                managed_channel_action(&method("send_file")),
+                Some((found, ManagedChannelAction::SendFile)) if found == channel
+            ));
+            assert!(matches!(
+                managed_channel_action(&method("remove")),
+                Some((found, ManagedChannelAction::Remove)) if found == channel
+            ));
+            assert!(managed_channel_action(&method("begin")).is_none());
+        }
+    }
 
     fn yaml_keys(value: &serde_yaml::Value) -> Vec<&str> {
         let mut keys = value
@@ -665,6 +720,17 @@ mod tests {
                 "mediaInput",
                 "replayTurns",
                 "tgProxy"
+            ]
+        );
+        assert_eq!(
+            yaml_keys(&document["channels"]["feishu"]),
+            [
+                "appIdEnv",
+                "appSecretEnv",
+                "enabled",
+                "mediaInput",
+                "platform",
+                "replayTurns"
             ]
         );
         assert_eq!(yaml_keys(&document["automation"]), ["enabled", "jobs"]);
@@ -716,11 +782,13 @@ mod tests {
             .await
             .unwrap();
         let channel = channels.list().await.unwrap();
-        assert_eq!(channel.len(), 2);
+        assert_eq!(channel.len(), 3);
         assert_eq!(channel[0].name, "weixin");
         assert!(!channel[0].enabled);
         assert_eq!(channel[1].name, "telegram");
         assert!(!channel[1].enabled);
+        assert_eq!(channel[2].name, "feishu");
+        assert!(!channel[2].enabled);
 
         let automation = parse_automation_config(profile.automation).unwrap();
         assert!(!automation.enabled);

@@ -22,6 +22,7 @@ src/
     attachments.rs     shared inbound attachment storage and resource links
     weixin.rs          Weixin SDK, media, context tokens, and message limits
     telegram.rs        Telegram polling, binding enforcement, media, and sends
+    feishu.rs          Feishu/Lark WebSocket, binding, resources, and sends
 ```
 
 Only `dwo serve` constructs the `Host` and its `AgentService`. CLI and ACP
@@ -57,6 +58,11 @@ dwo channel telegram bind
 dwo channel telegram unbind
 dwo channel telegram send-message <message>
 dwo channel telegram send-file <path>
+dwo channel feishu status
+dwo channel feishu bind
+dwo channel feishu unbind
+dwo channel feishu send-message <message>
+dwo channel feishu send-file <path>
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
@@ -94,6 +100,7 @@ runtime/sessions/YYYY/MM/DD/<session-id>/
 runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
+runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
 runtime/channel-capabilities/<channel>.md
 runtime/mcp/catalog.json
 runtime/mcp/oauth/
@@ -102,6 +109,8 @@ channels/weixin/runtime.yaml
 channels/weixin/secret.yaml
 channels/telegram/runtime.yaml
 channels/telegram/secret.yaml
+channels/feishu/runtime.yaml
+channels/feishu/secret.yaml
 ```
 
 Weixin user settings live in `profile.yaml` and are validated before the host
@@ -120,18 +129,38 @@ channels:
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
     mediaInput: true
+  feishu:
+    enabled: false
+    replayTurns: 5
+    appIdEnv: FEISHU_APP_ID
+    appSecretEnv: FEISHU_APP_SECRET
+    platform: feishu
+    mediaInput: true
 ```
 
 Weixin `runtime.yaml` stores the selected session, `syncBuf`, and SDK context
 tokens; its `secret.yaml` stores QR-login credentials. Telegram `runtime.yaml`
 stores one selected session; its `secret.yaml` stores the bot identity and the
-single bound private user/chat. These files are daemon-owned.
+single bound private user/chat. Feishu `runtime.yaml` also stores one selected
+session, while its `secret.yaml` stores only the bound `open_id` and `chat_id`.
+Application credentials are never persisted. These files are daemon-owned.
 
 Telegram is private-chat only. The token is read from `botTokenEnv`, never
 persisted. `dwo channel telegram bind` prints a one-time code that must be sent
 as `/bind <code>` in the bot private chat. `tgProxy` is an optional HTTP proxy
 used only by Telegram. The command menu is generated from the same clap
 metadata as Weixin `/help`.
+
+Feishu and Lark use the same private-chat adapter. `platform: feishu` selects
+`https://open.feishu.cn`; `platform: lark` selects
+`https://open.larksuite.com`. Create an enterprise application in the matching
+open platform, enable its bot, choose long-connection event delivery, subscribe
+to `im.message.receive_v1`, and grant permissions to receive messages, send
+messages as the application, and get/upload message resources. Publish the
+application, set the environment variables named by `appIdEnv` and
+`appSecretEnv`, restart the daemon, then run `dwo channel feishu bind` and send
+the printed `/bind <code>` to the bot in a private chat. No public webhook is
+required. The adapter reconnects its `openlark` WebSocket with bounded backoff.
 
 `replayTurns` is limited to 10. After `/use`, each replayed turn combines the
 user prompt and every non-empty assistant response into one message; tool
@@ -141,17 +170,18 @@ turn is running` notice. `/status` reports only current session state.
 
 `status` reports whether the channel is configured and bound, the bound user
 ID, and the selected session. `connected` means persisted credentials validate;
-Telegram additionally requires its token environment variable to resolve. It
-is not a live network health check. `send-message` and `send-file` always
-target the bound private conversation.
+Telegram additionally requires its token environment variable to resolve;
+Feishu requires both application credential environment variables. It is not
+a live network health check. `send-message` and `send-file` always target the
+bound private conversation.
 
-Inbound Weixin media and Telegram photo/document/video are downloaded under
-the selected session's dated channel attachment directory and submitted as a
-structured resource link containing the local path, MIME type, name, and size.
-A media-only message is a valid prompt. Telegram sends model output as plain
-text without parse mode or markdown rewriting. Sessions created without an
-explicit cwd use `runtime/workspaces/<session-id>` instead of the daemon
-process cwd.
+Inbound Weixin media, Telegram photo/document/video, and Feishu/Lark
+image/file messages are downloaded under the selected session's dated channel
+attachment directory and submitted as a structured resource link containing
+the local path, MIME type, name, and size. A media-only message is a valid
+prompt. Telegram and Feishu send model output as plain text without markdown
+rewriting. Sessions created without an explicit cwd use
+`runtime/workspaces/<session-id>` instead of the daemon process cwd.
 
 Channel slash commands are declared as one clap-derived command enum shared by
 platform adapters. Parsing, argument validation, and `/help` descriptions
@@ -164,11 +194,12 @@ and split only when the combined text exceeds 4,000 characters. Tool calls are
 sent immediately only when confirmation is required, together with the
 permission request ID.
 
-When Weixin or Telegram is enabled and bound, its adapter publishes a concise,
-secret-free prompt under `runtime/channel-capabilities/`. Each adapter owns its
-own wording, including the proactive `send-message` and `send-file` commands;
-the context builder only discovers generic projections. Binding and unbinding
-changes are reported to existing sessions by the environment watcher.
+When Weixin, Telegram, or Feishu is enabled and bound, its adapter publishes a
+concise, secret-free prompt under `runtime/channel-capabilities/`. Each adapter
+owns its own wording, including the proactive `send-message` and `send-file`
+commands; the context builder only discovers generic projections. Binding and
+unbinding changes are reported to existing sessions by the environment
+watcher.
 
 MCP servers are configured in `resource/mcp.json`. Static HTTP headers and
 stdio environment variables are resolved from that file, including `${ENV}`
@@ -214,7 +245,7 @@ prompt submitted by ACP is mirrored to the bound Weixin observer; a prompt that
 originates from Weixin is not echoed back to the same endpoint.
 
 The ACP command is a stdio bridge to the daemon IPC endpoint. It shares the
-same sessions and events as CLI and Weixin clients. Loading a session keeps a
+same sessions and events as CLI and channel clients. Loading a session keeps a
 live observer attached, so idle ACP clients continue to receive prompts, tool
 events, and permission requests from other clients.
 

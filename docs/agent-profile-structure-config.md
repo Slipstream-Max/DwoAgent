@@ -25,7 +25,10 @@
    |- weixin/
    |  |- runtime.yaml
    |  `- secret.yaml
-   `- telegram/
+   |- telegram/
+   |  |- runtime.yaml
+   |  `- secret.yaml
+   `- feishu/
       |- runtime.yaml
       `- secret.yaml
 ```
@@ -47,6 +50,13 @@ channels:
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
     mediaInput: true
+  feishu:
+    enabled: false
+    replayTurns: 5
+    appIdEnv: FEISHU_APP_ID
+    appSecretEnv: FEISHU_APP_SECRET
+    platform: feishu
+    mediaInput: true
 automation:
   enabled: false
   jobs: []
@@ -66,15 +76,17 @@ model:
 
 - `name`、`description`：profile 标识和描述，不能为空。
 - `policyMode`：`full_access`、`confirm` 或 `watch`，决定 session 默认权限模式。
-- `channels`：支持 daemon 托管的 Weixin 和 Telegram 私聊配置；不配置则不启动对应 channel。Telegram token 只从 `botTokenEnv` 指向的环境变量读取，`tgProxy` 是仅用于 Telegram 的可选 HTTP 代理，`mediaInput` 控制 photo、document、video 输入。
+- `channels`：支持 daemon 托管的 Weixin、Telegram 和 Feishu/Lark 私聊配置；不配置则不启动对应 channel。Telegram token 只从 `botTokenEnv` 指向的环境变量读取，`tgProxy` 是仅用于 Telegram 的可选 HTTP 代理。飞书应用凭据只从 `appIdEnv`、`appSecretEnv` 指向的环境变量读取；`platform` 取 `feishu`（国内）或 `lark`（海外）。`mediaInput` 控制对应平台的图片和文件输入。
 - `automation`：daemon 托管的定时任务配置。
 - `model`：provider 实例、模型别名和 profile 级限制覆盖。
 
 旧的 `agent.yaml`、`tools` 开关、supervisor profile registry 和额外 transport 配置不属于当前 schema，会被拒绝。
 
-Telegram 通过 `dwo channel telegram bind` 创建一次性验证码，并在 bot 私聊中用 `/bind <code>` 绑定唯一用户。`channels/telegram/secret.yaml` 保存 bot ID/username 和绑定 user/chat，不保存 token；`runtime.yaml` 只保存当前选中的 session。Telegram 和 Weixin 可以选择同一个全局 session。
+Telegram 和 Feishu 都通过 `dwo channel <name> bind` 创建一次性验证码，并在 bot 私聊中用 `/bind <code>` 绑定唯一用户。`channels/telegram/secret.yaml` 保存 bot ID/username 和绑定 user/chat，不保存 token；`channels/feishu/secret.yaml` 只保存绑定 `open_id/chat_id`，不保存 App ID/Secret。两个 `runtime.yaml` 都只保存当前选中的 session。所有 channel 都可以选择同一个全局 session。
 
-已启用且绑定的 channel adapter 各自维护 system prompt 文案，并把无 secret 的派生投影写入 `runtime/channel-capabilities/<channel>.md`。context builder 只通用扫描这些投影，不包含任何微信或 Telegram 专用判断；绑定和解绑会通过 environment watcher 更新已有 session。
+飞书应用需要在对应开放平台启用机器人，使用长连接订阅 `im.message.receive_v1`，并开通接收消息、以应用身份发送消息、获取和上传消息资源的权限。国内使用 `open.feishu.cn`，海外使用 `open.larksuite.com`，均无需公网 webhook。
+
+已启用且绑定的 channel adapter 各自维护 system prompt 文案，并把无 secret 的派生投影写入 `runtime/channel-capabilities/<channel>.md`。context builder 只通用扫描这些投影，不包含平台专用判断；绑定和解绑会通过 environment watcher 更新已有 session。
 
 ## model
 

@@ -1,6 +1,6 @@
 # Dwo Agent
 
-Dwo Agent is a native Rust, multi-session agent runtime. One local `dwo` daemon owns the profile, model clients, sessions, channels, MCP connections, automation jobs, and tool runtimes. CLI, ACP, and Weixin clients all attach to that same runtime over local IPC.
+Dwo Agent is a native Rust, multi-session agent runtime. One local `dwo` daemon owns the profile, model clients, sessions, channels, MCP connections, automation jobs, and tool runtimes. CLI, ACP, Weixin, Telegram, and Feishu/Lark clients all attach to that same runtime over local IPC.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ dwo daemon
 |- provider-configured model clients
 |- terminal and file-edit tools
 |- managed MCP runtime
-|- Weixin and Telegram channel runtimes
+|- Weixin, Telegram, and Feishu/Lark channel runtimes
 `- automation scheduler
 
 clients
@@ -53,6 +53,7 @@ dwo daemon start|stop|status
 dwo session list|new|delete|prompt|cancel|watch|model|reasoning
 dwo channel weixin status|bind|unbind|send-message|send-file
 dwo channel telegram status|bind|unbind|send-message|send-file
+dwo channel feishu status|bind|unbind|send-message|send-file
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server> [--logout]
@@ -89,7 +90,10 @@ The default layout is:
    |- weixin/
    |  |- runtime.yaml
    |  `- secret.yaml
-   `- telegram/
+   |- telegram/
+   |  |- runtime.yaml
+   |  `- secret.yaml
+   `- feishu/
       |- runtime.yaml
       `- secret.yaml
 ```

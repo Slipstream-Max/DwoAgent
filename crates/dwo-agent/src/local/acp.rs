@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk,
@@ -22,8 +24,10 @@ use agent_client_protocol::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::ipc;
@@ -58,8 +62,45 @@ impl TurnTerminal {
 }
 
 pub async fn run(config_path: PathBuf) -> Result<()> {
-    let stdin = tokio::io::stdin().compat();
-    let stdout = tokio::io::stdout().compat_write();
+    run_with_io(config_path, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+struct EofReader<R> {
+    inner: R,
+    eof: CancellationToken,
+}
+
+impl<R> EofReader<R> {
+    fn new(inner: R, eof: CancellationToken) -> Self {
+        Self { inner, eof }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for EofReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled = buffer.filled().len();
+        let had_capacity = buffer.remaining() > 0;
+        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if had_capacity && matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() == filled
+        {
+            self.eof.cancel();
+        }
+        result
+    }
+}
+
+async fn run_with_io<R, W>(config_path: PathBuf, stdin: R, stdout: W) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let eof = CancellationToken::new();
+    let stdin = EofReader::new(stdin, eof.clone()).compat();
+    let stdout = stdout.compat_write();
     let transport = ByteStreams::new(stdout, stdin);
     let runtime = AcpRuntime {
         config_path: config_path.clone(),
@@ -72,7 +113,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
     let set_runtime = runtime;
     let cancel_config = config_path;
 
-    Agent
+    let agent = Agent
         .builder()
         .name("dwo")
         .on_receive_request(
@@ -254,10 +295,28 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
                 Ok(())
             },
             on_receive_notification!(),
-        )
-        .connect_to(transport)
+        );
+    connect_until_eof(agent, transport, eof)
         .await
         .map_err(|error| anyhow::anyhow!("ACP connection failed: {error}"))
+}
+
+async fn connect_until_eof<H, Run, Transport>(
+    agent: agent_client_protocol::Builder<Agent, H, Run>,
+    transport: Transport,
+    eof: CancellationToken,
+) -> agent_client_protocol::Result<()>
+where
+    H: agent_client_protocol::HandleDispatchFrom<Client> + 'static,
+    Run: agent_client_protocol::RunWithConnectionTo<Client> + 'static,
+    Transport: agent_client_protocol::ConnectTo<Agent> + 'static,
+{
+    agent
+        .connect_with(transport, async move |_cx| {
+            eof.cancelled().await;
+            Ok(())
+        })
+        .await
 }
 
 async fn run_prompt(
@@ -966,6 +1025,30 @@ mod tests {
     use agent_client_protocol::schema::{
         BlobResourceContents, EmbeddedResource, ImageContent, TextResourceContents,
     };
+
+    #[tokio::test]
+    async fn acp_exits_when_the_client_closes_stdin() {
+        let (client_stdin, agent_stdin) = tokio::io::duplex(1024);
+        let (agent_stdout, _client_stdout) = tokio::io::duplex(1024);
+        let eof = CancellationToken::new();
+        let transport = ByteStreams::new(
+            agent_stdout.compat_write(),
+            EofReader::new(agent_stdin, eof.clone()).compat(),
+        );
+        let agent = Agent.builder().with_spawned(|cx| async move {
+            let _connection_held_by_observer = cx;
+            std::future::pending().await
+        });
+        let task = tokio::spawn(connect_until_eof(agent, transport, eof));
+
+        drop(client_stdin);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("ACP runner should stop after stdin EOF")
+            .expect("ACP runner task should not panic")
+            .expect("stdin EOF should be a clean ACP shutdown");
+    }
 
     #[test]
     fn acp_prompt_flattens_text_embedded_text_and_resource_links_in_order() {

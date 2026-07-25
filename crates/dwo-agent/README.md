@@ -218,6 +218,14 @@ same sessions and events as CLI and Weixin clients. Loading a session keeps a
 live observer attached, so idle ACP clients continue to receive prompts, tool
 events, and permission requests from other clients.
 
+ACP text blocks, text embedded resources, and resource links are flattened in
+their original order before submission. Resource text retains its URI and MIME
+type; links retain their name, URI, and available metadata so referenced files
+and directories remain visible to the model. ACP image and audio input and
+binary embedded resources are rejected. `embeddedContext` remains enabled for
+clients that paste text file contents, while `image` and `audio` remain
+disabled.
+
 External prompts use interrupt semantics: an active turn is cancelled, the
 host waits for its terminal event, and then starts the replacement turn. The
 origin endpoint does not receive its own prompt notification; every other

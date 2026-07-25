@@ -110,3 +110,5 @@ dwo acp
 ```
 
 ACP 使用 stdio 连接同一个 daemon，共享 session、事件流、模型配置和 tool runtime，不会创建独立的 session 或 MCP 连接。
+
+ACP prompt 会按原顺序把普通文本、文本型 embedded resource 和 resource link 展开为文本。embedded resource 保留 URI、MIME 和正文，resource link 保留名称、URI 与可用元数据，因此 Zed 引用的本地文件或目录会作为明确路径进入模型上下文。当前不声明图片或音频输入能力，并拒绝 image、audio 与二进制 embedded resource；`embeddedContext` 仅用于客户端粘贴文本文件内容。

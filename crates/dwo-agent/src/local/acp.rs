@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption, SessionId,
-    SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
+    EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
+    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, ResourceLink, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionInfo,
+    SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
     ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind, UsageUpdate,
@@ -266,7 +267,13 @@ async fn run_prompt(
     cx: ConnectionTo<Client>,
 ) {
     let session_id = request.session_id.to_string();
-    let text = prompt_text(&request.prompt);
+    let text = match prompt_text(&request.prompt) {
+        Ok(text) => text,
+        Err(error) => {
+            let _ = responder.respond_with_error(invalid_params(error));
+            return;
+        }
+    };
     let observer = match ensure_observer(&runtime, &session_id, &cx, false).await {
         Ok(observer) => observer,
         Err(error) => {
@@ -874,9 +881,57 @@ fn snapshot_usage(snapshot: &Value) -> Option<(u64, u64)> {
     Some((usage.get("used")?.as_u64()?, usage.get("size")?.as_u64()?))
 }
 
-fn prompt_text(prompt: &[ContentBlock]) -> String {
-    let value = serde_json::to_value(prompt).unwrap_or(Value::Null);
-    content_text(&value)
+fn prompt_text(prompt: &[ContentBlock]) -> Result<String> {
+    let mut output = Vec::with_capacity(prompt.len());
+    for block in prompt {
+        let text = match block {
+            ContentBlock::Text(content) => content.text.clone(),
+            ContentBlock::ResourceLink(resource) => resource_link_text(resource),
+            ContentBlock::Resource(resource) => match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(resource) => embedded_resource_text(
+                    &resource.uri,
+                    resource.mime_type.as_deref(),
+                    &resource.text,
+                ),
+                EmbeddedResourceResource::BlobResourceContents(_) => {
+                    anyhow::bail!("binary embedded resources are not supported")
+                }
+                _ => anyhow::bail!("unsupported embedded resource type"),
+            },
+            ContentBlock::Image(_) => anyhow::bail!("image input is not supported"),
+            ContentBlock::Audio(_) => anyhow::bail!("audio input is not supported"),
+            _ => anyhow::bail!("unsupported ACP content block"),
+        };
+        if !text.is_empty() {
+            output.push(text);
+        }
+    }
+    Ok(output.join("\n"))
+}
+
+fn resource_link_text(resource: &ResourceLink) -> String {
+    let mut text = format!(
+        "Referenced resource:\nName: {}\nURI: {}",
+        resource.name, resource.uri
+    );
+    if let Some(title) = &resource.title {
+        text.push_str(&format!("\nTitle: {title}"));
+    }
+    if let Some(mime_type) = &resource.mime_type {
+        text.push_str(&format!("\nMIME type: {mime_type}"));
+    }
+    if let Some(size) = resource.size {
+        text.push_str(&format!("\nSize: {size} bytes"));
+    }
+    if let Some(description) = &resource.description {
+        text.push_str(&format!("\nDescription: {description}"));
+    }
+    text
+}
+
+fn embedded_resource_text(uri: &str, mime_type: Option<&str>, content: &str) -> String {
+    let mime_type = mime_type.unwrap_or("text/plain");
+    format!("Embedded resource:\nURI: {uri}\nMIME type: {mime_type}\nContent:\n{content}")
 }
 
 fn content_text(value: &Value) -> String {
@@ -901,9 +956,62 @@ fn internal_error(error: impl std::fmt::Display) -> agent_client_protocol::schem
     agent_client_protocol::schema::Error::internal_error().data(error.to_string())
 }
 
+fn invalid_params(error: impl std::fmt::Display) -> agent_client_protocol::schema::Error {
+    agent_client_protocol::schema::Error::invalid_params().data(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::{
+        BlobResourceContents, EmbeddedResource, ImageContent, TextResourceContents,
+    };
+
+    #[test]
+    fn acp_prompt_flattens_text_embedded_text_and_resource_links_in_order() {
+        let prompt = vec![
+            ContentBlock::Text(TextContent::new("explain")),
+            ContentBlock::ResourceLink(
+                ResourceLink::new("README.md", "file:///C:/workspace/README.md")
+                    .mime_type("text/markdown")
+                    .description("Project documentation"),
+            ),
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                    "fn main() {}",
+                    "file:///C:/workspace/main.rs",
+                )),
+            )),
+        ];
+
+        assert_eq!(
+            prompt_text(&prompt).unwrap(),
+            "explain\nReferenced resource:\nName: README.md\nURI: file:///C:/workspace/README.md\nMIME type: text/markdown\nDescription: Project documentation\nEmbedded resource:\nURI: file:///C:/workspace/main.rs\nMIME type: text/plain\nContent:\nfn main() {}"
+        );
+    }
+
+    #[test]
+    fn acp_prompt_rejects_images_and_binary_embedded_resources() {
+        let image = [ContentBlock::Image(ImageContent::new(
+            "aGVsbG8=",
+            "image/png",
+        ))];
+        assert_eq!(
+            prompt_text(&image).unwrap_err().to_string(),
+            "image input is not supported"
+        );
+
+        let blob = [ContentBlock::Resource(EmbeddedResource::new(
+            EmbeddedResourceResource::BlobResourceContents(BlobResourceContents::new(
+                "JVBERi0=",
+                "attachment://report.pdf",
+            )),
+        ))];
+        assert_eq!(
+            prompt_text(&blob).unwrap_err().to_string(),
+            "binary embedded resources are not supported"
+        );
+    }
 
     #[test]
     fn acp_exposes_model_reasoning_and_policy_options() {

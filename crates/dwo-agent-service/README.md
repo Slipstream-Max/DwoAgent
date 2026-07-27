@@ -78,8 +78,11 @@ AgentService
 
 Loading an active ID returns the existing actor. Repository `list` does not load
 sessions. Different session actors run concurrently. `prompt` starts immediately
-when idle; when a turn is active it atomically cancels that turn and starts the
-queued replacement after cancellation finishes.
+when idle. During an active turn, user and internal messages enter one FIFO and
+are appended after the current model response or tool-call batch. User messages
+keep the turn running; watcher-style internal messages can be appended without
+waking another model step. Explicit cancellation clears queued user messages,
+preserves internal messages, and is the only prompt path that interrupts a turn.
 
 The filesystem repository serializes save/load/delete only within the same
 `SessionId`. Records for different sessions do not share a filesystem write

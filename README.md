@@ -42,7 +42,7 @@ cargo build --release -p dwo-agent
 ./target/release/dwo.exe daemon status
 ```
 
-`install` creates the default profile at `~/.dwoagent/profile.yaml` and registers user-login startup. Use global `--config-path <path>` to operate another profile.
+`install` copies the CLI to `~/.dwoagent/bin`, adds that directory to the user PATH on Windows, creates the default profile at `~/.dwoagent/profile.yaml`, and registers user-login startup against the installed executable. Use global `--config-path <path>` to operate another profile.
 
 ## Commands
 
@@ -50,7 +50,8 @@ The complete command and behavior reference is [docs/commands.md](docs/commands.
 
 ```text
 dwo daemon start|stop|status
-dwo session list|new|delete|prompt|cancel|watch|model|reasoning
+dwo profile-list
+dwo session list|delete|prompt|cancel|watch|approve|deny
 dwo channel weixin status|bind|unbind|send-message|send-file
 dwo channel telegram status|bind|unbind|send-message|send-file
 dwo channel feishu status|bind|unbind|send-message|send-file
@@ -61,7 +62,7 @@ dwo automation list|status|run
 dwo acp
 ```
 
-Human-facing CLI output is readable YAML-style text. `session watch` is a continuous stream of reasoning, tool calls/results, answers, and terminal state; use `Ctrl+C` to stop watching. JSON is retained only where it is an explicit machine payload, such as MCP `--args` or automation `--json`.
+Human-facing CLI output is readable YAML-style text. `session watch` reads a bounded page of recent reasoning, tool calls/results, and answers; use its cursor to read later activity. JSON is retained only where it is an explicit machine payload, such as MCP `--args` or automation `--json`.
 
 ## Profile And Persistence
 

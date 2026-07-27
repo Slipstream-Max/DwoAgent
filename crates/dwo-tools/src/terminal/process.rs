@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -41,9 +42,11 @@ impl TerminalProcess {
         command: String,
         cwd: std::path::PathBuf,
         tty: bool,
+        environment_overrides: &HashMap<String, String>,
     ) -> Result<Arc<Self>> {
         let (program, args) = shell_command(&command);
-        let env = environment::current();
+        let mut env = environment::current();
+        env.extend(environment_overrides.clone());
         let spawned = if tty {
             dwo_pty::spawn_pty_process(
                 &program,

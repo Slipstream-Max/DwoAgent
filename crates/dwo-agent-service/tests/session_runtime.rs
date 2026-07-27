@@ -15,6 +15,7 @@ use support::{ScriptedCompletionStep, ScriptedModelGateway, ScriptedStep, Script
 fn new_session(cwd: &std::path::Path, mode: SessionMode) -> NewSession {
     NewSession {
         id: None,
+        parent_session_id: None,
         title: Some("test".to_string()),
         cwd: cwd.to_path_buf(),
         mode,
@@ -66,6 +67,7 @@ async fn unnamed_session_gets_model_generated_title() {
     let agent = service
         .create(NewSession {
             id: None,
+            parent_session_id: None,
             title: None,
             cwd: dir.path().to_path_buf(),
             mode: SessionMode::FullAccess,
@@ -409,10 +411,10 @@ async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
 }
 
 #[tokio::test]
-async fn prompt_waits_for_cancellation_then_starts_the_replacement_turn() {
+async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([
-        ScriptedStep::delayed_text("obsolete", 5_000),
+        ScriptedStep::delayed_text("first answer", 200),
         ScriptedStep::text("replacement"),
     ]);
     let service = AgentService::new(
@@ -439,14 +441,10 @@ async fn prompt_waits_for_cancellation_then_starts_the_replacement_turn() {
         .await
         .unwrap()
         .unwrap();
-    assert_ne!(first, second);
+    assert_eq!(first, second);
     assert!(matches!(
         wait_for_turn_end(&mut events).await,
-        SessionEventPayload::TurnCancelled { turn_id } if turn_id == first
-    ));
-    assert!(matches!(
-        wait_for_turn_end(&mut events).await,
-        SessionEventPayload::TurnCompleted { turn_id } if turn_id == second
+        SessionEventPayload::TurnCompleted { turn_id } if turn_id == first
     ));
 
     let requests = model.requests().await;
@@ -462,6 +460,132 @@ async fn prompt_waits_for_cancellation_then_starts_the_replacement_turn() {
         snapshot.record.context.messages.last().unwrap().content,
         "replacement"
     );
+}
+
+#[tokio::test]
+async fn cancel_clears_queued_user_prompts() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::delayed_text("late", 5_000)]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    let first = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    while model.requests().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let queued_agent = agent.clone();
+    let queued =
+        tokio::spawn(async move { queued_agent.prompt(EndpointId::new(), "queued").await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    agent.cancel(Some(first.clone())).await.unwrap();
+    let error = queued.await.unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        dwo_agent_service::AgentServiceError::PromptCancelled(_)
+    ));
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCancelled { turn_id } if turn_id == first
+    ));
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(snapshot.transcript.iter().all(|event| {
+        !matches!(
+            &event.payload,
+            SessionEventPayload::UserPromptSubmitted { content, .. }
+                if content.as_text() == Some("queued")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn queued_prompts_are_delivered_fifo_in_the_same_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::delayed_text("first answer", 200),
+        ScriptedStep::text("combined answer"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    let turn = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    while model.requests().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second_agent = agent.clone();
+    let second =
+        tokio::spawn(async move { second_agent.prompt(EndpointId::new(), "second").await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let third_agent = agent.clone();
+    let third = tokio::spawn(async move { third_agent.prompt(EndpointId::new(), "third").await });
+    assert_eq!(second.await.unwrap().unwrap(), turn);
+    assert_eq!(third.await.unwrap().unwrap(), turn);
+    wait_for_turn_end(&mut events).await;
+
+    let requests = model.requests().await;
+    let users = requests[1]
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == dwo_agent_service::MessageRole::User
+                && message.kind == dwo_agent_service::MessageKind::Conversation
+        })
+        .map(|message| message.content.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(users, ["first", "second", "third"]);
+}
+
+#[tokio::test]
+async fn cancel_keeps_internal_messages_without_waking_another_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::delayed_text("late", 5_000)]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    let turn = agent.prompt(EndpointId::new(), "work").await.unwrap();
+    while model.requests().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let notifying_agent = agent.clone();
+    let notification = tokio::spawn(async move {
+        notifying_agent
+            .notify_internal("<env_watcher>changed</env_watcher>")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    agent.cancel(Some(turn.clone())).await.unwrap();
+    assert_eq!(notification.await.unwrap().unwrap(), None);
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCancelled { turn_id } if turn_id == turn
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(model.requests().await.len(), 1);
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(snapshot.record.context.messages.iter().any(|message| {
+        message.kind == dwo_agent_service::MessageKind::Runtime
+            && message.content.contains("<env_watcher>")
+    }));
 }
 
 #[tokio::test]
@@ -537,6 +661,127 @@ async fn rejected_duplicate_file_edits_keep_calls_and_results_unchanged_before_r
     );
     assert!(!dir.path().join("a").exists());
     assert!(!dir.path().join("b").exists());
+}
+
+#[tokio::test]
+async fn internal_message_during_tool_execution_is_injected_after_the_tool_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = if cfg!(windows) {
+        "Start-Sleep -Milliseconds 250; Write-Output done"
+    } else {
+        "sleep 0.25; printf done"
+    };
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::tools(
+            Vec::new(),
+            vec![json!({
+                "id": "slow-tool",
+                "name": "terminal",
+                "arguments": {"action": "run", "command": command}
+            })],
+        ),
+        ScriptedStep::text("used child result"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "start work").await.unwrap();
+
+    loop {
+        if matches!(
+            events.recv().await.unwrap().payload,
+            SessionEventPayload::ToolStarted { .. }
+        ) {
+            break;
+        }
+    }
+    agent
+        .notify_internal("<subsession_result session_id=\"child\">ready</subsession_result>")
+        .await
+        .unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { .. }
+    ));
+
+    let requests = model.requests().await;
+    assert_eq!(requests.len(), 2);
+    let notification_index = requests[1]
+        .messages
+        .iter()
+        .position(|message| {
+            message.kind == dwo_agent_service::MessageKind::Runtime
+                && message.content.contains("<subsession_result")
+        })
+        .unwrap();
+    let tool_index = requests[1]
+        .messages
+        .iter()
+        .position(|message| message.role == dwo_agent_service::MessageRole::Tool)
+        .unwrap();
+    assert!(
+        notification_index > tool_index,
+        "message order: {:?}",
+        requests[1]
+            .messages
+            .iter()
+            .map(|message| (&message.role, &message.content))
+            .collect::<Vec<_>>()
+    );
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(
+        snapshot
+            .transcript
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                SessionEventPayload::UserPromptSubmitted { .. }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn waking_internal_message_starts_an_idle_session_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::text("handled notification")]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent
+        .notify_internal("<subsession_result session_id=\"child\">done</subsession_result>")
+        .await
+        .unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { .. }
+    ));
+    let requests = model.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().any(|message| {
+        message.kind == dwo_agent_service::MessageKind::Runtime
+            && message.content.contains("<subsession_result")
+    }));
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(snapshot.transcript.iter().all(|event| !matches!(
+        event.payload,
+        SessionEventPayload::UserPromptSubmitted { .. }
+    )));
 }
 
 #[tokio::test]
@@ -1253,6 +1498,7 @@ async fn prompt_is_stable_while_agents_changes_are_appended_as_watcher_messages(
     let agent = service
         .create(NewSession {
             id: None,
+            parent_session_id: None,
             title: Some("profile test".to_string()),
             cwd: cwd.clone(),
             mode: SessionMode::FullAccess,

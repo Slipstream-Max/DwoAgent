@@ -45,6 +45,7 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    ProfileList,
     Channel {
         #[command(subcommand)]
         command: ChannelCommand,
@@ -69,32 +70,37 @@ enum DaemonCommand {
 
 #[derive(Subcommand)]
 enum SessionCommand {
-    List,
-    New {
-        name: Option<String>,
+    List {
         #[arg(long)]
-        cwd: Option<PathBuf>,
+        all: bool,
     },
     Delete {
         id: String,
     },
     Prompt {
-        id: String,
         message: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        policy: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        reasoning: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
     },
     Cancel {
         id: String,
     },
     Watch {
         id: String,
-    },
-    Model {
-        id: String,
-        model: String,
-    },
-    Reasoning {
-        id: String,
-        reasoning: Option<String>,
+        #[arg(long)]
+        cursor: Option<usize>,
+        #[arg(long, default_value_t = 3)]
+        limit: usize,
     },
     Approve {
         id: String,
@@ -103,7 +109,6 @@ enum SessionCommand {
     Deny {
         id: String,
         permission_id: String,
-        reason: Option<String>,
     },
 }
 
@@ -213,6 +218,10 @@ pub(crate) async fn run() -> Result<()> {
             }
         },
         Command::Session { command } => run_session(command, &config_path).await?,
+        Command::ProfileList => {
+            let value = ipc::request(&config_path, "profile.list", json!({})).await?;
+            print_value(&value)?;
+        }
         Command::Channel { command } => run_channel(command, &config_path).await?,
         Command::Mcp { command } => run_mcp(command, &config_path).await?,
         Command::Automation { command } => run_automation(command, &config_path).await?,
@@ -304,31 +313,44 @@ async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
 async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> {
     let endpoint_id = format!("cli-{}", Uuid::new_v4());
     match command {
-        SessionCommand::List => {
-            let value = ipc::request(config_path, "session.list", json!({})).await?;
-            render::print_session_list(&value)?;
-        }
-        SessionCommand::New { name, cwd } => {
+        SessionCommand::List { all } => {
             let value = ipc::request(
                 config_path,
-                "session.new",
-                json!({"title": name, "cwd": cwd}),
+                "session.list",
+                json!({"all": all, "caller_session_id": current_session_id()}),
             )
             .await?;
-            print_value(&value)?;
+            render::print_session_list(&value)?;
         }
         SessionCommand::Delete { id } => {
             ipc::request(config_path, "session.delete", json!({"session_id": id})).await?;
             println!("Deleted session");
         }
-        SessionCommand::Prompt { id, message } => {
+        SessionCommand::Prompt {
+            message,
+            title,
+            cwd,
+            policy,
+            model,
+            reasoning,
+            to,
+        } => {
+            let policy = policy
+                .map(|value| dwo_tools::SessionMode::parse(&value).map_err(anyhow::Error::msg))
+                .transpose()?;
             let value = ipc::request(
                 config_path,
                 "session.prompt",
                 json!({
-                    "session_id": id,
+                    "session_id": to,
+                    "caller_session_id": current_session_id(),
                     "endpoint_id": endpoint_id,
                     "message": message,
+                    "title": title,
+                    "cwd": cwd,
+                    "policy": policy,
+                    "model": model,
+                    "reasoning": reasoning,
                 }),
             )
             .await?;
@@ -338,40 +360,29 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             ipc::request(config_path, "session.cancel", json!({"session_id": id})).await?;
             println!("Cancellation requested");
         }
-        SessionCommand::Watch { id } => {
-            let (snapshot, events) = ipc::subscribe(config_path, &id, &endpoint_id).await?;
-            render::stream_watch(std::io::stdout(), snapshot, events).await?;
-        }
-        SessionCommand::Model { id, model } => {
-            ipc::request(
+        SessionCommand::Watch { id, cursor, limit } => {
+            let value = ipc::request(
                 config_path,
-                "session.set_model",
-                json!({"session_id": id, "value": model}),
+                "session.read",
+                json!({"session_id": id, "cursor": cursor, "limit": limit}),
             )
             .await?;
-            println!("Model updated");
-        }
-        SessionCommand::Reasoning { id, reasoning } => {
-            ipc::request(
-                config_path,
-                "session.set_reasoning",
-                json!({"session_id": id, "value": reasoning}),
-            )
-            .await?;
-            println!("Reasoning updated");
+            print_value(&value)?;
         }
         SessionCommand::Approve { id, permission_id } => {
             permission(config_path, id, endpoint_id, permission_id, true, None).await?;
         }
-        SessionCommand::Deny {
-            id,
-            permission_id,
-            reason,
-        } => {
-            permission(config_path, id, endpoint_id, permission_id, false, reason).await?;
+        SessionCommand::Deny { id, permission_id } => {
+            permission(config_path, id, endpoint_id, permission_id, false, None).await?;
         }
     }
     Ok(())
+}
+
+fn current_session_id() -> Option<String> {
+    std::env::var("DWO_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 async fn permission(
@@ -575,6 +586,8 @@ fn start_registered_service() -> Result<bool> {
 
 fn install(config_path: &Path) -> Result<()> {
     let root = config_path.parent().context("config path has no parent")?;
+    let executable = install_executable(root)?;
+    expose_executable(root.join("bin"))?;
     std::fs::create_dir_all(root.join("resource/prompts"))?;
     std::fs::create_dir_all(root.join("resource/skills"))?;
     std::fs::create_dir_all(root.join("runtime/sessions"))?;
@@ -591,7 +604,55 @@ fn install(config_path: &Path) -> Result<()> {
         &root.join("resource/mcp.json"),
         "{\n  \"mcpServers\": {}\n}\n",
     )?;
-    register_service(config_path)
+    register_service(config_path, &executable)
+}
+
+fn install_executable(root: &Path) -> Result<PathBuf> {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let executable_name = if cfg!(windows) { "dwo.exe" } else { "dwo" };
+    let destination = bin.join(executable_name);
+    let source = std::env::current_exe()?;
+    if destination.exists()
+        && std::fs::canonicalize(&source)? == std::fs::canonicalize(&destination)?
+    {
+        return Ok(destination);
+    }
+
+    let temporary = bin.join(format!(".{executable_name}.{}.tmp", Uuid::new_v4()));
+    std::fs::copy(&source, &temporary)
+        .with_context(|| format!("install executable at {}", destination.display()))?;
+    if destination.exists() {
+        std::fs::remove_file(&destination)
+            .with_context(|| format!("replace executable at {}", destination.display()))?;
+    }
+    if let Err(error) = std::fs::rename(&temporary, &destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("install executable at {}", destination.display()));
+    }
+    Ok(destination)
+}
+
+#[cfg(windows)]
+fn expose_executable(bin: PathBuf) -> Result<()> {
+    let status = ProcessCommand::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$bin = $env:DWO_INSTALL_BIN; $path = [Environment]::GetEnvironmentVariable('Path', 'User'); $entries = @($path -split ';' | Where-Object { $_ }); if (-not ($entries | Where-Object { $_.TrimEnd('\\') -ieq $bin.TrimEnd('\\') })) { [Environment]::SetEnvironmentVariable('Path', (($entries + $bin) -join ';'), 'User') }",
+        ])
+        .env("DWO_INSTALL_BIN", &bin)
+        .status()?;
+    if !status.success() {
+        bail!("failed to add {} to the user PATH", bin.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn expose_executable(_bin: PathBuf) -> Result<()> {
+    Ok(())
 }
 
 fn write_if_missing(path: &Path, content: &str) -> Result<()> {
@@ -602,20 +663,29 @@ fn write_if_missing(path: &Path, content: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn register_service(config_path: &Path) -> Result<()> {
-    let executable = std::env::current_exe()?;
+fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
+    let root = config_path.parent().context("config path has no parent")?;
+    let launcher = root.join("runtime/dwo-daemon.vbs");
     let command = format!(
         "\"{}\" --config-path \"{}\" serve",
         executable.display(),
         config_path.display()
     );
-    let root = config_path.parent().context("config path has no parent")?;
-    let launcher = root.join("runtime/dwo-daemon.vbs");
     let script = format!(
         "Set shell = CreateObject(\"WScript.Shell\")\r\nexitCode = shell.Run(\"{}\", 0, True)\r\nWScript.Quit exitCode\r\n",
         command.replace('"', "\"\"")
     );
     std::fs::write(&launcher, script)?;
+    let exists = ProcessCommand::new("schtasks.exe")
+        .args(["/Query", "/TN", "dwoagent"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success();
+    if exists {
+        return Ok(());
+    }
+
     let task = format!("wscript.exe \"{}\"", launcher.display());
     let status = ProcessCommand::new("schtasks.exe")
         .args(["/Create", "/SC", "ONLOGON", "/TN", "dwoagent", "/TR"])
@@ -639,9 +709,8 @@ fn register_service(config_path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn register_service(config_path: &Path) -> Result<()> {
+fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let executable = std::env::current_exe()?;
     let home = home_dir()?;
     let launch_agents = home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&launch_agents)?;
@@ -667,7 +736,7 @@ fn register_service(config_path: &Path) -> Result<()> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn register_service(_config_path: &Path) -> Result<()> {
+fn register_service(_config_path: &Path, _executable: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -923,5 +992,69 @@ mod tests {
                 command: AutomationCommand::Run { ref job, json: false }
             } if job == "daily-report"
         ));
+    }
+
+    #[test]
+    fn parses_subsession_commands() {
+        let prompt = Cli::try_parse_from([
+            "dwo",
+            "session",
+            "prompt",
+            "inspect the failure",
+            "--title",
+            "inspector",
+            "--policy",
+            "watch",
+            "--model",
+            "fast",
+            "--reasoning",
+            "high",
+        ])
+        .unwrap();
+        assert!(matches!(
+            prompt.command,
+            Command::Session {
+                command: SessionCommand::Prompt {
+                    ref message,
+                    ref title,
+                    ref policy,
+                    ref model,
+                    ref reasoning,
+                    to: None,
+                    ..
+                }
+            } if message == "inspect the failure"
+                && title.as_deref() == Some("inspector")
+                && policy.as_deref() == Some("watch")
+                && model.as_deref() == Some("fast")
+                && reasoning.as_deref() == Some("high")
+        ));
+
+        let watch = Cli::try_parse_from([
+            "dwo",
+            "session",
+            "watch",
+            "session-child",
+            "--cursor",
+            "12",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            watch.command,
+            Command::Session {
+                command: SessionCommand::Watch {
+                    ref id,
+                    cursor: Some(12),
+                    limit: 5,
+                }
+            } if id == "session-child"
+        ));
+
+        assert!(Cli::try_parse_from(["dwo", "session", "new"]).is_err());
+        assert!(Cli::try_parse_from(["dwo", "session", "model", "id", "model"]).is_err());
+        assert!(Cli::try_parse_from(["dwo", "profile-list"]).is_ok());
+        assert!(Cli::try_parse_from(["dwo", "profilelist"]).is_err());
     }
 }

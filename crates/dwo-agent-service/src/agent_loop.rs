@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use dwo_context::{
-    CompactionPlan, CompactionPlanner, ContextManager, SessionContext, SystemPromptBuilder,
-    ToolResultRecord, TurnId,
+    CompactionPlan, CompactionPlanner, ContextManager, MessageContent, MessageKind, SessionContext,
+    SystemPromptBuilder, ToolResultRecord, TurnId,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection, ModelStreamEvent};
 use dwo_tools::{ExecutionContext, ParsedToolCall, ToolManager, ToolResult};
@@ -26,6 +26,19 @@ pub(crate) enum TurnActorMessage {
         context: Box<SessionContext>,
         completed: oneshot::Sender<anyhow::Result<()>>,
     },
+    TakePendingMessages {
+        completed: oneshot::Sender<PendingMessageBatch>,
+    },
+}
+
+pub(crate) enum PendingContextMessage {
+    User(MessageContent),
+    Internal(MessageContent),
+}
+
+pub(crate) struct PendingMessageBatch {
+    pub messages: Vec<PendingContextMessage>,
+    pub should_continue: bool,
 }
 
 pub(crate) enum TurnEvent {
@@ -90,6 +103,29 @@ impl RunTurn {
             .map_err(|_| anyhow::anyhow!("session actor stopped"))?;
         wait.await
             .map_err(|_| anyhow::anyhow!("session actor dropped checkpoint"))?
+    }
+
+    async fn take_pending_messages(&self) -> anyhow::Result<PendingMessageBatch> {
+        let (completed, wait) = oneshot::channel();
+        self.actor
+            .send(TurnActorMessage::TakePendingMessages { completed })
+            .map_err(|_| anyhow::anyhow!("session actor stopped"))?;
+        wait.await
+            .map_err(|_| anyhow::anyhow!("session actor dropped pending message request"))
+    }
+
+    fn append_pending_messages(&mut self, batch: PendingMessageBatch) -> bool {
+        for message in batch.messages {
+            match message {
+                PendingContextMessage::User(content) => {
+                    self.context.append_user(self.turn_id.clone(), content);
+                }
+                PendingContextMessage::Internal(content) => {
+                    self.context.append_internal(MessageKind::Runtime, content);
+                }
+            }
+        }
+        batch.should_continue
     }
 }
 
@@ -156,6 +192,21 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             tool_calls: active_tool_calls.clone(),
         });
         if response.tool_calls.is_empty() {
+            let pending = match turn.take_pending_messages().await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
+                }
+            };
+            if turn.append_pending_messages(pending) {
+                refresh_context_usage(turn);
+                if let Err(error) = turn.checkpoint().await {
+                    return TurnOutcome::Failed(format!(
+                        "persist pending message checkpoint: {error:#}"
+                    ));
+                }
+                continue;
+            }
             if let Err(error) = turn.checkpoint().await {
                 return TurnOutcome::Failed(format!("persist assistant checkpoint: {error:#}"));
             }
@@ -193,6 +244,13 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             turn.context
                 .append_tool(turn.turn_id.clone(), context_result);
         }
+        let pending = match turn.take_pending_messages().await {
+            Ok(pending) => pending,
+            Err(error) => {
+                return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
+            }
+        };
+        turn.append_pending_messages(pending);
         refresh_context_usage(turn);
         if let Err(error) = turn.checkpoint().await {
             return TurnOutcome::Failed(format!("persist tool checkpoint: {error:#}"));

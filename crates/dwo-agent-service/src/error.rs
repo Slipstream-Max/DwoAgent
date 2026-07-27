@@ -4,8 +4,8 @@ use crate::{SessionId, TurnId};
 pub enum AgentServiceError {
     #[error("session not found: {0}")]
     SessionNotFound(SessionId),
-    #[error("session is busy: {0}")]
-    SessionBusy(SessionId),
+    #[error("queued prompt was cancelled: {0}")]
+    PromptCancelled(SessionId),
     #[error("turn is not active: {0}")]
     TurnNotActive(TurnId),
     #[error("permission request not found: {0}")]

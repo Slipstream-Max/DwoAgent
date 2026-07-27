@@ -60,6 +60,7 @@ struct TerminalEntry {
 
 pub struct TerminalManager {
     base_cwd: PathBuf,
+    environment: HashMap<String, String>,
     terminals: RwLock<HashMap<TerminalId, Arc<TerminalEntry>>>,
 }
 
@@ -77,9 +78,17 @@ pub struct TerminalSnapshot {
 
 impl TerminalManager {
     pub fn new(base_cwd: impl Into<PathBuf>) -> Result<Self> {
+        Self::new_with_environment(base_cwd, HashMap::new())
+    }
+
+    pub fn new_with_environment(
+        base_cwd: impl Into<PathBuf>,
+        environment: HashMap<String, String>,
+    ) -> Result<Self> {
         let base_cwd = std::fs::canonicalize(base_cwd.into())?;
         Ok(Self {
             base_cwd,
+            environment,
             terminals: RwLock::new(HashMap::new()),
         })
     }
@@ -94,7 +103,9 @@ impl TerminalManager {
     ) -> Result<TerminalSnapshot> {
         let cwd = resolve_cwd(&self.base_cwd, cwd)?;
         let terminal_id = TerminalId::new();
-        let process = TerminalProcess::spawn(terminal_id.clone(), command, cwd, tty).await?;
+        let process =
+            TerminalProcess::spawn(terminal_id.clone(), command, cwd, tty, &self.environment)
+                .await?;
         let entry = Arc::new(TerminalEntry {
             process: process.clone(),
             operation: Mutex::new(()),

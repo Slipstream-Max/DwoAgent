@@ -37,14 +37,12 @@ dwo uninstall [--purge]
 dwo serve --config-path <profile.yaml>
 dwo daemon start|stop|status
 
-dwo session list
-dwo session new [name] [--cwd <path>]
+dwo profile-list
+dwo session list [--all]
 dwo session delete <id>
-dwo session prompt <id> <message>
+dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <id>]
 dwo session cancel <id>
-dwo session watch <id>
-dwo session model <id> <model>
-dwo session reasoning <id> [reasoning]
+dwo session watch <id> [--cursor <cursor>] [--limit <count>]
 dwo session approve|deny <id> <permission-id>
 
 dwo channel list
@@ -73,7 +71,11 @@ dwo automation run <job> [--json]
 dwo acp
 ```
 
-`session model` can move an idle image-bearing session to a text-only model.
+`dwo install` deploys the running executable to `~/.dwoagent/bin`, adds that
+directory to the Windows user PATH, and registers the daemon using the stable
+installed path.
+
+`session prompt --to ... --model ...` can move an idle image-bearing session to a text-only model.
 Before committing the switch, the current image-capable model converts the
 images into a text summary; the model context is then image-free while replay
 keeps the original image events. The switch fails without changing state if
@@ -257,18 +259,17 @@ binary embedded resources are rejected. `embeddedContext` remains enabled for
 clients that paste text file contents, while `image` and `audio` remain
 disabled.
 
-External prompts use interrupt semantics: an active turn is cancelled, the
-host waits for its terminal event, and then starts the replacement turn. The
-origin endpoint does not receive its own prompt notification; every other
-observer does.
+External prompts use stable FIFO semantics. During an active turn they wait for
+the current model-response or tool-call boundary, join that turn in arrival
+order, and never cancel tools implicitly. The origin endpoint does not receive
+its own prompt notification; every other observer does.
 
 ## Automation
 
 The daemon watches the `automation` section in `profile.yaml`. Jobs use a
 standard five-field cron expression and either create a fresh session for every
-run or target a fixed session. A fixed-session run intentionally uses the same
-prompt semantics as an interactive interruption: an active turn is cancelled,
-then the automation prompt starts.
+run or target a fixed session. A fixed-session run uses the same FIFO prompt
+semantics as other clients and joins an active turn at its next safe boundary.
 
 Automation is unattended. Tool confirmation requests are denied automatically
 instead of waiting forever. Automation does not create a separate state or

@@ -13,32 +13,36 @@ dwo daemon stop
 dwo daemon status
 ```
 
-`install` 创建固定的 profile/resource/runtime 目录并注册 daemon 自启动任务。`--start` 同时启动 daemon。`serve` 在前台运行 host；通常由系统任务或 `daemon start` 管理。`daemon status` 返回 YAML 风格的健康状态、session 数量、channel 数量和 automation 数量。
+`install` 把当前 CLI 复制到 `~/.dwoagent/bin/dwo`（Windows 为 `dwo.exe`），在 Windows 用户级 PATH 中幂等加入该目录，创建固定的 profile/resource/runtime 目录，并使用安装后的固定路径注册 daemon 自启动任务。`--start` 同时启动 daemon。`serve` 在前台运行 host；通常由系统任务或 `daemon start` 管理。`daemon status` 返回 YAML 风格的健康状态、session 数量、channel 数量和 automation 数量。
 
 daemon 启动 host 时会并发初始化 `resource/mcp.json` 中的全部 MCP server。每个 server 会等待到 `ready`、`auth_required` 或 `failed`；stdio/HTTP 连接由 daemon 持续托管并复用。新增或修改配置由 watcher 使用相同流程初始化。`runtime/mcp/catalog.json` 是内存 catalog 的派生投影，不是活跃连接的凭据。
 
 ## Session
 
 ```text
-dwo session list
-dwo session new [name] [--cwd <path>]
+dwo profile-list
+dwo session list [--all]
 dwo session delete <session-id>
-dwo session prompt <session-id> <message>
+dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <session-id>]
 dwo session cancel <session-id>
-dwo session watch <session-id>
-dwo session model <session-id> <model>
-dwo session reasoning <session-id> [reasoning]
+dwo session watch <session-id> [--cursor <cursor>] [--limit <count>]
 dwo session approve <session-id> <permission-id>
-dwo session deny <session-id> <permission-id> [reason]
+dwo session deny <session-id> <permission-id>
 ```
 
-`session list` 只输出 session id 和标题。`session watch` 先输出当前 snapshot，然后持续流式输出 reasoning、tool call、tool result、answer 和状态事件；它是持续订阅，使用 `Ctrl+C` 退出。
+agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此创建根 session并使用 profile 默认值。
 
-普通 CLI 输出使用适合终端阅读的 YAML 风格文本，不把 JSONL 直接打印给用户。`session prompt`、`session new` 等命令的响应也遵循这一规则。
+`session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 profile 中的全部 session。`profile-list` 输出 profile 描述、默认 policy、可用 model/reasoning、默认 model 和 session 总数。
 
-`session cancel` 只请求取消当前 turn。正在运行的 terminal/tool future 会先清理，session 等待取消结果后才恢复 idle；取消期间提交的新 prompt 会排队到旧 turn 完成之后。
+`session watch` 默认返回最近 3 个内容事件及 `next_cursor`，不会建立持续广播。传入 `--cursor <next_cursor>` 可读取之后的事件，`--limit` 范围为 1 到 100。普通 CLI 输出使用适合终端阅读的 YAML 风格文本。
 
-`session model` 的模型切换应用于后续 model request。若目标模型支持图片则直接切换；若目标模型是纯文本模型且当前 context 含图片，idle session 会先使用当前或最后成功的视觉模型生成文字摘要，再重建无图 model context。摘要失败时模型和 context 都不改变；图片 turn 运行期间不允许降级切换。client transcript 始终保留原始图片用于 replay，文本模型也会在持久化前拒绝新的图片 prompt。迁移成功会将当前 context token 重置为 0，并按目标模型窗口发送新的 usage update。
+子 session 的 turn 结束后，daemon 自动向父 agent 投递 `<subsession_result>`。父 agent idle 时立即启动；父 agent 正在运行时先缓冲，并在当前 tool call 批次结束后写入上下文。
+
+active turn 运行期间收到的新 prompt 会进入 session FIFO，在当前 model response 或 tool-call batch 完成后按顺序写入同一个 turn，不会隐式 cancel 或关闭 tools。内部 watcher/子 session 消息使用 internal context message，不会伪装成用户事件。
+
+`session cancel` 是唯一主动中断当前 turn 的入口。取消会清理排队的用户 prompt；已经到达的 internal watcher 消息仍写入 context，但不会因此启动下一次模型调用。
+
+`session prompt --to ... --model ...` 的模型切换应用于后续 model request。若目标模型支持图片则直接切换；若目标模型是纯文本模型且当前 context 含图片，idle session 会先使用当前或最后成功的视觉模型生成文字摘要，再重建无图 model context。摘要失败时模型和 context 都不改变；图片 turn 运行期间不允许降级切换。client transcript 始终保留原始图片用于 replay，文本模型也会在持久化前拒绝新的图片 prompt。迁移成功会将当前 context token 重置为 0，并按目标模型窗口发送新的 usage update。
 
 Session 文件布局为：
 

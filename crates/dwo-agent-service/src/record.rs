@@ -63,6 +63,8 @@ pub struct SessionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionId>,
     pub title: String,
     pub cwd: PathBuf,
     pub mode: SessionMode,
@@ -126,6 +128,7 @@ impl SessionRecord {
         Self {
             info: SessionInfo {
                 id,
+                parent_session_id: None,
                 title,
                 cwd,
                 mode,
@@ -136,6 +139,10 @@ impl SessionRecord {
             context: SessionContext::default(),
             auto_title_pending: false,
         }
+    }
+
+    pub(crate) fn set_parent_session_id(&mut self, parent_session_id: Option<SessionId>) {
+        self.info.parent_session_id = parent_session_id;
     }
 
     pub(crate) fn enable_auto_title(&mut self) {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -61,7 +62,19 @@ impl ToolManager {
         policy: Arc<ToolPolicyEngine>,
         file_edit: Arc<FileEditManager>,
     ) -> Result<Self> {
-        let terminals = Arc::new(TerminalManager::new(&cwd)?);
+        Self::new_with_environment(cwd, policy, file_edit, [])
+    }
+
+    pub fn new_with_environment(
+        cwd: PathBuf,
+        policy: Arc<ToolPolicyEngine>,
+        file_edit: Arc<FileEditManager>,
+        environment: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self> {
+        let terminals = Arc::new(TerminalManager::new_with_environment(
+            &cwd,
+            environment.into_iter().collect::<HashMap<_, _>>(),
+        )?);
         Ok(Self {
             cwd,
             policy,

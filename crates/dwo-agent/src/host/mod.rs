@@ -4,10 +4,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use dwo_agent_service::{
     AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession, SessionConfig,
-    SessionConfigUpdate, SessionId, SessionLlmSettings,
+    SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings,
 };
 use dwo_mcp::McpRuntime;
-use dwo_tools::{ConfirmationDecision, PolicyConfig};
+use dwo_tools::{ConfirmationDecision, PolicyConfig, SessionMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,8 @@ pub struct Host {
     default_model: String,
     default_mode: dwo_tools::SessionMode,
     model_options: Vec<SessionModelOption>,
+    profile_name: String,
+    profile_description: String,
     shutdown: CancellationToken,
 }
 
@@ -43,10 +45,35 @@ struct NewSessionParam {
 }
 
 #[derive(Deserialize)]
+struct ListSessionParam {
+    #[serde(default)]
+    all: bool,
+    caller_session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct PromptParam {
-    session_id: String,
+    session_id: Option<String>,
+    caller_session_id: Option<String>,
     endpoint_id: String,
     message: String,
+    title: Option<String>,
+    cwd: Option<PathBuf>,
+    policy: Option<SessionMode>,
+    model: Option<String>,
+    reasoning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReadSessionParam {
+    session_id: String,
+    cursor: Option<usize>,
+    #[serde(default = "default_read_limit")]
+    limit: usize,
+}
+
+fn default_read_limit() -> usize {
+    3
 }
 
 #[derive(Deserialize)]
@@ -142,6 +169,17 @@ struct SessionOptionSnapshot {
     models: Vec<SessionModelOption>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileSnapshot {
+    name: String,
+    description: String,
+    policy: SessionMode,
+    default_model: String,
+    models: Vec<SessionModelOption>,
+    session_count: usize,
+}
+
 impl Host {
     pub async fn load(config_path: &Path) -> Result<Arc<Self>> {
         let profile_root = profile_root(config_path)?;
@@ -150,6 +188,8 @@ impl Host {
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
+        let profile_name = profile.config.name.clone();
+        let profile_description = profile.config.description.clone();
         let model_options = profile
             .models
             .models
@@ -189,6 +229,8 @@ impl Host {
             default_model,
             default_mode,
             model_options,
+            profile_name,
+            profile_description,
             shutdown,
         });
         host.channel_hub.start_all(host.clone()).await;
@@ -223,7 +265,23 @@ impl Host {
                 self.shutdown.cancel();
                 Ok(json!({"stopping": true}))
             }
-            "session.list" => Ok(serde_json::to_value(self.service.list().await?)?),
+            "profile.list" => Ok(serde_json::to_value(ProfileSnapshot {
+                name: self.profile_name.clone(),
+                description: self.profile_description.clone(),
+                policy: self.default_mode,
+                default_model: self.default_model.clone(),
+                models: self.model_options.clone(),
+                session_count: self.service.list().await?.len(),
+            })?),
+            "session.list" => {
+                let params: ListSessionParam = serde_json::from_value(params)?;
+                let caller = parse_optional_session(params.caller_session_id.clone())?;
+                let mut records = self.service.list().await?;
+                if !params.all {
+                    records.retain(|record| record.info.parent_session_id == caller);
+                }
+                Ok(serde_json::to_value(records)?)
+            }
             "session.snapshot" => {
                 let id = parse_session(params)?;
                 Ok(serde_json::to_value(
@@ -246,11 +304,62 @@ impl Host {
             }
             "session.prompt" => {
                 let params: PromptParam = serde_json::from_value(params)?;
-                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let caller = parse_optional_session(params.caller_session_id.clone())?;
+                let (agent, parent_id) = self.resolve_prompt_session(&params, caller).await?;
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
-                let agent = self.service.load(&id).await?;
+                let subscription = agent.attach(EndpointId::new()).await?;
                 let turn_id = agent.prompt(endpoint, params.message).await?;
-                Ok(json!({"turn_id": turn_id}))
+                if let Some(parent_id) = parent_id {
+                    self.spawn_result_delivery(
+                        subscription,
+                        agent.id().clone(),
+                        parent_id,
+                        turn_id.clone(),
+                    );
+                }
+                Ok(json!({"session_id": agent.id(), "turn_id": turn_id}))
+            }
+            "session.read" => {
+                let params: ReadSessionParam = serde_json::from_value(params)?;
+                anyhow::ensure!(
+                    params.limit > 0 && params.limit <= 100,
+                    "limit must be between 1 and 100"
+                );
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let snapshot = self.service.load(&id).await?.snapshot().await?;
+                let total = snapshot.transcript.len();
+                let content = snapshot
+                    .transcript
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, event)| is_content_event(&event.payload))
+                    .collect::<Vec<_>>();
+                let messages = if let Some(cursor) = params.cursor {
+                    content
+                        .into_iter()
+                        .filter(|(index, _)| *index >= cursor.min(total))
+                        .take(params.limit)
+                        .collect::<Vec<_>>()
+                } else {
+                    content
+                        .into_iter()
+                        .rev()
+                        .take(params.limit)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                };
+                let start = messages
+                    .first()
+                    .map_or(params.cursor.unwrap_or(total), |(index, _)| *index);
+                let next_cursor = messages.last().map_or(start, |(index, _)| index + 1);
+                Ok(json!({
+                    "session_id": id,
+                    "cursor": start,
+                    "next_cursor": next_cursor,
+                    "messages": messages.into_iter().map(|(cursor, event)| json!({"cursor": cursor, "event": event})).collect::<Vec<_>>(),
+                }))
             }
             "session.cancel" => {
                 let params: CancelParam = serde_json::from_value(params)?;
@@ -495,6 +604,7 @@ impl Host {
             .service
             .create(NewSession {
                 id: Some(session_id),
+                parent_session_id: None,
                 title,
                 cwd,
                 mode: self.default_mode,
@@ -515,6 +625,136 @@ impl Host {
                 Err(error.into())
             }
         }
+    }
+
+    async fn resolve_prompt_session(
+        &self,
+        params: &PromptParam,
+        caller: Option<SessionId>,
+    ) -> Result<(Arc<dwo_agent_service::SessionAgent>, Option<SessionId>)> {
+        let records = self.service.list().await?;
+        let caller_record = caller
+            .as_ref()
+            .map(|id| {
+                records
+                    .iter()
+                    .find(|record| &record.info.id == id)
+                    .cloned()
+                    .with_context(|| format!("caller session not found: {id}"))
+            })
+            .transpose()?;
+
+        if let Some(target) = &params.session_id {
+            anyhow::ensure!(
+                params.title.is_none() && params.cwd.is_none(),
+                "--title and --cwd can only be used when creating a subsession"
+            );
+            let id = SessionId::parse(target.clone()).map_err(anyhow::Error::msg)?;
+            let record = records
+                .iter()
+                .find(|record| record.info.id == id)
+                .with_context(|| format!("session not found: {id}"))?;
+            if let Some(caller) = &caller {
+                anyhow::ensure!(
+                    record.info.parent_session_id.as_ref() == Some(caller),
+                    "session {id} is not a direct subsession of {caller}"
+                );
+            }
+            if let (Some(parent), Some(mode)) = (&caller_record, params.policy) {
+                ensure_policy_ceiling(mode, parent.info.mode)?;
+            }
+            let agent = self.service.load(&id).await?;
+            if let Some(mode) = params.policy {
+                agent.set_config(SessionConfigUpdate::Mode(mode)).await?;
+            }
+            if let Some(model) = &params.model {
+                agent
+                    .set_config(SessionConfigUpdate::Model(model.clone()))
+                    .await?;
+            }
+            if let Some(reasoning) = &params.reasoning {
+                agent
+                    .set_config(SessionConfigUpdate::Reasoning(Some(reasoning.clone())))
+                    .await?;
+            }
+            return Ok((agent, record.info.parent_session_id.clone()));
+        }
+
+        let inherited_mode = caller_record
+            .as_ref()
+            .map_or(self.default_mode, |record| record.info.mode);
+        let mode = params.policy.unwrap_or(inherited_mode);
+        if let Some(parent) = &caller_record {
+            ensure_policy_ceiling(mode, parent.info.mode)?;
+        }
+        let model = params.model.clone().unwrap_or_else(|| {
+            caller_record.as_ref().map_or_else(
+                || self.default_model.clone(),
+                |record| record.llm.model.clone(),
+            )
+        });
+        let reasoning = params.reasoning.clone().or_else(|| {
+            caller_record
+                .as_ref()
+                .and_then(|record| record.llm.reasoning.clone())
+        });
+        let session_id = SessionId::new();
+        let requested_cwd = params
+            .cwd
+            .clone()
+            .or_else(|| caller_record.as_ref().map(|record| record.info.cwd.clone()));
+        let uses_generated_workspace = requested_cwd.is_none();
+        let cwd = match requested_cwd {
+            Some(cwd) if cwd.is_absolute() => cwd,
+            Some(cwd) => self.profile_root.join(cwd),
+            None => {
+                let workspace = self
+                    .profile_root
+                    .join("runtime/workspaces")
+                    .join(session_id.as_str());
+                tokio::fs::create_dir_all(&workspace).await?;
+                workspace
+            }
+        };
+        let cleanup_path = uses_generated_workspace.then(|| cwd.clone());
+        let created = self
+            .service
+            .create(NewSession {
+                id: Some(session_id),
+                parent_session_id: caller.clone(),
+                title: params.title.clone(),
+                cwd,
+                mode,
+                llm: SessionLlmSettings { model, reasoning },
+            })
+            .await;
+        match created {
+            Ok(agent) => Ok((agent, caller)),
+            Err(error) => {
+                if let Some(path) = cleanup_path
+                    && path.is_dir()
+                {
+                    let _ = tokio::fs::remove_dir_all(path).await;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn spawn_result_delivery(
+        &self,
+        subscription: dwo_agent_service::SessionSubscription,
+        child_id: SessionId,
+        parent_id: SessionId,
+        watched_turn: dwo_agent_service::TurnId,
+    ) {
+        spawn_result_delivery(
+            self.service.clone(),
+            subscription,
+            child_id,
+            parent_id,
+            watched_turn,
+        );
     }
 
     pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
@@ -602,6 +842,84 @@ impl Host {
     }
 }
 
+fn spawn_result_delivery(
+    service: Arc<AgentService>,
+    mut subscription: dwo_agent_service::SessionSubscription,
+    child_id: SessionId,
+    parent_id: SessionId,
+    watched_turn: dwo_agent_service::TurnId,
+) {
+    tokio::spawn(async move {
+        let mut content = String::new();
+        let (status, error) = loop {
+            let Some(event) = subscription.events.recv().await else {
+                break ("closed", None);
+            };
+            match event.payload {
+                SessionEventPayload::AssistantCompleted {
+                    turn_id,
+                    content: completed,
+                    ..
+                } if turn_id == watched_turn => content = completed,
+                SessionEventPayload::TurnCompleted { turn_id } if turn_id == watched_turn => {
+                    break ("completed", None);
+                }
+                SessionEventPayload::TurnCancelled { turn_id } if turn_id == watched_turn => {
+                    break ("cancelled", None);
+                }
+                SessionEventPayload::TurnFailed { turn_id, error } if turn_id == watched_turn => {
+                    break ("failed", Some(error));
+                }
+                _ => {}
+            }
+        };
+        let notification = format!(
+            "<subsession_result>\n{}\n</subsession_result>",
+            json!({
+                "session_id": child_id,
+                "status": status,
+                "content": content,
+                "error": error,
+            })
+        );
+        let parent = match service.load(&parent_id).await {
+            Ok(parent) => parent,
+            Err(error) => {
+                eprintln!("load subsession parent {parent_id}: {error:#}");
+                return;
+            }
+        };
+        let parent_subscription = match parent.attach(EndpointId::new()).await {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                eprintln!("observe subsession parent {parent_id}: {error:#}");
+                return;
+            }
+        };
+        let grandparent_id = parent_subscription
+            .snapshot
+            .record
+            .info
+            .parent_session_id
+            .clone();
+        match parent.notify_internal(notification).await {
+            Ok(Some(parent_turn)) => {
+                if let Some(grandparent_id) = grandparent_id {
+                    spawn_result_delivery(
+                        service,
+                        parent_subscription,
+                        parent_id,
+                        grandparent_id,
+                        parent_turn,
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("deliver subsession result to {parent_id}: {error:#}"),
+        }
+    });
+}
+
 async fn remove_session_attachment_dirs(root: &Path, session_id: &str) -> Result<()> {
     if !root.is_dir() {
         return Ok(());
@@ -642,6 +960,40 @@ fn parse_session(params: Value) -> Result<SessionId> {
     SessionId::parse(params.session_id).map_err(anyhow::Error::msg)
 }
 
+fn parse_optional_session(value: Option<String>) -> Result<Option<SessionId>> {
+    value
+        .map(SessionId::parse)
+        .transpose()
+        .map_err(anyhow::Error::msg)
+}
+
+fn ensure_policy_ceiling(requested: SessionMode, parent: SessionMode) -> Result<()> {
+    let rank = |mode| match mode {
+        SessionMode::Watch => 0,
+        SessionMode::Confirm => 1,
+        SessionMode::FullAccess => 2,
+    };
+    anyhow::ensure!(
+        rank(requested) <= rank(parent),
+        "subsession policy {requested:?} exceeds parent policy {parent:?}"
+    );
+    Ok(())
+}
+
+fn is_content_event(payload: &SessionEventPayload) -> bool {
+    matches!(
+        payload,
+        SessionEventPayload::UserPromptSubmitted { .. }
+            | SessionEventPayload::AssistantCompleted { .. }
+            | SessionEventPayload::ToolStarted { .. }
+            | SessionEventPayload::ToolCompleted { .. }
+            | SessionEventPayload::PermissionRequested { .. }
+            | SessionEventPayload::PermissionResolved { .. }
+            | SessionEventPayload::TurnCancelled { .. }
+            | SessionEventPayload::TurnFailed { .. }
+    )
+}
+
 pub fn profile_root(config_path: &Path) -> Result<PathBuf> {
     let path = if config_path.is_dir() {
         config_path.to_path_buf()
@@ -680,6 +1032,14 @@ mod tests {
             ));
             assert!(managed_channel_action(&method("begin")).is_none());
         }
+    }
+
+    #[test]
+    fn subsession_policy_cannot_exceed_parent() {
+        assert!(ensure_policy_ceiling(SessionMode::Watch, SessionMode::Confirm).is_ok());
+        assert!(ensure_policy_ceiling(SessionMode::Confirm, SessionMode::Confirm).is_ok());
+        assert!(ensure_policy_ceiling(SessionMode::FullAccess, SessionMode::Confirm).is_err());
+        assert!(ensure_policy_ceiling(SessionMode::Confirm, SessionMode::Watch).is_err());
     }
 
     fn yaml_keys(value: &serde_yaml::Value) -> Vec<&str> {

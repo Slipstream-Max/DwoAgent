@@ -18,6 +18,7 @@ use crate::session::SessionAgent;
 
 pub struct NewSession {
     pub id: Option<SessionId>,
+    pub parent_session_id: Option<SessionId>,
     pub title: Option<String>,
     pub cwd: PathBuf,
     pub mode: SessionMode,
@@ -113,6 +114,7 @@ impl AgentService {
             new_session.mode,
             new_session.llm,
         );
+        record.set_parent_session_id(new_session.parent_session_id);
         if automatic_title {
             record.enable_auto_title();
         }
@@ -250,10 +252,11 @@ impl AgentService {
         if let Some(agent) = loaded.agents.get(&record.info.id).cloned() {
             return Ok(agent);
         }
-        let tools = Arc::new(ToolManager::new(
+        let tools = Arc::new(ToolManager::new_with_environment(
             record.info.cwd.clone(),
             self.policy.clone(),
             self.file_edit.clone(),
+            [("DWO_SESSION_ID".to_string(), record.info.id.to_string())],
         )?);
         let previous_tokens = record.context.usage.current_tokens;
         let mut context = ContextManager::new(record.context.clone());

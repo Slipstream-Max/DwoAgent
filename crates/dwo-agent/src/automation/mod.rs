@@ -298,6 +298,7 @@ impl AutomationRuntime {
                 self.service
                     .create(NewSession {
                         id: None,
+                        parent_session_id: None,
                         title: Some(
                             title
                                 .clone()

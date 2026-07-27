@@ -107,6 +107,12 @@ impl ContextManager {
         self.context.messages.push(ContextMessage::user(content));
     }
 
+    pub fn append_internal(&mut self, kind: MessageKind, content: impl Into<MessageContent>) {
+        self.context
+            .messages
+            .push(ContextMessage::internal(kind, content));
+    }
+
     pub fn append_assistant(
         &mut self,
         turn_id: TurnId,

@@ -1,8 +1,9 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
 use dwo_context::{
-    ContentBlock, ContextManager, ContextMessage, MessageContent, SystemPromptBuilder,
+    ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind, SystemPromptBuilder,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection};
 use dwo_tools::{ConfirmationDecision, ToolManager};
@@ -12,7 +13,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::TurnId;
-use crate::agent_loop::{self, RunTurn, TurnActorMessage, TurnEvent, TurnOutcome};
+use crate::agent_loop::{
+    self, PendingContextMessage, PendingMessageBatch, RunTurn, TurnActorMessage, TurnEvent,
+    TurnOutcome,
+};
 use crate::error::AgentServiceError;
 use crate::events::{
     ActiveToolCall, ClientTranscriptEvent, RuntimePhase, SessionEvent, SessionEventPayload,
@@ -90,7 +94,7 @@ impl SessionAgent {
             phase: RuntimePhase::Idle,
             active: None,
             permission: PermissionState::default(),
-            pending_prompt: None,
+            pending_messages: VecDeque::new(),
             closing_response: None,
             title_cancellation: None,
         };
@@ -192,6 +196,21 @@ impl SessionAgent {
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub async fn notify_internal(
+        &self,
+        content: impl Into<String>,
+    ) -> Result<Option<TurnId>, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::InternalMessage {
+            content: MessageContent::text(content),
+            wake: true,
+            response,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
     pub async fn respond_permission(
         &self,
         origin: EndpointId,
@@ -245,6 +264,11 @@ enum Control {
         update: SessionConfigUpdate,
         response: oneshot::Sender<Result<(), AgentServiceError>>,
     },
+    InternalMessage {
+        content: MessageContent,
+        wake: bool,
+        response: oneshot::Sender<Result<Option<TurnId>, AgentServiceError>>,
+    },
     RespondPermission {
         origin: EndpointId,
         request_id: String,
@@ -281,15 +305,22 @@ struct SessionActor {
     phase: RuntimePhase,
     active: Option<ActiveTurn>,
     permission: PermissionState,
-    pending_prompt: Option<PendingPrompt>,
+    pending_messages: VecDeque<PendingMessage>,
     closing_response: Option<oneshot::Sender<Result<(), AgentServiceError>>>,
     title_cancellation: Option<CancellationToken>,
 }
 
-struct PendingPrompt {
-    origin: EndpointId,
-    content: MessageContent,
-    response: oneshot::Sender<Result<TurnId, AgentServiceError>>,
+enum PendingMessage {
+    User {
+        origin: EndpointId,
+        content: MessageContent,
+        response: oneshot::Sender<Result<TurnId, AgentServiceError>>,
+    },
+    Internal {
+        content: MessageContent,
+        wake: bool,
+        response: oneshot::Sender<Result<Option<TurnId>, AgentServiceError>>,
+    },
 }
 
 impl SessionActor {
@@ -345,28 +376,26 @@ impl SessionActor {
                     )));
                     return false;
                 }
-                let Some(active) = &self.active else {
-                    let result = self.start_prompt(origin, content).await;
-                    let _ = response.send(result);
-                    return false;
-                };
-                if self.pending_prompt.is_some() {
-                    let _ = response.send(Err(AgentServiceError::SessionBusy(
+                if self.phase == RuntimePhase::Cancelling {
+                    let _ = response.send(Err(AgentServiceError::PromptCancelled(
                         self.record.info.id.clone(),
                     )));
                     return false;
                 }
-                let cancellation = active.cancellation.clone();
-                self.pending_prompt = Some(PendingPrompt {
+                if self.active.is_none() {
+                    let result = self.start_prompt(origin, content).await;
+                    let _ = response.send(result);
+                    return false;
+                }
+                if let Err(error) = self.validate_message_content(&content) {
+                    let _ = response.send(Err(error));
+                    return false;
+                }
+                self.pending_messages.push_back(PendingMessage::User {
                     origin,
                     content,
                     response,
                 });
-                cancellation.cancel();
-                self.phase = RuntimePhase::Cancelling;
-                self.permission.reject("turn interrupted by a new prompt");
-                let tools = self.tools.clone();
-                tokio::spawn(async move { tools.shutdown().await });
             }
             Control::Cancel {
                 expected_turn_id,
@@ -384,6 +413,7 @@ impl SessionActor {
                     return false;
                 }
                 active.cancellation.cancel();
+                self.clear_pending_users();
                 self.phase = RuntimePhase::Cancelling;
                 self.permission.reject("turn cancelled");
                 let tools = self.tools.clone();
@@ -442,6 +472,31 @@ impl SessionActor {
                 }
                 let _ = response.send(result);
             }
+            Control::InternalMessage {
+                content,
+                wake,
+                response,
+            } => {
+                if self.phase == RuntimePhase::Closing {
+                    let _ = response.send(Err(AgentServiceError::SessionClosed(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                if self.active.is_some() {
+                    self.pending_messages.push_back(PendingMessage::Internal {
+                        content,
+                        wake,
+                        response,
+                    });
+                } else if wake {
+                    let result = self.start_internal(content).await.map(Some);
+                    let _ = response.send(result);
+                } else {
+                    let result = self.append_internal_idle(content).await.map(|()| None);
+                    let _ = response.send(result);
+                }
+            }
             Control::RespondPermission {
                 origin: responder,
                 request_id,
@@ -474,11 +529,7 @@ impl SessionActor {
                 if let Some(cancellation) = self.title_cancellation.take() {
                     cancellation.cancel();
                 }
-                if let Some(pending) = self.pending_prompt.take() {
-                    let _ = pending.response.send(Err(AgentServiceError::SessionClosed(
-                        self.record.info.id.clone(),
-                    )));
-                }
+                self.reject_pending_messages();
                 self.emit(SessionEventPayload::Closing);
                 if let Some(active) = &self.active {
                     active.cancellation.cancel();
@@ -508,17 +559,7 @@ impl SessionActor {
                 self.record.info.id.clone(),
             ));
         }
-        if content.contains_images()
-            && !self
-                .model
-                .supports_image_input(&self.record.llm.model)
-                .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?
-        {
-            return Err(AgentServiceError::InvalidConfig(format!(
-                "model {} does not support image input",
-                self.record.llm.model
-            )));
-        }
+        self.validate_message_content(&content)?;
         let previous_usage = self.usage_snapshot();
         let turn_id = TurnId::new();
         let event_content = content.clone();
@@ -547,14 +588,6 @@ impl SessionActor {
         self.record.context = context.into_context();
         self.record.touch();
         self.repository.save(&self.record).await?;
-        let cancellation = CancellationToken::new();
-        self.active = Some(ActiveTurn {
-            id: turn_id.clone(),
-            cancellation: cancellation.clone(),
-            partial_message: String::new(),
-            tools: Vec::new(),
-        });
-        self.phase = RuntimePhase::Running;
         if let Some((source, original_title)) = title_generation {
             self.start_title_generation(source, original_title);
         }
@@ -573,6 +606,60 @@ impl SessionActor {
         if self.usage_snapshot() != previous_usage {
             self.emit_usage_changed();
         }
+        self.activate_turn(turn_id.clone());
+        Ok(turn_id)
+    }
+
+    async fn start_internal(
+        &mut self,
+        content: MessageContent,
+    ) -> Result<TurnId, AgentServiceError> {
+        if self.phase == RuntimePhase::Closing {
+            return Err(AgentServiceError::SessionClosed(
+                self.record.info.id.clone(),
+            ));
+        }
+        let previous_usage = self.usage_snapshot();
+        let turn_id = TurnId::new();
+        let mut context = ContextManager::new(self.record.context.clone());
+        context.append_internal(MessageKind::Runtime, content);
+        context.refresh_usage(&self.tools.schemas());
+        self.record.context = context.into_context();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        if self.usage_snapshot() != previous_usage {
+            self.emit_usage_changed();
+        }
+        self.activate_turn(turn_id.clone());
+        Ok(turn_id)
+    }
+
+    async fn append_internal_idle(
+        &mut self,
+        content: MessageContent,
+    ) -> Result<(), AgentServiceError> {
+        let previous_usage = self.usage_snapshot();
+        let mut context = ContextManager::new(self.record.context.clone());
+        context.append_internal(MessageKind::Runtime, content);
+        context.refresh_usage(&self.tools.schemas());
+        self.record.context = context.into_context();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        if self.usage_snapshot() != previous_usage {
+            self.emit_usage_changed();
+        }
+        Ok(())
+    }
+
+    fn activate_turn(&mut self, turn_id: TurnId) {
+        let cancellation = CancellationToken::new();
+        self.active = Some(ActiveTurn {
+            id: turn_id.clone(),
+            cancellation: cancellation.clone(),
+            partial_message: String::new(),
+            tools: Vec::new(),
+        });
+        self.phase = RuntimePhase::Running;
         self.emit(SessionEventPayload::TurnStarted {
             turn_id: turn_id.clone(),
         });
@@ -592,7 +679,21 @@ impl SessionActor {
             cancellation,
             actor: self.turn_tx.clone(),
         }));
-        Ok(turn_id)
+    }
+
+    fn validate_message_content(&self, content: &MessageContent) -> Result<(), AgentServiceError> {
+        if content.contains_images()
+            && !self
+                .model
+                .supports_image_input(&self.record.llm.model)
+                .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?
+        {
+            return Err(AgentServiceError::InvalidConfig(format!(
+                "model {} does not support image input",
+                self.record.llm.model
+            )));
+        }
+        Ok(())
     }
 
     async fn prepare_model_change(
@@ -696,6 +797,11 @@ impl SessionActor {
                 let _ = completed.send(result);
                 false
             }
+            TurnActorMessage::TakePendingMessages { completed } => {
+                let batch = self.take_pending_messages().await;
+                let _ = completed.send(batch);
+                false
+            }
         }
     }
 
@@ -793,6 +899,7 @@ impl SessionActor {
                 self.active = None;
                 self.permission.reject("turn finished");
                 self.phase = RuntimePhase::Idle;
+                let allow_pending_wake = !matches!(outcome, TurnOutcome::Cancelled);
                 match outcome {
                     TurnOutcome::Completed => {
                         self.emit(SessionEventPayload::TurnCompleted { turn_id })
@@ -804,21 +911,126 @@ impl SessionActor {
                         self.emit(SessionEventPayload::TurnFailed { turn_id, error })
                     }
                 }
-                if let Some(pending) = self.pending_prompt.take() {
-                    let result = self.start_prompt(pending.origin, pending.content).await;
-                    let _ = pending.response.send(result);
-                    return false;
-                }
                 if let Some(response) = self.closing_response.take() {
                     self.phase = RuntimePhase::Closing;
+                    self.reject_pending_messages();
                     self.tools.shutdown().await;
                     let result = self.repository.save(&self.record).await.map_err(Into::into);
                     let _ = response.send(result);
                     return true;
                 }
+                self.process_pending_idle(allow_pending_wake).await;
             }
         }
         false
+    }
+
+    async fn take_pending_messages(&mut self) -> PendingMessageBatch {
+        let turn_id = self
+            .active
+            .as_ref()
+            .expect("pending messages are taken only by an active turn")
+            .id
+            .clone();
+        let mut messages = Vec::with_capacity(self.pending_messages.len());
+        let mut should_continue = false;
+        while let Some(pending) = self.pending_messages.pop_front() {
+            match pending {
+                PendingMessage::User {
+                    origin,
+                    content,
+                    response,
+                } => {
+                    self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
+                        turn_id: turn_id.clone(),
+                        origin,
+                        content: content.clone(),
+                    })
+                    .await;
+                    messages.push(PendingContextMessage::User(content));
+                    should_continue = true;
+                    let _ = response.send(Ok(turn_id.clone()));
+                }
+                PendingMessage::Internal {
+                    content,
+                    wake,
+                    response,
+                } => {
+                    messages.push(PendingContextMessage::Internal(content));
+                    should_continue |= wake;
+                    let _ = response.send(Ok(None));
+                }
+            }
+        }
+        PendingMessageBatch {
+            messages,
+            should_continue,
+        }
+    }
+
+    async fn process_pending_idle(&mut self, allow_wake: bool) {
+        while let Some(pending) = self.pending_messages.pop_front() {
+            match pending {
+                PendingMessage::User {
+                    origin,
+                    content,
+                    response,
+                } => {
+                    let started = self.start_prompt(origin, content).await;
+                    let running = started.is_ok();
+                    let _ = response.send(started);
+                    if running {
+                        return;
+                    }
+                }
+                PendingMessage::Internal {
+                    content,
+                    wake,
+                    response,
+                } => {
+                    if wake && allow_wake {
+                        let started = self.start_internal(content).await.map(Some);
+                        let running = started.is_ok();
+                        let _ = response.send(started);
+                        if running {
+                            return;
+                        }
+                    } else {
+                        let result = self.append_internal_idle(content).await.map(|()| None);
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_pending_users(&mut self) {
+        let mut retained = VecDeque::with_capacity(self.pending_messages.len());
+        while let Some(pending) = self.pending_messages.pop_front() {
+            match pending {
+                PendingMessage::User { response, .. } => {
+                    let _ = response.send(Err(AgentServiceError::PromptCancelled(
+                        self.record.info.id.clone(),
+                    )));
+                }
+                internal => retained.push_back(internal),
+            }
+        }
+        self.pending_messages = retained;
+    }
+
+    fn reject_pending_messages(&mut self) {
+        while let Some(pending) = self.pending_messages.pop_front() {
+            let error = || AgentServiceError::SessionClosed(self.record.info.id.clone());
+            match pending {
+                PendingMessage::User { response, .. } => {
+                    let _ = response.send(Err(error()));
+                }
+                PendingMessage::Internal { response, .. } => {
+                    let _ = response.send(Err(error()));
+                }
+            }
+        }
     }
 
     fn handle_permission_request(&mut self, request: PermissionRequestEnvelope) {

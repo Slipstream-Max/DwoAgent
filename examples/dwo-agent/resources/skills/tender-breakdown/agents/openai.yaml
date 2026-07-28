@@ -1,4 +1,0 @@
-interface:
-  display_name: "招标拆解"
-  short_description: "从Word或PDF拆出招标分析并生成四类Word文档"
-  default_prompt: "Use $tender-breakdown to读取Word/PDF招标文件，拆解要求并生成四个中文Word文档。"

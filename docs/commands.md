@@ -112,6 +112,8 @@ Feishu/Lark 使用 `openlark` WebSocket 长连接，也不需要 webhook 或公�
 
 ## Automation
 
+配置示例、cron、时区、session 模式和无人值守权限行为见 [Automation 使用指南](automation.md)。
+
 ```text
 dwo automation list [--json]
 dwo automation status [--json]

@@ -81,9 +81,47 @@ export DEEPSEEK_API_KEY="your-key"
 dwo daemon start
 ```
 
-模型、权限和 channel 都在 `~/.dwoagent/profile.yaml` 配置，完整字段见 [Agent Profile 配置](docs/agent-profile-structure-config.md)。
+模型、权限和 channel 都在 `~/.dwoagent/profile.yaml` 配置，完整字段见 [Profile 配置指南](docs/profile.md)。
 
 > Windows ARM64 构建需要进入 Visual Studio Developer PowerShell，并选择 ARM64 host/toolchain，使 `ring` 等原生依赖能够找到 C 编译器。
+
+## Profile Structure
+
+`dwo install` 默认创建 `~/.dwoagent/`：
+
+```text
+~/.dwoagent/
+|- profile.yaml
+|- bin/
+|- resource/
+|  |- prompts/
+|  |  |- System.md
+|  |  `- AGENTS.md
+|  |- skills/<skill>/SKILL.md
+|  `- mcp.json
+|- runtime/
+|  |- sessions/YYYY/MM/DD/<session-id>/
+|  |- workspaces/<session-id>/
+|  |- attachments/<channel>/
+|  |- channel-capabilities/
+|  |- mcp/
+|  `- logs/
+`- channels/<channel>/
+   |- runtime.yaml
+   `- secret.yaml
+```
+
+| 路径 | 用途 |
+| --- | --- |
+| `profile.yaml` | Profile 名称、默认权限、模型、channels 和 automation。 |
+| `resource/prompts/System.md` | Agent 的主 system prompt。 |
+| `resource/prompts/AGENTS.md` | Profile 级规则，可留空。工作目录中的 `AGENTS.md` 也会加载。 |
+| `resource/skills/` | 本地 skills，每个 skill 使用独立目录和 `SKILL.md`。 |
+| `resource/mcp.json` | stdio、HTTP 和 OAuth MCP server 配置。 |
+| `runtime/` | Session、附件、MCP catalog、OAuth 和日志等运行数据。 |
+| `channels/` | 各 channel 的绑定信息和当前 session。Telegram token 与飞书 App 凭据从环境变量读取。 |
+
+通常只需要编辑 `profile.yaml` 和 `resource/`。`runtime/`、channel state 和 secret 文件由 daemon 管理。完整目录、YAML 字段、模型和运行数据说明见 [Profile 配置指南](docs/profile.md)。
 
 ## CLI 快速上手
 
@@ -176,6 +214,38 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
 
 普通文本直接作为 prompt 发送。在 `confirm` 模式下，Agent 请求执行敏感工具时，可以直接回复 `/allow` 或 `/deny`。
 
+## Automation
+
+定时任务写在 `~/.dwoagent/profile.yaml`。下面的任务每天 9:00 创建一个 session，并检查项目状态：
+
+```yaml
+automation:
+  enabled: true
+  jobs:
+    - name: daily-report
+      schedule:
+        cron: "0 9 * * *"
+        timezone: Asia/Shanghai
+      session:
+        mode: new
+        cwd: projects/demo
+        title: Daily report
+      prompt: 检查项目状态并整理今天需要处理的事项。
+```
+
+| Session 模式 | 用法 |
+| --- | --- |
+| `new` | 每次运行创建新 session，可设置 `cwd` 和 `title`。 |
+| `fixed` | 把 prompt 投递到指定 `sessionId`，适合持续更新同一项任务。 |
+
+```text
+dwo automation list
+dwo automation status
+dwo automation run daily-report
+```
+
+Cron 使用 `分钟 小时 日期 月份 星期` 五个字段。Daemon 会读取配置变化并更新执行时间。Automation 无人值守运行，遇到工具权限确认时会自动拒绝，避免任务长期等待。完整字段和 fixed session 示例见 [Automation 使用指南](docs/automation.md)。
+
 ## 运行方式
 
 ```text
@@ -215,8 +285,9 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | [文档索引](docs/README.md) | 按首次使用、日常操作和深入理解组织的阅读入口 |
 | [ACP 使用指南](docs/acp.md) | ACP 启动、session、权限、内容类型与限制 |
 | [Channel 部署与使用](docs/channels.md) | 微信、Telegram、飞书/Lark 部署和 slash commands |
+| [Automation 使用指南](docs/automation.md) | Cron、时区、新建/固定 session 和无人值守行为 |
 | [CLI 命令参考](docs/commands.md) | daemon、session、MCP、channel、automation 命令 |
-| [Agent Profile 配置](docs/agent-profile-structure-config.md) | profile、模型、资源、MCP 与持久化结构 |
+| [Profile 配置指南](docs/profile.md) | 完整 profile.yaml、资源目录、模型、MCP 与运行数据 |
 
 ## Development
 

@@ -9,4 +9,4 @@ You can delegate bounded work to child agents by running `dwo session` commands 
 - Stop a child: `dwo session cancel SESSION_ID`.
 - Inspect available profile policy, models, reasoning modes, description, and session count: `dwo profile-list`.
 
-When a child turn finishes, its final result is delivered to you automatically as a `<subsession_result>` message. If you are idle, that message starts a turn immediately. If you are running, it is buffered and inserted after the current tool-call batch. Do not busy-poll a child solely to detect completion.
+When a child turn finishes, its final result is delivered automatically as an internal `<subsession_result>` message, not as a user prompt. If you are idle, that message starts a turn immediately. If you are running, it is buffered and inserted after the current model response or tool-call batch. Do not busy-poll a child solely to detect completion.

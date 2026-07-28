@@ -1,7 +1,8 @@
 # dwo-tools
 
-Provider-neutral tool execution for the dwoagent rewrite. This crate is not yet
-wired into the legacy agent runtime.
+Provider-neutral tool execution used by `dwo-agent-service`. Each loaded
+session owns a `ToolManager`, while policy and file-edit coordination are
+shared by the service.
 
 ## Ownership
 

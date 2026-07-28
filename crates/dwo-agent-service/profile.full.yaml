@@ -83,7 +83,7 @@ automation:
         title: Daily report
       prompt: Summarize the current project status.
 
-    # A fixed job interrupts the session's active turn before starting.
+    # A fixed job uses normal FIFO prompt semantics and never interrupts an active turn.
     - name: continue-fixed-session
       enabled: false
       schedule:

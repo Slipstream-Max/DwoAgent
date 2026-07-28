@@ -128,9 +128,10 @@ SessionAgent::prompt(origin, user_message)
      -> ModelClient::stream_turn
      -> on ContextLengthExceeded, compact and retry that request once
      -> stream assistant deltas
-     -> without tool calls, persist the complete assistant message
+     -> without tool calls, drain queued user/internal messages after the response
      -> with tool calls, ToolManager::execute_batch using current SessionMode snapshot
-     -> persist assistant tool calls and all paired results in one checkpoint
+     -> drain queued user/internal messages after the tool-call batch
+     -> persist the complete response/tool/message checkpoint
      -> repeat model/tool steps
   -> TurnCompleted | TurnCancelled | TurnFailed
 ```
@@ -179,3 +180,8 @@ Any endpoint may cancel the current turn or resolve a pending permission; the
 first permission response wins. User prompts are broadcast to observers but
 filtered from the matching origin endpoint to avoid client-side echo. Close
 waits for cancellation checkpoints before unloading the actor.
+
+Internal messages are persisted as `MessageKind::Runtime` context messages and
+do not emit `UserPromptSubmitted`. A waking internal message starts an idle
+session immediately. Cancellation preserves queued internal messages but
+suppresses their wake behavior after the cancelled turn finishes.

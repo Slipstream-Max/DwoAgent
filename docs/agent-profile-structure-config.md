@@ -1,6 +1,6 @@
 # Agent Profile 结构和配置
 
-当前 rewrite 只有一个 profile host 和一个本地 daemon。profile 根目录默认是 `~/.dwoagent`，配置入口固定为 `profile.yaml`，资源入口固定为 `resource/`。
+当前运行时只有一个 profile host 和一个本地 daemon。profile 根目录默认是 `~/.dwoagent`，配置入口固定为 `profile.yaml`，资源入口固定为 `resource/`。
 
 ```text
 <profile-root>/

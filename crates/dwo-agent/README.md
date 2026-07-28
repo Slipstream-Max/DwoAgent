@@ -71,6 +71,13 @@ dwo automation run <job> [--json]
 dwo acp
 ```
 
+Without `--to`, `session prompt` creates a root session from an external shell
+or a direct child when `DWO_SESSION_ID` identifies the calling agent. `--title`
+and `--cwd` are creation-only options. With `--to`, the target must be a direct
+child for agent callers; optional policy, model, and reasoning changes are
+validated and persisted before the prompt is queued. Child policy cannot be
+more permissive than its parent.
+
 `dwo install` deploys the running executable to `~/.dwoagent/bin`, adds that
 directory to the Windows user PATH, and registers the daemon using the stable
 installed path.
@@ -263,6 +270,13 @@ External prompts use stable FIFO semantics. During an active turn they wait for
 the current model-response or tool-call boundary, join that turn in arrival
 order, and never cancel tools implicitly. The origin endpoint does not receive
 its own prompt notification; every other observer does.
+
+Completed child turns are delivered to their parent as internal
+`<subsession_result>` messages. They never appear as user prompt events. An
+idle parent starts immediately; a running parent accepts the result at its next
+model-response or tool-call boundary. Explicit cancellation clears queued user
+prompts, preserves internal messages, and prevents preserved messages from
+waking another model step after the cancelled turn.
 
 ## Automation
 

@@ -30,13 +30,15 @@ dwo session approve <session-id> <permission-id>
 dwo session deny <session-id> <permission-id>
 ```
 
-agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此创建根 session并使用 profile 默认值。
+agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此创建根 session 并使用 profile 默认值。
+
+`--title` 和 `--cwd` 只用于创建 session，和 `--to` 同时使用会被拒绝。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `profile-list` 中列出的有效组合。继续已有子 session 时，policy/model/reasoning 更新会在提交新 prompt 前写入 session 配置，并分别从下一批 tool call 或下一次 model request 生效。
 
 `session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 profile 中的全部 session。`profile-list` 输出 profile 描述、默认 policy、可用 model/reasoning、默认 model 和 session 总数。
 
 `session watch` 默认返回最近 3 个内容事件及 `next_cursor`，不会建立持续广播。传入 `--cursor <next_cursor>` 可读取之后的事件，`--limit` 范围为 1 到 100。普通 CLI 输出使用适合终端阅读的 YAML 风格文本。
 
-子 session 的 turn 结束后，daemon 自动向父 agent 投递 `<subsession_result>`。父 agent idle 时立即启动；父 agent 正在运行时先缓冲，并在当前 tool call 批次结束后写入上下文。
+子 session 的 turn 结束后，daemon 自动向父 agent 投递 `<subsession_result>` internal message，其中包含子 session ID、状态、最终文本和可选错误。它不会产生 `UserPromptSubmitted` 事件。父 agent idle 时立即启动；父 agent 正在运行时先缓冲，并在当前 model response 或 tool-call batch 完成后的安全边界写入上下文。
 
 active turn 运行期间收到的新 prompt 会进入 session FIFO，在当前 model response 或 tool-call batch 完成后按顺序写入同一个 turn，不会隐式 cancel 或关闭 tools。内部 watcher/子 session 消息使用 internal context message，不会伪装成用户事件。
 

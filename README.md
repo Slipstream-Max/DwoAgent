@@ -214,6 +214,20 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
 
 普通文本直接作为 prompt 发送。在 `confirm` 模式下，Agent 请求执行敏感工具时，可以直接回复 `/allow` 或 `/deny`。
 
+## Subsessions
+
+当前 agent 可以创建子 session，把检查模块、查找资料、运行测试等独立工作分出去。每个子 session 都有自己的上下文和 transcript，默认继承父 session 的工作目录、权限、模型和 reasoning；子 session 的权限不能高于父 session。
+
+```text
+dwo session prompt "检查认证模块并列出潜在问题" --title "auth review"
+dwo session list
+dwo session watch <session-id>
+dwo session prompt "再检查错误处理" --to <session-id>
+dwo session cancel <session-id>
+```
+
+子任务完成、失败或被取消后，daemon 会把结果作为 internal message 自动送回父 session。父 session 空闲时会立即处理，正在运行时会在当前模型响应或一批工具调用结束后接收，不需要持续轮询。子 session 也可以继续创建下一层子 session，结果会沿父子关系逐层返回。完整机制和示例见 [Subsessions 使用指南](docs/subsessions.md)。
+
 ## Automation
 
 定时任务写在 `~/.dwoagent/profile.yaml`。下面的任务每天 9:00 创建一个 session，并检查项目状态：
@@ -285,6 +299,7 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | [文档索引](docs/README.md) | 按首次使用、日常操作和深入理解组织的阅读入口 |
 | [ACP 使用指南](docs/acp.md) | ACP 启动、session、权限、内容类型与限制 |
 | [Channel 部署与使用](docs/channels.md) | 微信、Telegram、飞书/Lark 部署和 slash commands |
+| [Subsessions 使用指南](docs/subsessions.md) | 父子 session、配置继承、结果回传和常用命令 |
 | [Automation 使用指南](docs/automation.md) | Cron、时区、新建/固定 session 和无人值守行为 |
 | [CLI 命令参考](docs/commands.md) | daemon、session、MCP、channel、automation 命令 |
 | [Profile 配置指南](docs/profile.md) | 完整 profile.yaml、资源目录、模型、MCP 与运行数据 |

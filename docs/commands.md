@@ -21,6 +21,8 @@ daemon 启动 host 时会并发初始化 `resource/mcp.json` 中的全部 MCP se
 
 ## Session
 
+本节用于查询具体命令和参数。父子 session、继承规则与结果回传流程见 [Subsessions 使用指南](subsessions.md)。
+
 ```text
 dwo profile-list
 dwo session list [--all]

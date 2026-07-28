@@ -15,11 +15,12 @@
 | [CLI 命令参考](commands.md) | 查询命令、参数和 session/MCP/automation 行为 |
 | [ACP 使用指南](acp.md) | 将支持 ACP 的 IDE 或客户端连接到已有 daemon |
 | [Channel 部署与使用](channels.md) | 部署微信、Telegram、飞书/Lark，查询 slash commands |
+| [Subsessions 使用指南](subsessions.md) | 了解父子 session、配置继承、结果回传和任务控制 |
 | [Automation 使用指南](automation.md) | 配置 cron、时区、新建/固定 session 和无人值守任务 |
 | [Profile 配置指南](profile.md) | 修改模型、权限、资源、MCP、channel 和持久化目录 |
 
 ## 推荐阅读顺序
 
 - 首次部署：README -> Agent Profile -> ACP 或 Channels。
-- 日常操作：CLI 命令参考 + 对应入口指南。
+- 日常操作：CLI 命令参考 + 对应入口指南；需要拆分任务时阅读 Subsessions 使用指南。
 - 排查状态：先运行 `dwo daemon status`、`dwo profile-list` 和 `dwo channel <name> status`，再检查 `~/.dwoagent/runtime/logs/`。

@@ -5,6 +5,12 @@
 # 赤铎 · Dwo Agent
 
 <p align="center">
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&amp;logo=rust&amp;logoColor=white" alt="Rust"></a>
+  <a href="https://github.com/Slipstream-Max"><img src="https://img.shields.io/badge/Built%20by-Slipstream__Max-B7410E?style=for-the-badge&amp;logo=github&amp;logoColor=white" alt="Built by Slipstream_Max"></a>
+  <a href="https://github.com/Slipstream-Max/DwoAgent"><img src="https://img.shields.io/badge/Agents-Dwo-D4A017?style=for-the-badge&amp;logo=dependabot&amp;logoColor=white" alt="Agents: Dwo"></a>
+</p>
+
+<p align="center">
   Rust 写的轻量 Agent Runtime<br>
   本地能用，远程能聊，也方便嵌入现有软件
 </p>

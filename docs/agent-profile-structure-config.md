@@ -2,6 +2,8 @@
 
 当前运行时只有一个 profile host 和一个本地 daemon。profile 根目录默认是 `~/.dwoagent`，配置入口固定为 `profile.yaml`，资源入口固定为 `resource/`。
 
+首次安装和启动见根目录 [README](../README.md)，channel 部署见 [Channel 部署与使用](channels.md)，完整 CLI 见 [命令参考](commands.md)。
+
 ```text
 <profile-root>/
 |- profile.yaml
@@ -43,7 +45,9 @@ description: coding agent
 policyMode: confirm
 channels:
   weixin:
-    enabled: false
+    enabled: true
+    replayTurns: 5
+    markdownFilter: true
   telegram:
     enabled: false
     replayTurns: 5
@@ -142,7 +146,7 @@ context token 由 daemon 根据完整的 system prompt、消息、reasoning、�
 }
 ```
 
-daemon 启动时并发初始化所有 server，并持续托管成功的 stdio/HTTP 连接。配置 watcher 对新增或变更 server 使用同样的初始化流程。catalog 状态为 `starting`、`ready`、`auth_required` 或 `failed`；`runtime/mcp/catalog.json` 是当前内存 catalog 的派生投影，不是活跃连接证明。MCP schema 不会注册成模型 native tool。
+daemon 启动时并发初始化所有 server，并持续托管成功的 stdio/HTTP 连接。配置 watcher 对新增或变更 server 使用同样的初始化流程。catalog 状态为 `starting`、`ready`、`auth_required` 或 `failed`。`runtime/mcp/catalog.json` 保存当前内存 catalog 的派生内容，连接是否可用仍以 daemon 内的运行状态为准。MCP schema 不会注册成模型 native tool。
 
 模型通过 terminal 使用以下命令：
 

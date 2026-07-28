@@ -2,6 +2,8 @@
 
 `dwo` 是本地 daemon 的控制 CLI。除 `serve` 外，命令都通过 profile 的本地 IPC 连接已经运行的 daemon。默认 profile 是 `~/.dwoagent/profile.yaml`，也可以用全局 `--config-path <path>` 指定。
 
+面向首次使用者的安装与对话流程见根目录 [README](../README.md)；ACP 客户端接入见 [ACP 使用指南](acp.md)，消息平台部署和 slash commands 见 [Channel 部署与使用](channels.md)。
+
 ## 生命周期
 
 ```text
@@ -15,7 +17,7 @@ dwo daemon status
 
 `install` 把当前 CLI 复制到 `~/.dwoagent/bin/dwo`（Windows 为 `dwo.exe`），在 Windows 用户级 PATH 中幂等加入该目录，创建固定的 profile/resource/runtime 目录，并使用安装后的固定路径注册 daemon 自启动任务。`--start` 同时启动 daemon。`serve` 在前台运行 host；通常由系统任务或 `daemon start` 管理。`daemon status` 返回 YAML 风格的健康状态、session 数量、channel 数量和 automation 数量。
 
-daemon 启动 host 时会并发初始化 `resource/mcp.json` 中的全部 MCP server。每个 server 会等待到 `ready`、`auth_required` 或 `failed`；stdio/HTTP 连接由 daemon 持续托管并复用。新增或修改配置由 watcher 使用相同流程初始化。`runtime/mcp/catalog.json` 是内存 catalog 的派生投影，不是活跃连接的凭据。
+daemon 启动 host 时会并发初始化 `resource/mcp.json` 中的全部 MCP server。每个 server 会等待到 `ready`、`auth_required` 或 `failed`；stdio/HTTP 连接由 daemon 持续托管并复用。新增或修改配置由 watcher 使用相同流程初始化。`runtime/mcp/catalog.json` 保存内存 catalog 的派生内容，连接是否可用仍以 daemon 内的运行状态为准。
 
 ## Session
 
@@ -77,6 +79,8 @@ MCP 命令输出为 YAML 风格文本。只有 `--args` 的工具参数使用 JS
 
 ## Channel
 
+本节是 CLI 命令参考。各平台的环境变量、开放平台配置、绑定步骤和聊天内命令见 [Channel 部署与使用](channels.md)。
+
 ```text
 dwo channel list
 dwo channel weixin status
@@ -102,7 +106,7 @@ Telegram 使用 long polling，不需要 webhook 或公网地址。`tgProxy` 是
 
 Feishu/Lark 使用 `openlark` WebSocket 长连接，也不需要 webhook 或公网地址。`platform: feishu` 对应国内开放平台，`platform: lark` 对应海外开放平台。应用必须启用机器人、以长连接订阅 `im.message.receive_v1`，并开通接收消息、以应用身份发送消息、获取和上传消息资源的权限。入站 text、image、file 均可触发 prompt；image/file 下载到 `runtime/attachments/feishu/YYYY/MM/DD/<session-id>/`。输出使用 plain text。
 
-不同 channel 可以 `/use` 同一个全局 session，也各自在自己的 `runtime.yaml` 中保持当前选择。绑定、解绑或重绑某个 channel 只重启该 channel，不影响其他 channel。
+不同 channel 可以 `/use` 同一个全局 session，也会在各自的 `runtime.yaml` 中保持当前选择。绑定、解绑或重绑某个 channel 只重启该 channel，不影响其他 channel。
 
 在 `confirm` 模式下，收到授权请求后直接发送 `/allow` 或 `/deny` 即可处理当前 pending permission，不需要复制 request ID。仍可使用 `/allow <id>`、`/deny <id>` 显式指定请求。
 
@@ -117,6 +121,8 @@ dwo automation run <job> [--json]
 默认输出为可读文本；仅指定 `--json` 时保留机器读取的 JSON 输出。
 
 ## ACP
+
+客户端配置、session 协作、权限和内容类型限制见 [ACP 使用指南](acp.md)。
 
 ```text
 dwo acp

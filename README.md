@@ -169,6 +169,18 @@ dwo channel list
 
 所有参数和行为见 [CLI 命令参考](docs/commands.md)。
 
+## 原生工具
+
+赤铎内置三个由 Rust runtime 直接执行的基础工具，不需要额外配置 MCP server：
+
+| 工具 | 用途 |
+| --- | --- |
+| **终端 `terminal`** | 启动命令、向交互式终端写入输入、轮询增量输出或终止进程。多个独立终端可以并行运行，所有操作都会经过当前 session 的权限策略。 |
+| **读取 `read_file`** | 读取 UTF-8 文本或 PNG、JPEG、GIF、WebP 图片。文本每次最多返回 500 行，并通过 `cursor` 继续读取；图片只会加入支持图片输入的模型上下文。 |
+| **写入 `file_edit`** | 使用结构化 patch 新建、修改、移动或删除文件。一次调用可以原子表达多个相关文件变更；`confirm` 模式需要确认，`watch` 模式禁止写入。 |
+
+`read_file` 和 `file_edit` 使用 session 的工作目录解析相对路径。没有显式指定 `cwd` 的 session 使用自己的隔离工作区。
+
 ## 如何对话
 
 ### ACP：从 IDE 或 ACP 客户端连接

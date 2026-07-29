@@ -127,6 +127,17 @@ enum ChannelCommand {
         #[command(subcommand)]
         command: ManagedChannelCommand,
     },
+    Websocket {
+        #[command(subcommand)]
+        command: WebsocketChannelCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebsocketChannelCommand {
+    Status,
+    Token,
+    ResetToken,
 }
 
 #[derive(Subcommand)]
@@ -424,6 +435,20 @@ async fn run_channel(command: ChannelCommand, config_path: &Path) -> Result<()> 
         ChannelCommand::Feishu { command } => {
             run_managed_channel(ChannelKind::Feishu, command, config_path).await?
         }
+        ChannelCommand::Websocket { command } => {
+            let action = match command {
+                WebsocketChannelCommand::Status => "status",
+                WebsocketChannelCommand::Token => "token",
+                WebsocketChannelCommand::ResetToken => "reset_token",
+            };
+            let value = ipc::request(
+                config_path,
+                &format!("channel.websocket.{action}"),
+                json!({}),
+            )
+            .await?;
+            print_value(&value)?;
+        }
     }
     Ok(())
 }
@@ -461,6 +486,7 @@ async fn run_managed_channel(
             ChannelKind::Weixin => bind_weixin(config_path).await?,
             ChannelKind::Telegram => bind_telegram(config_path).await?,
             ChannelKind::Feishu => bind_feishu(config_path).await?,
+            ChannelKind::Websocket => bail!("WebSocket channel does not use binding"),
         },
     }
     Ok(())
@@ -867,6 +893,9 @@ channels:
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
     mediaInput: true
+  websocket:
+    enabled: false
+    port: 8765
 automation:
   enabled: false
   jobs: []
@@ -955,6 +984,29 @@ mod tests {
                     command: ManagedChannelCommand::SendFile { ref path }
                 }
             } if path == &PathBuf::from("report.pdf")
+        ));
+    }
+
+    #[test]
+    fn parses_websocket_commands() {
+        let token = Cli::try_parse_from(["dwo", "channel", "websocket", "token"]).unwrap();
+        assert!(matches!(
+            token.command,
+            Command::Channel {
+                command: ChannelCommand::Websocket {
+                    command: WebsocketChannelCommand::Token
+                }
+            }
+        ));
+
+        let reset = Cli::try_parse_from(["dwo", "channel", "websocket", "reset-token"]).unwrap();
+        assert!(matches!(
+            reset.command,
+            Command::Channel {
+                command: ChannelCommand::Websocket {
+                    command: WebsocketChannelCommand::ResetToken
+                }
+            }
         ));
     }
 

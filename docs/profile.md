@@ -187,8 +187,11 @@ Channels 配置 adapter 是否启动，以及回放、凭据环境变量、代�
 | 微信 | `enabled`、`replayTurns`、`markdownFilter`、`mediaInput` |
 | Telegram | `enabled`、`replayTurns`、`botTokenEnv`、`tgProxy`、`mediaInput` |
 | 飞书/Lark | `enabled`、`replayTurns`、`appIdEnv`、`appSecretEnv`、`platform`、`mediaInput` |
+| WebSocket | `enabled`、`port` |
 
 `replayTurns` 最大为 10。`platform` 使用 `feishu` 或 `lark`。Token、App ID 和 App Secret 从环境变量读取。
+
+WebSocket 固定监听 `0.0.0.0:<port>`，ACP 路径固定为 `/acp`。访问 token 自动生成并保存到 `channels/websocket/secret.yaml`，不需要写入 profile。
 
 绑定命令、开放平台设置和 slash commands 见 [Channel 部署与使用](channels.md)。
 

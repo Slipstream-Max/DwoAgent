@@ -19,12 +19,14 @@ rust-version = "1.95"
 agent-client-protocol = { version = "0.11", features = ["unstable_session_usage"] }
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 cron = "0.15"
 eventsource-stream = "0.2"
 futures = "0.3"
+getrandom = "0.4"
 lazy_static = "1"
 libc = "0.2"
 log = "0.4"
@@ -36,11 +38,14 @@ qr2term = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+subtle = "2"
 tempfile = "3"
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "process", "signal", "io-std", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
+tokio-tungstenite = "0.29"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 weixin-agent = "0.2"
 winapi = "0.3.9"

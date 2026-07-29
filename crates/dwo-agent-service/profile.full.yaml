@@ -67,6 +67,12 @@ channels:
     # Download inbound images and files as structured resources.
     mediaInput: true
 
+  websocket:
+    # ACP over WebSocket listens on all interfaces at /acp. A persistent
+    # access token is generated under channels/websocket/secret.yaml.
+    enabled: false
+    port: 8765
+
 # The daemon watches this section and reschedules valid changes automatically.
 # Cron uses the standard five fields: minute hour day-of-month month weekday.
 automation:

@@ -93,7 +93,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for EofReader<R> {
     }
 }
 
-async fn run_with_io<R, W>(config_path: PathBuf, stdin: R, stdout: W) -> Result<()>
+pub(crate) async fn run_with_io<R, W>(config_path: PathBuf, stdin: R, stdout: W) -> Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,

@@ -42,6 +42,21 @@ macOS/Linux: /home/<user>/.dwoagent/bin/dwo
 
 不同客户端的配置文件名和 UI 不同，但最终都应启动同一个命令。客户端关闭 stdin 后，`dwo acp` 会正常退出；daemon 继续运行。
 
+## WebSocket 客户端
+
+网页可以通过 WebSocket 使用完全相同的 ACP 协议：
+
+```yaml
+channels:
+  websocket:
+    enabled: true
+    port: 8765
+```
+
+服务地址固定为 `ws://<host>:8765/acp?token=<token>`。运行 `dwo channel websocket token` 查看 token。每条 ACP JSON-RPC 消息使用一个 WebSocket text frame，方法、通知、能力和 stdio ACP 相同。
+
+服务监听所有网卡。局域网连接需要放行防火墙端口；公网必须通过 TLS 反向代理使用 `wss://`。
+
 ## Session 工作方式
 
 - 新建 ACP session 时，客户端提供的 `cwd` 会成为 session 工作目录。

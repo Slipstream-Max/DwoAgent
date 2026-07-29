@@ -17,7 +17,7 @@
 
 ---
 
-赤铎（Dwo Agent）是一个用 Rust 写的轻量 Agent Runtime，可以常驻在本机或服务器上。CLI、ACP、微信、Telegram 和飞书/Lark 共享同一批 session，远程和本地可以随时接着使用。
+赤铎（Dwo Agent）是一个用 Rust 写的轻量 Agent Runtime，可以常驻在本机或服务器上。CLI、ACP、ACP WebSocket、微信、Telegram 和飞书/Lark 共享同一批 session，远程和本地可以随时接着使用。
 
 模型调用、终端、文件编辑、MCP、skills、subsessions、权限控制、上下文压缩和定时任务都已经接好。任务可以从 IDE 开始，再从手机继续；core 也可以嵌入其他程序，并按需要调整 system prompt、agent step、存储和工具。
 
@@ -203,7 +203,7 @@ args: [--config-path, /path/to/profile.yaml, acp]
 
 ### Channels：从聊天应用连接
 
-赤铎目前支持微信、Telegram 和飞书/Lark 私聊。启用 channel 后重启 daemon，再完成绑定：
+赤铎目前支持微信、Telegram、飞书/Lark 私聊和 ACP WebSocket。启用 channel 后重启 daemon；消息 channel 再完成绑定：
 
 ```text
 dwo channel weixin bind       # 终端扫码

@@ -6,6 +6,7 @@ mod hub;
 mod manager;
 mod render;
 mod telegram;
+mod websocket;
 mod weixin;
 
 pub(crate) use hub::ChannelHub;
@@ -18,16 +19,18 @@ pub(crate) enum ChannelKind {
     Weixin,
     Telegram,
     Feishu,
+    Websocket,
 }
 
 impl ChannelKind {
-    pub(crate) const ALL: [Self; 3] = [Self::Weixin, Self::Telegram, Self::Feishu];
+    pub(crate) const ALL: [Self; 4] = [Self::Weixin, Self::Telegram, Self::Feishu, Self::Websocket];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Weixin => "weixin",
             Self::Telegram => "telegram",
             Self::Feishu => "feishu",
+            Self::Websocket => "websocket",
         }
     }
 
@@ -36,6 +39,7 @@ impl ChannelKind {
             Self::Weixin => "Weixin",
             Self::Telegram => "Telegram",
             Self::Feishu => "Feishu",
+            Self::Websocket => "WebSocket",
         }
     }
 

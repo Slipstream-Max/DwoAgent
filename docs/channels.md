@@ -1,8 +1,8 @@
 # Channel 部署与使用
 
-赤铎可以把同一个 daemon 接到微信、Telegram 和飞书/Lark 私聊。它们共享全局 session、模型、工具、MCP 和持久化数据，并分别保存当前选择的 session。
+赤铎可以把同一个 daemon 接到微信、Telegram、飞书/Lark 私聊和 ACP WebSocket。所有入口共享全局 session、模型、工具、MCP 和持久化数据。
 
-所有 channel 都只接受已绑定用户的私聊。修改 `profile.yaml` 后重启 daemon，使 adapter 按新配置启动：
+三个消息 channel 只接受已绑定用户的私聊；WebSocket 使用独立 token 鉴权。修改 `profile.yaml` 后重启 daemon，使 adapter 按新配置启动：
 
 ```text
 dwo daemon stop
@@ -33,6 +33,9 @@ channels:
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
     mediaInput: true
+  websocket:
+    enabled: false
+    port: 8765
 ```
 
 `replayTurns` 最大为 10，控制 `/use` session 时回放多少个最近 turn。`mediaInput` 控制是否接收平台图片和文件。
@@ -104,9 +107,42 @@ $env:FEISHU_APP_SECRET = "xxx"
 
 `channels/feishu/secret.yaml` 只保存绑定的 `open_id` 和 `chat_id`，不会保存 App ID 或 App Secret。
 
+## ACP WebSocket
+
+WebSocket channel 把现有 ACP 协议开放给网页客户端。它不使用 slash commands，也没有绑定用户或当前 session；每个连接都是独立的 ACP client。
+
+```yaml
+channels:
+  websocket:
+    enabled: true
+    port: 8765
+```
+
+重启 daemon 后，服务固定监听 `0.0.0.0:8765`，路径固定为 `/acp`。首次启用时会生成 256-bit token，并保存到 `channels/websocket/secret.yaml`。
+
+查看状态和 token：
+
+```text
+dwo channel websocket status
+dwo channel websocket token
+dwo channel websocket reset-token
+```
+
+网页连接示例：
+
+```js
+const ws = new WebSocket(
+  "ws://192.168.1.20:8765/acp?token=" + encodeURIComponent(token)
+);
+```
+
+一条 ACP JSON-RPC 消息对应一个 WebSocket text frame。Binary frame 会被拒绝。重置 token 会立即断开已有连接，旧 token 随即失效。
+
+局域网使用前需要在系统防火墙中放行对应 TCP 端口。公网不要直接暴露明文 `ws://`；应通过 Caddy、Nginx 或其他反向代理提供 TLS，并使用 `wss://`。query token 可能进入代理访问日志，代理应避免记录完整 query string。
+
 ## Slash Commands
 
-三种 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。
+三个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP，不支持这些 slash commands。
 
 | 命令 | 说明 |
 | --- | --- |
@@ -155,7 +191,7 @@ Agent 只应在用户明确要求主动发送消息或文件时调用这些命�
 
 ```text
 dwo channel list
-dwo channel <weixin|telegram|feishu> status
+dwo channel <weixin|telegram|feishu|websocket> status
 ```
 
 `connected` 表示持久化绑定有效；Telegram 还要求 token 环境变量可读取，飞书/Lark 还要求 App ID/Secret 环境变量可读取。它不代表实时网络健康。排查顺序：

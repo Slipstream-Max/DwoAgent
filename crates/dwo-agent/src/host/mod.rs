@@ -25,6 +25,7 @@ pub struct Host {
     pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
     profile_root: PathBuf,
+    config_path: PathBuf,
     default_model: String,
     default_mode: dwo_tools::SessionMode,
     model_options: Vec<SessionModelOption>,
@@ -131,6 +132,8 @@ enum ManagedChannelAction {
     SendMessage,
     SendFile,
     Remove,
+    Token,
+    ResetToken,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +229,7 @@ impl Host {
             mcp,
             automation,
             profile_root,
+            config_path: config_path.to_path_buf(),
             default_model,
             default_mode,
             model_options,
@@ -241,6 +245,10 @@ impl Host {
 
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
+    }
+
+    pub(crate) fn config_path(&self) -> &Path {
+        &self.config_path
     }
 
     pub async fn shutdown(&self) {
@@ -549,14 +557,29 @@ impl Host {
     }
 
     async fn dispatch_channel(
-        &self,
+        self: &Arc<Self>,
         channel: ChannelKind,
         action: ManagedChannelAction,
         params: Value,
     ) -> Result<Value> {
         match action {
             ManagedChannelAction::Status => {
-                Ok(serde_json::to_value(self.channels.summary(channel).await?)?)
+                let mut value = serde_json::to_value(self.channels.summary(channel).await?)?;
+                if channel == ChannelKind::Websocket {
+                    let runtime = self.channels.load_websocket().await?;
+                    let object = value.as_object_mut().expect("channel summary is an object");
+                    object.insert(
+                        "running".to_string(),
+                        json!(self.channel_hub.is_running(channel).await),
+                    );
+                    object.insert(
+                        "listen".to_string(),
+                        json!(format!("0.0.0.0:{}", runtime.config.port)),
+                    );
+                    object.insert("path".to_string(), json!("/acp"));
+                    object.insert("authentication".to_string(), json!("token"));
+                }
+                Ok(value)
             }
             ManagedChannelAction::SendMessage => {
                 let params: SendMessageParam = serde_json::from_value(params)?;
@@ -573,6 +596,27 @@ impl Host {
             ManagedChannelAction::Remove => {
                 self.channel_hub.stop(channel).await;
                 Ok(json!({"removed": self.channels.remove(channel).await?}))
+            }
+            ManagedChannelAction::Token => {
+                anyhow::ensure!(
+                    channel == ChannelKind::Websocket,
+                    "token is only available for WebSocket"
+                );
+                let runtime = self.channels.load_websocket().await?;
+                Ok(json!({"token": runtime.token, "port": runtime.config.port, "path": "/acp"}))
+            }
+            ManagedChannelAction::ResetToken => {
+                anyhow::ensure!(
+                    channel == ChannelKind::Websocket,
+                    "reset-token is only available for WebSocket"
+                );
+                self.channel_hub.stop(channel).await;
+                let token = self.channels.reset_websocket_token().await?;
+                let summary = self.channels.summary(channel).await?;
+                if summary.enabled {
+                    self.channel_hub.start(channel, self.clone()).await?;
+                }
+                Ok(json!({"token": token, "reset": true}))
             }
         }
     }
@@ -950,6 +994,8 @@ fn managed_channel_action(method: &str) -> Option<(ChannelKind, ManagedChannelAc
         "send_message" => ManagedChannelAction::SendMessage,
         "send_file" => ManagedChannelAction::SendFile,
         "remove" => ManagedChannelAction::Remove,
+        "token" => ManagedChannelAction::Token,
+        "reset_token" => ManagedChannelAction::ResetToken,
         _ => return None,
     };
     Some((channel, action))
@@ -1142,13 +1188,15 @@ mod tests {
             .await
             .unwrap();
         let channel = channels.list().await.unwrap();
-        assert_eq!(channel.len(), 3);
+        assert_eq!(channel.len(), 4);
         assert_eq!(channel[0].name, "weixin");
         assert!(!channel[0].enabled);
         assert_eq!(channel[1].name, "telegram");
         assert!(!channel[1].enabled);
         assert_eq!(channel[2].name, "feishu");
         assert!(!channel[2].enabled);
+        assert_eq!(channel[3].name, "websocket");
+        assert!(!channel[3].enabled);
 
         let automation = parse_automation_config(profile.automation).unwrap();
         assert!(!automation.enabled);

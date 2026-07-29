@@ -10,12 +10,14 @@ use crate::host::Host;
 use super::ChannelKind;
 use super::feishu::RunningFeishu;
 use super::telegram::RunningTelegram;
+use super::websocket::RunningWebsocket;
 use super::weixin::RunningWeixin;
 
 enum RunningChannel {
     Weixin(RunningWeixin),
     Telegram(RunningTelegram),
     Feishu(RunningFeishu),
+    Websocket(RunningWebsocket),
 }
 
 impl RunningChannel {
@@ -24,6 +26,7 @@ impl RunningChannel {
             ChannelKind::Weixin => Ok(Self::Weixin(RunningWeixin::start(host).await?)),
             ChannelKind::Telegram => Ok(Self::Telegram(RunningTelegram::start(host).await?)),
             ChannelKind::Feishu => Ok(Self::Feishu(RunningFeishu::start(host).await?)),
+            ChannelKind::Websocket => Ok(Self::Websocket(RunningWebsocket::start(host).await?)),
         }
     }
 
@@ -32,6 +35,7 @@ impl RunningChannel {
             Self::Weixin(channel) => channel.stop().await,
             Self::Telegram(channel) => channel.stop().await,
             Self::Feishu(channel) => channel.stop().await,
+            Self::Websocket(channel) => channel.stop().await,
         }
     }
 
@@ -40,6 +44,7 @@ impl RunningChannel {
             Self::Weixin(channel) => channel.send_message(text).await,
             Self::Telegram(channel) => channel.send_message(text).await,
             Self::Feishu(channel) => channel.send_message(text).await,
+            Self::Websocket(_) => anyhow::bail!("WebSocket channel does not support send-message"),
         }
     }
 
@@ -48,6 +53,7 @@ impl RunningChannel {
             Self::Weixin(channel) => channel.send_file(path).await,
             Self::Telegram(channel) => channel.send_file(path).await,
             Self::Feishu(channel) => channel.send_file(path).await,
+            Self::Websocket(_) => anyhow::bail!("WebSocket channel does not support send-file"),
         }
     }
 }
@@ -110,6 +116,10 @@ impl ChannelHub {
         for channel in running {
             channel.stop().await;
         }
+    }
+
+    pub async fn is_running(&self, channel: ChannelKind) -> bool {
+        self.active.lock().await.contains_key(&channel)
     }
 
     pub async fn send_message(&self, channel: ChannelKind, text: &str) -> Result<()> {

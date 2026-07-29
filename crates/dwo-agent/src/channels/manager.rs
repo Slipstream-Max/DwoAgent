@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use teloxide::prelude::*;
 use teloxide::types::UpdateKind;
@@ -16,6 +17,23 @@ use super::ChannelKind;
 const WEIXIN_CHANNEL: &str = ChannelKind::Weixin.as_str();
 const TELEGRAM_CHANNEL: &str = ChannelKind::Telegram.as_str();
 const FEISHU_CHANNEL: &str = ChannelKind::Feishu.as_str();
+const WEBSOCKET_CHANNEL: &str = ChannelKind::Websocket.as_str();
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebsocketChannelConfig {
+    pub enabled: bool,
+    pub port: u16,
+}
+
+impl WebsocketChannelConfig {
+    fn validate(&self) -> Result<()> {
+        if self.port == 0 {
+            bail!("channels.websocket.port must be greater than 0");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -197,6 +215,21 @@ pub(crate) struct WeixinSecret {
     pub(crate) bound_user_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WebsocketSecret {
+    pub(crate) token: String,
+}
+
+impl WebsocketSecret {
+    fn validate(&self) -> Result<()> {
+        if self.token.trim().is_empty() {
+            bail!("channels.websocket secret field token must not be empty");
+        }
+        Ok(())
+    }
+}
+
 impl WeixinSecret {
     fn validate(&self) -> Result<()> {
         for (field, value) in [
@@ -232,6 +265,11 @@ pub(crate) struct FeishuRuntime {
     pub(crate) secret: FeishuSecret,
     pub(crate) app_id: String,
     pub(crate) app_secret: String,
+}
+
+pub(crate) struct WebsocketRuntime {
+    pub(crate) config: WebsocketChannelConfig,
+    pub(crate) token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,6 +411,7 @@ pub struct ChannelManager {
     weixin: Option<WeixinChannelConfig>,
     telegram: Option<TelegramChannelConfig>,
     feishu: Option<FeishuChannelConfig>,
+    websocket: Option<WebsocketChannelConfig>,
     pending_weixin: Mutex<HashMap<String, PendingLogin>>,
     pending_telegram: Mutex<HashMap<String, PendingTelegramBind>>,
     pending_feishu: Mutex<HashMap<String, PendingFeishuBind>>,
@@ -386,7 +425,7 @@ impl ChannelManager {
         if let Some(unsupported) = channels.keys().find(|name| {
             !matches!(
                 name.as_str(),
-                WEIXIN_CHANNEL | TELEGRAM_CHANNEL | FEISHU_CHANNEL
+                WEIXIN_CHANNEL | TELEGRAM_CHANNEL | FEISHU_CHANNEL | WEBSOCKET_CHANNEL
             )
         }) {
             bail!("unsupported channel configuration: channels.{unsupported}");
@@ -418,6 +457,15 @@ impl ChannelManager {
         if let Some(config) = &feishu {
             config.validate()?;
         }
+        let websocket = channels
+            .get(WEBSOCKET_CHANNEL)
+            .cloned()
+            .map(serde_yaml::from_value::<WebsocketChannelConfig>)
+            .transpose()
+            .context("parse channels.websocket")?;
+        if let Some(config) = &websocket {
+            config.validate()?;
+        }
         let root = profile_root.join("channels");
         let capability_root = profile_root.join("runtime/channel-capabilities");
         tokio::fs::create_dir_all(&root).await?;
@@ -428,6 +476,7 @@ impl ChannelManager {
             weixin,
             telegram,
             feishu,
+            websocket,
             pending_weixin: Mutex::new(HashMap::new()),
             pending_telegram: Mutex::new(HashMap::new()),
             pending_feishu: Mutex::new(HashMap::new()),
@@ -499,6 +548,21 @@ impl ChannelManager {
                 bound_user_id,
             });
         }
+        if let Some(config) = &self.websocket {
+            let connected = if config.enabled {
+                self.ensure_websocket_secret().await?;
+                true
+            } else {
+                self.store(ChannelKind::Websocket).secret_path().is_file()
+            };
+            summaries.push(ChannelSummary {
+                name: WEBSOCKET_CHANNEL.to_string(),
+                enabled: config.enabled,
+                connected,
+                selected_session_id: None,
+                bound_user_id: None,
+            });
+        }
         Ok(summaries)
     }
 
@@ -517,6 +581,7 @@ impl ChannelManager {
                 Ok(self.load_telegram().await?.secret.bound_chat_id.to_string())
             }
             ChannelKind::Feishu => Ok(self.load_feishu().await?.secret.bound_chat_id),
+            ChannelKind::Websocket => bail!("WebSocket channel has no bound target"),
         }
     }
 
@@ -586,6 +651,41 @@ impl ChannelManager {
             app_id,
             app_secret,
         })
+    }
+
+    pub(crate) async fn load_websocket(&self) -> Result<WebsocketRuntime> {
+        let config = self
+            .websocket
+            .clone()
+            .context("channels.websocket is not configured")?;
+        let secret = self.ensure_websocket_secret().await?;
+        Ok(WebsocketRuntime {
+            config,
+            token: secret.token,
+        })
+    }
+
+    pub async fn reset_websocket_token(&self) -> Result<String> {
+        self.websocket
+            .as_ref()
+            .context("channels.websocket is not configured")?;
+        let secret = new_websocket_secret()?;
+        self.store(ChannelKind::Websocket)
+            .save_secret(&secret)
+            .await?;
+        Ok(secret.token)
+    }
+
+    async fn ensure_websocket_secret(&self) -> Result<WebsocketSecret> {
+        let store = self.store(ChannelKind::Websocket);
+        if store.secret_path().is_file() {
+            let secret: WebsocketSecret = store.load_secret().await?;
+            secret.validate()?;
+            return Ok(secret);
+        }
+        let secret = new_websocket_secret()?;
+        store.save_secret(&secret).await?;
+        Ok(secret)
     }
 
     pub async fn begin_telegram_bind(&self) -> Result<TelegramBindStart> {
@@ -961,6 +1061,7 @@ impl ChannelManager {
                     };
                 (available, super::feishu::CAPABILITY_PROMPT)
             }
+            ChannelKind::Websocket => (false, ""),
         };
         self.sync_capability(channel.as_str(), available, content)
             .await
@@ -1013,6 +1114,14 @@ fn telegram_bind_identity(update: &Update, code: &str) -> Option<(u64, i64)> {
         && parts.next() == Some(code)
         && parts.next().is_none())
     .then_some((user.id.0, message.chat.id.0))
+}
+
+fn new_websocket_secret() -> Result<WebsocketSecret> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).context("generate WebSocket token")?;
+    Ok(WebsocketSecret {
+        token: URL_SAFE_NO_PAD.encode(bytes),
+    })
 }
 
 fn resolve_env(name: &str) -> Result<String> {
@@ -1274,6 +1383,36 @@ mediaInput: true
             .expect("empty Telegram proxy should fail");
 
         assert!(format!("{error:#}").contains("tgProxy"));
+    }
+
+    #[tokio::test]
+    async fn websocket_token_is_generated_persisted_and_reset() {
+        let profile = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+enabled: true
+port: 8765
+"#,
+        )
+        .unwrap();
+        let channels = BTreeMap::from([(WEBSOCKET_CHANNEL.to_string(), profile)]);
+        let root = tempfile::tempdir().unwrap();
+        let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
+
+        let first = manager.load_websocket().await.unwrap();
+        let second = manager.load_websocket().await.unwrap();
+        assert_eq!(first.config.port, 8765);
+        assert_eq!(first.token, second.token);
+        assert_eq!(first.token.len(), 43);
+        assert!(!first.token.contains('='));
+
+        let reset = manager.reset_websocket_token().await.unwrap();
+        assert_ne!(reset, first.token);
+        assert_eq!(manager.load_websocket().await.unwrap().token, reset);
+        let secret: WebsocketSecret =
+            read_yaml(&manager.store(ChannelKind::Websocket).secret_path())
+                .await
+                .unwrap();
+        assert_eq!(secret.token, reset);
     }
 
     #[tokio::test]

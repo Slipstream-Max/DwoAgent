@@ -100,6 +100,9 @@ dwo channel feishu bind
 dwo channel feishu unbind
 dwo channel feishu send-message <message>
 dwo channel feishu send-file <path>
+dwo channel websocket status
+dwo channel websocket token
+dwo channel websocket reset-token
 ```
 
 `weixin bind` 在终端显示 QR 登录流程。`telegram bind` 从 `botTokenEnv` 读取 BotFather token，终端显示一次性 `/bind <code>`；在 bot 私聊中发送后，daemon 把该 user/chat 写入 `channels/telegram/secret.yaml`。`feishu bind` 从 `appIdEnv`/`appSecretEnv` 读取企业自建应用凭据，临时建立长连接并等待同样的私聊命令，随后只把 `open_id/chat_id` 写入 `channels/feishu/secret.yaml`。只有绑定用户和私聊可以使用对应 bot，token/App Secret 都不会落盘。
@@ -107,6 +110,8 @@ dwo channel feishu send-file <path>
 Telegram 使用 long polling，不需要 webhook 或公网地址。`tgProxy` 是仅作用于 Telegram Bot API 和媒体下载的可选 HTTP 代理。入站 photo、document、video 下载到 `runtime/attachments/telegram/YYYY/MM/DD/<session-id>/` 并作为带本地路径、MIME、文件名和大小的 resource link 提交。输出使用 Telegram plain text，不启用 parse mode，也不修改模型文本。
 
 Feishu/Lark 使用 `openlark` WebSocket 长连接，也不需要 webhook 或公网地址。`platform: feishu` 对应国内开放平台，`platform: lark` 对应海外开放平台。应用必须启用机器人、以长连接订阅 `im.message.receive_v1`，并开通接收消息、以应用身份发送消息、获取和上传消息资源的权限。入站 text、image、file 均可触发 prompt；image/file 下载到 `runtime/attachments/feishu/YYYY/MM/DD/<session-id>/`。输出使用 plain text。
+
+`websocket` 在 `0.0.0.0:<port>/acp` 提供完整 ACP 协议。token 自动保存到 `channels/websocket/secret.yaml`；`token` 显示连接凭据，`reset-token` 使旧 token 失效并断开已有连接。
 
 不同 channel 可以 `/use` 同一个全局 session，也会在各自的 `runtime.yaml` 中保持当前选择。绑定、解绑或重绑某个 channel 只重启该 channel，不影响其他 channel。
 

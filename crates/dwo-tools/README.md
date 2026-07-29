@@ -18,7 +18,9 @@ AgentService
 ```
 
 `TerminalManager::list` and `shutdown_all` are internal service APIs. The model
-only sees `terminal` and `file_edit`; there is no `wait` or terminal-list tool.
+only sees `terminal`, `read_file`, and `file_edit`; there is no `wait` or
+terminal-list tool. `read_file` pages UTF-8 text at 500 lines and injects
+supported image content only when the selected model accepts image input.
 
 ## Call path
 

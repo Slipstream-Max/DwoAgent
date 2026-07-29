@@ -19,6 +19,13 @@ pub struct ParsedToolCall {
 pub enum ToolCall {
     Terminal(TerminalArgs),
     FileEdit(FileEditArgs),
+    ReadFile(ReadFileArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFileArgs {
+    pub path: PathBuf,
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +65,7 @@ pub enum ToolIntent {
         terminal_id: TerminalId,
     },
     FileEdit,
+    ReadFile,
 }
 
 impl ToolCall {
@@ -76,6 +84,7 @@ impl ToolCall {
                 terminal_id: terminal_id.clone(),
             },
             Self::FileEdit(_) => ToolIntent::FileEdit,
+            Self::ReadFile(_) => ToolIntent::ReadFile,
         }
     }
 
@@ -83,6 +92,7 @@ impl ToolCall {
         match self {
             Self::Terminal(_) => "terminal",
             Self::FileEdit(_) => "file_edit",
+            Self::ReadFile(_) => "read_file",
         }
     }
 }
@@ -122,6 +132,9 @@ impl ParsedToolCall {
             ),
             "file_edit" => ToolCall::FileEdit(
                 parse_file_edit(&arguments).map_err(|message| parse_error(&id, &name, message))?,
+            ),
+            "read_file" => ToolCall::ReadFile(
+                parse_read_file(&arguments).map_err(|message| parse_error(&id, &name, message))?,
             ),
             _ => return Err(parse_error(&id, &name, format!("Unknown tool: {name}"))),
         };
@@ -179,6 +192,26 @@ fn parse_file_edit(args: &Map<String, Value>) -> Result<FileEditArgs, String> {
         return Err("file_edit patch must not be empty.".to_string());
     }
     Ok(FileEditArgs { patch })
+}
+
+fn parse_read_file(args: &Map<String, Value>) -> Result<ReadFileArgs, String> {
+    let path = required_string(args, "path")?;
+    if path.trim().is_empty() {
+        return Err("read_file path must not be empty.".to_string());
+    }
+    let cursor = match args.get("cursor") {
+        None | Some(Value::Null) => 1,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Argument cursor must be a positive integer.".to_string())?,
+        Some(_) => return Err("Argument cursor must be a positive integer.".to_string()),
+    };
+    Ok(ReadFileArgs {
+        path: PathBuf::from(path),
+        cursor,
+    })
 }
 
 fn required_string(args: &Map<String, Value>, key: &str) -> Result<String, String> {

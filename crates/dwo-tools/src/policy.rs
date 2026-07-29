@@ -92,6 +92,7 @@ impl ToolPolicyEngine {
             ToolIntent::TerminalInput { data, .. } if data.is_empty() => Authorization::Allow,
             ToolIntent::TerminalInput { data, .. } => self.authorize_command(mode, data),
             ToolIntent::TerminalKill { .. } => Authorization::Allow,
+            ToolIntent::ReadFile => Authorization::Allow,
             ToolIntent::FileEdit => match mode {
                 SessionMode::FullAccess => Authorization::Allow,
                 SessionMode::Confirm => Authorization::Confirm,

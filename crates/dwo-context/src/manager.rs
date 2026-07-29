@@ -57,6 +57,18 @@ pub struct ContextManager {
     context: SessionContext,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingContextMessage {
+    User(MessageContent),
+    Internal(MessageContent),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingMessageBatch {
+    pub messages: Vec<PendingContextMessage>,
+    pub should_continue: bool,
+}
+
 impl ContextManager {
     pub fn new(context: SessionContext) -> Self {
         let mut context = context;
@@ -139,6 +151,40 @@ impl ContextManager {
 
     pub fn append_tool(&mut self, _turn_id: TurnId, result: ToolResultRecord) {
         self.context.messages.push(ContextMessage::tool(&result));
+        self.context
+            .messages
+            .extend(result.model_context.into_iter().map(ContextMessage::user));
+    }
+
+    pub fn append_tool_batch(
+        &mut self,
+        _turn_id: TurnId,
+        results: impl IntoIterator<Item = ToolResultRecord>,
+    ) {
+        let results = results.into_iter().collect::<Vec<_>>();
+        self.context
+            .messages
+            .extend(results.iter().map(ContextMessage::tool));
+        self.context.messages.extend(
+            results
+                .into_iter()
+                .flat_map(|result| result.model_context)
+                .map(ContextMessage::user),
+        );
+    }
+
+    pub fn append_pending(&mut self, turn_id: TurnId, batch: PendingMessageBatch) -> bool {
+        for message in batch.messages {
+            match message {
+                PendingContextMessage::User(content) => {
+                    self.append_user(turn_id.clone(), content);
+                }
+                PendingContextMessage::Internal(content) => {
+                    self.append_internal(MessageKind::Runtime, content);
+                }
+            }
+        }
+        batch.should_continue
     }
 
     pub fn record_model_success(&mut self, model: impl Into<String>) {
@@ -151,8 +197,25 @@ impl ContextManager {
         tokens
     }
 
-    pub fn should_compact(&self, trigger_tokens: u64) -> bool {
+    /// Refresh derived usage and return a persistence-ready context snapshot.
+    pub fn checkpoint(&mut self, tools: &[Value]) -> SessionContext {
+        self.refresh_usage(tools);
+        self.context.clone()
+    }
+
+    fn should_compact(&self, trigger_tokens: u64) -> bool {
         trigger_tokens > 0 && self.context.usage.current_tokens >= trigger_tokens
+    }
+
+    /// Refresh the complete request estimate and plan scheduled compaction when needed.
+    pub fn scheduled_compaction(
+        &mut self,
+        trigger_tokens: u64,
+        tools: &[Value],
+    ) -> Option<CompactionPlan> {
+        self.refresh_usage(tools);
+        self.should_compact(trigger_tokens)
+            .then(|| CompactionPlanner::default().build(&self.context))
     }
 
     /// Scan mutable profile/environment state at a model-step boundary.
@@ -177,6 +240,10 @@ impl ContextManager {
 
     pub fn plan_recovery_compaction(&self, planner: &CompactionPlanner) -> CompactionPlan {
         planner.build_recovery(&self.context)
+    }
+
+    pub fn recovery_compaction(&self) -> CompactionPlan {
+        CompactionPlanner::default().build_recovery(&self.context)
     }
 
     pub fn plan_image_downgrade(&self) -> CompactionPlan {

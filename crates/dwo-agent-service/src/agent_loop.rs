@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use dwo_context::{
-    CompactionPlan, CompactionPlanner, ContextManager, MessageContent, MessageKind, SessionContext,
-    SystemPromptBuilder, ToolResultRecord, TurnId,
+    CompactionPlan, ContextManager, PendingMessageBatch, SessionContext, SystemPromptBuilder,
+    TurnId,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection, ModelStreamEvent};
 use dwo_tools::{ExecutionContext, ParsedToolCall, ToolManager, ToolResult};
@@ -29,16 +29,6 @@ pub(crate) enum TurnActorMessage {
     TakePendingMessages {
         completed: oneshot::Sender<PendingMessageBatch>,
     },
-}
-
-pub(crate) enum PendingContextMessage {
-    User(MessageContent),
-    Internal(MessageContent),
-}
-
-pub(crate) struct PendingMessageBatch {
-    pub messages: Vec<PendingContextMessage>,
-    pub should_continue: bool,
 }
 
 pub(crate) enum TurnEvent {
@@ -93,11 +83,12 @@ impl RunTurn {
         let _ = self.actor.send(TurnActorMessage::Event(event));
     }
 
-    async fn checkpoint(&self) -> anyhow::Result<()> {
+    async fn checkpoint(&mut self) -> anyhow::Result<()> {
+        let context = self.context.checkpoint(&self.tools.schemas());
         let (completed, wait) = oneshot::channel();
         self.actor
             .send(TurnActorMessage::PersistContext {
-                context: Box::new(self.context.context().clone()),
+                context: Box::new(context),
                 completed,
             })
             .map_err(|_| anyhow::anyhow!("session actor stopped"))?;
@@ -112,20 +103,6 @@ impl RunTurn {
             .map_err(|_| anyhow::anyhow!("session actor stopped"))?;
         wait.await
             .map_err(|_| anyhow::anyhow!("session actor dropped pending message request"))
-    }
-
-    fn append_pending_messages(&mut self, batch: PendingMessageBatch) -> bool {
-        for message in batch.messages {
-            match message {
-                PendingContextMessage::User(content) => {
-                    self.context.append_user(self.turn_id.clone(), content);
-                }
-                PendingContextMessage::Internal(content) => {
-                    self.context.append_internal(MessageKind::Runtime, content);
-                }
-            }
-        }
-        batch.should_continue
     }
 }
 
@@ -146,23 +123,12 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
         if let Err(error) = turn.context.refresh_environment(&turn.prompt_builder) {
             return TurnOutcome::Failed(format!("refresh environment: {error:#}"));
         }
-        refresh_context_usage(turn);
-
-        let desired = current_selection(turn);
-        let limits = match turn.model.model_limits(&desired.model) {
-            Ok(limits) => limits,
-            Err(error) => return TurnOutcome::Failed(format!("compact context: {error:#}")),
-        };
-        if turn.context.should_compact(limits.compact_trigger_tokens) {
-            let plan = turn.context.plan_compaction(&CompactionPlanner::default());
-            let recovery = recovery_selection(turn, &desired);
-            if let Err(error) = compact_context(turn, plan, recovery).await {
-                return if turn.cancellation.is_cancelled() {
-                    TurnOutcome::Cancelled
-                } else {
-                    TurnOutcome::Failed(format!("compact context: {error:#}"))
-                };
-            }
+        if let Err(error) = compact_if_needed(turn).await {
+            return if turn.cancellation.is_cancelled() {
+                TurnOutcome::Cancelled
+            } else {
+                TurnOutcome::Failed(format!("compact context: {error:#}"))
+            };
         }
 
         let selection = current_selection(turn);
@@ -183,8 +149,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             response.reasoning.clone(),
             response.tool_calls.clone(),
         );
-        turn.context.record_model_success(selection.model);
-        refresh_context_usage(turn);
+        turn.context.record_model_success(selection.model.clone());
         turn.emit(TurnEvent::AssistantCompleted {
             turn_id: turn.turn_id.clone(),
             content: response.content,
@@ -198,8 +163,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                     return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
                 }
             };
-            if turn.append_pending_messages(pending) {
-                refresh_context_usage(turn);
+            if turn.context.append_pending(turn.turn_id.clone(), pending) {
                 if let Err(error) = turn.checkpoint().await {
                     return TurnOutcome::Failed(format!(
                         "persist pending message checkpoint: {error:#}"
@@ -222,6 +186,12 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
 
         let mut execution = ExecutionContext::new(turn.config.borrow().mode);
         execution.confirmation = Some(turn.permission.confirmation_handler());
+        execution.allow_image_input = match turn.model.supports_image_input(&selection.model) {
+            Ok(supported) => supported,
+            Err(error) => {
+                return TurnOutcome::Failed(format!("resolve model image capability: {error:#}"));
+            }
+        };
         let calls = response.tool_calls;
         let tool_results = tokio::select! {
             _ = turn.cancellation.cancelled() => cancelled_results(&calls),
@@ -230,28 +200,23 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
 
         let context_results = tool_results
             .iter()
-            .map(|result| ToolResultRecord {
-                tool_call_id: result.tool_call_id.clone(),
-                tool_name: result.tool_name.clone(),
-                output: result.output.clone(),
-            })
+            .map(ToolResult::context_record)
             .collect::<Vec<_>>();
-        for (result, context_result) in tool_results.into_iter().zip(context_results) {
+        for result in &tool_results {
             turn.emit(TurnEvent::ToolCompleted {
                 turn_id: turn.turn_id.clone(),
                 result: result.clone(),
             });
-            turn.context
-                .append_tool(turn.turn_id.clone(), context_result);
         }
+        turn.context
+            .append_tool_batch(turn.turn_id.clone(), context_results);
         let pending = match turn.take_pending_messages().await {
             Ok(pending) => pending,
             Err(error) => {
                 return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
             }
         };
-        turn.append_pending_messages(pending);
-        refresh_context_usage(turn);
+        turn.context.append_pending(turn.turn_id.clone(), pending);
         if let Err(error) = turn.checkpoint().await {
             return TurnOutcome::Failed(format!("persist tool checkpoint: {error:#}"));
         }
@@ -271,9 +236,7 @@ async fn request_with_context_recovery(
         Ok(response) => Ok(response),
         Err(error) if error.is_context_length_exceeded() => {
             let recovery = recovery_selection(turn, selection);
-            let plan = turn
-                .context
-                .plan_recovery_compaction(&CompactionPlanner::default());
+            let plan = turn.context.recovery_compaction();
             if !compact_context(turn, plan, recovery).await? {
                 return Err(error.into());
             }
@@ -348,8 +311,19 @@ async fn compact_context(
     Ok(true)
 }
 
-fn refresh_context_usage(turn: &mut RunTurn) {
-    turn.context.refresh_usage(&turn.tools.schemas());
+async fn compact_if_needed(turn: &mut RunTurn) -> anyhow::Result<()> {
+    let desired = current_selection(turn);
+    let trigger_tokens = turn
+        .model
+        .model_limits(&desired.model)?
+        .compact_trigger_tokens;
+    let schemas = turn.tools.schemas();
+    let Some(plan) = turn.context.scheduled_compaction(trigger_tokens, &schemas) else {
+        return Ok(());
+    };
+    let recovery = recovery_selection(turn, &desired);
+    compact_context(turn, plan, recovery).await?;
+    Ok(())
 }
 
 fn current_selection(turn: &RunTurn) -> ModelSelection {
@@ -392,6 +366,7 @@ fn cancelled_results(calls: &[Value]) -> Vec<ToolResult> {
                     "status": "cancelled",
                     "error": "turn cancelled",
                 }),
+                model_context: Vec::new(),
             }
         })
         .collect()

@@ -6,6 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
+dwo-context = { path = "../dwo-context" }
 dwo-pty = { path = "../dwo-pty" }
 futures.workspace = true
 regex.workspace = true

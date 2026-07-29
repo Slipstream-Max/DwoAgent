@@ -47,6 +47,7 @@ pub(crate) async fn execute(
         }
     }
 
+    let mut model_context = Vec::new();
     let output = match call.call {
         ToolCall::Terminal(TerminalArgs::Run {
             command,
@@ -85,12 +86,21 @@ pub(crate) async fn execute(
                     "changes": result.changes,
                 })
             }),
+        ToolCall::ReadFile(args) => {
+            crate::read_file::execute(args, &manager.cwd, context.allow_image_input)
+                .await
+                .map(|result| {
+                    model_context = result.model_context;
+                    result.output
+                })
+        }
     };
 
     ToolResult {
         tool_call_id: id,
         tool_name: name.clone(),
         output: output.unwrap_or_else(|error| error_output(&name, format!("{error:#}"))),
+        model_context,
     }
 }
 
@@ -199,6 +209,7 @@ fn blocked_result(id: &str, name: &str, message: impl Into<String>) -> ToolResul
             "status": "blocked_by_policy",
             "message": message.into(),
         }),
+        model_context: Vec::new(),
     }
 }
 
@@ -207,6 +218,7 @@ fn result_error(id: &str, name: &str, message: impl Into<String>) -> ToolResult 
         tool_call_id: id.to_string(),
         tool_name: name.to_string(),
         output: error_output(name, message),
+        model_context: Vec::new(),
     }
 }
 
@@ -226,6 +238,7 @@ fn result_error_with_code(
             "code": code,
             "error": message.into(),
         }),
+        model_context: Vec::new(),
     }
 }
 
@@ -242,6 +255,7 @@ fn tool_kind(name: &str) -> &'static str {
     match name {
         "terminal" => "terminal",
         "file_edit" => "file_edit",
+        "read_file" => "read_file",
         _ => "unknown",
     }
 }

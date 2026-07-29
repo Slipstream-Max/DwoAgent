@@ -28,8 +28,12 @@ fn usage_estimates_the_complete_context_without_provider_token_fields() {
         manager.context().usage.last_model.as_deref(),
         Some("second-model")
     );
-    assert!(!manager.should_compact(with_user + 1));
-    assert!(manager.should_compact(with_user));
+    assert!(
+        manager
+            .scheduled_compaction(with_user + 1, &tools)
+            .is_none()
+    );
+    assert!(manager.scheduled_compaction(with_user, &tools).is_some());
 
     let usage = serde_json::to_value(&manager.context().usage).unwrap();
     assert!(usage.get("input_tokens").is_none());
@@ -202,6 +206,41 @@ fn content_blocks_round_trip_through_context_storage() {
 }
 
 #[test]
+fn tool_batch_places_image_context_after_every_tool_result() {
+    let root = tempfile::tempdir().unwrap();
+    let builder = SystemPromptBuilder::new(None, root.path());
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+    let turn = TurnId::parse("turn-images").unwrap();
+    manager.append_tool_batch(
+        turn,
+        vec![
+            ToolResultRecord {
+                tool_call_id: "text-call".to_string(),
+                tool_name: "read_file".to_string(),
+                output: json!({"content":"hello", "start_line":1, "end_line":1}),
+                model_context: Vec::new(),
+            },
+            ToolResultRecord {
+                tool_call_id: "image-call".to_string(),
+                tool_name: "read_file".to_string(),
+                output: json!({"status":"completed"}),
+                model_context: vec![MessageContent::blocks(vec![ContentBlock::image(
+                    "image/png",
+                    "aGVsbG8=",
+                )])],
+            },
+        ],
+    );
+
+    let messages = manager.model_messages();
+    let tail = &messages[messages.len() - 3..];
+    assert_eq!(tail[0].role, MessageRole::Tool);
+    assert_eq!(tail[1].role, MessageRole::Tool);
+    assert_eq!(tail[2].role, MessageRole::User);
+    assert!(tail[2].content.contains_images());
+}
+
+#[test]
 fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
@@ -224,6 +263,7 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
             tool_call_id: "call-1".to_string(),
             tool_name: "terminal".to_string(),
             output: json!({"output":"src/main.rs:1:TODO"}),
+            model_context: Vec::new(),
         },
     );
     let second = TurnId::parse("turn-2").unwrap();
@@ -308,6 +348,7 @@ fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
             tool_call_id: "call-1".to_string(),
             tool_name: "file_edit".to_string(),
             output: json!({"status":"completed", "changes":[{"path":"x", "kind":"add"}]}),
+            model_context: Vec::new(),
         },
     );
 

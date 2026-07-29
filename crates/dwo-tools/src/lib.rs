@@ -6,6 +6,7 @@ pub mod file_edit;
 pub mod manager;
 pub mod policy;
 pub mod prompt;
+mod read_file;
 pub mod result;
 pub mod schema;
 pub mod terminal;

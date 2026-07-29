@@ -37,6 +37,7 @@ pub struct ConfirmationDecision {
 pub struct ExecutionContext {
     pub mode: SessionMode,
     pub confirmation: Option<ConfirmationHandler>,
+    pub allow_image_input: bool,
 }
 
 impl ExecutionContext {
@@ -44,6 +45,7 @@ impl ExecutionContext {
         Self {
             mode,
             confirmation: None,
+            allow_image_input: false,
         }
     }
 }
@@ -258,5 +260,41 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(dir.path().join("concurrent.txt").is_file());
         assert_eq!(task.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_file_only_adds_images_for_capable_models() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("image.bin"), b"\x89PNG\r\n\x1a\nimage").unwrap();
+        let call = || {
+            ParsedToolCall::parse(json!({
+                "id":"image",
+                "name":"read_file",
+                "arguments":{"path":"image.bin"}
+            }))
+            .unwrap()
+        };
+        let manager = manager(dir.path().to_path_buf());
+
+        let denied = manager
+            .execute(call(), &ExecutionContext::new(SessionMode::FullAccess))
+            .await;
+        assert_eq!(denied.output["status"], "error");
+        assert!(denied.model_context.is_empty());
+
+        let mut capable = ExecutionContext::new(SessionMode::FullAccess);
+        capable.allow_image_input = true;
+        let allowed = manager.execute(call(), &capable).await;
+        assert_eq!(allowed.output, json!({"status":"completed"}));
+        assert_eq!(allowed.model_context.len(), 1);
+        assert!(allowed.model_context[0].contains_images());
+        assert_eq!(
+            serde_json::to_value(&allowed).unwrap(),
+            json!({
+                "tool_call_id":"image",
+                "tool_name":"read_file",
+                "output":{"status":"completed"}
+            })
+        );
     }
 }

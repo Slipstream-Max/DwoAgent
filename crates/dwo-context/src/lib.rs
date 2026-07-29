@@ -12,7 +12,10 @@ pub use compaction::{
     DEFAULT_RECENT_CONTEXT_TOKENS, DEFAULT_RECENT_USER_TOKENS, IMAGE_DOWNGRADE_INSTRUCTION,
 };
 pub use env_watcher::{DynamicEnvironmentSnapshot, EnvChange, EnvWatcherState};
-pub use manager::{CompactionState, ContextManager, SessionContext, SessionUsage};
+pub use manager::{
+    CompactionState, ContextManager, PendingContextMessage, PendingMessageBatch, SessionContext,
+    SessionUsage,
+};
 pub use message::{
     ContentAnnotations, ContentAudienceRole, ContentBlock, ContextMessage,
     EmbeddedResourceContents, MessageContent, MessageKind, MessageRole, ToolResultRecord, TurnId,

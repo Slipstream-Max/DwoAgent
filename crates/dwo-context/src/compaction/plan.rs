@@ -337,6 +337,7 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "terminal".to_string(),
                 output: json!({"status":"completed","output":"large output"}),
+                model_context: Vec::new(),
             }));
         context
             .messages

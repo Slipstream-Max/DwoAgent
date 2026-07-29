@@ -29,8 +29,11 @@ Compaction is split into preparation and replacement phases. The model client
 owns the non-streaming summary request:
 
 ```text
-ContextManager::plan_compaction(CompactionPlanner)
-  -> estimate message, reasoning, image, tool-call, result, and schema tokens
+ContextManager::scheduled_compaction(trigger_tokens, tools)
+  -> refresh the complete message, reasoning, image, tool-call, result, and schema estimate
+  -> decide whether the model-specific trigger has been reached
+  -> return no plan when compaction is not needed
+  -> otherwise build the default CompactionPlan
   -> reserve approximately 20K newest context tokens, cutting inside a turn when needed
   -> keep the split turn's user question with the retained agent suffix
   -> pass the complete summary prefix to the summary model without history filtering

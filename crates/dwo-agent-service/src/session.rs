@@ -3,7 +3,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use dwo_context::{
-    ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind, SystemPromptBuilder,
+    ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind,
+    PendingContextMessage, PendingMessageBatch, SystemPromptBuilder,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection};
 use dwo_tools::{ConfirmationDecision, ToolManager};
@@ -13,10 +14,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::TurnId;
-use crate::agent_loop::{
-    self, PendingContextMessage, PendingMessageBatch, RunTurn, TurnActorMessage, TurnEvent,
-    TurnOutcome,
-};
+use crate::agent_loop::{self, RunTurn, TurnActorMessage, TurnEvent, TurnOutcome};
 use crate::error::AgentServiceError;
 use crate::events::{
     ActiveToolCall, ClientTranscriptEvent, RuntimePhase, SessionEvent, SessionEventPayload,

@@ -377,4 +377,6 @@ pub struct ToolResultRecord {
     pub tool_call_id: String,
     pub tool_name: String,
     pub output: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_context: Vec<MessageContent>,
 }

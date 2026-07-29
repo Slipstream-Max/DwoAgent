@@ -50,16 +50,7 @@ active turn 运行期间收到的新 prompt 会进入 session FIFO，在当前 m
 
 `session prompt --to ... --model ...` 的模型切换应用于后续 model request。若目标模型支持图片则直接切换；若目标模型是纯文本模型且当前 context 含图片，idle session 会先使用当前或最后成功的视觉模型生成文字摘要，再重建无图 model context。摘要失败时模型和 context 都不改变；图片 turn 运行期间不允许降级切换。client transcript 始终保留原始图片用于 replay，文本模型也会在持久化前拒绝新的图片 prompt。迁移成功会将当前 context token 重置为 0，并按目标模型窗口发送新的 usage update。
 
-Session 文件布局为：
-
-```text
-runtime/sessions/YYYY/MM/DD/<session-id>/
-|- session.json
-|- model_context.json
-`- client_transcript.jsonl
-```
-
-`session.json` 保存 session 配置，`model_context.json` 保存当前模型上下文和 usage，`client_transcript.jsonl` 是追加式的完整客户端事件流。
+Session 文件布局和持久化说明见 [Profile 配置指南](profile.md#session-数据)。
 
 ## MCP
 

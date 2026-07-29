@@ -93,41 +93,9 @@ dwo daemon start
 
 ## 📂 Profile 目录结构
 
-`dwo install` 默认创建 `~/.dwoagent/`：
+`dwo install` 在 `~/.dwoagent/` 下创建 `profile.yaml`、`resource/`（prompts、skills、MCP）、`runtime/`（session 数据和日志）和 `channels/`。日常只需要编辑 `profile.yaml` 和 `resource/`，其余由 daemon 自动管理。
 
-```text
-~/.dwoagent/
-|- profile.yaml
-|- bin/
-|- resource/
-|  |- prompts/
-|  |  |- System.md
-|  |  `- AGENTS.md
-|  |- skills/<skill>/SKILL.md
-|  `- mcp.json
-|- runtime/
-|  |- sessions/YYYY/MM/DD/<session-id>/
-|  |- workspaces/<session-id>/
-|  |- attachments/<channel>/
-|  |- channel-capabilities/
-|  |- mcp/
-|  `- logs/
-`- channels/<channel>/
-   |- runtime.yaml
-   `- secret.yaml
-```
-
-| 路径 | 用途 |
-| --- | --- |
-| `profile.yaml` | Profile 名称、默认权限、模型、channels 和 automation。 |
-| `resource/prompts/System.md` | Agent 的主 system prompt。 |
-| `resource/prompts/AGENTS.md` | Profile 级规则，可留空。工作目录中的 `AGENTS.md` 也会加载。 |
-| `resource/skills/` | 本地 skills，每个 skill 使用独立目录和 `SKILL.md`。 |
-| `resource/mcp.json` | stdio、HTTP 和 OAuth MCP server 配置。 |
-| `runtime/` | Session、附件、MCP catalog、OAuth 和日志等运行数据。 |
-| `channels/` | 各 channel 的绑定信息和当前 session。Telegram token 与飞书 App 凭据从环境变量读取。 |
-
-通常只需要编辑 `profile.yaml` 和 `resource/`。`runtime/`、channel state 和 secret 文件由 daemon 管理。完整目录、YAML 字段、模型和运行数据说明见 [Profile 配置指南](docs/profile.md)。
+完整目录树、YAML 字段和运行数据说明 → [Profile 配置指南](docs/profile.md)
 
 ## ⌨️ CLI 快速上手
 
@@ -150,24 +118,7 @@ dwo session watch <session-id>
 
 CLI 的 `prompt` 用来提交任务，`watch` 用来读取最新事件。需要连续聊天时，可以直接接 ACP 或消息 channel。
 
-常用管理命令：
-
-```text
-dwo profile-list
-dwo session list [--all]
-dwo session cancel <session-id>
-dwo session delete <session-id>
-
-dwo mcp search <query>
-dwo mcp call <server.tool> --args '<json>'
-dwo mcp auth <server> [--logout]
-
-dwo automation list
-dwo automation run <job>
-dwo channel list
-```
-
-所有参数和行为见 [CLI 命令参考](docs/commands.md)。
+完整命令参考 → [CLI 命令参考](docs/commands.md)
 
 ## 🧰 原生工具
 
@@ -213,70 +164,17 @@ dwo channel feishu bind       # 私聊机器人发送一次性 /bind <code>
 
 Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不需要公网 webhook。环境变量、开放平台权限和完整部署步骤见 [Channel 部署与使用](docs/channels.md)。
 
-所有 channel 共用下面这组 slash commands：
-
-| 命令 | 用途 |
-| --- | --- |
-| `/help` | 显示命令列表 |
-| `/list` | 列出 session，并标记当前选择 |
-| `/new [名称] [--cwd <路径>]` | 创建并选择一个 session |
-| `/use <session-id>` | 切换 session，并回放最近对话 |
-| `/status` | 查看当前 session、模型和运行状态 |
-| `/model <名称>` | 切换当前 session 的模型 |
-| `/reasoning <级别\|off>` | 调整或关闭 reasoning |
-| `/policy [full_access\|confirm\|watch]` | 查看或修改工具权限策略 |
-| `/allow [request-id]` | 允许当前或指定的权限请求 |
-| `/deny [request-id]` | 拒绝当前或指定的权限请求 |
-| `/cancel` | 取消正在运行的 turn |
-| `/del <session-id>` | 删除 session |
-
-普通文本直接作为 prompt 发送。在 `confirm` 模式下，Agent 请求执行敏感工具时，可以直接回复 `/allow` 或 `/deny`。
+普通文本直接作为 prompt 发送；在 `confirm` 模式下回复 `/allow` 或 `/deny` 即可处理权限请求。完整 slash commands → [Channel 部署与使用](docs/channels.md#slash-commands)
 
 ## 🧩 一个不够？派小弟
 
 当前 agent 可以创建子 session，把检查模块、查找资料、运行测试等独立工作分出去。每个子 session 都有自己的上下文和 transcript，默认继承父 session 的工作目录、权限、模型和 reasoning；子 session 的权限不能高于父 session。
 
-```text
-dwo session prompt "检查认证模块并列出潜在问题" --title "auth review"
-dwo session list
-dwo session watch <session-id>
-dwo session prompt "再检查错误处理" --to <session-id>
-dwo session cancel <session-id>
-```
-
-子任务完成、失败或被取消后，daemon 会把结果作为 internal message 自动送回父 session。父 session 空闲时会立即处理，正在运行时会在当前模型响应或一批工具调用结束后接收，不需要持续轮询。子 session 也可以继续创建下一层子 session，结果会沿父子关系逐层返回。完整机制和示例见 [Subsessions 使用指南](docs/subsessions.md)。
+子任务完成后，daemon 自动把结果送回父 session。父 session 忙时会在当前 turn 结束后接手处理，不需要轮询。子 session 还能继续派自己的小弟，结果沿树逐层返回。完整用法和示例 → [Subsessions 使用指南](docs/subsessions.md)
 
 ## ⏰ 让它替你值班
 
-定时任务写在 `~/.dwoagent/profile.yaml`。下面的任务每天 9:00 创建一个 session，并检查项目状态：
-
-```yaml
-automation:
-  enabled: true
-  jobs:
-    - name: daily-report
-      schedule:
-        cron: "0 9 * * *"
-        timezone: Asia/Shanghai
-      session:
-        mode: new
-        cwd: projects/demo
-        title: Daily report
-      prompt: 检查项目状态并整理今天需要处理的事项。
-```
-
-| Session 模式 | 用法 |
-| --- | --- |
-| `new` | 每次运行创建新 session，可设置 `cwd` 和 `title`。 |
-| `fixed` | 把 prompt 投递到指定 `sessionId`，适合持续更新同一项任务。 |
-
-```text
-dwo automation list
-dwo automation status
-dwo automation run daily-report
-```
-
-Cron 使用 `分钟 小时 日期 月份 星期` 五个字段。Daemon 会读取配置变化并更新执行时间。Automation 无人值守运行，遇到工具权限确认时会自动拒绝，避免任务长期等待。完整字段和 fixed session 示例见 [Automation 使用指南](docs/automation.md)。
+在 `profile.yaml` 里写一段 cron，daemon 到点自动创建 session 跑任务。支持每次新建 session 或持续投递同一个 session。无人值守时工具权限请求会自动拒绝，不会卡住。完整配置和示例 → [Automation 使用指南](docs/automation.md)
 
 ## 🔀 运行全景
 

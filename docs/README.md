@@ -5,8 +5,9 @@
 ## 从这里开始
 
 1. 按 [README 的 Build & Install](../README.md#build--install) 编译、安装并启动 daemon。
-2. 在 [Profile 配置指南](profile.md) 中设置模型、权限和需要启用的 channel。
-3. 选择一种对话入口：IDE/编辑器使用 [ACP](acp.md)，聊天应用使用 [Channels](channels.md)，脚本或终端使用 [CLI](commands.md)。
+1. 按 [README 的 Build & Install](../README.md#五分钟跑起来) 编译、安装并启动 daemon。
+1. 在 [Profile 配置指南](profile.md) 中设置模型、权限和需要启用的 channel。
+1. 选择一种对话入口：IDE/编辑器使用 [ACP](acp.md)，聊天应用使用 [Channels](channels.md)，脚本或终端使用 [CLI](commands.md)。
 
 ## 文档地图
 

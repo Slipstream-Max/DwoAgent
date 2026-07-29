@@ -249,14 +249,14 @@ impl ModelClient for ScriptedModelGateway {
     async fn stream_turn(
         &self,
         selection: ModelSelection,
-        messages: Vec<ContextMessage>,
-        _tools: Vec<Value>,
+        messages: &[ContextMessage],
+        _tools: &[Value],
         events: mpsc::UnboundedSender<ModelStreamEvent>,
-        cancellation: CancellationToken,
+        cancellation: &CancellationToken,
     ) -> Result<ModelReply, ModelClientError> {
         self.requests.lock().await.push(RecordedTurnRequest {
             selection,
-            messages,
+            messages: messages.to_vec(),
         });
         let step = self.steps.lock().await.pop_front().ok_or_else(|| {
             ModelClientError::Protocol("scripted model has no response left".into())

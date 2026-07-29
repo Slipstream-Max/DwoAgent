@@ -88,10 +88,10 @@ pub trait ModelClient: Send + Sync {
     async fn stream_turn(
         &self,
         selection: ModelSelection,
-        messages: Vec<ContextMessage>,
-        tools: Vec<Value>,
+        messages: &[ContextMessage],
+        tools: &[Value],
         events: mpsc::UnboundedSender<ModelStreamEvent>,
-        cancellation: CancellationToken,
+        cancellation: &CancellationToken,
     ) -> Result<ModelReply, ModelClientError>;
 
     async fn complete(

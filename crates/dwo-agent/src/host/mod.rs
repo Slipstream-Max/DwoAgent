@@ -253,14 +253,25 @@ impl Host {
     }
 
     pub async fn shutdown(&self) {
-        self.channel_hub.stop_all().await;
-        self.mcp.shutdown().await;
-        self.service.shutdown().await;
+        tokio::join!(
+            self.channel_hub.stop_all(),
+            self.mcp.shutdown(),
+            self.service.shutdown()
+        );
     }
 
     pub async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
         if let Some((channel, action)) = managed_channel_action(method) {
             return self.dispatch_channel(channel, action, params).await;
+        }
+        if method.starts_with("channel.") {
+            return self.dispatch_channel_binding(method, params).await;
+        }
+        if method.starts_with("automation.") {
+            return self.dispatch_automation(method, params).await;
+        }
+        if method.starts_with("mcp.") {
+            return self.dispatch_mcp(method, params).await;
         }
         match method {
             "daemon.status" => Ok(json!({
@@ -468,6 +479,12 @@ impl Host {
                     .await?;
                 Ok(json!({"resolved": true}))
             }
+            other => anyhow::bail!("unknown RPC method: {other}"),
+        }
+    }
+
+    async fn dispatch_automation(&self, method: &str, params: Value) -> Result<Value> {
+        match method {
             "automation.list" | "automation.status" => {
                 Ok(serde_json::to_value(self.automation.list().await)?)
             }
@@ -477,6 +494,43 @@ impl Host {
                     self.automation.run_now(&params.job).await?,
                 )?)
             }
+            other => anyhow::bail!("unknown RPC method: {other}"),
+        }
+    }
+
+    async fn dispatch_mcp(&self, method: &str, params: Value) -> Result<Value> {
+        match method {
+            "mcp.search" => {
+                let params: McpSearchParam = serde_json::from_value(params)?;
+                let catalog = self.mcp.catalog_snapshot().await?;
+                Ok(serde_json::to_value(catalog.search(&params.query))?)
+            }
+            "mcp.call" => {
+                let params: McpCallParam = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(
+                    self.mcp.call(&params.selector, params.arguments).await?,
+                )?)
+            }
+            "mcp.auth.login" => {
+                let params: McpAuthParam = serde_json::from_value(params)?;
+                self.mcp.auth_login(&params.server).await?;
+                Ok(json!({"authorized": true, "server": params.server}))
+            }
+            "mcp.auth.logout" => {
+                let params: McpAuthParam = serde_json::from_value(params)?;
+                self.mcp.auth_logout(&params.server).await?;
+                Ok(json!({"authorized": false, "server": params.server}))
+            }
+            other => anyhow::bail!("unknown RPC method: {other}"),
+        }
+    }
+
+    async fn dispatch_channel_binding(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        match method {
             "channel.list" => Ok(serde_json::to_value(self.channels.list().await?)?),
             "channel.weixin.begin" => Ok(serde_json::to_value(
                 self.channels.begin_weixin_login().await?,
@@ -531,27 +585,6 @@ impl Host {
                         .await?;
                 }
                 Ok(serde_json::to_value(progress)?)
-            }
-            "mcp.search" => {
-                let params: McpSearchParam = serde_json::from_value(params)?;
-                let catalog = self.mcp.catalog_snapshot().await?;
-                Ok(serde_json::to_value(catalog.search(&params.query))?)
-            }
-            "mcp.call" => {
-                let params: McpCallParam = serde_json::from_value(params)?;
-                Ok(serde_json::to_value(
-                    self.mcp.call(&params.selector, params.arguments).await?,
-                )?)
-            }
-            "mcp.auth.login" => {
-                let params: McpAuthParam = serde_json::from_value(params)?;
-                self.mcp.auth_login(&params.server).await?;
-                Ok(json!({"authorized": true, "server": params.server}))
-            }
-            "mcp.auth.logout" => {
-                let params: McpAuthParam = serde_json::from_value(params)?;
-                self.mcp.auth_logout(&params.server).await?;
-                Ok(json!({"authorized": false, "server": params.server}))
             }
             other => anyhow::bail!("unknown RPC method: {other}"),
         }

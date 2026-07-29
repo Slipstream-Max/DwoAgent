@@ -581,8 +581,8 @@ impl SessionActor {
             None
         };
         let mut context = ContextManager::new(self.record.context.clone());
-        context.append_user(turn_id.clone(), content);
-        context.refresh_usage(&self.tools.schemas());
+        context.append_user(content);
+        context.refresh_usage(self.tools.schemas());
         self.record.context = context.into_context();
         self.record.touch();
         self.repository.save(&self.record).await?;
@@ -621,7 +621,7 @@ impl SessionActor {
         let turn_id = TurnId::new();
         let mut context = ContextManager::new(self.record.context.clone());
         context.append_internal(MessageKind::Runtime, content);
-        context.refresh_usage(&self.tools.schemas());
+        context.refresh_usage(self.tools.schemas());
         self.record.context = context.into_context();
         self.record.touch();
         self.repository.save(&self.record).await?;
@@ -639,7 +639,7 @@ impl SessionActor {
         let previous_usage = self.usage_snapshot();
         let mut context = ContextManager::new(self.record.context.clone());
         context.append_internal(MessageKind::Runtime, content);
-        context.refresh_usage(&self.tools.schemas());
+        context.refresh_usage(self.tools.schemas());
         self.record.context = context.into_context();
         self.record.touch();
         self.repository.save(&self.record).await?;
@@ -744,7 +744,7 @@ impl SessionActor {
                 plan,
                 summary.summary,
                 &self.prompt_builder,
-                &self.tools.schemas(),
+                self.tools.schemas(),
             )
             .map_err(anyhow::Error::from)?;
         updated.context = context.into_context();
@@ -816,8 +816,7 @@ impl SessionActor {
                     false
                 };
                 if accepted {
-                    self.emit_client_event(SessionEventPayload::AssistantDelta { turn_id, delta })
-                        .await;
+                    self.emit(SessionEventPayload::AssistantDelta { turn_id, delta });
                 }
             }
             TurnEvent::AssistantReasoningDelta { turn_id, delta } => {
@@ -826,11 +825,7 @@ impl SessionActor {
                     .as_ref()
                     .is_some_and(|active| active.id == turn_id);
                 if accepted {
-                    self.emit_client_event(SessionEventPayload::AssistantReasoningDelta {
-                        turn_id,
-                        delta,
-                    })
-                    .await;
+                    self.emit(SessionEventPayload::AssistantReasoningDelta { turn_id, delta });
                 }
             }
             TurnEvent::AssistantCompleted {

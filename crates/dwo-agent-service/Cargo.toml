@@ -11,6 +11,7 @@ chrono.workspace = true
 dwo-tools = { path = "../dwo-tools" }
 dwo-context = { path = "../dwo-context" }
 dwo-model-client = { path = "../dwo-model-client" }
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

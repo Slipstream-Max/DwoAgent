@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{Datelike, Local, TimeZone};
 use dwo_context::SessionContext;
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
@@ -119,6 +120,7 @@ impl PersistedSessionMetadata {
 
 pub struct FsSessionRepository {
     root: PathBuf,
+    paths: RwLock<HashMap<SessionId, PathBuf>>,
     locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
@@ -126,8 +128,15 @@ impl FsSessionRepository {
     pub async fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         tokio::fs::create_dir_all(&root).await?;
+        let mut paths = HashMap::new();
+        for session_dir in Self::scan_session_dirs(&root).await? {
+            let metadata: PersistedSessionMetadata =
+                Self::read_json(&session_dir.join(SESSION_META_FILE)).await?;
+            paths.insert(metadata.info.id, session_dir);
+        }
         Ok(Self {
             root,
+            paths: RwLock::new(paths),
             locks: Mutex::new(HashMap::new()),
         })
     }
@@ -155,12 +164,11 @@ impl FsSessionRepository {
             .clone()
     }
 
-    async fn session_dirs(&self) -> Result<Vec<PathBuf>> {
-        let mut directories = vec![self.root.clone()];
+    async fn scan_session_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+        let mut directories = vec![root.to_path_buf()];
         let mut sessions = Vec::new();
         while let Some(directory) = directories.pop() {
-            if directory != self.root
-                && tokio::fs::try_exists(directory.join(SESSION_META_FILE)).await?
+            if directory != root && tokio::fs::try_exists(directory.join(SESSION_META_FILE)).await?
             {
                 sessions.push(directory);
                 continue;
@@ -175,12 +183,12 @@ impl FsSessionRepository {
         Ok(sessions)
     }
 
-    async fn find_dir(&self, id: &SessionId) -> Result<Option<PathBuf>> {
-        Ok(self
-            .session_dirs()
-            .await?
-            .into_iter()
-            .find(|path| path.file_name().is_some_and(|name| name == id.as_str())))
+    async fn session_dirs(&self) -> Vec<PathBuf> {
+        self.paths.read().await.values().cloned().collect()
+    }
+
+    async fn find_dir(&self, id: &SessionId) -> Option<PathBuf> {
+        self.paths.read().await.get(id).cloned()
     }
 
     async fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -256,23 +264,29 @@ impl SessionRepository for FsSessionRepository {
             &PersistedSessionMetadata::from_record(record),
         )
         .await?;
-        Self::ensure_transcript(&session_dir).await
+        Self::ensure_transcript(&session_dir).await?;
+        self.paths
+            .write()
+            .await
+            .insert(record.info.id.clone(), session_dir);
+        Ok(())
     }
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionRecord>> {
         let lock = self.session_lock(id).await;
         let _read = lock.lock().await;
-        let Some(session_dir) = self.find_dir(id).await? else {
+        let Some(session_dir) = self.find_dir(id).await else {
             return Ok(None);
         };
         Self::read_record(&session_dir).await.map(Some)
     }
 
     async fn list(&self) -> Result<Vec<SessionRecord>> {
-        let mut records = Vec::new();
-        for session_dir in self.session_dirs().await? {
-            records.push(Self::read_record(&session_dir).await?);
-        }
+        let mut records = stream::iter(self.session_dirs().await)
+            .map(|session_dir| async move { Self::read_record(&session_dir).await })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
         records.sort_by_key(|record| Reverse(record.info.updated_at_ms));
         Ok(records)
     }
@@ -280,11 +294,12 @@ impl SessionRepository for FsSessionRepository {
     async fn delete(&self, id: &SessionId) -> Result<bool> {
         let lock = self.session_lock(id).await;
         let _write = lock.lock().await;
-        let Some(session_dir) = self.find_dir(id).await? else {
+        let Some(session_dir) = self.find_dir(id).await else {
             return Ok(false);
         };
         tokio::fs::remove_dir_all(&session_dir).await?;
         self.remove_empty_date_directories(&session_dir).await?;
+        self.paths.write().await.remove(id);
         Ok(true)
     }
 
@@ -297,7 +312,7 @@ impl SessionRepository for FsSessionRepository {
         let _write = lock.lock().await;
         let session_dir = self
             .find_dir(id)
-            .await?
+            .await
             .with_context(|| format!("session {id} does not exist"))?;
         let path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
         let mut line = serde_json::to_vec(event)?;
@@ -316,7 +331,7 @@ impl SessionRepository for FsSessionRepository {
     async fn load_transcript(&self, id: &SessionId) -> Result<Vec<ClientTranscriptEvent>> {
         let lock = self.session_lock(id).await;
         let _read = lock.lock().await;
-        let Some(session_dir) = self.find_dir(id).await? else {
+        let Some(session_dir) = self.find_dir(id).await else {
             return Ok(Vec::new());
         };
         let path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
@@ -423,6 +438,8 @@ mod tests {
                 .len(),
             2
         );
+        drop(repository);
+        let repository = FsSessionRepository::new(root.path()).await.unwrap();
         assert_eq!(
             repository
                 .load(&record.info.id)
@@ -446,6 +463,7 @@ mod tests {
         );
         assert_eq!(repository.list().await.unwrap().len(), 1);
         assert!(repository.delete(&record.info.id).await.unwrap());
+        assert!(repository.load(&record.info.id).await.unwrap().is_none());
         assert!(!root.path().join("2026").exists());
     }
 }

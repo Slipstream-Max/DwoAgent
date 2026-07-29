@@ -98,10 +98,10 @@ impl ModelClient for ConfiguredModelClient {
     async fn stream_turn(
         &self,
         selection: ModelSelection,
-        messages: Vec<dwo_context::ContextMessage>,
-        tools: Vec<serde_json::Value>,
+        messages: &[dwo_context::ContextMessage],
+        tools: &[serde_json::Value],
         events: mpsc::UnboundedSender<ModelStreamEvent>,
-        cancellation: CancellationToken,
+        cancellation: &CancellationToken,
     ) -> Result<ModelReply, ModelClientError> {
         self.validate_selection(&selection)?;
         if messages
@@ -116,11 +116,11 @@ impl ModelClient for ConfiguredModelClient {
         provider
             .stream(
                 model,
-                &messages,
-                &tools,
+                messages,
+                tools,
                 selection.reasoning.as_deref(),
                 &events,
-                &cancellation,
+                cancellation,
             )
             .await
     }

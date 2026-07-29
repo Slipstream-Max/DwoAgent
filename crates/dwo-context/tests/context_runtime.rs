@@ -1,6 +1,6 @@
 use dwo_context::{
     CompactionPlanner, ContentBlock, ContextManager, MessageContent, MessageKind, MessageRole,
-    SystemPromptBuilder, ToolResultRecord, TurnId, estimate_content_tokens,
+    SystemPromptBuilder, ToolResultRecord, estimate_content_tokens, estimate_context_tokens,
 };
 use serde_json::json;
 
@@ -17,8 +17,12 @@ fn usage_estimates_the_complete_context_without_provider_token_fields() {
     let tools = vec![json!({"type":"function","function":{"name":"terminal"}})];
 
     let initial = manager.refresh_usage(&tools);
-    manager.append_user(TurnId::parse("turn-1").unwrap(), "hello world");
+    manager.append_user("hello world");
     let with_user = manager.refresh_usage(&tools);
+    assert_eq!(
+        with_user,
+        estimate_context_tokens(manager.model_messages(), &tools)
+    );
     manager.record_model_success("second-model");
 
     assert!(initial > 0);
@@ -210,27 +214,23 @@ fn tool_batch_places_image_context_after_every_tool_result() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
-    let turn = TurnId::parse("turn-images").unwrap();
-    manager.append_tool_batch(
-        turn,
-        vec![
-            ToolResultRecord {
-                tool_call_id: "text-call".to_string(),
-                tool_name: "read_file".to_string(),
-                output: json!({"content":"hello", "start_line":1, "end_line":1}),
-                model_context: Vec::new(),
-            },
-            ToolResultRecord {
-                tool_call_id: "image-call".to_string(),
-                tool_name: "read_file".to_string(),
-                output: json!({"status":"completed"}),
-                model_context: vec![MessageContent::blocks(vec![ContentBlock::image(
-                    "image/png",
-                    "aGVsbG8=",
-                )])],
-            },
-        ],
-    );
+    manager.append_tool_batch(vec![
+        ToolResultRecord {
+            tool_call_id: "text-call".to_string(),
+            tool_name: "read_file".to_string(),
+            output: json!({"content":"hello", "start_line":1, "end_line":1}),
+            model_context: Vec::new(),
+        },
+        ToolResultRecord {
+            tool_call_id: "image-call".to_string(),
+            tool_name: "read_file".to_string(),
+            output: json!({"status":"completed"}),
+            model_context: vec![MessageContent::blocks(vec![ContentBlock::image(
+                "image/png",
+                "aGVsbG8=",
+            )])],
+        },
+    ]);
 
     let messages = manager.model_messages();
     let tail = &messages[messages.len() - 3..];
@@ -245,10 +245,8 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
-    let first = TurnId::parse("turn-1").unwrap();
-    manager.append_user(first.clone(), "inspect the project");
+    manager.append_user("inspect the project");
     manager.append_assistant_with_reasoning(
-        first.clone(),
         "checking",
         Some("keep this reasoning in summary input".to_string()),
         vec![json!({
@@ -257,18 +255,14 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
             "arguments":{"action":"run","command":"rg TODO"}
         })],
     );
-    manager.append_tool(
-        first,
-        ToolResultRecord {
-            tool_call_id: "call-1".to_string(),
-            tool_name: "terminal".to_string(),
-            output: json!({"output":"src/main.rs:1:TODO"}),
-            model_context: Vec::new(),
-        },
-    );
-    let second = TurnId::parse("turn-2").unwrap();
-    manager.append_user(second.clone(), "continue");
-    manager.append_assistant(second, "done", Vec::new());
+    manager.append_tool(ToolResultRecord {
+        tool_call_id: "call-1".to_string(),
+        tool_name: "terminal".to_string(),
+        output: json!({"output":"src/main.rs:1:TODO"}),
+        model_context: Vec::new(),
+    });
+    manager.append_user("continue");
+    manager.append_assistant("done", Vec::new());
 
     let plan = manager.plan_compaction(&CompactionPlanner::new(20, 5_000));
     let historical_assistant = plan
@@ -302,12 +296,8 @@ fn historical_and_reserved_users_share_one_token_budget() {
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     for index in 1..=4 {
-        let turn = TurnId::parse(format!("turn-{index}")).unwrap();
-        manager.append_user(
-            turn.clone(),
-            format!("HEAD-{index}-{}-TAIL-{index}", "you".repeat(40)),
-        );
-        manager.append_assistant(turn, format!("answer {index}"), Vec::new());
+        manager.append_user(format!("HEAD-{index}-{}-TAIL-{index}", "you".repeat(40)));
+        manager.append_assistant(format!("answer {index}"), Vec::new());
     }
 
     let plan = manager.plan_compaction(&CompactionPlanner::new(50, 40));
@@ -331,10 +321,8 @@ fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
-    let turn = TurnId::parse("turn-tools").unwrap();
-    manager.append_user(turn.clone(), "inspect");
+    manager.append_user("inspect");
     manager.append_assistant(
-        turn.clone(),
         "",
         vec![json!({
             "id":"call-1",
@@ -342,15 +330,12 @@ fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
             "arguments":{"patch":"*** Begin Patch\n*** Add File: x\n+x\n*** End Patch"}
         })],
     );
-    manager.append_tool(
-        turn,
-        ToolResultRecord {
-            tool_call_id: "call-1".to_string(),
-            tool_name: "file_edit".to_string(),
-            output: json!({"status":"completed", "changes":[{"path":"x", "kind":"add"}]}),
-            model_context: Vec::new(),
-        },
-    );
+    manager.append_tool(ToolResultRecord {
+        tool_call_id: "call-1".to_string(),
+        tool_name: "file_edit".to_string(),
+        output: json!({"status":"completed", "changes":[{"path":"x", "kind":"add"}]}),
+        model_context: Vec::new(),
+    });
 
     let plan = manager.plan_compaction(&CompactionPlanner::new(10_000, 5_000));
     assert!(!plan.has_compactable_history());
@@ -372,15 +357,11 @@ fn normal_summary_preserves_images_and_image_downgrade_removes_them() {
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     for index in 1..=2 {
-        let turn = TurnId::parse(format!("turn-image-{index}")).unwrap();
-        manager.append_user(
-            turn.clone(),
-            MessageContent::blocks(vec![
-                ContentBlock::text(format!("user {index}")),
-                ContentBlock::image("image/png", format!("image-{index}")),
-            ]),
-        );
-        manager.append_assistant(turn, format!("answer {index}"), Vec::new());
+        manager.append_user(MessageContent::blocks(vec![
+            ContentBlock::text(format!("user {index}")),
+            ContentBlock::image("image/png", format!("image-{index}")),
+        ]));
+        manager.append_assistant(format!("answer {index}"), Vec::new());
     }
 
     let normal = manager.plan_compaction(&CompactionPlanner::new(10, 5_000));
@@ -420,7 +401,7 @@ fn compaction_rebuild_absorbs_current_rules_and_reestimates_usage() {
     write(&cwd.join("AGENTS.md"), "cwd rules v1");
     let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
-    manager.append_user(TurnId::parse("turn-1").unwrap(), "hello");
+    manager.append_user("hello");
 
     write(&profile.join("resource/prompts/System.md"), "system v2");
     write(&cwd.join("AGENTS.md"), "cwd rules v2");

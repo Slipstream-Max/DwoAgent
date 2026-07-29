@@ -11,8 +11,10 @@ mod weixin;
 
 pub(crate) use hub::ChannelHub;
 pub(crate) use manager::{
-    ChannelManager, FeishuBindProgress, TelegramBindProgress, WeixinLoginProgress, wait_before_poll,
+    ChannelManager, FeishuBindProgress, TelegramBindProgress, WeixinLoginProgress,
 };
+
+pub(crate) const BIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChannelKind {

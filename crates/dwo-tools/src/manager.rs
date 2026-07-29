@@ -56,6 +56,7 @@ pub struct ToolManager {
     pub(crate) policy: Arc<ToolPolicyEngine>,
     pub(crate) terminals: Arc<TerminalManager>,
     pub(crate) file_edit: Arc<FileEditManager>,
+    schemas: Vec<Value>,
 }
 
 impl ToolManager {
@@ -82,6 +83,7 @@ impl ToolManager {
             policy,
             terminals,
             file_edit,
+            schemas: crate::schema::tool_schemas(),
         })
     }
 
@@ -101,8 +103,8 @@ impl ToolManager {
         self.terminals.shutdown_all().await;
     }
 
-    pub fn schemas(&self) -> Vec<Value> {
-        crate::schema::tool_schemas()
+    pub fn schemas(&self) -> &[Value] {
+        &self.schemas
     }
 }
 

@@ -8,7 +8,7 @@ use http::{HeaderName, HeaderValue};
 use rmcp::{
     RoleClient, ServiceExt,
     model::{CallToolRequestParams, ClientInfo, Tool},
-    service::RunningService,
+    service::{Peer, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -23,6 +23,7 @@ use crate::{AuthConfig, Error, McpServerConfig, Result, StdioConfig, StreamableH
 const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) type ConnectedClient = RunningService<RoleClient, ClientInfo>;
+pub(crate) type ConnectedPeer = Peer<RoleClient>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -127,11 +128,7 @@ impl McpClient {
             .map_err(|_| timeout_error(name))?
     }
 
-    pub(crate) async fn list_tools(
-        &self,
-        name: &str,
-        client: &ConnectedClient,
-    ) -> Result<Vec<Tool>> {
+    pub(crate) async fn list_tools(&self, name: &str, client: &ConnectedPeer) -> Result<Vec<Tool>> {
         tokio::time::timeout(OPERATION_TIMEOUT, client.list_all_tools())
             .await
             .map_err(|_| timeout_error(name))?
@@ -141,7 +138,7 @@ impl McpClient {
     pub(crate) async fn call(
         &self,
         name: &str,
-        client: &ConnectedClient,
+        client: &ConnectedPeer,
         tool: &str,
         arguments: Map<String, Value>,
     ) -> Result<CallResult> {

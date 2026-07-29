@@ -86,7 +86,7 @@ impl RunTurn {
     }
 
     async fn checkpoint(&mut self) -> anyhow::Result<()> {
-        let context = self.context.checkpoint(&self.tools.schemas());
+        let context = self.context.checkpoint(self.tools.schemas());
         let (completed, wait) = oneshot::channel();
         self.actor
             .send(TurnActorMessage::PersistContext {
@@ -156,9 +156,17 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             return TurnOutcome::Cancelled;
         }
 
-        if let Err(error) = turn.context.refresh_environment(&turn.prompt_builder) {
-            return TurnOutcome::Failed(format!("refresh environment: {error:#}"));
-        }
+        let builder = turn.prompt_builder.clone();
+        let current = match tokio::task::spawn_blocking(move || builder.scan_dynamic()).await {
+            Ok(Ok(current)) => current,
+            Ok(Err(error)) => {
+                return TurnOutcome::Failed(format!("refresh environment: {error:#}"));
+            }
+            Err(error) => {
+                return TurnOutcome::Failed(format!("refresh environment task: {error:#}"));
+            }
+        };
+        turn.context.refresh_environment_snapshot(current);
         if let Err(error) = compact_if_needed(turn).await {
             return if turn.cancellation.is_cancelled() {
                 TurnOutcome::Cancelled
@@ -180,7 +188,6 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             .map(active_tool_call)
             .collect::<Vec<_>>();
         turn.context.append_assistant_with_reasoning(
-            turn.turn_id.clone(),
             response.content.clone(),
             response.reasoning.clone(),
             response.tool_calls.clone(),
@@ -199,7 +206,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                     return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
                 }
             };
-            if turn.context.append_pending(turn.turn_id.clone(), pending) {
+            if turn.context.append_pending(pending) {
                 if let Err(error) = turn.checkpoint().await {
                     return TurnOutcome::Failed(format!(
                         "persist pending message checkpoint: {error:#}"
@@ -269,15 +276,14 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             duration_ms = tools_started.elapsed().as_millis() as u64,
             "tool batch completed"
         );
-        turn.context
-            .append_tool_batch(turn.turn_id.clone(), context_results);
+        turn.context.append_tool_batch(context_results);
         let pending = match turn.take_pending_messages().await {
             Ok(pending) => pending,
             Err(error) => {
                 return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
             }
         };
-        turn.context.append_pending(turn.turn_id.clone(), pending);
+        turn.context.append_pending(pending);
         if let Err(error) = turn.checkpoint().await {
             return TurnOutcome::Failed(format!("persist tool checkpoint: {error:#}"));
         }
@@ -325,12 +331,15 @@ async fn request_model(
         "model request started"
     );
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let actor = turn.actor.clone();
+    let turn_id = turn.turn_id.clone();
+    let cancellation = turn.cancellation.clone();
     let model_call = turn.model.stream_turn(
         selection.clone(),
-        turn.context.model_messages().to_vec(),
+        turn.context.model_messages(),
         turn.tools.schemas(),
         chunk_tx,
-        turn.cancellation.clone(),
+        &cancellation,
     );
     tokio::pin!(model_call);
     loop {
@@ -338,7 +347,7 @@ async fn request_model(
             biased;
             response = &mut model_call => {
                 while let Ok(event) = chunk_rx.try_recv() {
-                    emit_model_delta(turn, event);
+                    emit_model_delta(&actor, &turn_id, event);
                 }
                 match &response {
                     Ok(reply) => tracing::info!(
@@ -367,20 +376,27 @@ async fn request_model(
                 return response;
             }
             Some(event) = chunk_rx.recv() => {
-                emit_model_delta(turn, event);
+                emit_model_delta(&actor, &turn_id, event);
             }
         }
     }
 }
 
-fn emit_model_delta(turn: &RunTurn, event: ModelStreamEvent) {
+fn emit_model_delta(
+    actor: &mpsc::UnboundedSender<TurnActorMessage>,
+    turn_id: &TurnId,
+    event: ModelStreamEvent,
+) {
+    let emit = |event| {
+        let _ = actor.send(TurnActorMessage::Event(event));
+    };
     match event {
-        ModelStreamEvent::TextDelta(delta) => turn.emit(TurnEvent::AssistantDelta {
-            turn_id: turn.turn_id.clone(),
+        ModelStreamEvent::TextDelta(delta) => emit(TurnEvent::AssistantDelta {
+            turn_id: turn_id.clone(),
             delta,
         }),
-        ModelStreamEvent::ReasoningDelta(delta) => turn.emit(TurnEvent::AssistantReasoningDelta {
-            turn_id: turn.turn_id.clone(),
+        ModelStreamEvent::ReasoningDelta(delta) => emit(TurnEvent::AssistantReasoningDelta {
+            turn_id: turn_id.clone(),
             delta,
         }),
     }
@@ -413,7 +429,7 @@ async fn compact_context(
         String::new()
     };
     turn.context
-        .apply_compaction(plan, summary, &turn.prompt_builder, &turn.tools.schemas())?;
+        .apply_compaction(plan, summary, &turn.prompt_builder, turn.tools.schemas())?;
     turn.checkpoint().await?;
     tracing::info!(
         event = "context.compaction_completed",
@@ -433,7 +449,7 @@ async fn compact_if_needed(turn: &mut RunTurn) -> anyhow::Result<()> {
         .model_limits(&desired.model)?
         .compact_trigger_tokens;
     let schemas = turn.tools.schemas();
-    let Some(plan) = turn.context.scheduled_compaction(trigger_tokens, &schemas) else {
+    let Some(plan) = turn.context.scheduled_compaction(trigger_tokens, schemas) else {
         return Ok(());
     };
     let recovery = recovery_selection(turn, &desired);

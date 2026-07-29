@@ -16,8 +16,11 @@ use crate::host;
 use crate::local::{acp, ipc};
 use crate::logging;
 
+mod install;
 mod output;
 mod render;
+
+use install::{install, unregister_service};
 
 #[derive(Parser)]
 #[command(name = "dwo", version, about = "dwoagent host and control CLI")]
@@ -228,13 +231,13 @@ pub(crate) async fn run() -> Result<()> {
             }
             DaemonCommand::Status => {
                 let status = ipc::request(&config_path, "daemon.status", json!({})).await?;
-                print_value(&status)?;
+                render::write_value(&status)?;
             }
         },
         Command::Session { command } => run_session(command, &config_path).await?,
         Command::ProfileList => {
             let value = ipc::request(&config_path, "profile.list", json!({})).await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         Command::Channel { command } => run_channel(command, &config_path).await?,
         Command::Mcp { command } => run_mcp(command, &config_path).await?,
@@ -277,7 +280,7 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
         AutomationCommand::List { json } | AutomationCommand::Status { json } => {
             let value = ipc::request(config_path, "automation.list", json!({})).await?;
             if json {
-                print_value(&value)?;
+                render::write_value(&value)?;
             } else {
                 let jobs: Vec<AutomationJobStatus> = serde_json::from_value(value)?;
                 if jobs.is_empty() {
@@ -297,7 +300,7 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
         AutomationCommand::Run { job, json } => {
             let value = ipc::request(config_path, "automation.run", json!({"job": job})).await?;
             if json {
-                print_value(&value)?;
+                render::write_value(&value)?;
             } else {
                 let record: AutomationRunRecord = serde_json::from_value(value)?;
                 output::line(format_args!(
@@ -333,7 +336,7 @@ async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
                 json!({"selector": selector, "arguments": arguments}),
             )
             .await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         McpCommand::Auth { server, logout } => {
             let method = if logout {
@@ -398,7 +401,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                 }),
             )
             .await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         SessionCommand::Cancel { id } => {
             ipc::request(config_path, "session.cancel", json!({"session_id": id})).await?;
@@ -411,7 +414,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                 json!({"session_id": id, "cursor": cursor, "limit": limit}),
             )
             .await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         SessionCommand::Approve { id, permission_id } => {
             permission(config_path, id, endpoint_id, permission_id, true, None).await?;
@@ -457,7 +460,7 @@ async fn run_channel(command: ChannelCommand, config_path: &Path) -> Result<()> 
     match command {
         ChannelCommand::List => {
             let value = ipc::request(config_path, "channel.list", json!({})).await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         ChannelCommand::Weixin { command } => {
             run_managed_channel(ChannelKind::Weixin, command, config_path).await?
@@ -480,7 +483,7 @@ async fn run_channel(command: ChannelCommand, config_path: &Path) -> Result<()> 
                 json!({}),
             )
             .await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
     }
     Ok(())
@@ -495,11 +498,11 @@ async fn run_managed_channel(
     match command {
         ManagedChannelCommand::Status => {
             let value = ipc::request(config_path, &method("status"), json!({})).await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         ManagedChannelCommand::Unbind => {
             let value = ipc::request(config_path, &method("remove"), json!({})).await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         ManagedChannelCommand::SendMessage { message } => {
             let value = ipc::request(
@@ -508,12 +511,12 @@ async fn run_managed_channel(
                 json!({"text": message}),
             )
             .await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         ManagedChannelCommand::SendFile { path } => {
             let value =
                 ipc::request(config_path, &method("send_file"), json!({"path": path})).await?;
-            print_value(&value)?;
+            render::write_value(&value)?;
         }
         ManagedChannelCommand::Bind => match channel {
             ChannelKind::Weixin => bind_weixin(config_path).await?,
@@ -536,7 +539,7 @@ async fn bind_weixin(config_path: &Path) -> Result<()> {
     output::line(format_args!("{rendered_qr}"))?;
     let mut verify_code: Option<String> = None;
     loop {
-        channels::wait_before_poll().await;
+        tokio::time::sleep(channels::BIND_POLL_INTERVAL).await;
         let progress = ipc::request(
             config_path,
             "channel.weixin.poll",
@@ -645,188 +648,6 @@ fn start_registered_service() -> Result<bool> {
     Ok(false)
 }
 
-fn install(config_path: &Path) -> Result<()> {
-    let root = config_path.parent().context("config path has no parent")?;
-    let executable = install_executable(root)?;
-    expose_executable(root.join("bin"))?;
-    std::fs::create_dir_all(root.join("resource/prompts"))?;
-    std::fs::create_dir_all(root.join("resource/skills"))?;
-    std::fs::create_dir_all(root.join("runtime/sessions"))?;
-    std::fs::create_dir_all(root.join("runtime/mcp"))?;
-    std::fs::create_dir_all(root.join("runtime/logs"))?;
-    std::fs::create_dir_all(root.join("channels"))?;
-    write_if_missing(config_path, DEFAULT_PROFILE)?;
-    write_if_missing(
-        &root.join("resource/prompts/System.md"),
-        "You are a coding agent. Work carefully and report concrete results.\n",
-    )?;
-    write_if_missing(&root.join("resource/prompts/AGENTS.md"), "")?;
-    write_if_missing(
-        &root.join("resource/mcp.json"),
-        "{\n  \"mcpServers\": {}\n}\n",
-    )?;
-    register_service(config_path, &executable)
-}
-
-fn install_executable(root: &Path) -> Result<PathBuf> {
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&bin)?;
-    let executable_name = if cfg!(windows) { "dwo.exe" } else { "dwo" };
-    let destination = bin.join(executable_name);
-    let source = std::env::current_exe()?;
-    if destination.exists()
-        && std::fs::canonicalize(&source)? == std::fs::canonicalize(&destination)?
-    {
-        return Ok(destination);
-    }
-
-    let temporary = bin.join(format!(".{executable_name}.{}.tmp", Uuid::new_v4()));
-    std::fs::copy(&source, &temporary)
-        .with_context(|| format!("install executable at {}", destination.display()))?;
-    if destination.exists() {
-        std::fs::remove_file(&destination)
-            .with_context(|| format!("replace executable at {}", destination.display()))?;
-    }
-    if let Err(error) = std::fs::rename(&temporary, &destination) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error)
-            .with_context(|| format!("install executable at {}", destination.display()));
-    }
-    Ok(destination)
-}
-
-#[cfg(windows)]
-fn expose_executable(bin: PathBuf) -> Result<()> {
-    let status = ProcessCommand::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "$bin = $env:DWO_INSTALL_BIN; $path = [Environment]::GetEnvironmentVariable('Path', 'User'); $entries = @($path -split ';' | Where-Object { $_ }); if (-not ($entries | Where-Object { $_.TrimEnd('\\') -ieq $bin.TrimEnd('\\') })) { [Environment]::SetEnvironmentVariable('Path', (($entries + $bin) -join ';'), 'User') }",
-        ])
-        .env("DWO_INSTALL_BIN", &bin)
-        .status()?;
-    if !status.success() {
-        bail!("failed to add {} to the user PATH", bin.display());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn expose_executable(_bin: PathBuf) -> Result<()> {
-    Ok(())
-}
-
-fn write_if_missing(path: &Path, content: &str) -> Result<()> {
-    if !path.exists() {
-        std::fs::write(path, content)?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
-    let root = config_path.parent().context("config path has no parent")?;
-    let launcher = root.join("runtime/dwo-daemon.vbs");
-    let command = format!(
-        "\"{}\" --config-path \"{}\" serve",
-        executable.display(),
-        config_path.display()
-    );
-    let script = format!(
-        "Set shell = CreateObject(\"WScript.Shell\")\r\nexitCode = shell.Run(\"{}\", 0, True)\r\nWScript.Quit exitCode\r\n",
-        command.replace('"', "\"\"")
-    );
-    std::fs::write(&launcher, script)?;
-    let exists = ProcessCommand::new("schtasks.exe")
-        .args(["/Query", "/TN", "dwoagent"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?
-        .success();
-    if exists {
-        return Ok(());
-    }
-
-    let task = format!("wscript.exe \"{}\"", launcher.display());
-    let status = ProcessCommand::new("schtasks.exe")
-        .args(["/Create", "/SC", "ONLOGON", "/TN", "dwoagent", "/TR"])
-        .arg(task)
-        .args(["/F"])
-        .status()?;
-    if !status.success() {
-        bail!("failed to register dwoagent startup task");
-    }
-    let settings = ProcessCommand::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "$task = Get-ScheduledTask -TaskName 'dwoagent'; $task.Settings.DisallowStartIfOnBatteries = $false; $task.Settings.StopIfGoingOnBatteries = $false; $task.Settings.ExecutionTimeLimit = 'PT0S'; Set-ScheduledTask -InputObject $task | Out-Null",
-        ])
-        .status()?;
-    if !settings.success() {
-        bail!("failed to configure dwoagent startup task");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let home = home_dir()?;
-    let launch_agents = home.join("Library/LaunchAgents");
-    std::fs::create_dir_all(&launch_agents)?;
-    let plist = launch_agents.join("com.dwoagent.host.plist");
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>com.dwoagent.host</string>
-<key>ProgramArguments</key><array><string>{}</string><string>--config-path</string><string>{}</string><string>serve</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-</dict></plist>"#,
-        executable.display(),
-        config_path.display()
-    );
-    std::fs::write(&plist, body)?;
-    std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o600))?;
-    let _ = ProcessCommand::new("launchctl")
-        .args(["bootstrap", &format!("gui/{}", unsafe { libc::geteuid() })])
-        .arg(&plist)
-        .status();
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn register_service(_config_path: &Path, _executable: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn unregister_service(_config_path: &Path) -> Result<()> {
-    let _ = ProcessCommand::new("schtasks.exe")
-        .args(["/Delete", "/TN", "dwoagent", "/F"])
-        .status()?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn unregister_service(_config_path: &Path) -> Result<()> {
-    let plist = home_dir()?.join("Library/LaunchAgents/com.dwoagent.host.plist");
-    let _ = ProcessCommand::new("launchctl")
-        .args(["bootout", &format!("gui/{}", unsafe { libc::geteuid() })])
-        .arg(&plist)
-        .status();
-    if plist.exists() {
-        std::fs::remove_file(plist)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn unregister_service(_config_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 fn default_config_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".dwoagent/profile.yaml"))
 }
@@ -835,10 +656,6 @@ fn home_dir() -> Result<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .context("cannot determine user home directory")
-}
-
-fn print_value(value: &Value) -> Result<()> {
-    render::write_value(value)
 }
 
 async fn bind_telegram(config_path: &Path) -> Result<()> {
@@ -856,7 +673,7 @@ async fn bind_telegram(config_path: &Path) -> Result<()> {
     output::line(format_args!("/bind {code}\n"))?;
     output::line(format_args!("Waiting for Telegram binding confirmation..."))?;
     loop {
-        channels::wait_before_poll().await;
+        tokio::time::sleep(channels::BIND_POLL_INTERVAL).await;
         let progress = ipc::request(
             config_path,
             "channel.telegram.poll",
@@ -893,7 +710,7 @@ async fn bind_feishu(config_path: &Path) -> Result<()> {
         "Waiting for {product} binding confirmation..."
     ))?;
     loop {
-        channels::wait_before_poll().await;
+        tokio::time::sleep(channels::BIND_POLL_INTERVAL).await;
         let progress = ipc::request(
             config_path,
             "channel.feishu.poll",

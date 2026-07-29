@@ -26,5 +26,6 @@ pub use prompt::{
     SystemPromptBuilder,
 };
 pub use token::{
-    estimate_content_tokens, estimate_context_tokens, estimate_message_tokens, estimate_text_tokens,
+    estimate_content_tokens, estimate_context_tokens, estimate_message_tokens,
+    estimate_text_tokens, estimate_tool_tokens,
 };

@@ -412,7 +412,7 @@ pub struct ChannelManager {
     telegram: Option<TelegramChannelConfig>,
     feishu: Option<FeishuChannelConfig>,
     websocket: Option<WebsocketChannelConfig>,
-    pending_weixin: Mutex<HashMap<String, PendingLogin>>,
+    pending_weixin: Mutex<HashMap<String, Arc<Mutex<PendingLogin>>>>,
     pending_telegram: Mutex<HashMap<String, PendingTelegramBind>>,
     pending_feishu: Mutex<HashMap<String, PendingFeishuBind>>,
 }
@@ -486,92 +486,114 @@ impl ChannelManager {
     }
 
     pub async fn list(&self) -> Result<Vec<ChannelSummary>> {
-        let mut summaries = Vec::new();
-        if let Some(config) = &self.weixin {
-            let store = self.store(ChannelKind::Weixin);
-            let state: WeixinChannelState = store.load_runtime().await?;
-            let (connected, bound_user_id) = if store.secret_path().is_file() {
-                let secret = store.load_secret::<WeixinSecret>().await?;
-                secret.validate()?;
-                (true, Some(secret.bound_user_id))
-            } else {
-                (false, None)
-            };
-            summaries.push(ChannelSummary {
-                name: WEIXIN_CHANNEL.to_string(),
-                enabled: config.enabled,
-                connected,
-                selected_session_id: state.selected_session_id,
-                bound_user_id,
-            });
-        }
-        if let Some(config) = &self.telegram {
-            let store = self.store(ChannelKind::Telegram);
-            let state: TelegramChannelState = store.load_runtime().await?;
-            let (connected, bound_user_id) = if store.secret_path().is_file() {
-                let secret = store.load_secret::<TelegramSecret>().await?;
-                secret.validate()?;
-                (
-                    resolve_env(&config.bot_token_env).is_ok(),
-                    Some(secret.bound_user_id.to_string()),
-                )
-            } else {
-                (false, None)
-            };
-            summaries.push(ChannelSummary {
-                name: TELEGRAM_CHANNEL.to_string(),
-                enabled: config.enabled,
-                connected,
-                selected_session_id: state.selected_session_id,
-                bound_user_id,
-            });
-        }
-        if let Some(config) = &self.feishu {
-            let store = self.store(ChannelKind::Feishu);
-            let state: FeishuChannelState = store.load_runtime().await?;
-            let (connected, bound_user_id) = if store.secret_path().is_file() {
-                let secret = store.load_secret::<FeishuSecret>().await?;
-                secret.validate()?;
-                (
-                    resolve_env(&config.app_id_env).is_ok()
-                        && resolve_env(&config.app_secret_env).is_ok(),
-                    Some(secret.bound_open_id),
-                )
-            } else {
-                (false, None)
-            };
-            summaries.push(ChannelSummary {
-                name: FEISHU_CHANNEL.to_string(),
-                enabled: config.enabled,
-                connected,
-                selected_session_id: state.selected_session_id,
-                bound_user_id,
-            });
-        }
-        if let Some(config) = &self.websocket {
-            let connected = if config.enabled {
-                self.ensure_websocket_secret().await?;
-                true
-            } else {
-                self.store(ChannelKind::Websocket).secret_path().is_file()
-            };
-            summaries.push(ChannelSummary {
-                name: WEBSOCKET_CHANNEL.to_string(),
-                enabled: config.enabled,
-                connected,
-                selected_session_id: None,
-                bound_user_id: None,
-            });
+        let configured = [
+            (ChannelKind::Weixin, self.weixin.is_some()),
+            (ChannelKind::Telegram, self.telegram.is_some()),
+            (ChannelKind::Feishu, self.feishu.is_some()),
+            (ChannelKind::Websocket, self.websocket.is_some()),
+        ];
+        let mut summaries = Vec::with_capacity(configured.len());
+        for (channel, is_configured) in configured {
+            if is_configured {
+                summaries.push(self.summary(channel).await?);
+            }
         }
         Ok(summaries)
     }
 
     pub async fn summary(&self, channel: ChannelKind) -> Result<ChannelSummary> {
-        self.list()
-            .await?
-            .into_iter()
-            .find(|summary| summary.name == channel.as_str())
-            .with_context(|| format!("channels.{} is not configured", channel.as_str()))
+        let store = self.store(channel);
+        match channel {
+            ChannelKind::Weixin => {
+                let config = self
+                    .weixin
+                    .as_ref()
+                    .context("channels.weixin is not configured")?;
+                let state: WeixinChannelState = store.load_runtime().await?;
+                let (connected, bound_user_id) = if store.secret_path().is_file() {
+                    let secret = store.load_secret::<WeixinSecret>().await?;
+                    secret.validate()?;
+                    (true, Some(secret.bound_user_id))
+                } else {
+                    (false, None)
+                };
+                Ok(ChannelSummary {
+                    name: WEIXIN_CHANNEL.to_string(),
+                    enabled: config.enabled,
+                    connected,
+                    selected_session_id: state.selected_session_id,
+                    bound_user_id,
+                })
+            }
+            ChannelKind::Telegram => {
+                let config = self
+                    .telegram
+                    .as_ref()
+                    .context("channels.telegram is not configured")?;
+                let state: TelegramChannelState = store.load_runtime().await?;
+                let (connected, bound_user_id) = if store.secret_path().is_file() {
+                    let secret = store.load_secret::<TelegramSecret>().await?;
+                    secret.validate()?;
+                    (
+                        resolve_env(&config.bot_token_env).is_ok(),
+                        Some(secret.bound_user_id.to_string()),
+                    )
+                } else {
+                    (false, None)
+                };
+                Ok(ChannelSummary {
+                    name: TELEGRAM_CHANNEL.to_string(),
+                    enabled: config.enabled,
+                    connected,
+                    selected_session_id: state.selected_session_id,
+                    bound_user_id,
+                })
+            }
+            ChannelKind::Feishu => {
+                let config = self
+                    .feishu
+                    .as_ref()
+                    .context("channels.feishu is not configured")?;
+                let state: FeishuChannelState = store.load_runtime().await?;
+                let (connected, bound_user_id) = if store.secret_path().is_file() {
+                    let secret = store.load_secret::<FeishuSecret>().await?;
+                    secret.validate()?;
+                    (
+                        resolve_env(&config.app_id_env).is_ok()
+                            && resolve_env(&config.app_secret_env).is_ok(),
+                        Some(secret.bound_open_id),
+                    )
+                } else {
+                    (false, None)
+                };
+                Ok(ChannelSummary {
+                    name: FEISHU_CHANNEL.to_string(),
+                    enabled: config.enabled,
+                    connected,
+                    selected_session_id: state.selected_session_id,
+                    bound_user_id,
+                })
+            }
+            ChannelKind::Websocket => {
+                let config = self
+                    .websocket
+                    .as_ref()
+                    .context("channels.websocket is not configured")?;
+                let connected = if config.enabled {
+                    self.ensure_websocket_secret().await?;
+                    true
+                } else {
+                    store.secret_path().is_file()
+                };
+                Ok(ChannelSummary {
+                    name: WEBSOCKET_CHANNEL.to_string(),
+                    enabled: config.enabled,
+                    connected,
+                    selected_session_id: None,
+                    bound_user_id: None,
+                })
+            }
+        }
     }
 
     pub(crate) async fn bound_target(&self, channel: ChannelKind) -> Result<String> {
@@ -916,10 +938,10 @@ impl ChannelManager {
         let session = login.start(None, &existing).await?;
         let binding_id = format!("binding-{}", Uuid::new_v4());
         let qrcode = session.qrcode_img_content.clone();
-        self.pending_weixin
-            .lock()
-            .await
-            .insert(binding_id.clone(), PendingLogin { session, config });
+        self.pending_weixin.lock().await.insert(
+            binding_id.clone(),
+            Arc::new(Mutex::new(PendingLogin { session, config })),
+        );
         Ok(WeixinLoginStart { binding_id, qrcode })
     }
 
@@ -928,30 +950,29 @@ impl ChannelManager {
         binding_id: &str,
         verify_code: Option<&str>,
     ) -> Result<WeixinLoginProgress> {
-        let mut pending = self.pending_weixin.lock().await;
-        let login = pending
+        let login_slot = self
+            .pending_weixin
+            .lock()
+            .await
             .get(binding_id)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown or completed binding: {binding_id}"))?;
+        let login = login_slot.lock().await;
         let api = StandaloneQrLogin::new(&login.config);
         let status = api.poll_status(&login.session, verify_code).await?;
-        match status {
+        let (progress, completed) = match status {
             LoginStatus::Wait | LoginStatus::ScannedButRedirect { .. } => {
-                Ok(WeixinLoginProgress::Waiting)
+                (WeixinLoginProgress::Waiting, false)
             }
-            LoginStatus::Scanned => Ok(WeixinLoginProgress::Scanned),
-            LoginStatus::Expired => {
-                pending.remove(binding_id);
-                Ok(WeixinLoginProgress::Expired)
-            }
-            LoginStatus::NeedVerifyCode => Ok(WeixinLoginProgress::NeedVerifyCode),
+            LoginStatus::Scanned => (WeixinLoginProgress::Scanned, false),
+            LoginStatus::Expired => (WeixinLoginProgress::Expired, true),
+            LoginStatus::NeedVerifyCode => (WeixinLoginProgress::NeedVerifyCode, false),
             LoginStatus::Confirmed {
                 bot_token,
                 ilink_bot_id,
                 base_url,
                 ilink_user_id,
             } => {
-                pending.remove(binding_id);
-                drop(pending);
                 self.save_weixin(WeixinSecret {
                     bot_token,
                     base_url,
@@ -959,22 +980,28 @@ impl ChannelManager {
                     bound_user_id: ilink_user_id,
                 })
                 .await?;
-                let channel = self
-                    .list()
-                    .await?
-                    .into_iter()
-                    .find(|channel| channel.name == WEIXIN_CHANNEL)
-                    .expect("configured Weixin channel is listed");
-                Ok(WeixinLoginProgress::Confirmed { channel })
+                let channel = self.summary(ChannelKind::Weixin).await?;
+                (WeixinLoginProgress::Confirmed { channel }, true)
             }
-            LoginStatus::VerifyCodeBlocked | LoginStatus::BindedRedirect => {
-                pending.remove(binding_id);
-                Ok(WeixinLoginProgress::Failed {
+            LoginStatus::VerifyCodeBlocked | LoginStatus::BindedRedirect => (
+                WeixinLoginProgress::Failed {
                     message: "Weixin rejected this QR login".to_string(),
-                })
+                },
+                true,
+            ),
+            _ => (WeixinLoginProgress::Waiting, false),
+        };
+        drop(login);
+        if completed {
+            let mut pending = self.pending_weixin.lock().await;
+            if pending
+                .get(binding_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &login_slot))
+            {
+                pending.remove(binding_id);
             }
-            _ => Ok(WeixinLoginProgress::Waiting),
         }
+        Ok(progress)
     }
 
     async fn save_weixin(&self, secret: WeixinSecret) -> Result<()> {
@@ -1175,10 +1202,6 @@ async fn set_private_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 async fn set_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-pub async fn wait_before_poll() {
-    tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
 #[cfg(test)]

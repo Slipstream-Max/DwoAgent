@@ -131,22 +131,25 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(client.default_model_id(), "chat");
     assert!(client.supports_image_input("chat").unwrap());
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let messages = vec![
+        ContextMessage::system("system prompt"),
+        ContextMessage::user(MessageContent::blocks(vec![
+            ContentBlock::text("hello"),
+            ContentBlock::image("image/png", "aGVsbG8="),
+        ])),
+    ];
+    let tools = vec![json!({"type":"function","function":{"name":"terminal"}})];
+    let cancellation = CancellationToken::new();
     let reply = client
         .stream_turn(
             ModelSelection {
                 model: "chat".to_string(),
                 reasoning: Some("high".to_string()),
             },
-            vec![
-                ContextMessage::system("system prompt"),
-                ContextMessage::user(MessageContent::blocks(vec![
-                    ContentBlock::text("hello"),
-                    ContentBlock::image("image/png", "aGVsbG8="),
-                ])),
-            ],
-            vec![json!({"type":"function","function":{"name":"terminal"}})],
+            &messages,
+            &tools,
             events_tx,
-            CancellationToken::new(),
+            &cancellation,
         )
         .await
         .unwrap();
@@ -275,19 +278,20 @@ async fn cancellation_interrupts_an_in_flight_request() {
         cancel.cancel();
     });
     let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let messages = vec![
+        ContextMessage::system("system"),
+        ContextMessage::user("hello"),
+    ];
     let error = client
         .stream_turn(
             ModelSelection {
                 model: "chat".to_string(),
                 reasoning: None,
             },
-            vec![
-                ContextMessage::system("system"),
-                ContextMessage::user("hello"),
-            ],
-            Vec::new(),
+            &messages,
+            &[],
             events,
-            cancellation,
+            &cancellation,
         )
         .await
         .unwrap_err();

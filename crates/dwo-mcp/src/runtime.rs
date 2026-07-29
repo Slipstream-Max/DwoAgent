@@ -1,14 +1,17 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use futures::future::join_all;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::client::{ConnectedClient, catalog_tool, parse_tool_selector};
+use crate::client::{ConnectedClient, ConnectedPeer, catalog_tool, parse_tool_selector};
 use crate::{
     AuthStatus, CallResult, Catalog, CatalogServer, McpClient, McpConfig, McpServerConfig, Result,
     ServerStatus, oauth_login, oauth_logout, read_catalog_cache, write_catalog_cache,
@@ -33,13 +36,21 @@ struct RuntimeState {
 }
 
 struct ManagedServer {
-    connection: Mutex<Option<ConnectedClient>>,
+    connection: Mutex<Option<ManagedConnection>>,
+    next_generation: AtomicU64,
+}
+
+struct ManagedConnection {
+    service: ConnectedClient,
+    peer: ConnectedPeer,
+    generation: u64,
 }
 
 impl ManagedServer {
     fn new() -> Self {
         Self {
             connection: Mutex::new(None),
+            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -47,7 +58,7 @@ impl ManagedServer {
         let Some(mut connection) = self.connection.lock().await.take() else {
             return;
         };
-        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.close()).await;
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, connection.service.close()).await;
     }
 }
 
@@ -126,9 +137,12 @@ impl McpRuntime {
             (catalog, retired)
         };
         self.persist_current_catalog().await?;
-        for server in retired {
-            server.close().await;
-        }
+        join_all(
+            retired
+                .into_iter()
+                .map(|server| async move { server.close().await }),
+        )
+        .await;
         Ok(catalog)
     }
 
@@ -176,32 +190,42 @@ impl McpRuntime {
         let (config, managed) = self.server(server_name).await?;
         self.require_authorization(server_name, &config).await?;
 
-        let mut connection = managed.connection.lock().await;
-        self.connect_if_needed(server_name, &config, &mut connection)
-            .await?;
+        let (peer, generation) = {
+            let mut connection = managed.connection.lock().await;
+            self.connect_if_needed(&managed, server_name, &config, &mut connection)
+                .await?;
+            let connection = connection
+                .as_ref()
+                .expect("connected MCP server must retain its client");
+            (connection.peer.clone(), connection.generation)
+        };
         let result = self
             .client
-            .call(
-                server_name,
-                connection
-                    .as_ref()
-                    .expect("connected MCP server must retain its client"),
-                tool_name,
-                arguments,
-            )
+            .call(server_name, &peer, tool_name, arguments)
             .await;
         if let Err(error) = &result
-            && connection
-                .as_ref()
-                .is_some_and(|connection| connection.is_closed())
+            && peer.is_transport_closed()
         {
-            *connection = None;
-            self.set_catalog_server(
-                server_name,
-                &config,
-                failed_server(server_name, &config, error.to_string()),
-            )
-            .await?;
+            let invalidated = {
+                let mut connection = managed.connection.lock().await;
+                if connection
+                    .as_ref()
+                    .is_some_and(|current| current.generation == generation)
+                {
+                    *connection = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if invalidated {
+                self.set_catalog_server(
+                    server_name,
+                    &config,
+                    failed_server(server_name, &config, error.to_string()),
+                )
+                .await?;
+            }
         }
         result
     }
@@ -226,16 +250,20 @@ impl McpRuntime {
             let mut state = self.state.lock().await;
             std::mem::take(&mut state.servers)
         };
-        for server in servers.into_values() {
-            server.close().await;
-        }
+        join_all(
+            servers
+                .into_values()
+                .map(|server| async move { server.close().await }),
+        )
+        .await;
     }
 
     async fn activate(&self, name: &str) -> Result<()> {
         let (config, managed) = self.server(name).await?;
         self.require_authorization(name, &config).await?;
         let mut connection = managed.connection.lock().await;
-        self.connect_if_needed(name, &config, &mut connection).await
+        self.connect_if_needed(&managed, name, &config, &mut connection)
+            .await
     }
 
     async fn server(&self, name: &str) -> Result<(McpServerConfig, Arc<ManagedServer>)> {
@@ -290,14 +318,14 @@ impl McpRuntime {
 
     async fn connect_if_needed(
         &self,
+        managed: &ManagedServer,
         name: &str,
         config: &McpServerConfig,
-        connection: &mut Option<ConnectedClient>,
+        connection: &mut Option<ManagedConnection>,
     ) -> Result<()> {
-        if connection
-            .as_ref()
-            .is_some_and(|connection| !connection.is_closed())
-        {
+        if connection.as_ref().is_some_and(|connection| {
+            !connection.service.is_closed() && !connection.peer.is_transport_closed()
+        }) {
             return Ok(());
         }
         *connection = None;
@@ -308,7 +336,8 @@ impl McpRuntime {
                 return Err(error);
             }
         };
-        let tools = match self.client.list_tools(name, &client).await {
+        let peer = client.peer().clone();
+        let tools = match self.client.list_tools(name, &peer).await {
             Ok(tools) => tools,
             Err(error) => {
                 self.record_connection_error(name, config, &error).await?;
@@ -317,7 +346,11 @@ impl McpRuntime {
         };
         self.set_catalog_server(name, config, ready_server(name, config, tools))
             .await?;
-        *connection = Some(client);
+        *connection = Some(ManagedConnection {
+            service: client,
+            peer,
+            generation: managed.next_generation.fetch_add(1, Ordering::Relaxed),
+        });
         Ok(())
     }
 
@@ -657,6 +690,7 @@ mod tests {
                 .await
                 .as_ref()
                 .expect("first call must retain the connection")
+                .service
                 .is_closed(),
             "the server session must remain open after its first call"
         );

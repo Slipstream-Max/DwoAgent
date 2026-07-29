@@ -11,7 +11,6 @@ use super::{ChannelCapabilitySnapshot, xml_block};
 
 const FALLBACK_AGENT_PROMPT: &str =
     "You are an agent. Follow the user request and use the available tools when needed.";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProfilePaths {
     pub root: PathBuf,

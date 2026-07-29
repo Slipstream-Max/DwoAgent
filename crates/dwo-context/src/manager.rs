@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::compaction::{CompactionPlan, CompactionPlanner};
-use crate::env_watcher::EnvWatcherState;
+use crate::env_watcher::{DynamicEnvironmentSnapshot, EnvWatcherState};
 use crate::prompt::{PromptBuildError, SystemPromptBlock, SystemPromptBuilder};
 use crate::{
-    ContextMessage, MessageContent, MessageKind, ToolResultRecord, TurnId, estimate_context_tokens,
+    ContextMessage, MessageContent, MessageKind, ToolResultRecord, estimate_message_tokens,
+    estimate_tool_tokens,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +56,7 @@ impl SessionContext {
 #[derive(Debug, Clone)]
 pub struct ContextManager {
     context: SessionContext,
+    message_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +85,15 @@ impl ContextManager {
                 ContextMessage::system(context.system_prompt.content.clone()),
             );
         }
-        Self { context }
+        let message_tokens = context
+            .messages
+            .iter()
+            .map(estimate_message_tokens)
+            .fold(0, u64::saturating_add);
+        Self {
+            context,
+            message_tokens,
+        }
     }
 
     pub fn initialize(builder: &SystemPromptBuilder) -> Result<Self, PromptBuildError> {
@@ -115,69 +125,54 @@ impl ContextManager {
             .any(|message| message.content.contains_images())
     }
 
-    pub fn append_user(&mut self, _turn_id: TurnId, content: impl Into<MessageContent>) {
-        self.context.messages.push(ContextMessage::user(content));
+    pub fn append_user(&mut self, content: impl Into<MessageContent>) {
+        self.extend_messages([ContextMessage::user(content)]);
     }
 
     pub fn append_internal(&mut self, kind: MessageKind, content: impl Into<MessageContent>) {
-        self.context
-            .messages
-            .push(ContextMessage::internal(kind, content));
+        self.extend_messages([ContextMessage::internal(kind, content)]);
     }
 
-    pub fn append_assistant(
-        &mut self,
-        turn_id: TurnId,
-        content: impl Into<String>,
-        tool_calls: Vec<Value>,
-    ) {
-        self.append_assistant_with_reasoning(turn_id, content, None, tool_calls);
+    pub fn append_assistant(&mut self, content: impl Into<String>, tool_calls: Vec<Value>) {
+        self.append_assistant_with_reasoning(content, None, tool_calls);
     }
 
     pub fn append_assistant_with_reasoning(
         &mut self,
-        _turn_id: TurnId,
         content: impl Into<String>,
         reasoning: Option<String>,
         tool_calls: Vec<Value>,
     ) {
         let content = content.into();
-        self.context
-            .messages
-            .push(ContextMessage::assistant_with_reasoning(
-                content, reasoning, tool_calls,
-            ));
+        self.extend_messages([ContextMessage::assistant_with_reasoning(
+            content, reasoning, tool_calls,
+        )]);
     }
 
-    pub fn append_tool(&mut self, _turn_id: TurnId, result: ToolResultRecord) {
-        self.context.messages.push(ContextMessage::tool(&result));
-        self.context
-            .messages
-            .extend(result.model_context.into_iter().map(ContextMessage::user));
+    pub fn append_tool(&mut self, result: ToolResultRecord) {
+        let messages = std::iter::once(ContextMessage::tool(&result))
+            .chain(result.model_context.into_iter().map(ContextMessage::user));
+        self.extend_messages(messages);
     }
 
-    pub fn append_tool_batch(
-        &mut self,
-        _turn_id: TurnId,
-        results: impl IntoIterator<Item = ToolResultRecord>,
-    ) {
+    pub fn append_tool_batch(&mut self, results: impl IntoIterator<Item = ToolResultRecord>) {
         let results = results.into_iter().collect::<Vec<_>>();
-        self.context
-            .messages
-            .extend(results.iter().map(ContextMessage::tool));
-        self.context.messages.extend(
+        let mut messages = Vec::with_capacity(results.len());
+        messages.extend(results.iter().map(ContextMessage::tool));
+        messages.extend(
             results
                 .into_iter()
                 .flat_map(|result| result.model_context)
                 .map(ContextMessage::user),
         );
+        self.extend_messages(messages);
     }
 
-    pub fn append_pending(&mut self, turn_id: TurnId, batch: PendingMessageBatch) -> bool {
+    pub fn append_pending(&mut self, batch: PendingMessageBatch) -> bool {
         for message in batch.messages {
             match message {
                 PendingContextMessage::User(content) => {
-                    self.append_user(turn_id.clone(), content);
+                    self.append_user(content);
                 }
                 PendingContextMessage::Internal(content) => {
                     self.append_internal(MessageKind::Runtime, content);
@@ -192,7 +187,9 @@ impl ContextManager {
     }
 
     pub fn refresh_usage(&mut self, tools: &[Value]) -> u64 {
-        let tokens = estimate_context_tokens(&self.context.messages, tools);
+        let tokens = self
+            .message_tokens
+            .saturating_add(estimate_tool_tokens(tools));
         self.context.usage.current_tokens = tokens;
         tokens
     }
@@ -224,14 +221,18 @@ impl ContextManager {
         builder: &SystemPromptBuilder,
     ) -> Result<usize, PromptBuildError> {
         let current = builder.scan_dynamic()?;
+        Ok(self.refresh_environment_snapshot(current))
+    }
+
+    pub fn refresh_environment_snapshot(&mut self, current: DynamicEnvironmentSnapshot) -> usize {
         let changes = self.context.env_watcher.update(current);
         let count = changes.len();
-        self.context.messages.extend(
+        self.extend_messages(
             changes
                 .into_iter()
                 .map(|change| ContextMessage::internal(MessageKind::EnvWatcher, change.render())),
         );
-        Ok(count)
+        count
     }
 
     pub fn plan_compaction(&self, planner: &CompactionPlanner) -> CompactionPlan {
@@ -267,10 +268,25 @@ impl ContextManager {
         let replacement = plan.into_replacement(&rebuilt_prompt, summary.clone());
         self.context.system_prompt = rebuilt_prompt;
         self.context.messages = replacement;
+        self.message_tokens = self
+            .context
+            .messages
+            .iter()
+            .map(estimate_message_tokens)
+            .fold(0, u64::saturating_add);
         self.context.env_watcher = EnvWatcherState { baseline };
         self.context.compaction.count = self.context.compaction.count.saturating_add(1);
         self.context.compaction.summary = (!summary.is_empty()).then_some(summary);
         self.refresh_usage(tools);
         Ok(())
+    }
+
+    fn extend_messages(&mut self, messages: impl IntoIterator<Item = ContextMessage>) {
+        for message in messages {
+            self.message_tokens = self
+                .message_tokens
+                .saturating_add(estimate_message_tokens(&message));
+            self.context.messages.push(message);
+        }
     }
 }

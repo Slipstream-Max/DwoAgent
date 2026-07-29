@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::future::join_all;
 use tokio::sync::Mutex;
 
 use crate::host::Host;
@@ -59,13 +60,15 @@ impl RunningChannel {
 }
 
 pub struct ChannelHub {
-    active: Mutex<HashMap<ChannelKind, RunningChannel>>,
+    active: Mutex<HashMap<ChannelKind, Arc<Mutex<Option<RunningChannel>>>>>,
+    operations: Mutex<HashMap<ChannelKind, Arc<Mutex<()>>>>,
 }
 
 impl ChannelHub {
     pub fn new() -> Self {
         Self {
             active: Mutex::new(HashMap::new()),
+            operations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -100,21 +103,31 @@ impl ChannelHub {
     }
 
     pub async fn start(self: &Arc<Self>, channel: ChannelKind, host: Arc<Host>) -> Result<()> {
-        let mut active = self.active.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(entry) = active.entry(channel) {
-            entry.insert(RunningChannel::start(channel, host).await?);
-            tracing::info!(
-                event = "channel.started",
-                channel = channel.as_str(),
-                "channel started"
-            );
+        let operation = self.operation(channel).await;
+        let _operation = operation.lock().await;
+        if self.active.lock().await.contains_key(&channel) {
+            return Ok(());
         }
+        let running = RunningChannel::start(channel, host).await?;
+        self.active
+            .lock()
+            .await
+            .insert(channel, Arc::new(Mutex::new(Some(running))));
+        tracing::info!(
+            event = "channel.started",
+            channel = channel.as_str(),
+            "channel started"
+        );
         Ok(())
     }
 
     pub async fn stop(&self, channel: ChannelKind) {
-        let running = self.active.lock().await.remove(&channel);
-        if let Some(running) = running {
+        let operation = self.operation(channel).await;
+        let _operation = operation.lock().await;
+        let slot = self.active.lock().await.remove(&channel);
+        if let Some(slot) = slot
+            && let Some(running) = slot.lock().await.take()
+        {
             running.stop().await;
             tracing::info!(
                 event = "channel.stopped",
@@ -125,15 +138,12 @@ impl ChannelHub {
     }
 
     pub async fn stop_all(&self) {
-        let running = self.active.lock().await.drain().collect::<Vec<_>>();
-        for (kind, channel) in running {
-            channel.stop().await;
-            tracing::info!(
-                event = "channel.stopped",
-                channel = kind.as_str(),
-                "channel stopped"
-            );
-        }
+        join_all(
+            ChannelKind::ALL
+                .into_iter()
+                .map(|channel| self.stop(channel)),
+        )
+        .await;
     }
 
     pub async fn is_running(&self, channel: ChannelKind) -> bool {
@@ -141,20 +151,43 @@ impl ChannelHub {
     }
 
     pub async fn send_message(&self, channel: ChannelKind, text: &str) -> Result<()> {
-        let active = self.active.lock().await;
-        active
+        let slot = self
+            .active
+            .lock()
+            .await
             .get(&channel)
-            .with_context(|| format!("{} channel is not running", channel.display_name()))?
+            .cloned()
+            .with_context(|| format!("{} channel is not running", channel.display_name()))?;
+        let running = slot.lock().await;
+        running
+            .as_ref()
+            .context("channel stopped before message delivery")?
             .send_message(text)
             .await
     }
 
     pub async fn send_file(&self, channel: ChannelKind, path: &Path) -> Result<()> {
-        let active = self.active.lock().await;
-        active
+        let slot = self
+            .active
+            .lock()
+            .await
             .get(&channel)
-            .with_context(|| format!("{} channel is not running", channel.display_name()))?
+            .cloned()
+            .with_context(|| format!("{} channel is not running", channel.display_name()))?;
+        let running = slot.lock().await;
+        running
+            .as_ref()
+            .context("channel stopped before file delivery")?
             .send_file(path)
             .await
+    }
+
+    async fn operation(&self, channel: ChannelKind) -> Arc<Mutex<()>> {
+        self.operations
+            .lock()
+            .await
+            .entry(channel)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }

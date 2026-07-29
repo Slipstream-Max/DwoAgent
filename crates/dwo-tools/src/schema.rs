@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::call::{DEFAULT_READ_FILE_LINES, MAX_READ_FILE_LINES};
+
 pub fn tool_schemas() -> Vec<Value> {
     vec![terminal_schema(), read_file_schema(), file_edit_schema()]
 }
@@ -9,7 +11,7 @@ pub fn read_file_schema() -> Value {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file in pages of up to 500 lines, or add a PNG, JPEG, GIF, or WebP image directly to model context.",
+            "description": "Read a selected range from a UTF-8 text file, or add a PNG, JPEG, GIF, or WebP image directly to model context.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -21,6 +23,13 @@ pub fn read_file_schema() -> Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "Optional 1-based start line. Continue with the previous end_line + 1."
+                    },
+                    "line_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_READ_FILE_LINES,
+                        "default": DEFAULT_READ_FILE_LINES,
+                        "description": "Optional number of text lines to return. Defaults to 500 and cannot exceed 500."
                     }
                 },
                 "required": ["path"],
@@ -76,14 +85,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_file_schema_only_accepts_path_and_cursor() {
+    fn read_file_schema_accepts_optional_line_count() {
         let schema = read_file_schema();
         let parameters = &schema["function"]["parameters"];
         assert_eq!(parameters["required"], json!(["path"]));
         assert_eq!(parameters["additionalProperties"], false);
         assert!(parameters["properties"].get("path").is_some());
         assert!(parameters["properties"].get("cursor").is_some());
-        assert!(parameters["properties"].get("line_count").is_none());
+        assert_eq!(parameters["properties"]["line_count"]["minimum"], 1);
+        assert_eq!(parameters["properties"]["line_count"]["maximum"], 500);
+        assert_eq!(parameters["properties"]["line_count"]["default"], 500);
         assert!(parameters["properties"].get("next_cursor").is_none());
     }
 }

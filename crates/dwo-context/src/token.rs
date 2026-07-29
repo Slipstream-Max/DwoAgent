@@ -45,7 +45,11 @@ pub fn estimate_context_tokens(messages: &[ContextMessage], tools: &[Value]) -> 
         .iter()
         .map(estimate_message_tokens)
         .fold(0, u64::saturating_add);
-    message_tokens.saturating_add(estimate_serialized_tokens(tools))
+    message_tokens.saturating_add(estimate_tool_tokens(tools))
+}
+
+pub fn estimate_tool_tokens(tools: &[Value]) -> u64 {
+    estimate_serialized_tokens(tools)
 }
 
 pub(crate) fn cap_content_tokens(content: &MessageContent, budget: u64) -> MessageContent {

@@ -226,7 +226,9 @@ async fn empty_title_without_history_is_filled_by_the_next_user_question() {
         ScriptedModelGateway::new([ScriptedStep::text("done")]),
         PolicyConfig::default(),
     );
-    let loaded = restarted.load(&id).await.unwrap();
+    let (first_load, second_load) = tokio::join!(restarted.load(&id), restarted.load(&id));
+    let loaded = first_load.unwrap();
+    assert!(Arc::ptr_eq(&loaded, &second_load.unwrap()));
     let mut events = loaded.attach(EndpointId::new()).await.unwrap().events;
     loaded
         .prompt(EndpointId::new(), "please investigate this failure")
@@ -2074,12 +2076,9 @@ async fn filesystem_repository_loads_context_after_service_restart() {
         transcript_kinds,
         [
             "user",
-            "assistant_delta",
             "assistant_completed",
             "tool_started",
             "tool_completed",
-            "reasoning_delta",
-            "assistant_delta",
             "assistant_completed",
         ]
     );

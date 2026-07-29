@@ -7,6 +7,8 @@ use thiserror::Error;
 use crate::terminal::TerminalId;
 
 const DEFAULT_YIELD_MS: u64 = 10_000;
+pub(crate) const DEFAULT_READ_FILE_LINES: usize = 500;
+pub(crate) const MAX_READ_FILE_LINES: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedToolCall {
@@ -26,6 +28,7 @@ pub enum ToolCall {
 pub struct ReadFileArgs {
     pub path: PathBuf,
     pub cursor: usize,
+    pub line_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,9 +211,27 @@ fn parse_read_file(args: &Map<String, Value>) -> Result<ReadFileArgs, String> {
             .ok_or_else(|| "Argument cursor must be a positive integer.".to_string())?,
         Some(_) => return Err("Argument cursor must be a positive integer.".to_string()),
     };
+    let line_count = match args.get("line_count") {
+        None | Some(Value::Null) => DEFAULT_READ_FILE_LINES,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (1..=MAX_READ_FILE_LINES).contains(value))
+            .ok_or_else(|| {
+                format!(
+                    "Argument line_count must be an integer between 1 and {MAX_READ_FILE_LINES}."
+                )
+            })?,
+        Some(_) => {
+            return Err(format!(
+                "Argument line_count must be an integer between 1 and {MAX_READ_FILE_LINES}."
+            ));
+        }
+    };
     Ok(ReadFileArgs {
         path: PathBuf::from(path),
         cursor,
+        line_count,
     })
 }
 
@@ -292,5 +313,31 @@ mod tests {
             parsed.call,
             ToolCall::Terminal(TerminalArgs::Input { data, .. }) if data.is_empty()
         ));
+    }
+
+    #[test]
+    fn read_file_accepts_bounded_line_count() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id": "call-1",
+            "name": "read_file",
+            "arguments": {"path":"src/main.rs", "cursor":20, "line_count":40},
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed.call,
+            ToolCall::ReadFile(ReadFileArgs {
+                cursor: 20,
+                line_count: 40,
+                ..
+            })
+        ));
+
+        let error = ParsedToolCall::parse(json!({
+            "id": "call-2",
+            "name": "read_file",
+            "arguments": {"path":"src/main.rs", "line_count":501},
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("between 1 and 500"));
     }
 }

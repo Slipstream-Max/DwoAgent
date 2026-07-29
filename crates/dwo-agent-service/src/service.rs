@@ -32,6 +32,7 @@ pub struct AgentService {
     file_edit: Arc<FileEditManager>,
     profile_root: Option<PathBuf>,
     loaded: Mutex<LoadedSessionRegistry>,
+    operations: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
 #[derive(Default)]
@@ -83,6 +84,7 @@ impl AgentService {
             file_edit: Arc::new(FileEditManager::new()),
             profile_root,
             loaded: Mutex::new(LoadedSessionRegistry::default()),
+            operations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -119,11 +121,24 @@ impl AgentService {
             record.enable_auto_title();
         }
         record.context = context;
+        let operation = self.session_operation(&record.info.id).await;
+        let _operation = operation.lock().await;
         self.repository.save(&record).await?;
         self.load_record(record).await
     }
 
     pub async fn load(&self, id: &SessionId) -> Result<Arc<SessionAgent>, AgentServiceError> {
+        {
+            let loaded = self.loaded.lock().await;
+            if loaded.deleting.contains(id) {
+                return Err(AgentServiceError::SessionDeleting(id.clone()));
+            }
+            if let Some(agent) = loaded.agents.get(id).cloned() {
+                return Ok(agent);
+            }
+        }
+        let operation = self.session_operation(id).await;
+        let _operation = operation.lock().await;
         {
             let loaded = self.loaded.lock().await;
             if loaded.deleting.contains(id) {
@@ -185,6 +200,8 @@ impl AgentService {
     }
 
     pub async fn delete(&self, id: &SessionId) -> Result<(), AgentServiceError> {
+        let operation = self.session_operation(id).await;
+        let _operation = operation.lock().await;
         let agent = {
             let mut loaded = self.loaded.lock().await;
             if !loaded.deleting.insert(id.clone()) {
@@ -219,6 +236,8 @@ impl AgentService {
     }
 
     pub async fn shutdown(&self) {
+        use futures::future::join_all;
+
         let agents: Vec<_> = self
             .loaded
             .lock()
@@ -227,15 +246,27 @@ impl AgentService {
             .drain()
             .map(|(_, agent)| agent)
             .collect();
-        for agent in agents {
-            let _ = agent.close().await;
-        }
+        join_all(
+            agents
+                .into_iter()
+                .map(|agent| async move { agent.close().await }),
+        )
+        .await;
     }
 
     async fn load_record(
         &self,
         mut record: SessionRecord,
     ) -> Result<Arc<SessionAgent>, AgentServiceError> {
+        {
+            let loaded = self.loaded.lock().await;
+            if loaded.deleting.contains(&record.info.id) {
+                return Err(AgentServiceError::SessionDeleting(record.info.id.clone()));
+            }
+            if let Some(agent) = loaded.agents.get(&record.info.id).cloned() {
+                return Ok(agent);
+            }
+        }
         let transcript = self.repository.load_transcript(&record.info.id).await?;
         let prompt_builder = self.prompt_builder(record.info.cwd.clone());
         let mut record_changed = repair_empty_title(&mut record, &transcript);
@@ -245,13 +276,6 @@ impl AgentService {
                 .into_context();
             record_changed = true;
         }
-        let mut loaded = self.loaded.lock().await;
-        if loaded.deleting.contains(&record.info.id) {
-            return Err(AgentServiceError::SessionDeleting(record.info.id));
-        }
-        if let Some(agent) = loaded.agents.get(&record.info.id).cloned() {
-            return Ok(agent);
-        }
         let tools = Arc::new(ToolManager::new_with_environment(
             record.info.cwd.clone(),
             self.policy.clone(),
@@ -260,13 +284,20 @@ impl AgentService {
         )?);
         let previous_tokens = record.context.usage.current_tokens;
         let mut context = ContextManager::new(record.context.clone());
-        let current_tokens = context.refresh_usage(&tools.schemas());
+        let current_tokens = context.refresh_usage(tools.schemas());
         record.context = context.into_context();
         if current_tokens != previous_tokens {
             record_changed = true;
         }
         if record_changed {
             self.repository.save(&record).await?;
+        }
+        let mut loaded = self.loaded.lock().await;
+        if loaded.deleting.contains(&record.info.id) {
+            return Err(AgentServiceError::SessionDeleting(record.info.id.clone()));
+        }
+        if let Some(agent) = loaded.agents.get(&record.info.id).cloned() {
+            return Ok(agent);
         }
         let agent = SessionAgent::spawn(
             record.clone(),
@@ -283,6 +314,15 @@ impl AgentService {
     fn prompt_builder(&self, cwd: PathBuf) -> SystemPromptBuilder {
         SystemPromptBuilder::new(self.profile_root.clone(), cwd)
             .with_tool_prompt(dwo_tools::prompt::combined())
+    }
+
+    async fn session_operation(&self, id: &SessionId) -> Arc<Mutex<()>> {
+        self.operations
+            .lock()
+            .await
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 

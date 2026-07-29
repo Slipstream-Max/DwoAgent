@@ -76,7 +76,12 @@ impl RunningTelegram {
             conversation,
         ));
         if let Err(error) = bridge.resume_observer().await {
-            eprintln!("restore Telegram session observer: {error:#}");
+            tracing::warn!(
+                event = "channel.observer_restore_failed",
+                channel = "telegram",
+                error = %format!("{error:#}"),
+                "restore channel session observer failed"
+            );
         }
 
         let access = TelegramAccess {

@@ -28,7 +28,7 @@ pub use events::{
     ActiveToolCall, ClientTranscriptEvent, PendingPermission, RuntimePhase, SessionEvent,
     SessionEventPayload, SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
-pub use profile::{AgentProfileConfig, LoadedAgentProfile, load_profile};
+pub use profile::{AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, load_profile};
 pub use record::{
     SessionConfig, SessionConfigUpdate, SessionId, SessionInfo, SessionLlmSettings, SessionRecord,
 };

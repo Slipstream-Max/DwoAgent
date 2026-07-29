@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::host::Host;
 
@@ -74,7 +76,11 @@ async fn serve_windows(host: Arc<Host>, endpoint: &str) -> Result<()> {
         let host = host.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(server, host).await {
-                eprintln!("IPC connection failed: {error:#}");
+                tracing::warn!(
+                    event = "ipc.connection_failed",
+                    error = %format!("{error:#}"),
+                    "IPC connection failed"
+                );
             }
         });
     }
@@ -99,7 +105,11 @@ async fn serve_unix(host: Arc<Host>, endpoint: &Path) -> Result<()> {
                 let host = host.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, host).await {
-                        eprintln!("IPC connection failed: {error:#}");
+                        tracing::warn!(
+                            event = "ipc.connection_failed",
+                            error = %format!("{error:#}"),
+                            "IPC connection failed"
+                        );
                     }
                 });
             }
@@ -115,10 +125,17 @@ async fn handle_connection<S>(stream: S, host: Arc<Host>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let connection_id = Uuid::new_v4();
+    tracing::debug!(
+        event = "ipc.connection_opened",
+        connection_id = %connection_id,
+        "IPC connection opened"
+    );
     let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         let request: RpcRequest = serde_json::from_str(&line).context("parse RPC request")?;
+        let started = Instant::now();
         if request.method == "session.watch" {
             let session_id = request
                 .params
@@ -132,6 +149,16 @@ where
                 .context("endpoint_id is required")?;
             match host.watch(session_id, endpoint_id).await {
                 Ok(mut subscription) => {
+                    tracing::info!(
+                        event = "ipc.watch_attached",
+                        connection_id = %connection_id,
+                        request_id = request.id,
+                        method = %request.method,
+                        session_id,
+                        endpoint_id,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "IPC watch attached"
+                    );
                     write_frame(
                         &mut write,
                         &RpcResponse {
@@ -148,8 +175,28 @@ where
                         )
                         .await?;
                     }
+                    tracing::info!(
+                        event = "ipc.watch_closed",
+                        connection_id = %connection_id,
+                        request_id = request.id,
+                        method = %request.method,
+                        session_id,
+                        endpoint_id,
+                        "IPC watch closed"
+                    );
                 }
                 Err(error) => {
+                    tracing::warn!(
+                        event = "ipc.request_failed",
+                        connection_id = %connection_id,
+                        request_id = request.id,
+                        method = %request.method,
+                        session_id,
+                        endpoint_id,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        error = %format!("{error:#}"),
+                        "IPC request failed"
+                    );
                     write_frame(
                         &mut write,
                         &RpcResponse {
@@ -176,8 +223,33 @@ where
                 error: Some(format!("{error:#}")),
             },
         };
+        if let Some(error) = response.error.as_deref() {
+            tracing::warn!(
+                event = "ipc.request_failed",
+                connection_id = %connection_id,
+                request_id = request.id,
+                method = %request.method,
+                duration_ms = started.elapsed().as_millis() as u64,
+                error,
+                "IPC request failed"
+            );
+        } else {
+            tracing::info!(
+                event = "ipc.request_completed",
+                connection_id = %connection_id,
+                request_id = request.id,
+                method = %request.method,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "IPC request completed"
+            );
+        }
         write_frame(&mut write, &response).await?;
     }
+    tracing::debug!(
+        event = "ipc.connection_closed",
+        connection_id = %connection_id,
+        "IPC connection closed"
+    );
     Ok(())
 }
 

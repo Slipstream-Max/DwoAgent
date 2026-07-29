@@ -193,13 +193,22 @@ impl AutomationRuntime {
                 _ = self.shutdown.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(error) = self.reload_if_changed().await {
-                        eprintln!("reload automation configuration: {error:#}");
+                        tracing::warn!(
+                            event = "automation.reload_failed",
+                            error = %format!("{error:#}"),
+                            "reload automation configuration failed"
+                        );
                     }
                     for job in self.take_due_jobs().await {
                         let runtime = self.clone();
                         tokio::spawn(async move {
                             if let Err(error) = runtime.run_job(job.clone(), true).await {
-                                eprintln!("automation job {} failed: {error:#}", job.name);
+                                tracing::error!(
+                                    event = "automation.job_failed",
+                                    job = %job.name,
+                                    error = %format!("{error:#}"),
+                                    "automation job failed"
+                                );
                             }
                         });
                     }
@@ -247,7 +256,12 @@ impl AutomationRuntime {
                 Ok(next) => {
                     state.next_runs.insert(job.name.clone(), next);
                 }
-                Err(error) => eprintln!("schedule automation job {}: {error:#}", job.name),
+                Err(error) => tracing::warn!(
+                    event = "automation.schedule_failed",
+                    job = %job.name,
+                    error = %format!("{error:#}"),
+                    "schedule automation job failed"
+                ),
             }
         }
         jobs

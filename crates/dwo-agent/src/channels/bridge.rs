@@ -424,7 +424,11 @@ async fn stream_session(
 
 async fn send(transport: &Arc<dyn ConversationTransport>, text: &str) {
     if let Err(error) = transport.send_text(text).await {
-        eprintln!("send channel message: {error:#}");
+        tracing::warn!(
+            event = "channel.message_send_failed",
+            error = %format!("{error:#}"),
+            "send channel message failed"
+        );
     }
 }
 

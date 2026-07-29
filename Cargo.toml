@@ -45,6 +45,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "process", "signal", "io-std", "io-util"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tokio-tungstenite = "0.29"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 weixin-agent = "0.2"

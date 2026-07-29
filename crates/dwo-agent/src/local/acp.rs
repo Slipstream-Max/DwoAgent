@@ -493,7 +493,11 @@ fn handle_session_event(
                 if let Err(error) =
                     resolve_permission(&config_path, &cx, &session_id, &endpoint_id, &payload).await
                 {
-                    eprintln!("ACP permission failed: {error:#}");
+                    tracing::error!(
+                        event = "acp.permission_failed",
+                        error = %format!("{error:#}"),
+                        "ACP permission resolution failed"
+                    );
                 }
                 Ok(())
             });
@@ -528,7 +532,11 @@ fn handle_session_event(
                             ),
                         );
                     }
-                    Err(error) => eprintln!("refresh ACP config options: {error:#}"),
+                    Err(error) => tracing::warn!(
+                        event = "acp.config_refresh_failed",
+                        error = %format!("{error:#}"),
+                        "refresh ACP config options failed"
+                    ),
                 }
                 Ok(())
             });

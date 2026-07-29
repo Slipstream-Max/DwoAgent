@@ -2,8 +2,10 @@ use anyhow::Result;
 use dwo_agent_service::SessionRecord;
 use serde_json::Value;
 
-pub fn print_value(value: &Value) -> Result<()> {
-    print!("{}", render_value(value));
+use super::output;
+
+pub fn write_value(value: &Value) -> Result<()> {
+    output::write(format_args!("{}", render_value(value)))?;
     Ok(())
 }
 
@@ -11,16 +13,16 @@ pub fn render_value(value: &Value) -> String {
     serde_yaml::to_string(value).unwrap_or_else(|_| "value: <unrenderable>\n".to_string())
 }
 
-pub fn print_session_list(value: &Value) -> Result<()> {
+pub fn write_session_list(value: &Value) -> Result<()> {
     let records: Vec<SessionRecord> = serde_json::from_value(value.clone())?;
     if records.is_empty() {
-        println!("No sessions");
+        output::line(format_args!("No sessions"))?;
         return Ok(());
     }
 
     for record in records {
-        println!("{}", record.info.id);
-        println!("  title: {}", yaml_scalar(&record.info.title));
+        output::line(format_args!("{}", record.info.id))?;
+        output::line(format_args!("  title: {}", yaml_scalar(&record.info.title)))?;
     }
     Ok(())
 }

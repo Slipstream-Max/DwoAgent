@@ -77,7 +77,12 @@ impl RunningFeishu {
             conversation,
         ));
         if let Err(error) = bridge.resume_observer().await {
-            eprintln!("restore Feishu session observer: {error:#}");
+            tracing::warn!(
+                event = "channel.observer_restore_failed",
+                channel = "feishu",
+                error = %format!("{error:#}"),
+                "restore channel session observer failed"
+            );
         }
 
         let (payload_tx, payload_rx) = mpsc::unbounded_channel();
@@ -174,7 +179,12 @@ async fn run_connection(
             _ = cancel.cancelled() => break,
             result = LarkWsClient::open(Arc::new(config.clone()), handler.clone()) => result,
         };
-        eprintln!("Feishu long connection stopped: {result:?}");
+        tracing::warn!(
+            event = "channel.connection_stopped",
+            channel = "feishu",
+            result = ?result,
+            "channel connection stopped"
+        );
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(retry_delay) => {}
@@ -204,7 +214,12 @@ async fn run_messages(
             Ok(Some(incoming)) => incoming,
             Ok(None) => continue,
             Err(error) => {
-                eprintln!("parse Feishu event: {error:#}");
+                tracing::warn!(
+                    event = "channel.event_parse_failed",
+                    channel = "feishu",
+                    error = %format!("{error:#}"),
+                    "parse channel event failed"
+                );
                 continue;
             }
         };
@@ -220,14 +235,26 @@ async fn run_messages(
             Ok(messages) => {
                 for message in messages {
                     if let Err(error) = api.send_text(&message).await {
-                        eprintln!("send Feishu command response: {error:#}");
+                        tracing::warn!(
+                            event = "channel.message_send_failed",
+                            channel = "feishu",
+                            kind = "command_response",
+                            error = %format!("{error:#}"),
+                            "send channel message failed"
+                        );
                     }
                 }
             }
             Err(error) => {
                 if let Err(send_error) = api.send_text(&format!("dwoagent error: {error:#}")).await
                 {
-                    eprintln!("send Feishu error response: {send_error:#}");
+                    tracing::warn!(
+                        event = "channel.message_send_failed",
+                        channel = "feishu",
+                        kind = "error_response",
+                        error = %format!("{send_error:#}"),
+                        "send channel message failed"
+                    );
                 }
             }
         }

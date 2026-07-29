@@ -76,14 +76,24 @@ impl RunningWeixin {
             .import(state.lock().await.adapter.context_tokens.clone());
         let _ = client_ref.set(client.clone());
         if let Err(error) = bridge.resume_observer().await {
-            eprintln!("restore Weixin session observer: {error:#}");
+            tracing::warn!(
+                event = "channel.observer_restore_failed",
+                channel = "weixin",
+                error = %format!("{error:#}"),
+                "restore channel session observer failed"
+            );
         }
         let running_client = client.clone();
         let task_state = state.clone();
         let client_task = tokio::spawn(async move {
             let sync_buf = task_state.lock().await.adapter.sync_buf.clone();
             if let Err(error) = running_client.start(sync_buf).await {
-                eprintln!("Weixin channel stopped: {error}");
+                tracing::warn!(
+                    event = "channel.connection_stopped",
+                    channel = "weixin",
+                    error = %error,
+                    "channel connection stopped"
+                );
             }
         });
         Ok(Self {
@@ -224,14 +234,26 @@ impl MessageHandler for WeixinHandler {
 
     async fn on_sync_buf_updated(&self, sync_buf: &str) -> weixin_agent::Result<()> {
         if let Err(error) = self.conversation.save_runtime(Some(sync_buf)).await {
-            eprintln!("save Weixin sync state: {error:#}");
+            tracing::warn!(
+                event = "channel.runtime_save_failed",
+                channel = "weixin",
+                state = "sync",
+                error = %format!("{error:#}"),
+                "save channel runtime state failed"
+            );
         }
         Ok(())
     }
 
     async fn on_shutdown(&self) -> weixin_agent::Result<()> {
         if let Err(error) = self.conversation.save_runtime(None).await {
-            eprintln!("save Weixin shutdown state: {error:#}");
+            tracing::warn!(
+                event = "channel.runtime_save_failed",
+                channel = "weixin",
+                state = "shutdown",
+                error = %format!("{error:#}"),
+                "save channel runtime state failed"
+            );
         }
         Ok(())
     }

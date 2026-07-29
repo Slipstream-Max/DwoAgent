@@ -14,7 +14,9 @@ use crate::channels::{
 };
 use crate::host;
 use crate::local::{acp, ipc};
+use crate::logging;
 
+mod output;
 mod render;
 
 #[derive(Parser)]
@@ -193,7 +195,10 @@ pub(crate) async fn run() -> Result<()> {
     match cli.command {
         Command::Install { start } => {
             install(&config_path)?;
-            println!("Installed profile at {}", config_path.display());
+            output::line(format_args!(
+                "Installed profile at {}",
+                config_path.display()
+            ))?;
             if start {
                 daemon_start(&config_path).await?;
             }
@@ -207,21 +212,19 @@ pub(crate) async fn run() -> Result<()> {
                     std::fs::remove_dir_all(root)?;
                 }
             }
-            println!(
+            output::line(format_args!(
                 "Uninstalled dwoagent{}",
                 if purge { " and removed profile" } else { "" }
-            );
+            ))?;
         }
         Command::Serve => {
-            let host = host::Host::load(&config_path).await?;
-            println!("dwoagent serving {}", ipc::endpoint(&config_path));
-            ipc::serve(host, &config_path).await?;
+            run_daemon(&config_path).await?;
         }
         Command::Daemon { command } => match command {
             DaemonCommand::Start => daemon_start(&config_path).await?,
             DaemonCommand::Stop => {
                 ipc::request(&config_path, "daemon.shutdown", json!({})).await?;
-                println!("Stopping dwoagent daemon");
+                output::line(format_args!("Stopping dwoagent daemon"))?;
             }
             DaemonCommand::Status => {
                 let status = ipc::request(&config_path, "daemon.status", json!({})).await?;
@@ -241,6 +244,34 @@ pub(crate) async fn run() -> Result<()> {
     Ok(())
 }
 
+async fn run_daemon(config_path: &Path) -> Result<()> {
+    let _logging = logging::init(config_path)?;
+    tracing::info!(
+        event = "daemon.starting",
+        config_path = %config_path.display(),
+        "daemon starting"
+    );
+    let result = async {
+        let host = host::Host::load(config_path).await?;
+        tracing::info!(
+            event = "daemon.ready",
+            endpoint = %ipc::endpoint(config_path),
+            "daemon ready"
+        );
+        ipc::serve(host, config_path).await
+    }
+    .await;
+    match &result {
+        Ok(()) => tracing::info!(event = "daemon.stopped", "daemon stopped"),
+        Err(error) => tracing::error!(
+            event = "daemon.failed",
+            error = %format!("{error:#}"),
+            "daemon failed"
+        ),
+    }
+    result
+}
+
 async fn run_automation(command: AutomationCommand, config_path: &Path) -> Result<()> {
     match command {
         AutomationCommand::List { json } | AutomationCommand::Status { json } => {
@@ -250,7 +281,7 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
             } else {
                 let jobs: Vec<AutomationJobStatus> = serde_json::from_value(value)?;
                 if jobs.is_empty() {
-                    println!("No automation jobs configured");
+                    output::line(format_args!("No automation jobs configured"))?;
                 }
                 for status in jobs {
                     let next = status.next_run_at.as_deref().unwrap_or("disabled");
@@ -259,7 +290,7 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
                     } else {
                         format!(" active={}", status.active_runs.len())
                     };
-                    println!("{}  next={}{}", status.job.name, next, active);
+                    output::line(format_args!("{}  next={}{}", status.job.name, next, active))?;
                 }
             }
         }
@@ -269,17 +300,17 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
                 print_value(&value)?;
             } else {
                 let record: AutomationRunRecord = serde_json::from_value(value)?;
-                println!(
+                output::line(format_args!(
                     "{}  {:?}  session={}",
                     record.job,
                     record.status,
                     record.session_id.as_deref().unwrap_or("-")
-                );
+                ))?;
                 if let Some(error) = record.error {
-                    println!("error: {error}");
+                    output::line(format_args!("error: {error}"))?;
                 }
                 if !record.response.is_empty() {
-                    println!("\n{}", record.response);
+                    output::line(format_args!("\n{}", record.response))?;
                 }
             }
         }
@@ -292,7 +323,7 @@ async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
         McpCommand::Search { query } => {
             let value = ipc::request(config_path, "mcp.search", json!({"query": query})).await?;
             let groups: Vec<SearchGroup> = serde_json::from_value(value)?;
-            print!("{}", dwo_mcp::render_search(&groups));
+            output::write(format_args!("{}", dwo_mcp::render_search(&groups)))?;
         }
         McpCommand::Call { selector, args } => {
             let arguments: Value = serde_json::from_str(&args).context("parse --args JSON")?;
@@ -308,14 +339,16 @@ async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
             let method = if logout {
                 "mcp.auth.logout"
             } else {
-                println!("Opening the authorization page for {server}...");
+                output::line(format_args!(
+                    "Opening the authorization page for {server}..."
+                ))?;
                 "mcp.auth.login"
             };
             ipc::request(config_path, method, json!({"server": server})).await?;
-            println!(
+            output::line(format_args!(
                 "Authorization {}",
                 if logout { "removed" } else { "updated" }
-            );
+            ))?;
         }
     }
     Ok(())
@@ -331,11 +364,11 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                 json!({"all": all, "caller_session_id": current_session_id()}),
             )
             .await?;
-            render::print_session_list(&value)?;
+            render::write_session_list(&value)?;
         }
         SessionCommand::Delete { id } => {
             ipc::request(config_path, "session.delete", json!({"session_id": id})).await?;
-            println!("Deleted session");
+            output::line(format_args!("Deleted session"))?;
         }
         SessionCommand::Prompt {
             message,
@@ -369,7 +402,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
         }
         SessionCommand::Cancel { id } => {
             ipc::request(config_path, "session.cancel", json!({"session_id": id})).await?;
-            println!("Cancellation requested");
+            output::line(format_args!("Cancellation requested"))?;
         }
         SessionCommand::Watch { id, cursor, limit } => {
             let value = ipc::request(
@@ -416,7 +449,7 @@ async fn permission(
         }),
     )
     .await?;
-    println!("Permission resolved");
+    output::line(format_args!("Permission resolved"))?;
     Ok(())
 }
 
@@ -498,11 +531,9 @@ async fn bind_weixin(config_path: &Path) -> Result<()> {
         .as_str()
         .context("daemon omitted binding_id")?;
     let qrcode = start["qrcode"].as_str().context("daemon omitted qrcode")?;
-    println!("Scan this QR code with Weixin:\n");
-    if let Err(error) = qr2term::print_qr(qrcode) {
-        eprintln!("Could not render terminal QR: {error}");
-        println!("{qrcode}");
-    }
+    output::line(format_args!("Scan this QR code with Weixin:\n"))?;
+    let rendered_qr = qr2term::generate_qr_string(qrcode).unwrap_or_else(|_| qrcode.to_string());
+    output::line(format_args!("{rendered_qr}"))?;
     let mut verify_code: Option<String> = None;
     loop {
         channels::wait_before_poll().await;
@@ -515,13 +546,17 @@ async fn bind_weixin(config_path: &Path) -> Result<()> {
         let progress: WeixinLoginProgress = serde_json::from_value(progress)?;
         match progress {
             WeixinLoginProgress::Waiting => {}
-            WeixinLoginProgress::Scanned => println!("Scanned; confirm on your phone"),
+            WeixinLoginProgress::Scanned => {
+                output::line(format_args!("Scanned; confirm on your phone"))?;
+            }
             WeixinLoginProgress::Confirmed { channel } => {
-                println!("Channel {} connected", channel.name);
+                output::line(format_args!("Channel {} connected", channel.name))?;
                 break;
             }
             WeixinLoginProgress::NeedVerifyCode => {
-                println!("Enter the verification code shown on your phone:");
+                output::line(format_args!(
+                    "Enter the verification code shown on your phone:"
+                ))?;
                 let mut code = String::new();
                 std::io::stdin().read_line(&mut code)?;
                 verify_code = Some(code.trim().to_string());
@@ -538,7 +573,7 @@ async fn daemon_start(config_path: &Path) -> Result<()> {
         .await
         .is_ok()
     {
-        println!("dwoagent daemon is already running");
+        output::line(format_args!("dwoagent daemon is already running"))?;
         return Ok(());
     }
     if !start_registered_service()? {
@@ -564,7 +599,7 @@ async fn daemon_start(config_path: &Path) -> Result<()> {
             .await
             .is_ok()
         {
-            println!("dwoagent daemon started");
+            output::line(format_args!("dwoagent daemon started"))?;
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -803,7 +838,7 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn print_value(value: &Value) -> Result<()> {
-    render::print_value(value)
+    render::write_value(value)
 }
 
 async fn bind_telegram(config_path: &Path) -> Result<()> {
@@ -815,9 +850,11 @@ async fn bind_telegram(config_path: &Path) -> Result<()> {
     let bot_username = start["bot_username"]
         .as_str()
         .context("daemon omitted bot_username")?;
-    println!("Open @{bot_username} in Telegram and send this private message:\n");
-    println!("/bind {code}\n");
-    println!("Waiting for Telegram binding confirmation...");
+    output::line(format_args!(
+        "Open @{bot_username} in Telegram and send this private message:\n"
+    ))?;
+    output::line(format_args!("/bind {code}\n"))?;
+    output::line(format_args!("Waiting for Telegram binding confirmation..."))?;
     loop {
         channels::wait_before_poll().await;
         let progress = ipc::request(
@@ -829,7 +866,7 @@ async fn bind_telegram(config_path: &Path) -> Result<()> {
         match serde_json::from_value::<TelegramBindProgress>(progress)? {
             TelegramBindProgress::Waiting => {}
             TelegramBindProgress::Confirmed { channel } => {
-                println!("Channel {} connected", channel.name);
+                output::line(format_args!("Channel {} connected", channel.name))?;
                 break;
             }
             TelegramBindProgress::Expired => bail!("Telegram binding code expired"),
@@ -848,9 +885,13 @@ async fn bind_feishu(config_path: &Path) -> Result<()> {
         .as_str()
         .context("daemon omitted Feishu platform")?;
     let product = if platform == "lark" { "Lark" } else { "Feishu" };
-    println!("Open the application bot in {product} and send this private message:\n");
-    println!("/bind {code}\n");
-    println!("Waiting for {product} binding confirmation...");
+    output::line(format_args!(
+        "Open the application bot in {product} and send this private message:\n"
+    ))?;
+    output::line(format_args!("/bind {code}\n"))?;
+    output::line(format_args!(
+        "Waiting for {product} binding confirmation..."
+    ))?;
     loop {
         channels::wait_before_poll().await;
         let progress = ipc::request(
@@ -862,7 +903,7 @@ async fn bind_feishu(config_path: &Path) -> Result<()> {
         match serde_json::from_value::<FeishuBindProgress>(progress)? {
             FeishuBindProgress::Waiting => {}
             FeishuBindProgress::Confirmed { channel } => {
-                println!("Channel {} connected", channel.name);
+                output::line(format_args!("Channel {} connected", channel.name))?;
                 break;
             }
             FeishuBindProgress::Expired => bail!("Feishu binding code expired"),
@@ -875,6 +916,9 @@ async fn bind_feishu(config_path: &Path) -> Result<()> {
 const DEFAULT_PROFILE: &str = r#"name: coder
 description: coding agent
 policyMode: confirm
+logging:
+  level: info
+  retentionDays: 14
 channels:
   weixin:
     enabled: true

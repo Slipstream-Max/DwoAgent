@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use dwo_context::{
     CompactionPlan, ContextManager, PendingMessageBatch, SessionContext, SystemPromptBuilder,
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::events::ActiveToolCall;
 use crate::permission::PermissionRequester;
-use crate::record::{SessionConfig, SessionLlmSettings};
+use crate::record::{SessionConfig, SessionId, SessionLlmSettings};
 
 const MAX_MODEL_STEPS: usize = 100;
 
@@ -67,6 +68,7 @@ pub(crate) enum TurnOutcome {
 }
 
 pub(crate) struct RunTurn {
+    pub session_id: SessionId,
     pub turn_id: TurnId,
     pub context: ContextManager,
     pub prompt_builder: SystemPromptBuilder,
@@ -107,7 +109,41 @@ impl RunTurn {
 }
 
 pub(crate) async fn run(mut turn: RunTurn) {
+    let started = Instant::now();
+    let selection = current_selection(&turn);
+    tracing::info!(
+        event = "turn.started",
+        session_id = %turn.session_id,
+        turn_id = %turn.turn_id,
+        model = %selection.model,
+        reasoning = selection.reasoning.as_deref(),
+        "turn started"
+    );
     let outcome = run_inner(&mut turn).await;
+    match &outcome {
+        TurnOutcome::Completed => tracing::info!(
+            event = "turn.completed",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "turn completed"
+        ),
+        TurnOutcome::Cancelled => tracing::info!(
+            event = "turn.cancelled",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "turn cancelled"
+        ),
+        TurnOutcome::Failed(error) => tracing::error!(
+            event = "turn.failed",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            error = %error,
+            "turn failed"
+        ),
+    }
     turn.emit(TurnEvent::Finished {
         turn_id: turn.turn_id.clone(),
         outcome,
@@ -193,6 +229,14 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             }
         };
         let calls = response.tool_calls;
+        let tools_started = Instant::now();
+        tracing::info!(
+            event = "tool.batch_started",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            tool_count = calls.len(),
+            "tool batch started"
+        );
         let tool_results = tokio::select! {
             _ = turn.cancellation.cancelled() => cancelled_results(&calls),
             results = turn.tools.execute_batch(calls.clone(), &execution) => results,
@@ -203,11 +247,28 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             .map(ToolResult::context_record)
             .collect::<Vec<_>>();
         for result in &tool_results {
+            tracing::info!(
+                event = "tool.call_completed",
+                session_id = %turn.session_id,
+                turn_id = %turn.turn_id,
+                tool_call_id = %result.tool_call_id,
+                tool = %result.tool_name,
+                status = result.output.get("status").and_then(|value| value.as_str()),
+                "tool call completed"
+            );
             turn.emit(TurnEvent::ToolCompleted {
                 turn_id: turn.turn_id.clone(),
                 result: result.clone(),
             });
         }
+        tracing::info!(
+            event = "tool.batch_completed",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            tool_count = tool_results.len(),
+            duration_ms = tools_started.elapsed().as_millis() as u64,
+            "tool batch completed"
+        );
         turn.context
             .append_tool_batch(turn.turn_id.clone(), context_results);
         let pending = match turn.take_pending_messages().await {
@@ -250,6 +311,19 @@ async fn request_model(
     turn: &mut RunTurn,
     selection: &ModelSelection,
 ) -> Result<ModelReply, dwo_model_client::ModelClientError> {
+    let started = Instant::now();
+    let message_count = turn.context.model_messages().len();
+    let tool_count = turn.tools.schemas().len();
+    tracing::debug!(
+        event = "model.request_started",
+        session_id = %turn.session_id,
+        turn_id = %turn.turn_id,
+        model = %selection.model,
+        reasoning = selection.reasoning.as_deref(),
+        message_count,
+        tool_count,
+        "model request started"
+    );
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
     let model_call = turn.model.stream_turn(
         selection.clone(),
@@ -265,6 +339,30 @@ async fn request_model(
             response = &mut model_call => {
                 while let Ok(event) = chunk_rx.try_recv() {
                     emit_model_delta(turn, event);
+                }
+                match &response {
+                    Ok(reply) => tracing::info!(
+                        event = "model.request_completed",
+                        session_id = %turn.session_id,
+                        turn_id = %turn.turn_id,
+                        model = %selection.model,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        input_tokens = reply.usage.input_tokens,
+                        output_tokens = reply.usage.output_tokens,
+                        total_tokens = reply.usage.total_tokens,
+                        tool_call_count = reply.tool_calls.len(),
+                        finish_reason = ?reply.finish_reason,
+                        "model request completed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        event = "model.request_failed",
+                        session_id = %turn.session_id,
+                        turn_id = %turn.turn_id,
+                        model = %selection.model,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        error = %error,
+                        "model request failed"
+                    ),
                 }
                 return response;
             }
@@ -296,6 +394,15 @@ async fn compact_context(
     if !plan.needs_replacement() {
         return Ok(false);
     }
+    let started = Instant::now();
+    tracing::info!(
+        event = "context.compaction_started",
+        session_id = %turn.session_id,
+        turn_id = %turn.turn_id,
+        model = %selection.model,
+        "context compaction started"
+    );
+    let model = selection.model.clone();
     let summary = if plan.has_compactable_history() {
         let summary = turn
             .model
@@ -308,6 +415,14 @@ async fn compact_context(
     turn.context
         .apply_compaction(plan, summary, &turn.prompt_builder, &turn.tools.schemas())?;
     turn.checkpoint().await?;
+    tracing::info!(
+        event = "context.compaction_completed",
+        session_id = %turn.session_id,
+        turn_id = %turn.turn_id,
+        model = %model,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "context compaction completed"
+    );
     Ok(true)
 }
 

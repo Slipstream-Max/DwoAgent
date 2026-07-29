@@ -14,11 +14,58 @@ pub struct AgentProfileConfig {
     pub name: String,
     pub description: String,
     pub policy_mode: SessionMode,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     pub model: AgentModelConfig,
     #[serde(default)]
     pub channels: BTreeMap<String, serde_yaml::Value>,
     #[serde(default)]
     pub automation: serde_yaml::Value,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub level: LogLevel,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: usize,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+fn default_retention_days() -> usize {
+    14
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +115,11 @@ impl AgentProfileConfig {
     pub fn validate(&self) -> Result<(), AgentServiceError> {
         validate_text(&self.name, "name")?;
         validate_text(&self.description, "description")?;
+        if !(1..=365).contains(&self.logging.retention_days) {
+            return Err(AgentServiceError::InvalidConfig(
+                "logging.retentionDays must be between 1 and 365".to_string(),
+            ));
+        }
         self.model
             .validate()
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))
@@ -131,6 +183,7 @@ model:
 
         assert_eq!(profile.name, "coder");
         assert_eq!(profile.policy_mode, SessionMode::Confirm);
+        assert_eq!(profile.logging, LoggingConfig::default());
         assert!(profile.channels.contains_key("weixin"));
         assert_eq!(profile.model.providers.len(), 1);
         assert_eq!(profile.model.models.len(), 2);
@@ -139,6 +192,58 @@ model:
             .unwrap();
         assert_eq!(resolved.providers.len(), 1);
         assert_eq!(resolved.models.len(), 2);
+    }
+
+    #[test]
+    fn profile_parses_logging_configuration() {
+        let profile = AgentProfileConfig::from_yaml(
+            r#"
+name: coder
+description: coding agent
+policyMode: confirm
+logging:
+  level: debug
+  retentionDays: 30
+model:
+  defaultModelId: chat
+  providers:
+    local:
+      type: local
+  models:
+    - modelName: chat
+      provider: local
+      modelId: chat
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(profile.logging.level, LogLevel::Debug);
+        assert_eq!(profile.logging.retention_days, 30);
+    }
+
+    #[test]
+    fn profile_rejects_invalid_log_retention() {
+        let error = AgentProfileConfig::from_yaml(
+            r#"
+name: coder
+description: coding agent
+policyMode: confirm
+logging:
+  retentionDays: 0
+model:
+  defaultModelId: chat
+  providers:
+    local:
+      type: local
+  models:
+    - modelName: chat
+      provider: local
+      modelId: chat
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("logging.retentionDays"));
     }
 
     #[test]

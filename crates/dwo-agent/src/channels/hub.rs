@@ -73,7 +73,11 @@ impl ChannelHub {
         let channels = match host.channels.list().await {
             Ok(channels) => channels,
             Err(error) => {
-                eprintln!("load channels: {error:#}");
+                tracing::error!(
+                    event = "channel.load_failed",
+                    error = %format!("{error:#}"),
+                    "load channels failed"
+                );
                 return;
             }
         };
@@ -85,7 +89,12 @@ impl ChannelHub {
                 continue;
             };
             if let Err(error) = self.start(channel, host.clone()).await {
-                eprintln!("start {} channel: {error:#}", channel.display_name());
+                tracing::error!(
+                    event = "channel.start_failed",
+                    channel = channel.as_str(),
+                    error = %format!("{error:#}"),
+                    "start channel failed"
+                );
             }
         }
     }
@@ -94,6 +103,11 @@ impl ChannelHub {
         let mut active = self.active.lock().await;
         if let std::collections::hash_map::Entry::Vacant(entry) = active.entry(channel) {
             entry.insert(RunningChannel::start(channel, host).await?);
+            tracing::info!(
+                event = "channel.started",
+                channel = channel.as_str(),
+                "channel started"
+            );
         }
         Ok(())
     }
@@ -102,19 +116,23 @@ impl ChannelHub {
         let running = self.active.lock().await.remove(&channel);
         if let Some(running) = running {
             running.stop().await;
+            tracing::info!(
+                event = "channel.stopped",
+                channel = channel.as_str(),
+                "channel stopped"
+            );
         }
     }
 
     pub async fn stop_all(&self) {
-        let running = self
-            .active
-            .lock()
-            .await
-            .drain()
-            .map(|(_, channel)| channel)
-            .collect::<Vec<_>>();
-        for channel in running {
+        let running = self.active.lock().await.drain().collect::<Vec<_>>();
+        for (kind, channel) in running {
             channel.stop().await;
+            tracing::info!(
+                event = "channel.stopped",
+                channel = kind.as_str(),
+                "channel stopped"
+            );
         }
     }
 

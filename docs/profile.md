@@ -60,6 +60,10 @@ name: coder
 description: coding agent
 policyMode: confirm
 
+logging:
+  level: info
+  retentionDays: 14
+
 channels:
   weixin:
     enabled: true
@@ -107,6 +111,7 @@ Profile 使用严格 schema，未知字段会报错。旧的 `agent.yaml`、prof
 | `name` | 是 | Profile 名称，不能为空。 |
 | `description` | 是 | Profile 说明，不能为空。 |
 | `policyMode` | 是 | 新 session 的默认权限：`full_access`、`confirm` 或 `watch`。 |
+| `logging` | 否 | Daemon 文件日志级别和保留天数。 |
 | `channels` | 否 | 微信、Telegram 和飞书/Lark adapter。 |
 | `automation` | 否 | Cron 定时任务。 |
 | `model` | 是 | Provider、模型 alias 和默认模型。 |
@@ -120,6 +125,24 @@ Profile 使用严格 schema，未知字段会报错。旧的 `agent.yaml`、prof
 | `watch` | 只允许简单只读命令和 watch allow rule，文件编辑会被拒绝。 |
 
 `policyMode` 只设置新 session 的默认值。已有 session 可以通过 ACP config、channel `/policy` 或 CLI 参数单独修改。
+
+## Logging
+
+```yaml
+logging:
+  level: info
+  retentionDays: 14
+```
+
+Daemon 将结构化 JSONL 日志写入 `runtime/logs/`，按日轮转，不向 stdout 或 stderr 输出诊断日志。`level` 支持 `error`、`warn`、`info`、`debug` 和 `trace`；`retentionDays` 的有效范围是 1 到 365。
+
+环境变量 `DWO_LOG` 可以临时覆盖配置级别，并接受 `tracing` filter directives，例如：
+
+```text
+DWO_LOG=dwo_agent_service=debug,dwo_mcp=trace
+```
+
+日志只记录控制流、标识符、耗时和错误，不记录 prompt、模型响应、tool 参数、授权头或 channel 消息正文。CLI 的用户输出和 ACP/IPC 协议流不会写入 daemon 日志。
 
 ## Model
 

@@ -188,6 +188,7 @@ impl Host {
         let profile_root = profile_root(config_path)?;
         let mcp = Arc::new(McpRuntime::new(&profile_root));
         mcp.sync_and_start().await?;
+        tracing::info!(event = "mcp.synchronized", "MCP configuration synchronized");
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
@@ -867,7 +868,11 @@ impl Host {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
                         if let Err(error) = runtime.sync_and_start().await {
-                            eprintln!("synchronize MCP configuration: {error:#}");
+                            tracing::warn!(
+                                event = "mcp.synchronization_failed",
+                                error = %format!("{error:#}"),
+                                "synchronize MCP configuration failed"
+                            );
                         }
                     }
                 }
@@ -929,14 +934,24 @@ fn spawn_result_delivery(
         let parent = match service.load(&parent_id).await {
             Ok(parent) => parent,
             Err(error) => {
-                eprintln!("load subsession parent {parent_id}: {error:#}");
+                tracing::error!(
+                    event = "subsession.parent_load_failed",
+                    parent_session_id = %parent_id,
+                    error = %format!("{error:#}"),
+                    "load subsession parent failed"
+                );
                 return;
             }
         };
         let parent_subscription = match parent.attach(EndpointId::new()).await {
             Ok(subscription) => subscription,
             Err(error) => {
-                eprintln!("observe subsession parent {parent_id}: {error:#}");
+                tracing::error!(
+                    event = "subsession.parent_observe_failed",
+                    parent_session_id = %parent_id,
+                    error = %format!("{error:#}"),
+                    "observe subsession parent failed"
+                );
                 return;
             }
         };
@@ -959,7 +974,12 @@ fn spawn_result_delivery(
                 }
             }
             Ok(None) => {}
-            Err(error) => eprintln!("deliver subsession result to {parent_id}: {error:#}"),
+            Err(error) => tracing::error!(
+                event = "subsession.result_delivery_failed",
+                parent_session_id = %parent_id,
+                error = %format!("{error:#}"),
+                "deliver subsession result failed"
+            ),
         }
     });
 }
@@ -1109,11 +1129,13 @@ mod tests {
                 "automation",
                 "channels",
                 "description",
+                "logging",
                 "model",
                 "name",
                 "policyMode",
             ]
         );
+        assert_eq!(yaml_keys(&document["logging"]), ["level", "retentionDays"]);
         assert_eq!(
             yaml_keys(&document["channels"]["weixin"]),
             ["enabled", "markdownFilter", "mediaInput", "replayTurns"]

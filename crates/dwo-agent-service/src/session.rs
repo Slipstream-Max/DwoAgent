@@ -667,6 +667,7 @@ impl SessionActor {
             self.permission_tx.clone(),
         );
         tokio::spawn(agent_loop::run(RunTurn {
+            session_id: self.record.info.id.clone(),
             turn_id: turn_id.clone(),
             context: ContextManager::new(self.record.context.clone()),
             prompt_builder: self.prompt_builder.clone(),
@@ -1153,7 +1154,12 @@ impl SessionActor {
             .await
         {
             Ok(()) => self.transcript.push(event),
-            Err(error) => eprintln!("persist client transcript event: {error:#}"),
+            Err(error) => tracing::error!(
+                event = "session.transcript_persist_failed",
+                session_id = %self.record.info.id,
+                error = %format!("{error:#}"),
+                "persist client transcript event failed"
+            ),
         }
         self.emit(payload);
     }

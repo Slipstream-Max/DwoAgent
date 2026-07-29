@@ -11,6 +11,15 @@ description: coding agent
 # full_access | confirm | watch
 policyMode: confirm
 
+# Daemon diagnostics are structured JSONL files under runtime/logs. DWO_LOG
+# can temporarily override the configured level with tracing filter directives.
+logging:
+  # error | warn | info | debug | trace
+  level: info
+
+  # Daily files retained on disk. Valid range: 1..=365.
+  retentionDays: 14
+
 # Channel credentials and mutable state are daemon-owned files under
 # channels/<name>/{secret,runtime}.yaml and never belong in profile.yaml.
 channels:

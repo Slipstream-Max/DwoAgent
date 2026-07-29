@@ -35,6 +35,48 @@ pub(super) fn seek_sequence(
     None
 }
 
+pub(super) struct PartialMatch {
+    pub index: usize,
+    pub matched: usize,
+}
+
+pub(super) fn best_partial_match(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+    eof: bool,
+) -> PartialMatch {
+    let first = start.min(lines.len());
+    let candidates = if eof {
+        let index = lines.len().saturating_sub(pattern.len());
+        index..=index
+    } else {
+        first..=lines.len()
+    };
+    let mut best = PartialMatch {
+        index: first,
+        matched: 0,
+    };
+    for strategy in [
+        MatchStrategy::Exact,
+        MatchStrategy::Rstrip,
+        MatchStrategy::Trim,
+        MatchStrategy::Unicode,
+    ] {
+        for index in candidates.clone() {
+            let matched = pattern
+                .iter()
+                .zip(lines.iter().skip(index))
+                .take_while(|(expected, actual)| line_matches(actual, expected, strategy))
+                .count();
+            if matched > best.matched || (matched == best.matched && index < best.index) {
+                best = PartialMatch { index, matched };
+            }
+        }
+    }
+    best
+}
+
 #[derive(Clone, Copy)]
 enum MatchStrategy {
     Exact,

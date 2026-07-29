@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use parser::{Hunk, UpdateChunk, parse_patch};
-use seek_sequence::seek_sequence;
+use seek_sequence::{best_partial_match, seek_sequence};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PatchChange {
@@ -94,7 +94,8 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<Vec<PatchChange>> {
                     bail!("Move destination already exists: {}", destination.display());
                 }
                 let original = read_text_file(&source)?;
-                let updated = apply_chunks(&original.text, &chunks)?;
+                let updated = apply_chunks(&original.text, &chunks)
+                    .with_context(|| format!("apply update to {}", source.display()))?;
                 let updated = restore_text_format(&updated, &original);
                 let mut bytes = Vec::with_capacity(updated.len() + usize::from(original.bom) * 3);
                 if original.bom {
@@ -146,18 +147,89 @@ fn apply_chunks(content: &str, chunks: &[UpdateChunk]) -> Result<String> {
     let mut lines = split_lines(content);
     let mut cursor = 0;
     for chunk in chunks {
-        if let Some(context) = &chunk.context {
+        let anchor = if let Some(context) = &chunk.context {
             let context_index = seek_sequence(&lines, std::slice::from_ref(context), cursor, false)
-                .ok_or_else(|| anyhow::anyhow!("Update context not found: {context}"))?;
+                .ok_or_else(|| context_not_found_error(&lines, context, cursor))?;
             cursor = context_index + 1;
-        }
+            Some((context.as_str(), context_index))
+        } else {
+            None
+        };
         let index = seek_sequence(&lines, &chunk.old_lines, cursor, chunk.end_of_file)
-            .ok_or_else(|| anyhow::anyhow!("Update hunk did not match target file"))?;
+            .ok_or_else(|| hunk_mismatch_error(&lines, chunk, anchor, cursor))?;
         let old_len = chunk.old_lines.len();
         lines.splice(index..index + old_len, chunk.new_lines.clone());
         cursor = index + chunk.new_lines.len();
     }
     Ok(lines.join("\n"))
+}
+
+fn context_not_found_error(lines: &[String], context: &str, search_start: usize) -> anyhow::Error {
+    let actual = lines.get(search_start).map(String::as_str);
+    anyhow::anyhow!(
+        "Update context not found.\nAnchor: {context:?}\nSearch started at target line {}.\nFirst mismatch:\n  expected anchor: {}\n  actual target: {}\nTarget file near line {}:\n{}",
+        search_start + 1,
+        display_line(Some(context)),
+        display_line(actual),
+        search_start + 1,
+        render_excerpt(lines, search_start),
+    )
+}
+
+fn hunk_mismatch_error(
+    lines: &[String],
+    chunk: &UpdateChunk,
+    anchor: Option<(&str, usize)>,
+    search_start: usize,
+) -> anyhow::Error {
+    let partial = best_partial_match(lines, &chunk.old_lines, search_start, chunk.end_of_file);
+    let expected = chunk.old_lines.get(partial.matched).map(String::as_str);
+    let target_index = partial.index + partial.matched;
+    let actual = lines.get(target_index).map(String::as_str);
+    let anchor_description = anchor.map_or_else(
+        || "<none>".to_string(),
+        |(context, index)| format!("{context:?} at target line {}", index + 1),
+    );
+    anyhow::anyhow!(
+        "Update hunk did not match target file.\nAnchor: {anchor_description}\nSearch started at target line {}.\nFirst mismatch at patch old line {} and target line {}:\n  expected: {}\n  actual: {}\nTarget file near line {}:\n{}",
+        search_start + 1,
+        partial.matched + 1,
+        target_index + 1,
+        display_line(expected),
+        display_line(actual),
+        target_index + 1,
+        render_excerpt(lines, target_index),
+    )
+}
+
+fn display_line(line: Option<&str>) -> String {
+    line.map_or_else(|| "<end of file>".to_string(), |line| format!("{line:?}"))
+}
+
+fn render_excerpt(lines: &[String], center: usize) -> String {
+    if lines.is_empty() {
+        return "  <empty file>".to_string();
+    }
+    let center = center.min(lines.len() - 1);
+    let start = center.saturating_sub(2);
+    let end = (center + 3).min(lines.len());
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| format!("  {:>4} | {}", start + offset + 1, truncate_line(line)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_line(line: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut chars = line.chars();
+    let prefix: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 fn split_lines(content: &str) -> Vec<String> {
@@ -274,6 +346,57 @@ mod tests {
                 .into_iter()
                 .chain(*b"ONE\r\ntwo")
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mismatch_reports_anchor_first_difference_and_excerpt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "heading\nbadge\nold value\ntail\n").unwrap();
+        let error = apply_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@ heading\n badge\n-expected value\n+new value\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Anchor: \"heading\" at target line 1"));
+        assert!(message.contains("First mismatch at patch old line 2 and target line 3"));
+        assert!(message.contains("expected: \"expected value\""));
+        assert!(message.contains("actual: \"old value\""));
+        assert!(message.contains("3 | old value"));
+    }
+
+    #[test]
+    fn missing_anchor_reports_target_excerpt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "one\ntwo\n").unwrap();
+        let error = apply_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@ missing\n-two\n+TWO\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Anchor: \"missing\""));
+        assert!(message.contains("expected anchor: \"missing\""));
+        assert!(message.contains("actual target: \"one\""));
+        assert!(message.contains("1 | one"));
+    }
+
+    #[test]
+    fn unprefixed_blank_lines_between_additions_are_inserted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        fs::write(&path, "marker\n").unwrap();
+        apply_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@ marker\n+i = 1\n\n\n+def abc()\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "marker\ni = 1\n\n\ndef abc()\n"
         );
     }
 }

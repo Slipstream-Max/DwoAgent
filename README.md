@@ -2,7 +2,7 @@
   <img src="assets/logo.svg" alt="赤铎 Dwo Agent" width="760">
 </p>
 
-# 赤铎 · Dwo Agent
+<h1 align="center">赤铎 · Dwo Agent</h1>
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&amp;logo=rust&amp;logoColor=white" alt="Rust"></a>
@@ -11,25 +11,25 @@
 </p>
 
 <p align="center">
-  Rust 写的轻量 Agent Runtime<br>
-  本地能用，远程能聊，也方便嵌入现有软件
+  <strong>一个 Agent Runtime，只做一件事：让你的 AI 常驻在身边。</strong><br>
+  Rust 原生，常驻内存 ~6MB，CLI、IDE、微信、Telegram、飞书随时连接。
 </p>
 
 ---
 
-赤铎（Dwo Agent）是一个用 Rust 写的轻量 Agent Runtime，可以常驻在本机或服务器上。CLI、ACP、ACP WebSocket、微信、Telegram 和飞书/Lark 共享同一批 session，远程和本地可以随时接着使用。
+赤铎不是又一层 LLM 包装器，而是你设备上的常住助手。CLI、ACP、微信、Telegram、飞书——随便哪个入口接入，对话都不会断。任务从 IDE 发起，手机上继续，无缝接力。
 
-模型调用、终端、文件编辑、MCP、skills、subsessions、权限控制、上下文压缩和定时任务都已经接好。任务可以从 IDE 开始，再从手机继续；core 也可以嵌入其他程序，并按需要调整 system prompt、agent step、存储和工具。
+模型调用、终端、文件编辑、MCP、skills、subsessions、权限控制、上下文压缩和定时任务均已内置。core 可以单独嵌入其他程序，system prompt、agent step、存储和工具都可以按需定制。
 
-## 为什么做赤铎
+## 🤔 为什么做了赤铎
 
 赤铎是一个体积小、性能好、功能完整的 Agent 运行时。Core 保留日常使用需要的功能，稍加配置就能作为长期使用的个人 Agent。清楚的 Rust API 也方便继续开发和做实验。
 
-OpenClaw 的功能很多，常驻内存、组件数量和整体复杂度也比较高。CLI、Web UI、gateway 和 runtime 混在一个大项目里时，单独取出 Agent core 会比较费力。很多轻量的 claw 项目只完成了基本 agent loop，session、MCP、skills、subsessions、权限、消息渠道和多端协作还没有补齐。另一些成熟 Agent 已经形成固定产品形态，从头调整 system prompt、agent step、工具和存储同样需要花不少时间。
+OpenClaw 功能很全，但常驻内存、组件数量和整体复杂度也跟着上去了。CLI、Web UI、gateway 和 runtime 全塞在一个大项目里，想把 Agent core 单独拎出来，牵一发动全身。很多轻量 claw 项目只做了基本的 agent loop，session、MCP、skills、subsessions、权限、消息渠道、多端协作——这些还没补齐。另一头呢，成熟的 Agent 已经定型，想从头调 system prompt、agent step、工具和存储，也得脱层皮。🫠
 
-赤铎主要提供 Agent Runtime。CLI 控制 daemon，ACP 和 channel 处理对话，`dwo-agent-service` 提供可嵌入的 session core。各部分可以单独使用，也能组合成一个完整的个人 Agent。
+赤铎就做一件事：Agent Runtime。CLI 管 daemon，ACP 和 channel 处理对话，`dwo-agent-service` 是可嵌入的 session core。按需拼装——单独用也行，组合起来就是一个完整的个人 Agent。✨
 
-## 特点
+## ✨ 特点
 
 | 亮点 | 说明 |
 | --- | --- |
@@ -43,13 +43,13 @@ OpenClaw 的功能很多，常驻内存、组件数量和整体复杂度也比�
 | **可嵌入 Core** | `dwo-agent-service` 暴露 session、repository、model、event 和 config API，可用于桌面应用、IDE、服务端程序和实验项目。 |
 | **文件化配置** | system prompt、`AGENTS.md`、skills、模型和 MCP 都有固定目录，修改后由 watcher 更新现有 session。 |
 
-## 关于记忆
+## 🧠 关于记忆
 
 赤铎目前没有额外加入长期记忆系统，也没有内置向量库、用户画像或自动提取并写回记忆的流程。现阶段还没有找到在准确性、可控性、成本和维护复杂度上都适合日常使用的方案。
 
 Session 会保存完整 transcript 和当前模型上下文，明确需要长期保留的内容可以放进 system prompt、`AGENTS.md` 或 skills。以后出现经过实际使用验证的记忆方案，再考虑加入对应能力。
 
-## Build & Install
+## 🚀 五分钟跑起来
 
 需要 Rust `1.95` 或更新版本。
 
@@ -91,7 +91,7 @@ dwo daemon start
 
 > Windows ARM64 构建需要进入 Visual Studio Developer PowerShell，并选择 ARM64 host/toolchain，使 `ring` 等原生依赖能够找到 C 编译器。
 
-## Profile Structure
+## 📂 Profile 目录结构
 
 `dwo install` 默认创建 `~/.dwoagent/`：
 
@@ -129,7 +129,7 @@ dwo daemon start
 
 通常只需要编辑 `profile.yaml` 和 `resource/`。`runtime/`、channel state 和 secret 文件由 daemon 管理。完整目录、YAML 字段、模型和运行数据说明见 [Profile 配置指南](docs/profile.md)。
 
-## CLI 快速上手
+## ⌨️ CLI 快速上手
 
 启动和检查服务：
 
@@ -169,7 +169,7 @@ dwo channel list
 
 所有参数和行为见 [CLI 命令参考](docs/commands.md)。
 
-## 原生工具
+## 🧰 原生工具
 
 赤铎内置三个由 Rust runtime 直接执行的基础工具，不需要额外配置 MCP server：
 
@@ -181,7 +181,7 @@ dwo channel list
 
 `read_file` 和 `file_edit` 使用 session 的工作目录解析相对路径。没有显式指定 `cwd` 的 session 使用自己的隔离工作区。
 
-## 如何对话
+## 💬 怎么和它说话
 
 ### ACP：从 IDE 或 ACP 客户端连接
 
@@ -232,7 +232,7 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
 
 普通文本直接作为 prompt 发送。在 `confirm` 模式下，Agent 请求执行敏感工具时，可以直接回复 `/allow` 或 `/deny`。
 
-## Subsessions
+## 🧩 一个不够？派小弟
 
 当前 agent 可以创建子 session，把检查模块、查找资料、运行测试等独立工作分出去。每个子 session 都有自己的上下文和 transcript，默认继承父 session 的工作目录、权限、模型和 reasoning；子 session 的权限不能高于父 session。
 
@@ -246,7 +246,7 @@ dwo session cancel <session-id>
 
 子任务完成、失败或被取消后，daemon 会把结果作为 internal message 自动送回父 session。父 session 空闲时会立即处理，正在运行时会在当前模型响应或一批工具调用结束后接收，不需要持续轮询。子 session 也可以继续创建下一层子 session，结果会沿父子关系逐层返回。完整机制和示例见 [Subsessions 使用指南](docs/subsessions.md)。
 
-## Automation
+## ⏰ 让它替你值班
 
 定时任务写在 `~/.dwoagent/profile.yaml`。下面的任务每天 9:00 创建一个 session，并检查项目状态：
 
@@ -278,7 +278,7 @@ dwo automation run daily-report
 
 Cron 使用 `分钟 小时 日期 月份 星期` 五个字段。Daemon 会读取配置变化并更新执行时间。Automation 无人值守运行，遇到工具权限确认时会自动拒绝，避免任务长期等待。完整字段和 fixed session 示例见 [Automation 使用指南](docs/automation.md)。
 
-## 运行方式
+## 🔀 运行全景
 
 ```text
                          +------------------+
@@ -292,7 +292,7 @@ Cron 使用 `分钟 小时 日期 月份 星期` 五个字段。Daemon 会读取
 
 所有入口共享 session，每个 channel 会单独保存当前选择的 session。没有显式 `cwd` 的 session 使用 `runtime/workspaces/<session-id>/`；完整 transcript 与当前模型上下文分别持久化，模型压缩不会删除 transcript。
 
-## Core 嵌入
+## 🔌 Core 嵌入
 
 真正运行 session 和 agent loop 的代码在 `crates/dwo-agent-service`。它提供这些公开类型：
 
@@ -306,11 +306,11 @@ Cron 使用 `分钟 小时 日期 月份 星期` 五个字段。Daemon 会读取
 
 System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource/prompts/AGENTS.md`，skills 和 MCP 也使用独立目录。做新的 agent step、上下文策略、工具策略或客户端时，可以从对应 crate 开始修改，不需要先拆开一个完整的 Web 产品。
 
-## 项目说明
+## 📝 写在最后
 
 赤铎来自实际使用中的需求，目前也用于作者的日常 Agent 工作流。后续开发会继续做好稳定常驻、多端协作、低开销和扩展能力。
 
-## 文档
+## 📚 文档索引
 
 | 文档 | 内容 |
 | --- | --- |
@@ -322,7 +322,7 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | [CLI 命令参考](docs/commands.md) | daemon、session、MCP、channel、automation 命令 |
 | [Profile 配置指南](docs/profile.md) | 完整 profile.yaml、资源目录、模型、MCP 与运行数据 |
 
-## Development
+## 🛠️ 开发
 
 ```powershell
 cargo fmt --all

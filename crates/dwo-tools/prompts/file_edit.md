@@ -33,13 +33,36 @@ Create a file that does not already exist. Every content line starts with `+`.
 
 Modify an existing file using one or more ordered hunks.
 
+Complete example without an anchor:
+
 ```text
+*** Begin Patch
 *** Update File: path/to/existing.txt
-@@ optional context line
- unchanged context
--old line
-+new line
+@@
+ fn greet() {
+-    println!("hello");
++    println!("hello, world");
+ }
+*** End Patch
 ```
+
+Complete example using an anchor:
+
+```text
+*** Begin Patch
+*** Update File: path/to/existing.txt
+@@ impl Greeter {
+     fn greet(&self) {
+-        println!("hello");
++        println!("hello, world");
+     }
+*** End Patch
+```
+
+`@@ impl Greeter {` finds that anchor and starts matching on the line after it.
+Do not repeat the anchor as a context or removed line below the `@@` header. In
+the example above, there is intentionally no ` impl Greeter {` line after the
+header.
 
 Within an update hunk:
 
@@ -47,7 +70,8 @@ Within an update hunk:
 - `-` removes a line.
 - `+` adds a line.
 - `@@` starts a hunk.
-- `@@ context` searches for the named context before matching the hunk.
+- `@@ context` finds an anchor, then matches the hunk after that anchor. Do not repeat the anchor in the hunk body.
+- Blank context lines should normally contain a single leading space. Completely empty lines are accepted for compatibility: between `+` lines they are inferred as additions, between `-` lines as removals, and otherwise as unchanged context.
 - `*** End of File` requires the hunk to match at the end of the file.
 
 ## Move File

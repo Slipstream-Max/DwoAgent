@@ -45,7 +45,7 @@ pub(crate) async fn execute(
     let text = String::from_utf8(bytes)
         .with_context(|| format!("{} is not UTF-8 text or a supported image", path.display()))?;
     Ok(ReadFileOutput {
-        output: text_page(&text, args.cursor, args.line_count)?,
+        output: text_page(&text, args.cursor, args.line_count, args.offset)?,
         model_context: Vec::new(),
     })
 }
@@ -72,34 +72,102 @@ fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn text_page(text: &str, cursor: usize, line_count: usize) -> Result<Value> {
+fn text_page(text: &str, cursor: usize, line_count: usize, offset: usize) -> Result<Value> {
     let lines = text.lines().collect::<Vec<_>>();
     let total_lines = lines.len();
     if cursor > total_lines && !(cursor == 1 && total_lines == 0) {
         bail!("cursor {cursor} is past the end of the file ({total_lines} lines)");
     }
+    let mut output = Map::new();
+    output.insert("start_line".to_string(), json!(cursor));
+    if total_lines > line_count {
+        output.insert("total_lines".to_string(), json!(total_lines));
+    }
+
+    if offset > 0 {
+        if line_count != 1 {
+            bail!("offset is only valid with line_count 1");
+        }
+        if lines.is_empty() {
+            bail!("cannot page an empty file with offset");
+        }
+        let line = lines[cursor - 1];
+        let line_chars = line.chars().count();
+        if offset >= line_chars {
+            bail!("offset {offset} is past the end of the line ({line_chars} chars)");
+        }
+        let slice: String = line.chars().skip(offset).collect();
+        output.insert(
+            "content".to_string(),
+            json!(render_capped(slice.as_bytes(), DEFAULT_MODEL_CAP_BYTES)),
+        );
+        output.insert("end_line".to_string(), json!(cursor));
+        output.insert("offset".to_string(), json!(offset));
+        output.insert("line_chars".to_string(), json!(line_chars));
+        output.insert("remaining_chars".to_string(), json!(line_chars - offset));
+        return Ok(Value::Object(output));
+    }
 
     let start = cursor.saturating_sub(1);
     let end = start.saturating_add(line_count).min(total_lines);
+    let mut truncated_lines = Vec::new();
     let content = lines[start..end]
         .iter()
-        .map(|line| render_capped(line.as_bytes(), DEFAULT_MODEL_CAP_BYTES))
+        .enumerate()
+        .map(|(index, line)| {
+            if line.len() > DEFAULT_MODEL_CAP_BYTES {
+                truncated_lines.push(json!({
+                    "line": start + index + 1,
+                    "chars": line.chars().count(),
+                }));
+            }
+            render_capped(line.as_bytes(), DEFAULT_MODEL_CAP_BYTES)
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut output = Map::new();
     output.insert("content".to_string(), json!(content));
-    output.insert("start_line".to_string(), json!(cursor));
     output.insert("end_line".to_string(), json!(end));
-    if total_lines > line_count {
-        output.insert("total_lines".to_string(), json!(total_lines));
+    if !truncated_lines.is_empty() {
+        output.insert("truncated_lines".to_string(), json!(truncated_lines));
     }
     Ok(Value::Object(output))
 }
 
 #[test]
+fn offset_pages_through_a_long_line() {
+    let text = "0123456789".repeat(10);
+    let page = text_page(&text, 1, 1, 50).unwrap();
+    assert!(page["content"].as_str().unwrap().starts_with("01234"));
+    assert_eq!(page["offset"], 50);
+    assert_eq!(page["line_chars"], 100);
+    assert_eq!(page["remaining_chars"], 50);
+}
+
+#[test]
+fn offset_requires_single_line_and_valid_range() {
+    let text = "short\n";
+    assert!(text_page(&text, 1, 2, 10).is_err());
+    assert!(text_page(&text, 1, 1, 100).is_err());
+    assert!(text_page("", 1, 1, 10).is_err());
+}
+
+#[test]
+fn reports_truncated_lines_metadata() {
+    let text = format!("{}short", "x".repeat(50_000));
+    let page = text_page(&text, 1, 1, 0).unwrap();
+    assert_eq!(
+        page["truncated_lines"],
+        json!([{"line": 1, "chars": 50_005}])
+    );
+
+    let short = text_page("fine\n", 1, 1, 0).unwrap();
+    assert!(short.get("truncated_lines").is_none());
+}
+
+#[test]
 fn truncates_long_lines_like_terminal_output() {
     let text = format!("HEAD{}TAIL", "x".repeat(50_000));
-    let page = text_page(&text, 1, 1).unwrap();
+        let page = text_page(&text, 1, 1, 0).unwrap();
     let content = page["content"].as_str().unwrap();
     assert!(content.starts_with("HEAD"));
     assert!(content.ends_with("TAIL"));
@@ -109,7 +177,7 @@ fn truncates_long_lines_like_terminal_output() {
 
 #[test]
 fn keeps_short_lines_untouched() {
-    let page = text_page("short line\n", 1, 1).unwrap();
+        let page = text_page("short line\n", 1, 1, 0).unwrap();
     assert_eq!(page["content"], "short line");
 }
 
@@ -119,7 +187,7 @@ mod tests {
 
     #[test]
     fn pages_text_and_only_reports_total_for_long_files() {
-        let short = text_page("one\ntwo\n", 1, 500).unwrap();
+        let short = text_page("one\ntwo\n", 1, 500, 0).unwrap();
         assert_eq!(
             short,
             json!({"content":"one\ntwo", "start_line":1, "end_line":2})
@@ -129,14 +197,14 @@ mod tests {
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let first = text_page(&long, 1, 500).unwrap();
+        let first = text_page(&long, 1, 500, 0).unwrap();
         assert_eq!(first["start_line"], 1);
         assert_eq!(first["end_line"], 500);
         assert_eq!(first["total_lines"], 1203);
         assert!(first.get("line_count").is_none());
         assert!(first.get("next_cursor").is_none());
 
-        let next = text_page(&long, 501, 500).unwrap();
+        let next = text_page(&long, 501, 500, 0).unwrap();
         assert_eq!(next["start_line"], 501);
         assert_eq!(next["end_line"], 1000);
     }
@@ -147,7 +215,7 @@ mod tests {
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let page = text_page(&text, 20, 3).unwrap();
+        let page = text_page(&text, 20, 3, 0).unwrap();
         assert_eq!(page["content"], "line 20\nline 21\nline 22");
         assert_eq!(page["start_line"], 20);
         assert_eq!(page["end_line"], 22);

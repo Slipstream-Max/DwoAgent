@@ -29,6 +29,7 @@ pub struct ReadFileArgs {
     pub path: PathBuf,
     pub cursor: usize,
     pub line_count: usize,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,10 +229,19 @@ fn parse_read_file(args: &Map<String, Value>) -> Result<ReadFileArgs, String> {
             ));
         }
     };
+    let offset = match args.get("offset") {
+        None | Some(Value::Null) => 0,
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "Argument offset must be a non-negative integer.".to_string())?,
+        Some(_) => return Err("Argument offset must be a non-negative integer.".to_string()),
+    };
     Ok(ReadFileArgs {
         path: PathBuf::from(path),
         cursor,
         line_count,
+        offset,
     })
 }
 

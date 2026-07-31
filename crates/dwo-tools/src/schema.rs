@@ -11,7 +11,7 @@ pub fn read_file_schema() -> Value {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a selected range from a UTF-8 text file, or add a PNG, JPEG, GIF, or WebP image directly to model context. Lines longer than 20000 bytes are truncated keeping head and tail, matching terminal output truncation.",
+            "description": "Read a selected range from a UTF-8 text file, or add a PNG, JPEG, GIF, or WebP image directly to model context. Lines longer than 20000 bytes are truncated keeping head and tail, matching terminal output truncation; truncated lines are listed in truncated_lines. Page through a long line with offset and line_count 1; the result reports offset, line_chars, and remaining_chars. Examples: {\"path\":\"src/main.rs\"} reads the first 500 lines; {\"path\":\"big.html\",\"cursor\":3844,\"line_count\":1,\"offset\":300000} reads line 3844 starting at character 300000.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -30,6 +30,12 @@ pub fn read_file_schema() -> Value {
                         "maximum": MAX_READ_FILE_LINES,
                         "default": DEFAULT_READ_FILE_LINES,
                         "description": "Optional number of text lines to return. Defaults to 500 and cannot exceed 500."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Optional 0-based character offset into the single line at cursor. Requires line_count 1; use it to page through lines longer than 20000 bytes."
                     }
                 },
                 "required": ["path"],

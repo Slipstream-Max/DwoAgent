@@ -936,11 +936,30 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
                     send_thought_chunk(cx, session_id, delta);
                 }
             }
+            Some("assistant_completed") => {
+                let (reasoning, content) = assistant_completed_text(payload);
+                if let Some(reasoning) = reasoning {
+                    send_thought_chunk(cx, session_id, reasoning);
+                }
+                if let Some(content) = content {
+                    send_chunk(cx, session_id, content, false);
+                }
+            }
             Some("tool_started") => send_tool_started(cx, session_id, payload),
             Some("tool_completed") => send_tool_completed(cx, session_id, payload),
             _ => {}
         }
     }
+}
+
+fn assistant_completed_text(payload: &Value) -> (Option<&str>, Option<&str>) {
+    let non_empty_text = |field| {
+        payload
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    (non_empty_text("reasoning"), non_empty_text("content"))
 }
 
 fn snapshot_usage(snapshot: &Value) -> Option<(u64, u64)> {
@@ -1154,6 +1173,22 @@ mod tests {
             }
         });
         assert_eq!(snapshot_usage(&snapshot), Some((15, 200_000)));
+    }
+
+    #[test]
+    fn assistant_completed_replays_reasoning_and_answer() {
+        let payload = json!({
+            "kind": "assistant_completed",
+            "content": "final answer",
+            "reasoning": "reasoning summary"
+        });
+        assert_eq!(
+            assistant_completed_text(&payload),
+            (Some("reasoning summary"), Some("final answer"))
+        );
+
+        let empty = json!({"content": "", "reasoning": null});
+        assert_eq!(assistant_completed_text(&empty), (None, None));
     }
 
     #[test]

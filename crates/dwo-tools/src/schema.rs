@@ -11,7 +11,7 @@ pub fn read_file_schema() -> Value {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a selected range from a UTF-8 text file, or add a PNG, JPEG, GIF, or WebP image directly to model context.",
+            "description": "Read a selected range from a UTF-8 text file, or add a PNG, JPEG, GIF, or WebP image directly to model context. Lines longer than 20000 bytes are truncated keeping head and tail, matching terminal output truncation.",
             "parameters": {
                 "type": "object",
                 "properties": {

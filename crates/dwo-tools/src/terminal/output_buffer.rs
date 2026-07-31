@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 const DEFAULT_HARD_CAP_BYTES: usize = 1024 * 1024;
-const DEFAULT_MODEL_CAP_BYTES: usize = 20_000;
+pub(crate) const DEFAULT_MODEL_CAP_BYTES: usize = 20_000;
 const OMITTED_MARKER: &str = "\n... output omitted ...\n";
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl OutputBuffer {
     }
 }
 
-fn render_capped(bytes: &[u8], cap: usize) -> String {
+pub(crate) fn render_capped(bytes: &[u8], cap: usize) -> String {
     if bytes.len() <= cap {
         return cap_valid_utf8(String::from_utf8_lossy(bytes).into_owned(), cap);
     }

@@ -6,6 +6,7 @@ use dwo_context::{ContentBlock, MessageContent};
 use serde_json::{Map, Value, json};
 
 use crate::call::{DEFAULT_READ_FILE_LINES, ReadFileArgs};
+use crate::terminal::{DEFAULT_MODEL_CAP_BYTES, render_capped};
 
 pub(crate) struct ReadFileOutput {
     pub output: Value,
@@ -80,14 +81,36 @@ fn text_page(text: &str, cursor: usize, line_count: usize) -> Result<Value> {
 
     let start = cursor.saturating_sub(1);
     let end = start.saturating_add(line_count).min(total_lines);
+    let content = lines[start..end]
+        .iter()
+        .map(|line| render_capped(line.as_bytes(), DEFAULT_MODEL_CAP_BYTES))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut output = Map::new();
-    output.insert("content".to_string(), json!(lines[start..end].join("\n")));
+    output.insert("content".to_string(), json!(content));
     output.insert("start_line".to_string(), json!(cursor));
     output.insert("end_line".to_string(), json!(end));
     if total_lines > line_count {
         output.insert("total_lines".to_string(), json!(total_lines));
     }
     Ok(Value::Object(output))
+}
+
+#[test]
+fn truncates_long_lines_like_terminal_output() {
+    let text = format!("HEAD{}TAIL", "x".repeat(50_000));
+    let page = text_page(&text, 1, 1).unwrap();
+    let content = page["content"].as_str().unwrap();
+    assert!(content.starts_with("HEAD"));
+    assert!(content.ends_with("TAIL"));
+    assert!(content.contains("output omitted"));
+    assert!(content.len() <= DEFAULT_MODEL_CAP_BYTES);
+}
+
+#[test]
+fn keeps_short_lines_untouched() {
+    let page = text_page("short line\n", 1, 1).unwrap();
+    assert_eq!(page["content"], "short line");
 }
 
 #[cfg(test)]

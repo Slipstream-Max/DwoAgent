@@ -51,6 +51,8 @@ macro_rules! string_id {
 
 string_id!(SessionId, "session-");
 
+pub const DEFAULT_MAX_MODEL_STEPS: usize = 100;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub info: SessionInfo,
@@ -58,6 +60,12 @@ pub struct SessionRecord {
     pub context: SessionContext,
     #[serde(default, skip_serializing_if = "is_false")]
     auto_title_pending: bool,
+    #[serde(default = "default_max_model_steps")]
+    max_model_steps: usize,
+}
+
+fn default_max_model_steps() -> usize {
+    DEFAULT_MAX_MODEL_STEPS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +91,7 @@ pub struct SessionConfig {
     pub mode: SessionMode,
     pub model: String,
     pub reasoning: Option<String>,
+    pub max_model_steps: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +123,7 @@ impl SessionRecord {
             llm,
             context,
             auto_title_pending,
+            max_model_steps: DEFAULT_MAX_MODEL_STEPS,
         }
     }
 
@@ -123,6 +133,7 @@ impl SessionRecord {
         cwd: PathBuf,
         mode: SessionMode,
         llm: SessionLlmSettings,
+        max_model_steps: usize,
     ) -> Self {
         let now = unix_time_ms();
         Self {
@@ -138,6 +149,7 @@ impl SessionRecord {
             llm,
             context: SessionContext::default(),
             auto_title_pending: false,
+            max_model_steps,
         }
     }
 
@@ -168,6 +180,7 @@ impl SessionRecord {
             mode: self.info.mode,
             model: self.llm.model.clone(),
             reasoning: self.llm.reasoning.clone(),
+            max_model_steps: self.max_model_steps,
         }
     }
 

@@ -115,6 +115,7 @@ pub struct AutomationRuntime {
     profile_path: PathBuf,
     default_model: String,
     default_mode: SessionMode,
+    default_max_model_steps: usize,
     shutdown: CancellationToken,
     state: Mutex<RuntimeState>,
 }
@@ -126,6 +127,7 @@ impl AutomationRuntime {
         config: AutomationConfig,
         default_model: String,
         default_mode: SessionMode,
+        default_max_model_steps: usize,
         shutdown: CancellationToken,
     ) -> Result<Arc<Self>> {
         validate_config(&config)?;
@@ -137,6 +139,7 @@ impl AutomationRuntime {
             profile_root,
             default_model,
             default_mode,
+            default_max_model_steps,
             shutdown,
             state: Mutex::new(RuntimeState {
                 source,
@@ -320,6 +323,7 @@ impl AutomationRuntime {
                         ),
                         cwd,
                         mode: self.default_mode,
+                        max_model_steps: self.default_max_model_steps,
                         llm: SessionLlmSettings {
                             model: self.default_model.clone(),
                             reasoning: None,

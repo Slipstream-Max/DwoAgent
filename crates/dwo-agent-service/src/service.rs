@@ -23,6 +23,7 @@ pub struct NewSession {
     pub cwd: PathBuf,
     pub mode: SessionMode,
     pub llm: SessionLlmSettings,
+    pub max_model_steps: usize,
 }
 
 pub struct AgentService {
@@ -115,6 +116,7 @@ impl AgentService {
             cwd,
             new_session.mode,
             new_session.llm,
+            new_session.max_model_steps,
         );
         record.set_parent_session_id(new_session.parent_session_id);
         if automatic_title {

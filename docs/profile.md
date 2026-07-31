@@ -111,6 +111,7 @@ Profile 使用严格 schema，未知字段会报错。旧的 `agent.yaml`、prof
 | `name` | 是 | Profile 名称，不能为空。 |
 | `description` | 是 | Profile 说明，不能为空。 |
 | `policyMode` | 是 | 新 session 的默认权限：`full_access`、`confirm` 或 `watch`。 |
+| `maxModelSteps` | 否 | 单回合 agent 循环的最大模型步数：`0`（无限）或 `5`–`200`，默认 `100`。 |
 | `logging` | 否 | Daemon 文件日志级别和保留天数。 |
 | `channels` | 否 | 微信、Telegram 和飞书/Lark adapter。 |
 | `automation` | 否 | Cron 定时任务。 |

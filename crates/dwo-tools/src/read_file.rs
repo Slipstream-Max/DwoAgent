@@ -167,7 +167,7 @@ fn reports_truncated_lines_metadata() {
 #[test]
 fn truncates_long_lines_like_terminal_output() {
     let text = format!("HEAD{}TAIL", "x".repeat(50_000));
-        let page = text_page(&text, 1, 1, 0).unwrap();
+    let page = text_page(&text, 1, 1, 0).unwrap();
     let content = page["content"].as_str().unwrap();
     assert!(content.starts_with("HEAD"));
     assert!(content.ends_with("TAIL"));
@@ -177,7 +177,7 @@ fn truncates_long_lines_like_terminal_output() {
 
 #[test]
 fn keeps_short_lines_untouched() {
-        let page = text_page("short line\n", 1, 1, 0).unwrap();
+    let page = text_page("short line\n", 1, 1, 0).unwrap();
     assert_eq!(page["content"], "short line");
 }
 

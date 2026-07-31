@@ -1130,6 +1130,7 @@ mod tests {
                 mode: dwo_tools::SessionMode::FullAccess,
                 model: "deepseek-v4-flash".to_string(),
                 reasoning: Some("max".to_string()),
+                max_model_steps: 100,
             },
             models: vec![SessionModelOption {
                 id: "deepseek-v4-flash".to_string(),

@@ -15,8 +15,6 @@ use crate::events::ActiveToolCall;
 use crate::permission::PermissionRequester;
 use crate::record::{SessionConfig, SessionId, SessionLlmSettings};
 
-const MAX_MODEL_STEPS: usize = 100;
-
 pub(crate) enum TurnActorMessage {
     Event(TurnEvent),
     TitleGenerated {
@@ -151,7 +149,15 @@ pub(crate) async fn run(mut turn: RunTurn) {
 }
 
 async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
-    for _ in 0..MAX_MODEL_STEPS {
+    let max_model_steps = turn.config.borrow().max_model_steps;
+    let mut step = 0usize;
+    loop {
+        if max_model_steps > 0 && step >= max_model_steps {
+            return TurnOutcome::Failed(format!(
+                "agent loop exceeded {max_model_steps} model steps"
+            ));
+        }
+        step += 1;
         if turn.cancellation.is_cancelled() {
             return TurnOutcome::Cancelled;
         }
@@ -291,8 +297,6 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             return TurnOutcome::Cancelled;
         }
     }
-
-    TurnOutcome::Failed(format!("agent loop exceeded {MAX_MODEL_STEPS} model steps"))
 }
 
 async fn request_with_context_recovery(

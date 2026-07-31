@@ -385,6 +385,7 @@ mod tests {
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
             SessionLlmSettings::default(),
+            crate::record::DEFAULT_MAX_MODEL_STEPS,
         );
         record.info.created_at_ms = 1_768_521_600_000;
         record.context.usage.current_tokens = 321;

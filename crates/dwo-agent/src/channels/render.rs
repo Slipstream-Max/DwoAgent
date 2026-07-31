@@ -339,6 +339,7 @@ mod tests {
                 PathBuf::from("."),
                 SessionMode::Confirm,
                 SessionLlmSettings::default(),
+                dwo_agent_service::DEFAULT_MAX_MODEL_STEPS,
             ),
             transcript: vec![
                 ClientTranscriptEvent::new(SessionEventPayload::UserPromptSubmitted {

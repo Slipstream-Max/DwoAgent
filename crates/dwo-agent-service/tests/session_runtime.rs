@@ -19,6 +19,7 @@ fn new_session(cwd: &std::path::Path, mode: SessionMode) -> NewSession {
         title: Some("test".to_string()),
         cwd: cwd.to_path_buf(),
         mode,
+        max_model_steps: 100,
         llm: SessionLlmSettings::default(),
     }
 }
@@ -71,6 +72,7 @@ async fn unnamed_session_gets_model_generated_title() {
             title: None,
             cwd: dir.path().to_path_buf(),
             mode: SessionMode::FullAccess,
+            max_model_steps: 100,
             llm: SessionLlmSettings::default(),
         })
         .await
@@ -1504,6 +1506,7 @@ async fn prompt_is_stable_while_agents_changes_are_appended_as_watcher_messages(
             title: Some("profile test".to_string()),
             cwd: cwd.clone(),
             mode: SessionMode::FullAccess,
+            max_model_steps: 100,
             llm: SessionLlmSettings::default(),
         })
         .await

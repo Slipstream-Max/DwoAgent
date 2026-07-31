@@ -502,6 +502,7 @@ mod tests {
             PathBuf::from("."),
             SessionMode::Confirm,
             SessionLlmSettings::default(),
+            dwo_agent_service::DEFAULT_MAX_MODEL_STEPS,
         );
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let subscription = SessionSubscription {

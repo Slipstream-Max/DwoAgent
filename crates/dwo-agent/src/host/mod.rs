@@ -28,6 +28,7 @@ pub struct Host {
     config_path: PathBuf,
     default_model: String,
     default_mode: dwo_tools::SessionMode,
+    default_max_model_steps: usize,
     model_options: Vec<SessionModelOption>,
     profile_name: String,
     profile_description: String,
@@ -192,6 +193,7 @@ impl Host {
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
+        let default_max_model_steps = profile.config.max_model_steps;
         let profile_name = profile.config.name.clone();
         let profile_description = profile.config.description.clone();
         let model_options = profile
@@ -221,6 +223,7 @@ impl Host {
             automation_config,
             default_model.clone(),
             default_mode,
+            default_max_model_steps,
             shutdown.clone(),
         )?;
         let host = Arc::new(Self {
@@ -233,6 +236,7 @@ impl Host {
             config_path: config_path.to_path_buf(),
             default_model,
             default_mode,
+            default_max_model_steps,
             model_options,
             profile_name,
             profile_description,
@@ -686,6 +690,7 @@ impl Host {
                 title,
                 cwd,
                 mode: self.default_mode,
+                max_model_steps: self.default_max_model_steps,
                 llm: SessionLlmSettings {
                     model: self.default_model.clone(),
                     reasoning: None,
@@ -803,6 +808,7 @@ impl Host {
                 title: params.title.clone(),
                 cwd,
                 mode,
+                max_model_steps: self.default_max_model_steps,
                 llm: SessionLlmSettings { model, reasoning },
             })
             .await;

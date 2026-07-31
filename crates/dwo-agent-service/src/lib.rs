@@ -30,7 +30,8 @@ pub use events::{
 };
 pub use profile::{AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, load_profile};
 pub use record::{
-    SessionConfig, SessionConfigUpdate, SessionId, SessionInfo, SessionLlmSettings, SessionRecord,
+    DEFAULT_MAX_MODEL_STEPS, SessionConfig, SessionConfigUpdate, SessionId, SessionInfo,
+    SessionLlmSettings, SessionRecord,
 };
 pub use repository::{FsSessionRepository, MemorySessionRepository, SessionRepository};
 pub use service::{AgentService, NewSession};

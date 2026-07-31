@@ -7,6 +7,7 @@ use dwo_tools::SessionMode;
 use serde::{Deserialize, Serialize};
 
 use crate::AgentServiceError;
+use crate::record::DEFAULT_MAX_MODEL_STEPS;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -14,6 +15,8 @@ pub struct AgentProfileConfig {
     pub name: String,
     pub description: String,
     pub policy_mode: SessionMode,
+    #[serde(default = "default_max_model_steps")]
+    pub max_model_steps: usize,
     #[serde(default)]
     pub logging: LoggingConfig,
     pub model: AgentModelConfig,
@@ -68,6 +71,10 @@ fn default_retention_days() -> usize {
     14
 }
 
+fn default_max_model_steps() -> usize {
+    DEFAULT_MAX_MODEL_STEPS
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedAgentProfile {
     pub root: PathBuf,
@@ -118,6 +125,11 @@ impl AgentProfileConfig {
         if !(1..=365).contains(&self.logging.retention_days) {
             return Err(AgentServiceError::InvalidConfig(
                 "logging.retentionDays must be between 1 and 365".to_string(),
+            ));
+        }
+        if self.max_model_steps != 0 && !(5..=200).contains(&self.max_model_steps) {
+            return Err(AgentServiceError::InvalidConfig(
+                "maxModelSteps must be 0 (unlimited) or between 5 and 200".to_string(),
             ));
         }
         self.model
@@ -244,6 +256,75 @@ model:
         .unwrap_err();
 
         assert!(error.to_string().contains("logging.retentionDays"));
+    }
+
+    #[test]
+    fn profile_max_model_steps_defaults_and_accepts_bounds() {
+        let default = AgentProfileConfig::from_yaml(
+            r#"
+name: coder
+description: coding agent
+policyMode: confirm
+model:
+  defaultModelId: chat
+  providers:
+    local:
+      type: local
+  models:
+    - modelName: chat
+      provider: local
+      modelId: chat
+"#,
+        )
+        .unwrap();
+        assert_eq!(default.max_model_steps, 100);
+
+        for value in [0, 5, 200] {
+            let profile = AgentProfileConfig::from_yaml(&format!(
+                r#"
+name: coder
+description: coding agent
+policyMode: confirm
+maxModelSteps: {value}
+model:
+  defaultModelId: chat
+  providers:
+    local:
+      type: local
+  models:
+    - modelName: chat
+      provider: local
+      modelId: chat
+"#
+            ))
+            .unwrap();
+            assert_eq!(profile.max_model_steps, value);
+        }
+    }
+
+    #[test]
+    fn profile_rejects_out_of_range_max_model_steps() {
+        for value in [4, 201] {
+            let error = AgentProfileConfig::from_yaml(&format!(
+                r#"
+name: coder
+description: coding agent
+policyMode: confirm
+maxModelSteps: {value}
+model:
+  defaultModelId: chat
+  providers:
+    local:
+      type: local
+  models:
+    - modelName: chat
+      provider: local
+      modelId: chat
+"#
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("maxModelSteps"));
+        }
     }
 
     #[test]

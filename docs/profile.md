@@ -104,6 +104,18 @@ model:
 
 Profile 使用严格 schema，未知字段会报错。旧的 `agent.yaml`、profile 级 `tools` 开关和额外 provider transport 配置不受支持。
 
+## 热加载
+
+Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份配置，不需要重启。无效或写入中的配置不会覆盖当前运行态，修正文件后会在下一次检查自动生效。
+
+- `name`、`description` 和模型选项会立即反映到 `profile-list`、ACP 和后续配置查询。
+- provider、模型地址、凭据、能力和限制从已有 session 的下一次模型请求起生效。删除已有 session 正在使用的模型 alias 会使该 session 的后续请求报配置错误，直到切换到有效模型。
+- `policyMode`、默认模型和 `maxModelSteps` 是创建新 session、subsession 或 automation session 时使用的默认值，不会改写已有 session 自己的配置。
+- `channels` 变化会重新构造 channel manager，并短暂停止和重启已连接且仍启用的 channel。
+- `automation` 会重新计算任务调度；`logging.level` 和 `logging.retentionDays` 也会立即更新。设置了 `DWO_LOG` 时，环境变量仍优先于 profile 日志级别。
+
+`resource/prompts/`、`resource/skills/`、`resource/mcp.json` 和运行时 channel capability 仍由各自 watcher 热加载。已有 session 会在模型步骤边界收到环境变更消息；发生 compaction 时，system prompt 会从当前资源重新构建。
+
 ## 顶层字段
 
 | 字段 | 必需 | 说明 |
@@ -306,6 +318,7 @@ dwo mcp auth <server> [--logout]
 | --- | --- |
 | `channels/<channel>/runtime.yaml` | 当前选择的 session 等运行状态。 |
 | `runtime/automation.yaml` | `new + once` automation job 的 sticky session 绑定。 |
+| `runtime/automation-runs.yaml` | 最近 100 次 automation run 的有界状态与回答预览。 |
 | `channels/<channel>/secret.yaml` | 绑定用户和私聊目标。 |
 | `runtime/channel-capabilities/<channel>.md` | 已绑定 channel 提供给模型的能力说明，不含凭据。 |
 | `runtime/attachments/<channel>/...` | 从 channel 下载的图片和文件。 |

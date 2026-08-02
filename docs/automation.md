@@ -85,22 +85,31 @@ dwo session list --all
 
 ```text
 dwo automation list
-dwo automation status
+dwo automation status <job>
+dwo automation add <job> --cron <expr> --prompt <text>
+dwo automation enable <job|--all>
+dwo automation disable <job|--all>
+dwo automation delete <job>
+dwo automation delete --all --yes
 dwo automation run <job>
 ```
 
-`list` 和 `status` 显示任务配置、下一次执行时间和当前运行记录。`run` 登记任务后立即返回 `run_id`，不会等待 session 创建、prompt 提交或 Agent 完成。运行开始后，`automation status` 中的 active record 会包含 `session_id` 和 `turn_id`。
+`list` 显示任务总数、启用/禁用数量、运行数量和每个任务的下一次执行时间。`status <job>` 显示完整任务配置、当前有效模型、sticky/fixed session、active runs 和最近 10 次 run。最近回答会折叠空白并限制在 100 个字符内；完整回答保存在对应 session transcript 中。
+
+`add` 默认使用 `--session every-time`。可改用 `--session once`，或者使用 `--session fixed --session-id <id>`。`enable` 和 `disable` 接受单个任务名或 `--all`。CLI 会原子更新并校验 `profile.yaml`，daemon 随即热加载；任务定义不存在第二套 runtime 配置源。
+
+`run` 会等待 session 创建或解析以及 prompt 提交成功，然后返回 `run_id`、`session_id` 和 `turn_id`，但不会等待 Agent 完成。启动阶段失败会直接使命令报错，不会先返回一个无法执行的 `running` 记录。
 
 当 `run` 由 Agent session 内的终端调用时，CLI 会自动携带当前 session ID。任务完成、失败或取消后，daemon 会把 `<automation_result>` 内部消息投递回调用方上下文；调用方不需要轮询。外部 shell 没有调用方 session，因此只负责异步启动任务，可用 `automation status` 查看仍在运行的任务。
 
 需要机器读取时可以加 `--json`：
 
 ```text
-dwo automation status --json
+dwo automation status daily-report --json
 dwo automation run daily-report --json
 ```
 
-`automation.enabled` 和 job 的 `enabled` 控制定时调度。手动 `run` 仍可执行已经写在配置中的任务，方便在启用 schedule 前进行测试。
+job 的 `enabled` 控制定时调度。为了兼容已有 profile，底层仍读取 `automation.enabled`；CLI 的 `add` 和 `enable` 会自动打开该兼容开关。手动 `run` 始终可以执行 disabled 任务，方便启用 schedule 前测试。
 
 ## 权限与记录
 
@@ -108,11 +117,11 @@ Automation 按无人值守方式运行。出现工具权限确认时，daemon �
 
 需要写文件或执行命令的任务，应提前选择合适的 profile 默认 policy，并确认对应命令能按该 policy 执行。`watch` 只允许简单只读命令；`confirm` 中需要确认的操作会被拒绝；`full_access` 仍会应用显式 deny rule。
 
-Automation 不使用单独的历史目录。运行结果保存在所使用 session 中；`new + once` 的 sticky 绑定单独保存在 `runtime/automation.yaml`。当前运行状态保存在 daemon 内存里，daemon 重启后不会保留已完成的 run record。
+Automation 不复制完整 session 历史。运行结果保存在所使用 session 中；`new + once` 的 sticky 绑定保存在 `runtime/automation.yaml`。最近 100 次 run 的状态、session/turn ID 和最多 100 字符的回答预览保存在 `runtime/automation-runs.yaml`，用于 `automation status`，不会无限增长。
 
 ## 排查
 
-1. 运行 `dwo automation status`，检查任务和下一次执行时间。
+1. 运行 `dwo automation list`，再用 `dwo automation status <job>` 检查任务和下一次执行时间。
 2. 用 `dwo automation run <job>` 手动启动测试，再检查对应 session 或运行状态。
 3. 确认 cron 只有五个字段，时区名称有效。
 4. 新建模式检查 `cwd` 是否存在；固定模式检查 `sessionId` 是否存在。

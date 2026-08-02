@@ -26,6 +26,7 @@ daemon 启动 host 时会并发初始化 `resource/mcp.json` 中的全部 MCP se
 ```text
 dwo profile-list
 dwo session list [--all]
+dwo session status <session-id> [--json]
 dwo session delete <session-id>
 dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <session-id>]
 dwo session cancel <session-id>
@@ -38,7 +39,7 @@ agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不�
 
 `--title` 和 `--cwd` 只用于创建 session，和 `--to` 同时使用会被拒绝。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `profile-list` 中列出的有效组合。继续已有子 session 时，policy/model/reasoning 更新会在提交新 prompt 前写入 session 配置，并分别从下一批 tool call 或下一次 model request 生效。
 
-`session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 profile 中的全部 session。`profile-list` 输出 profile 描述、默认 policy、可用 model/reasoning、默认 model 和 session 总数。
+`session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 profile 中的全部 session。输出包含总数、运行状态、模型、更新时间和标题。`session status` 显示单个 session 的配置、usage、active turn 和最后一条最终回答；回答会折叠空白并限制在 100 个字符内。完整内容继续使用 `session watch`。`profile-list` 输出 profile 描述、默认 policy、可用 model/reasoning、默认 model 和 session 总数。
 
 `session watch` 默认返回最近 3 个内容事件及 `next_cursor`，不会建立持续广播。传入 `--cursor <next_cursor>` 可读取之后的事件，`--limit` 范围为 1 到 100。普通 CLI 输出使用适合终端阅读的 YAML 风格文本。
 
@@ -114,13 +115,22 @@ Feishu/Lark 使用 `openlark` WebSocket 长连接，也不需要 webhook 或公�
 
 ```text
 dwo automation list [--json]
-dwo automation status [--json]
+dwo automation status <job> [--json]
+dwo automation add <job> --cron <expr> --prompt <text> [--timezone <zone>] [--session every-time|once|fixed] [--session-id <id>] [--cwd <path>] [--title <title>] [--disabled] [--json]
+dwo automation enable <job>
+dwo automation enable --all
+dwo automation disable <job>
+dwo automation disable --all
+dwo automation delete <job>
+dwo automation delete --all --yes
 dwo automation run <job> [--json]
 ```
 
 默认输出为可读文本；仅指定 `--json` 时保留机器读取的 JSON 输出。
 
-`automation run` 登记后立即返回运行 ID，session 创建和 prompt 提交也在后台进行。在 Agent session 内调用时，最终结果或错误会作为 `<automation_result>` 内部消息自动进入调用方上下文，无需等待或轮询。
+`add` 默认创建启用的 `new + every_time` 任务；`--session once` 复用 sticky session，`--session fixed` 必须同时提供 `--session-id`。`enable` 和 `disable` 接受任务名或 `--all`，只控制定时调度；手动 `run` 仍可执行 disabled 任务。`delete --all` 必须显式提供 `--yes`。
+
+`automation run` 在 session 已创建或解析、prompt 已成功提交后返回 `runId`、`sessionId` 和 `turnId`，但不等待 Agent 完成。在 Agent session 内调用时，最终结果或错误会作为 `<automation_result>` 内部消息自动进入调用方上下文，无需轮询。
 
 ## ACP
 

@@ -3,12 +3,15 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dwo_mcp::SearchGroup;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::automation::{AutomationJobStatus, AutomationRunRecord};
+use crate::automation::{
+    AutomationJob, AutomationJobStatus, AutomationNewBehavior, AutomationRunRecord,
+    AutomationSchedule, AutomationSession,
+};
 use crate::channels::{
     self, ChannelKind, FeishuBindProgress, TelegramBindProgress, WeixinLoginProgress,
 };
@@ -81,6 +84,11 @@ enum SessionCommand {
     },
     Delete {
         id: String,
+    },
+    Status {
+        id: String,
+        #[arg(long)]
+        json: bool,
     },
     Prompt {
         message: String,
@@ -182,14 +190,61 @@ enum AutomationCommand {
         json: bool,
     },
     Status {
+        job: String,
         #[arg(long)]
         json: bool,
+    },
+    Add {
+        name: String,
+        #[arg(long)]
+        cron: String,
+        #[arg(long, default_value = "local")]
+        timezone: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, value_enum, default_value_t = AutomationSessionArg::EveryTime)]
+        session: AutomationSessionArg,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Enable {
+        job: Option<String>,
+        #[arg(long, conflicts_with = "job", required_unless_present = "job")]
+        all: bool,
+    },
+    Disable {
+        job: Option<String>,
+        #[arg(long, conflicts_with = "job", required_unless_present = "job")]
+        all: bool,
+    },
+    #[command(alias = "del")]
+    Delete {
+        job: Option<String>,
+        #[arg(long, conflicts_with = "job", required_unless_present = "job")]
+        all: bool,
+        #[arg(long, requires = "all")]
+        yes: bool,
     },
     Run {
         job: String,
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AutomationSessionArg {
+    EveryTime,
+    Once,
+    Fixed,
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -277,25 +332,101 @@ async fn run_daemon(config_path: &Path) -> Result<()> {
 
 async fn run_automation(command: AutomationCommand, config_path: &Path) -> Result<()> {
     match command {
-        AutomationCommand::List { json } | AutomationCommand::Status { json } => {
+        AutomationCommand::List { json } => {
             let value = ipc::request(config_path, "automation.list", json!({})).await?;
             if json {
                 render::write_value(&value)?;
             } else {
                 let jobs: Vec<AutomationJobStatus> = serde_json::from_value(value)?;
-                if jobs.is_empty() {
-                    output::line(format_args!("No automation jobs configured"))?;
-                }
-                for status in jobs {
-                    let next = status.next_run_at.as_deref().unwrap_or("disabled");
-                    let active = if status.active_runs.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" active={}", status.active_runs.len())
-                    };
-                    output::line(format_args!("{}  next={}{}", status.job.name, next, active))?;
-                }
+                render::write_automation_list(&jobs)?;
             }
+        }
+        AutomationCommand::Status { job, json } => {
+            let value = ipc::request(config_path, "automation.status", json!({"job": job})).await?;
+            if json {
+                render::write_value(&value)?;
+            } else {
+                let status: AutomationJobStatus = serde_json::from_value(value)?;
+                render::write_automation_status(&status)?;
+            }
+        }
+        AutomationCommand::Add {
+            name,
+            cron,
+            timezone,
+            prompt,
+            session,
+            session_id,
+            cwd,
+            title,
+            disabled,
+            json,
+        } => {
+            let session = match session {
+                AutomationSessionArg::EveryTime | AutomationSessionArg::Once => {
+                    anyhow::ensure!(
+                        session_id.is_none(),
+                        "--session-id requires --session fixed"
+                    );
+                    AutomationSession::New {
+                        behavior: if matches!(session, AutomationSessionArg::EveryTime) {
+                            AutomationNewBehavior::EveryTime
+                        } else {
+                            AutomationNewBehavior::Once
+                        },
+                        cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
+                        title,
+                    }
+                }
+                AutomationSessionArg::Fixed => {
+                    anyhow::ensure!(cwd.is_none(), "--cwd is unavailable with --session fixed");
+                    anyhow::ensure!(
+                        title.is_none(),
+                        "--title is unavailable with --session fixed"
+                    );
+                    AutomationSession::Fixed {
+                        session_id: session_id
+                            .context("--session-id is required with --session fixed")?,
+                    }
+                }
+            };
+            let job = AutomationJob {
+                name,
+                enabled: !disabled,
+                schedule: AutomationSchedule { cron, timezone },
+                session,
+                prompt,
+            };
+            let value = ipc::request(config_path, "automation.add", json!({"job": job})).await?;
+            if json {
+                render::write_value(&value)?;
+            } else {
+                let status: AutomationJobStatus = serde_json::from_value(value)?;
+                output::line(format_args!("Added automation {}", status.job.name))?;
+            }
+        }
+        AutomationCommand::Enable { job, all } => {
+            set_automation_enabled(config_path, job, all, true).await?;
+        }
+        AutomationCommand::Disable { job, all } => {
+            set_automation_enabled(config_path, job, all, false).await?;
+        }
+        AutomationCommand::Delete { job, all, yes } => {
+            anyhow::ensure!(!all || yes, "automation delete --all requires --yes");
+            ipc::request(
+                config_path,
+                "automation.delete",
+                json!({"job": job, "all": all}),
+            )
+            .await?;
+            output::line(format_args!(
+                "Deleted automation {}",
+                if all {
+                    "jobs".to_string()
+                } else {
+                    job.unwrap()
+                }
+            ))?;
         }
         AutomationCommand::Run { job, json } => {
             let value = ipc::request(
@@ -309,12 +440,39 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
             } else {
                 let record: AutomationRunRecord = serde_json::from_value(value)?;
                 output::line(format_args!(
-                    "{}  {:?}  run={}",
-                    record.job, record.status, record.run_id
+                    "Started automation {}  run={}  session={}  turn={}",
+                    record.job,
+                    record.run_id,
+                    record.session_id.as_deref().unwrap_or("-"),
+                    record.turn_id.as_deref().unwrap_or("-")
                 ))?;
             }
         }
     }
+    Ok(())
+}
+
+async fn set_automation_enabled(
+    config_path: &Path,
+    job: Option<String>,
+    all: bool,
+    enabled: bool,
+) -> Result<()> {
+    let method = if enabled {
+        "automation.enable"
+    } else {
+        "automation.disable"
+    };
+    ipc::request(config_path, method, json!({"job": job, "all": all})).await?;
+    output::line(format_args!(
+        "{} automation {}",
+        if enabled { "Enabled" } else { "Disabled" },
+        if all {
+            "jobs".to_string()
+        } else {
+            job.expect("clap requires a job unless --all is present")
+        }
+    ))?;
     Ok(())
 }
 
@@ -360,7 +518,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
         SessionCommand::List { all } => {
             let value = ipc::request(
                 config_path,
-                "session.list",
+                "session.status-list",
                 json!({"all": all, "caller_session_id": current_session_id()}),
             )
             .await?;
@@ -369,6 +527,15 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
         SessionCommand::Delete { id } => {
             ipc::request(config_path, "session.delete", json!({"session_id": id})).await?;
             output::line(format_args!("Deleted session"))?;
+        }
+        SessionCommand::Status { id, json } => {
+            let value =
+                ipc::request(config_path, "session.status", json!({"session_id": id})).await?;
+            if json {
+                render::write_value(&value)?;
+            } else {
+                render::write_session_status(&value)?;
+            }
         }
         SessionCommand::Prompt {
             message,
@@ -901,6 +1068,53 @@ mod tests {
             Command::Automation {
                 command: AutomationCommand::Run { ref job, json: false }
             } if job == "daily-report"
+        ));
+
+        let add = Cli::try_parse_from([
+            "dwo",
+            "automation",
+            "add",
+            "daily-report",
+            "--cron",
+            "0 9 * * *",
+            "--prompt",
+            "summarize",
+            "--session",
+            "once",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add.command,
+            Command::Automation {
+                command: AutomationCommand::Add {
+                    ref name,
+                    session: AutomationSessionArg::Once,
+                    ..
+                }
+            } if name == "daily-report"
+        ));
+
+        let enable_all = Cli::try_parse_from(["dwo", "automation", "enable", "--all"]).unwrap();
+        assert!(matches!(
+            enable_all.command,
+            Command::Automation {
+                command: AutomationCommand::Enable {
+                    job: None,
+                    all: true
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from(["dwo", "automation", "enable"]).is_err());
+        assert!(
+            Cli::try_parse_from(["dwo", "automation", "enable", "daily-report", "--all"]).is_err()
+        );
+
+        let status = Cli::try_parse_from(["dwo", "session", "status", "session-1"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Command::Session {
+                command: SessionCommand::Status { ref id, json: false }
+            } if id == "session-1"
         ));
     }
 

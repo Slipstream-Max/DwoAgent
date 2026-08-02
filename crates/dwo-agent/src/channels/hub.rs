@@ -73,7 +73,7 @@ impl ChannelHub {
     }
 
     pub async fn start_all(self: &Arc<Self>, host: Arc<Host>) {
-        let channels = match host.channels.list().await {
+        let channels = match host.channels().list().await {
             Ok(channels) => channels,
             Err(error) => {
                 tracing::error!(

@@ -142,6 +142,16 @@ pub struct SessionSnapshot {
     pub seq: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatusSnapshot {
+    pub record: SessionRecord,
+    pub usage: SessionUsageSnapshot,
+    pub phase: RuntimePhase,
+    pub active_turn_id: Option<TurnId>,
+    pub last_answer: Option<String>,
+}
+
 pub struct SessionSubscription {
     pub snapshot: SessionSnapshot,
     pub events: mpsc::UnboundedReceiver<SessionEvent>,

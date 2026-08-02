@@ -40,7 +40,7 @@ pub(crate) struct RunningWeixin {
 
 impl RunningWeixin {
     pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
-        let runtime = host.channels.load_weixin().await?;
+        let runtime = host.channels().load_weixin().await?;
         let target = runtime.secret.bound_user_id.clone();
         let state = Arc::new(Mutex::new(runtime.state));
         let selected_session_id = state.lock().await.selected_session_id.clone();
@@ -163,7 +163,7 @@ impl WeixinConversation {
             state.clone()
         };
         self.host
-            .channels
+            .channels()
             .save_state(ChannelKind::Weixin, &snapshot)
             .await
     }
@@ -197,7 +197,7 @@ impl ConversationTransport for WeixinConversation {
             state.clone()
         };
         self.host
-            .channels
+            .channels()
             .save_state(ChannelKind::Weixin, &snapshot)
             .await
     }

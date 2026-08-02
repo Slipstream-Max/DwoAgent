@@ -41,7 +41,7 @@ pub(crate) struct RunningTelegram {
 
 impl RunningTelegram {
     pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
-        let runtime = host.channels.load_telegram().await?;
+        let runtime = host.channels().load_telegram().await?;
         let bot = telegram_bot(&runtime.bot_token, runtime.config.tg_proxy.as_deref())?;
         let me = bot.get_me().await?;
         ensure!(
@@ -319,7 +319,7 @@ impl ConversationTransport for TelegramConversation {
             state.clone()
         };
         self.host
-            .channels
+            .channels()
             .save_state(ChannelKind::Telegram, &snapshot)
             .await
     }

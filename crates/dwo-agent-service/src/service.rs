@@ -1,14 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use dwo_context::{ContextManager, SystemPromptBuilder};
-use dwo_model_client::{ConfiguredModelClient, ModelClient, ModelSelection};
+use async_trait::async_trait;
+use dwo_context::{CompactionView, ContextManager, ContextMessage, SystemPromptBuilder};
+use dwo_model_client::{
+    ConfiguredModelClient, ModelClient, ModelClientConfig, ModelClientError, ModelLimits,
+    ModelReply, ModelSelection, ModelStreamEvent, SummaryReply,
+};
 use dwo_tools::{FileEditManager, PolicyConfig, SessionMode, ToolManager, ToolPolicyEngine};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentServiceError;
-use crate::events::{ClientTranscriptEvent, SessionEventPayload};
+use crate::events::{
+    ClientTranscriptEvent, RuntimePhase, SessionEventPayload, SessionStatusSnapshot,
+    SessionUsageSnapshot,
+};
 use crate::profile::LoadedAgentProfile;
 use crate::record::{
     SessionConfigUpdate, SessionId, SessionLlmSettings, SessionRecord, title_from_user_content,
@@ -28,12 +36,88 @@ pub struct NewSession {
 
 pub struct AgentService {
     repository: Arc<dyn SessionRepository>,
-    model: Arc<dyn ModelClient>,
+    model: Arc<ReloadableModelClient>,
     policy: Arc<ToolPolicyEngine>,
     file_edit: Arc<FileEditManager>,
     profile_root: Option<PathBuf>,
     loaded: Mutex<LoadedSessionRegistry>,
     operations: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
+}
+
+struct ReloadableModelClient {
+    current: RwLock<Arc<dyn ModelClient>>,
+}
+
+impl ReloadableModelClient {
+    fn new(model: Arc<dyn ModelClient>) -> Self {
+        Self {
+            current: RwLock::new(model),
+        }
+    }
+
+    fn current(&self) -> Arc<dyn ModelClient> {
+        self.current
+            .read()
+            .expect("reloadable model client lock poisoned")
+            .clone()
+    }
+
+    fn replace(&self, model: Arc<dyn ModelClient>) {
+        *self
+            .current
+            .write()
+            .expect("reloadable model client lock poisoned") = model;
+    }
+}
+
+#[async_trait]
+impl ModelClient for ReloadableModelClient {
+    fn model_limits(&self, model: &str) -> Result<ModelLimits, ModelClientError> {
+        self.current().model_limits(model)
+    }
+
+    fn supports_image_input(&self, model: &str) -> Result<bool, ModelClientError> {
+        self.current().supports_image_input(model)
+    }
+
+    fn validate_selection(&self, selection: &ModelSelection) -> Result<(), ModelClientError> {
+        self.current().validate_selection(selection)
+    }
+
+    async fn stream_turn(
+        &self,
+        selection: ModelSelection,
+        messages: &[ContextMessage],
+        tools: &[serde_json::Value],
+        events: mpsc::UnboundedSender<ModelStreamEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelReply, ModelClientError> {
+        self.current()
+            .stream_turn(selection, messages, tools, events, cancellation)
+            .await
+    }
+
+    async fn complete(
+        &self,
+        selection: ModelSelection,
+        messages: Vec<ContextMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<ModelReply, ModelClientError> {
+        self.current()
+            .complete(selection, messages, cancellation)
+            .await
+    }
+
+    async fn summarize(
+        &self,
+        selection: ModelSelection,
+        view: CompactionView,
+        cancellation: CancellationToken,
+    ) -> Result<SummaryReply, ModelClientError> {
+        self.current()
+            .summarize(selection, view, cancellation)
+            .await
+    }
 }
 
 #[derive(Default)]
@@ -80,13 +164,24 @@ impl AgentService {
     ) -> Self {
         Self {
             repository,
-            model,
+            model: Arc::new(ReloadableModelClient::new(model)),
             policy: Arc::new(ToolPolicyEngine::new(policy)),
             file_edit: Arc::new(FileEditManager::new()),
             profile_root,
             loaded: Mutex::new(LoadedSessionRegistry::default()),
             operations: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn replace_model(&self, model: Arc<dyn ModelClient>) {
+        self.model.replace(model);
+    }
+
+    pub fn replace_models(&self, config: ModelClientConfig) -> Result<(), AgentServiceError> {
+        let model = ConfiguredModelClient::from_resolved(config)
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+        self.replace_model(model);
+        Ok(())
     }
 
     pub async fn create(
@@ -172,6 +267,48 @@ impl AgentService {
             }
         }
         Ok(records)
+    }
+
+    pub async fn list_statuses(&self) -> Result<Vec<SessionStatusSnapshot>, AgentServiceError> {
+        let records = self.list().await?;
+        let loaded = self.loaded.lock().await.agents.clone();
+        let mut statuses = Vec::with_capacity(records.len());
+        for record in records {
+            if let Some(agent) = loaded.get(&record.info.id) {
+                let snapshot = agent.snapshot().await?;
+                statuses.push(SessionStatusSnapshot {
+                    last_answer: last_answer_preview(&snapshot.transcript),
+                    record: snapshot.record,
+                    usage: snapshot.usage,
+                    phase: snapshot.phase,
+                    active_turn_id: snapshot.active_turn_id,
+                });
+            } else {
+                let transcript = self.repository.load_transcript(&record.info.id).await?;
+                let used = record.context.usage.current_tokens;
+                let size = self
+                    .model
+                    .model_limits(&record.llm.model)
+                    .map(|limits| limits.context_window_tokens)
+                    .unwrap_or(used);
+                statuses.push(SessionStatusSnapshot {
+                    last_answer: last_answer_preview(&transcript),
+                    record,
+                    usage: SessionUsageSnapshot { used, size },
+                    phase: RuntimePhase::Idle,
+                    active_turn_id: None,
+                });
+            }
+        }
+        Ok(statuses)
+    }
+
+    pub async fn status(&self, id: &SessionId) -> Result<SessionStatusSnapshot, AgentServiceError> {
+        self.list_statuses()
+            .await?
+            .into_iter()
+            .find(|status| &status.record.info.id == id)
+            .ok_or_else(|| AgentServiceError::SessionNotFound(id.clone()))
     }
 
     pub async fn close(&self, id: &SessionId) -> Result<(), AgentServiceError> {
@@ -349,4 +486,47 @@ fn repair_empty_title(record: &mut SessionRecord, transcript: &[ClientTranscript
     };
     record.set_automatic_title(title);
     true
+}
+
+fn last_answer_preview(transcript: &[ClientTranscriptEvent]) -> Option<String> {
+    transcript.iter().rev().find_map(|event| {
+        let SessionEventPayload::AssistantCompleted { content, .. } = &event.payload else {
+            return None;
+        };
+        let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            return None;
+        }
+        let truncated = normalized.chars().count() > 100;
+        let mut preview = normalized
+            .chars()
+            .take(if truncated { 97 } else { 100 })
+            .collect::<String>();
+        if truncated {
+            preview.push_str("...");
+        }
+        Some(preview)
+    })
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use crate::TurnId;
+
+    #[test]
+    fn last_answer_preview_is_bounded_to_one_hundred_characters() {
+        let transcript = vec![ClientTranscriptEvent::new(
+            SessionEventPayload::AssistantCompleted {
+                turn_id: TurnId::new(),
+                content: format!("answer\n{}", "x".repeat(120)),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+        )];
+        let preview = last_answer_preview(&transcript).unwrap();
+        assert_eq!(preview.chars().count(), 100);
+        assert!(preview.starts_with("answer "));
+        assert!(preview.ends_with("..."));
+    }
 }

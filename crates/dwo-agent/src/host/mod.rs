@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::automation::{AutomationRuntime, parse_config as parse_automation_config};
+use crate::automation::{
+    AutomationConfig, AutomationJob, AutomationRuntime, parse_config as parse_automation_config,
+};
 use crate::channels::{
     ChannelHub, ChannelKind, ChannelManager, FeishuBindProgress, TelegramBindProgress,
     WeixinLoginProgress,
@@ -20,19 +22,21 @@ use crate::channels::{
 
 pub struct Host {
     pub service: Arc<AgentService>,
-    pub channels: Arc<ChannelManager>,
     pub channel_hub: Arc<ChannelHub>,
     pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
+    channels: RwLock<Arc<ChannelManager>>,
     profile_root: PathBuf,
     config_path: PathBuf,
-    default_model: String,
-    default_mode: dwo_tools::SessionMode,
-    default_max_model_steps: usize,
-    model_options: Vec<SessionModelOption>,
-    profile_name: String,
-    profile_description: String,
+    profile: RwLock<RuntimeProfile>,
+    profile_reload: tokio::sync::Mutex<()>,
     shutdown: CancellationToken,
+}
+
+struct RuntimeProfile {
+    source: String,
+    config: dwo_agent_service::AgentProfileConfig,
+    model_options: Vec<SessionModelOption>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +163,30 @@ struct AutomationJobParam {
     caller_session_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct AutomationNameParam {
+    job: String,
+}
+
+#[derive(Deserialize)]
+struct AutomationAddParam {
+    job: AutomationJob,
+}
+
+#[derive(Deserialize)]
+struct AutomationToggleParam {
+    job: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Deserialize)]
+struct AutomationDeleteParam {
+    job: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionModelOption {
@@ -192,11 +220,11 @@ impl Host {
         mcp.sync_and_start().await?;
         tracing::info!(event = "mcp.synchronized", "MCP configuration synchronized");
         let profile = LoadedAgentProfile::load(&profile_root)?;
+        let source = std::fs::read_to_string(profile_root.join("profile.yaml"))?;
         let default_model = profile.models.default_model_id.clone();
         let default_mode = profile.config.policy_mode;
         let default_max_model_steps = profile.config.max_model_steps;
-        let profile_name = profile.config.name.clone();
-        let profile_description = profile.config.description.clone();
+        let profile_config = profile.config.clone();
         let model_options = profile
             .models
             .models
@@ -229,22 +257,23 @@ impl Host {
         )?;
         let host = Arc::new(Self {
             service,
-            channels,
             channel_hub: Arc::new(ChannelHub::new()),
             mcp,
             automation,
+            channels: RwLock::new(channels),
             profile_root,
             config_path: config_path.to_path_buf(),
-            default_model,
-            default_mode,
-            default_max_model_steps,
-            model_options,
-            profile_name,
-            profile_description,
+            profile: RwLock::new(RuntimeProfile {
+                source,
+                config: profile_config,
+                model_options,
+            }),
+            profile_reload: tokio::sync::Mutex::new(()),
             shutdown,
         });
         host.channel_hub.start_all(host.clone()).await;
         host.start_mcp_watcher();
+        host.start_profile_watcher();
         host.automation.start();
         Ok(host)
     }
@@ -283,21 +312,33 @@ impl Host {
                 "healthy": true,
                 "profile_root": self.profile_root,
                 "sessions": self.service.list().await?.len(),
-                "channels": self.channels.list().await?.len(),
+                "channels": self.channels().list().await?.len(),
                 "automationJobs": self.automation.list().await.len(),
             })),
             "daemon.shutdown" => {
                 self.shutdown.cancel();
                 Ok(json!({"stopping": true}))
             }
-            "profile.list" => Ok(serde_json::to_value(ProfileSnapshot {
-                name: self.profile_name.clone(),
-                description: self.profile_description.clone(),
-                policy: self.default_mode,
-                default_model: self.default_model.clone(),
-                models: self.model_options.clone(),
-                session_count: self.service.list().await?.len(),
-            })?),
+            "profile.list" => {
+                let (name, description, policy, default_model, models) = {
+                    let profile = self.profile.read().expect("profile lock poisoned");
+                    (
+                        profile.config.name.clone(),
+                        profile.config.description.clone(),
+                        profile.config.policy_mode,
+                        profile.config.model.default_model_id.clone(),
+                        profile.model_options.clone(),
+                    )
+                };
+                Ok(serde_json::to_value(ProfileSnapshot {
+                    name,
+                    description,
+                    policy,
+                    default_model,
+                    models,
+                    session_count: self.service.list().await?.len(),
+                })?)
+            }
             "session.list" => {
                 let params: ListSessionParam = serde_json::from_value(params)?;
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
@@ -306,6 +347,19 @@ impl Host {
                     records.retain(|record| record.info.parent_session_id == caller);
                 }
                 Ok(serde_json::to_value(records)?)
+            }
+            "session.status-list" => {
+                let params: ListSessionParam = serde_json::from_value(params)?;
+                let caller = parse_optional_session(params.caller_session_id.clone())?;
+                let mut statuses = self.service.list_statuses().await?;
+                if !params.all {
+                    statuses.retain(|status| status.record.info.parent_session_id == caller);
+                }
+                Ok(serde_json::to_value(statuses)?)
+            }
+            "session.status" => {
+                let id = parse_session(params)?;
+                Ok(serde_json::to_value(self.service.status(&id).await?)?)
             }
             "session.snapshot" => {
                 let id = parse_session(params)?;
@@ -463,7 +517,12 @@ impl Host {
                     .with_context(|| format!("session not found: {id}"))?;
                 Ok(serde_json::to_value(SessionOptionSnapshot {
                     config: record.config(),
-                    models: self.model_options.clone(),
+                    models: self
+                        .profile
+                        .read()
+                        .expect("profile lock poisoned")
+                        .model_options
+                        .clone(),
                 })?)
             }
             "session.permission" => {
@@ -488,10 +547,82 @@ impl Host {
         }
     }
 
-    async fn dispatch_automation(&self, method: &str, params: Value) -> Result<Value> {
+    async fn dispatch_automation(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
         match method {
-            "automation.list" | "automation.status" => {
-                Ok(serde_json::to_value(self.automation.list().await)?)
+            "automation.list" => Ok(serde_json::to_value(self.automation.list().await)?),
+            "automation.status" => {
+                let params: AutomationNameParam = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(
+                    self.automation.status(&params.job).await?,
+                )?)
+            }
+            "automation.add" => {
+                let params: AutomationAddParam = serde_json::from_value(params)?;
+                let name = params.job.name.clone();
+                self.mutate_automation_config(|config| {
+                    anyhow::ensure!(
+                        !config.jobs.iter().any(|job| job.name == name),
+                        "automation job already exists: {name}"
+                    );
+                    config.enabled = true;
+                    config.jobs.push(params.job);
+                    Ok(())
+                })
+                .await?;
+                Ok(serde_json::to_value(self.automation.status(&name).await?)?)
+            }
+            "automation.enable" | "automation.disable" => {
+                let params: AutomationToggleParam = serde_json::from_value(params)?;
+                let expected = method == "automation.enable";
+                let job_name = params.job.clone();
+                let all = params.all;
+                self.mutate_automation_config(|config| {
+                    anyhow::ensure!(all ^ job_name.is_some(), "specify a job or --all");
+                    if expected {
+                        config.enabled = true;
+                    }
+                    if all {
+                        for job in &mut config.jobs {
+                            job.enabled = expected;
+                        }
+                    } else if let Some(name) = &job_name {
+                        let job = config
+                            .jobs
+                            .iter_mut()
+                            .find(|job| &job.name == name)
+                            .with_context(|| format!("automation job not found: {name}"))?;
+                        job.enabled = expected;
+                    }
+                    Ok(())
+                })
+                .await?;
+                Ok(
+                    json!({"updated": if all { "all" } else { job_name.as_deref().unwrap() }, "enabled": expected}),
+                )
+            }
+            "automation.delete" => {
+                let params: AutomationDeleteParam = serde_json::from_value(params)?;
+                let job_name = params.job.clone();
+                let all = params.all;
+                self.mutate_automation_config(|config| {
+                    anyhow::ensure!(all ^ job_name.is_some(), "specify a job or --all");
+                    if all {
+                        config.jobs.clear();
+                    } else if let Some(name) = &job_name {
+                        let previous = config.jobs.len();
+                        config.jobs.retain(|job| &job.name != name);
+                        anyhow::ensure!(
+                            config.jobs.len() != previous,
+                            "automation job not found: {name}"
+                        );
+                    }
+                    Ok(())
+                })
+                .await?;
+                self.automation
+                    .remove_job_state(job_name.as_deref(), all)
+                    .await?;
+                Ok(json!({"deleted": if all { "all" } else { job_name.as_deref().unwrap() }}))
             }
             "automation.run" => {
                 let params: AutomationJobParam = serde_json::from_value(params)?;
@@ -505,6 +636,30 @@ impl Host {
             }
             other => anyhow::bail!("unknown RPC method: {other}"),
         }
+    }
+
+    async fn mutate_automation_config<F>(self: &Arc<Self>, update: F) -> Result<()>
+    where
+        F: FnOnce(&mut AutomationConfig) -> Result<()>,
+    {
+        let reload = self.profile_reload.lock().await;
+        let mut profile = dwo_agent_service::AgentProfileConfig::load(&self.profile_root)?;
+        let mut automation = parse_automation_config(profile.automation.clone())?;
+        update(&mut automation)?;
+        parse_automation_config(serde_yaml::to_value(&automation)?)?;
+        profile.automation = serde_yaml::to_value(automation)?;
+        profile.validate()?;
+
+        let path = self.profile_root.join("profile.yaml");
+        let temporary = path.with_extension(format!("yaml.{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, serde_yaml::to_string(&profile)?).await?;
+        if tokio::fs::try_exists(&path).await? {
+            tokio::fs::remove_file(&path).await?;
+        }
+        tokio::fs::rename(&temporary, &path).await?;
+        drop(reload);
+        self.reload_profile_if_changed().await?;
+        Ok(())
     }
 
     async fn dispatch_mcp(&self, method: &str, params: Value) -> Result<Value> {
@@ -540,14 +695,14 @@ impl Host {
         params: Value,
     ) -> Result<Value> {
         match method {
-            "channel.list" => Ok(serde_json::to_value(self.channels.list().await?)?),
+            "channel.list" => Ok(serde_json::to_value(self.channels().list().await?)?),
             "channel.weixin.begin" => Ok(serde_json::to_value(
-                self.channels.begin_weixin_login().await?,
+                self.channels().begin_weixin_login().await?,
             )?),
             "channel.weixin.poll" => {
                 let params: PollBindParam = serde_json::from_value(params)?;
                 let progress = self
-                    .channels
+                    .channels()
                     .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
                     .await?;
                 if let WeixinLoginProgress::Confirmed { channel } = &progress {
@@ -561,13 +716,16 @@ impl Host {
                 Ok(serde_json::to_value(progress)?)
             }
             "channel.telegram.begin" => {
-                let start = self.channels.begin_telegram_bind().await?;
+                let start = self.channels().begin_telegram_bind().await?;
                 self.channel_hub.stop(ChannelKind::Telegram).await;
                 Ok(serde_json::to_value(start)?)
             }
             "channel.telegram.poll" => {
                 let params: TelegramPollBindParam = serde_json::from_value(params)?;
-                let progress = self.channels.poll_telegram_bind(&params.binding_id).await?;
+                let progress = self
+                    .channels()
+                    .poll_telegram_bind(&params.binding_id)
+                    .await?;
                 if let TelegramBindProgress::Confirmed { channel } = &progress
                     && channel.enabled
                 {
@@ -580,12 +738,12 @@ impl Host {
             "channel.feishu.begin" => {
                 self.channel_hub.stop(ChannelKind::Feishu).await;
                 Ok(serde_json::to_value(
-                    self.channels.begin_feishu_bind().await?,
+                    self.channels().begin_feishu_bind().await?,
                 )?)
             }
             "channel.feishu.poll" => {
                 let params: TelegramPollBindParam = serde_json::from_value(params)?;
-                let progress = self.channels.poll_feishu_bind(&params.binding_id).await?;
+                let progress = self.channels().poll_feishu_bind(&params.binding_id).await?;
                 if let FeishuBindProgress::Confirmed { channel } = &progress
                     && channel.enabled
                 {
@@ -607,9 +765,9 @@ impl Host {
     ) -> Result<Value> {
         match action {
             ManagedChannelAction::Status => {
-                let mut value = serde_json::to_value(self.channels.summary(channel).await?)?;
+                let mut value = serde_json::to_value(self.channels().summary(channel).await?)?;
                 if channel == ChannelKind::Websocket {
-                    let runtime = self.channels.load_websocket().await?;
+                    let runtime = self.channels().load_websocket().await?;
                     let object = value.as_object_mut().expect("channel summary is an object");
                     object.insert(
                         "running".to_string(),
@@ -626,26 +784,26 @@ impl Host {
             }
             ManagedChannelAction::SendMessage => {
                 let params: SendMessageParam = serde_json::from_value(params)?;
-                let target = self.channels.bound_target(channel).await?;
+                let target = self.channels().bound_target(channel).await?;
                 self.channel_hub.send_message(channel, &params.text).await?;
                 Ok(json!({"sent": true, "to": target}))
             }
             ManagedChannelAction::SendFile => {
                 let params: SendFileParam = serde_json::from_value(params)?;
-                let target = self.channels.bound_target(channel).await?;
+                let target = self.channels().bound_target(channel).await?;
                 self.channel_hub.send_file(channel, &params.path).await?;
                 Ok(json!({"sent": true, "to": target, "path": params.path}))
             }
             ManagedChannelAction::Remove => {
                 self.channel_hub.stop(channel).await;
-                Ok(json!({"removed": self.channels.remove(channel).await?}))
+                Ok(json!({"removed": self.channels().remove(channel).await?}))
             }
             ManagedChannelAction::Token => {
                 anyhow::ensure!(
                     channel == ChannelKind::Websocket,
                     "token is only available for WebSocket"
                 );
-                let runtime = self.channels.load_websocket().await?;
+                let runtime = self.channels().load_websocket().await?;
                 Ok(json!({"token": runtime.token, "port": runtime.config.port, "path": "/acp"}))
             }
             ManagedChannelAction::ResetToken => {
@@ -654,8 +812,8 @@ impl Host {
                     "reset-token is only available for WebSocket"
                 );
                 self.channel_hub.stop(channel).await;
-                let token = self.channels.reset_websocket_token().await?;
-                let summary = self.channels.summary(channel).await?;
+                let token = self.channels().reset_websocket_token().await?;
+                let summary = self.channels().summary(channel).await?;
                 if summary.enabled {
                     self.channel_hub.start(channel, self.clone()).await?;
                 }
@@ -669,6 +827,7 @@ impl Host {
         title: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<Arc<dwo_agent_service::SessionAgent>> {
+        let (default_model, default_mode, default_max_model_steps) = self.defaults();
         let session_id = SessionId::new();
         let uses_generated_workspace = cwd.is_none();
         let cwd = match cwd {
@@ -694,10 +853,10 @@ impl Host {
                 parent_session_id: None,
                 title,
                 cwd,
-                mode: self.default_mode,
-                max_model_steps: self.default_max_model_steps,
+                mode: default_mode,
+                max_model_steps: default_max_model_steps,
                 llm: SessionLlmSettings {
-                    model: self.default_model.clone(),
+                    model: default_model,
                     reasoning: None,
                 },
             })
@@ -720,6 +879,7 @@ impl Host {
         params: &PromptParam,
         caller: Option<SessionId>,
     ) -> Result<(Arc<dwo_agent_service::SessionAgent>, Option<SessionId>)> {
+        let (default_model, default_mode, default_max_model_steps) = self.defaults();
         let records = self.service.list().await?;
         let caller_record = caller
             .as_ref()
@@ -770,16 +930,15 @@ impl Host {
 
         let inherited_mode = caller_record
             .as_ref()
-            .map_or(self.default_mode, |record| record.info.mode);
+            .map_or(default_mode, |record| record.info.mode);
         let mode = params.policy.unwrap_or(inherited_mode);
         if let Some(parent) = &caller_record {
             ensure_policy_ceiling(mode, parent.info.mode)?;
         }
         let model = params.model.clone().unwrap_or_else(|| {
-            caller_record.as_ref().map_or_else(
-                || self.default_model.clone(),
-                |record| record.llm.model.clone(),
-            )
+            caller_record
+                .as_ref()
+                .map_or_else(|| default_model.clone(), |record| record.llm.model.clone())
         });
         let reasoning = params.reasoning.clone().or_else(|| {
             caller_record
@@ -813,7 +972,7 @@ impl Host {
                 title: params.title.clone(),
                 cwd,
                 mode,
-                max_model_steps: self.default_max_model_steps,
+                max_model_steps: default_max_model_steps,
                 llm: SessionLlmSettings { model, reasoning },
             })
             .await;
@@ -900,6 +1059,110 @@ impl Host {
 
     pub fn profile_root_path(&self) -> &Path {
         &self.profile_root
+    }
+
+    pub(crate) fn channels(&self) -> Arc<ChannelManager> {
+        self.channels
+            .read()
+            .expect("channel manager lock poisoned")
+            .clone()
+    }
+
+    fn defaults(&self) -> (String, SessionMode, usize) {
+        let profile = self.profile.read().expect("profile lock poisoned");
+        (
+            profile.config.model.default_model_id.clone(),
+            profile.config.policy_mode,
+            profile.config.max_model_steps,
+        )
+    }
+
+    fn start_profile_watcher(self: &Arc<Self>) {
+        let host = self.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = host.reload_profile_if_changed().await {
+                            tracing::warn!(
+                                event = "profile.reload_failed",
+                                error = %format!("{error:#}"),
+                                "reload profile configuration failed; keeping previous configuration"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn reload_profile_if_changed(self: &Arc<Self>) -> Result<bool> {
+        let _reload = self.profile_reload.lock().await;
+        let source = std::fs::read_to_string(self.profile_root.join("profile.yaml"))?;
+        if self.profile.read().expect("profile lock poisoned").source == source {
+            return Ok(false);
+        }
+
+        let loaded = LoadedAgentProfile::load(&self.profile_root)?;
+        let automation_config = parse_automation_config(loaded.config.automation.clone())?;
+        let channels_changed = self
+            .profile
+            .read()
+            .expect("profile lock poisoned")
+            .config
+            .channels
+            != loaded.config.channels;
+        let replacement_channels = if channels_changed {
+            Some(Arc::new(
+                ChannelManager::new(&self.profile_root, &loaded.config.channels).await?,
+            ))
+        } else {
+            None
+        };
+        let model_options = loaded
+            .models
+            .models
+            .iter()
+            .map(|(id, model)| SessionModelOption {
+                id: id.clone(),
+                reasoning: model.reasoning.keys().cloned().collect(),
+                default_reasoning: model.default_reasoning_mode.clone(),
+            })
+            .collect();
+        let default_model = loaded.models.default_model_id.clone();
+        let default_mode = loaded.config.policy_mode;
+        let default_max_model_steps = loaded.config.max_model_steps;
+
+        self.service.replace_models(loaded.models)?;
+        self.automation
+            .apply_profile(
+                automation_config,
+                default_model,
+                default_mode,
+                default_max_model_steps,
+            )
+            .await?;
+        crate::logging::reload(&loaded.config.logging)?;
+
+        if let Some(channels) = replacement_channels {
+            self.channel_hub.stop_all().await;
+            *self
+                .channels
+                .write()
+                .expect("channel manager lock poisoned") = channels;
+            self.channel_hub.start_all(self.clone()).await;
+        }
+
+        *self.profile.write().expect("profile lock poisoned") = RuntimeProfile {
+            source,
+            config: loaded.config,
+            model_options,
+        };
+        tracing::info!(event = "profile.reloaded", "profile configuration reloaded");
+        Ok(true)
     }
 
     fn start_mcp_watcher(self: &Arc<Self>) {
@@ -1298,6 +1561,147 @@ model:
     }
 
     #[tokio::test]
+    async fn profile_yaml_reloads_all_host_configuration_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        let host = Host::load(&config).await.unwrap();
+        let existing = host.create_session(None, None).await.unwrap();
+        std::fs::write(
+            &config,
+            r#"name: reloaded
+description: reloaded agent
+policyMode: watch
+maxModelSteps: 17
+logging:
+  level: debug
+  retentionDays: 7
+model:
+  defaultModelId: backup
+  providers:
+    deepseek:
+      type: deepseek
+  models:
+    - modelName: deepseek-v4-pro
+      provider: deepseek
+      modelId: deepseek-v4-pro
+    - modelName: backup
+      provider: deepseek
+      modelId: deepseek-v4-pro
+channels:
+  websocket:
+    enabled: false
+    port: 19000
+automation:
+  enabled: false
+  jobs: []
+"#,
+        )
+        .unwrap();
+
+        assert!(host.reload_profile_if_changed().await.unwrap());
+        let snapshot = host.dispatch("profile.list", json!({})).await.unwrap();
+        assert_eq!(snapshot["name"], "reloaded");
+        assert_eq!(snapshot["description"], "reloaded agent");
+        assert_eq!(snapshot["policy"], "watch");
+        assert_eq!(snapshot["defaultModel"], "backup");
+        assert_eq!(snapshot["models"].as_array().unwrap().len(), 2);
+        assert_eq!(host.channels().list().await.unwrap().len(), 1);
+        existing
+            .set_config(SessionConfigUpdate::Model("backup".to_string()))
+            .await
+            .unwrap();
+
+        let session = host.create_session(None, None).await.unwrap();
+        let record = session
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record;
+        assert_eq!(record.info.mode, SessionMode::Watch);
+        assert_eq!(record.llm.model, "backup");
+        assert_eq!(record.config().max_model_steps, 17);
+
+        let invalid =
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .replacen("name: reloaded", "name: ''", 1);
+        std::fs::write(&config, invalid).unwrap();
+        assert!(host.reload_profile_if_changed().await.is_err());
+        let snapshot = host.dispatch("profile.list", json!({})).await.unwrap();
+        assert_eq!(snapshot["name"], "reloaded");
+        assert_eq!(snapshot["defaultModel"], "backup");
+
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn automation_crud_updates_profile_and_runtime_together() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        let host = Host::load(&config).await.unwrap();
+        let job = json!({
+            "name": "daily-report",
+            "enabled": true,
+            "schedule": {"cron": "0 9 * * *", "timezone": "Asia/Shanghai"},
+            "session": {"mode": "new", "behavior": "every_time", "cwd": "."},
+            "prompt": "summarize the project"
+        });
+
+        let added = host
+            .dispatch("automation.add", json!({"job": job}))
+            .await
+            .unwrap();
+        assert_eq!(added["job"]["name"], "daily-report");
+        assert_eq!(host.automation.list().await.len(), 1);
+
+        host.dispatch(
+            "automation.disable",
+            json!({"job": "daily-report", "all": false}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !host
+                .automation
+                .status("daily-report")
+                .await
+                .unwrap()
+                .job
+                .enabled
+        );
+
+        host.dispatch("automation.enable", json!({"job": null, "all": true}))
+            .await
+            .unwrap();
+        assert!(
+            host.automation
+                .status("daily-report")
+                .await
+                .unwrap()
+                .job
+                .enabled
+        );
+
+        host.dispatch(
+            "automation.delete",
+            json!({"job": "daily-report", "all": false}),
+        )
+        .await
+        .unwrap();
+        assert!(host.automation.list().await.is_empty());
+        let profile = dwo_agent_service::AgentProfileConfig::load(root.path()).unwrap();
+        assert!(
+            parse_automation_config(profile.automation)
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn sessions_use_runtime_workspaces_unless_cwd_is_explicit() {
         let profile = tempfile::tempdir().unwrap();
         let config = write_test_profile(profile.path());
@@ -1370,7 +1774,7 @@ model:
     }
 
     #[tokio::test]
-    async fn automation_run_returns_before_background_startup() {
+    async fn automation_run_returns_after_session_and_prompt_start() {
         let profile = tempfile::tempdir().unwrap();
         let config = write_test_profile(profile.path());
         let mut source = std::fs::read_to_string(&config).unwrap();
@@ -1383,15 +1787,28 @@ automation:
       schedule: { cron: "0 9 * * *", timezone: Asia/Shanghai }
       session: { mode: new, behavior: every_time, cwd: definitely-missing }
       prompt: this must be submitted in the background
+    - name: valid-start
+      schedule: { cron: "0 9 * * *", timezone: Asia/Shanghai }
+      session: { mode: new, behavior: every_time, cwd: . }
+      prompt: this starts before the command returns
 "#,
         );
         std::fs::write(&config, source).unwrap();
         let host = Host::load(&config).await.unwrap();
 
-        let value = host
+        let error = host
             .dispatch(
                 "automation.run",
                 json!({"job": "background-failure", "caller_session_id": null}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot find the file"));
+
+        let value = host
+            .dispatch(
+                "automation.run",
+                json!({"job": "valid-start", "caller_session_id": null}),
             )
             .await
             .unwrap();
@@ -1401,8 +1818,8 @@ automation:
             crate::automation::AutomationRunStatus::Running
         );
         assert!(record.run_id.starts_with("run-"));
-        assert!(record.session_id.is_none());
-        assert!(record.turn_id.is_none());
+        assert!(record.session_id.is_some());
+        assert!(record.turn_id.is_some());
 
         host.shutdown.cancel();
         host.service.shutdown().await;

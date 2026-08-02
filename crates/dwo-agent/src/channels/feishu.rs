@@ -50,7 +50,7 @@ pub(crate) struct RunningFeishu {
 
 impl RunningFeishu {
     pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
-        let runtime = host.channels.load_feishu().await?;
+        let runtime = host.channels().load_feishu().await?;
         let config = openlark_config(
             &runtime.config,
             runtime.app_id.clone(),
@@ -485,7 +485,7 @@ impl ConversationTransport for FeishuConversation {
             state.clone()
         };
         self.host
-            .channels
+            .channels()
             .save_state(ChannelKind::Feishu, &snapshot)
             .await
     }

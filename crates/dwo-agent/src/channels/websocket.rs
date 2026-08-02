@@ -21,7 +21,7 @@ pub(crate) struct RunningWebsocket {
 
 impl RunningWebsocket {
     pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
-        let runtime = host.channels.load_websocket().await?;
+        let runtime = host.channels().load_websocket().await?;
         let listener = TcpListener::bind(("0.0.0.0", runtime.config.port))
             .await
             .with_context(|| format!("listen on 0.0.0.0:{}", runtime.config.port))?;

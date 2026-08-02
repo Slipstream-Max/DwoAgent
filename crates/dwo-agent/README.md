@@ -39,6 +39,7 @@ dwo daemon start|stop|status
 
 dwo profile-list
 dwo session list [--all]
+dwo session status <id> [--json]
 dwo session delete <id>
 dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <id>]
 dwo session cancel <id>
@@ -66,7 +67,12 @@ dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
 dwo mcp auth <server> --logout
 dwo automation list [--json]
-dwo automation status [--json]
+dwo automation status <job> [--json]
+dwo automation add <job> --cron <expr> --prompt <text> [options]
+dwo automation enable|disable <job>
+dwo automation enable|disable --all
+dwo automation delete <job>
+dwo automation delete --all --yes
 dwo automation run <job> [--json]
 dwo acp
 ```
@@ -280,17 +286,23 @@ waking another model step after the cancelled turn.
 
 ## Automation
 
-The daemon watches the `automation` section in `profile.yaml`. Jobs use a
-standard five-field cron expression. New sessions require an explicit
+The daemon validates and hot-reloads the complete `profile.yaml`, including
+models, defaults, logging, channels, and automation. Invalid intermediate
+writes leave the previous runtime configuration active. Channel changes
+restart managed connections; model changes reach existing sessions on their
+next request, while changed defaults apply only to newly created sessions.
+
+Automation jobs use a standard five-field cron expression. New sessions require an explicit
 `behavior`: `every_time` creates one per run, while `once` persists a sticky
 job-to-session binding in `runtime/automation.yaml`. A fixed-session run targets
 an explicit ID and uses the same FIFO prompt semantics as other clients.
 
 Automation is unattended. Tool confirmation requests are denied automatically
-instead of waiting forever. Automation does not create a separate state or
-history directory; execution is persisted only through the target session.
-Manual `automation run` returns a run ID immediately and starts the configured
-session and turn in the background. When invoked from an agent session, its
+instead of waiting forever. Full execution remains in the target session; a
+bounded `runtime/automation-runs.yaml` keeps the latest run status, session and
+turn IDs, and a 100-character answer preview. Manual `automation run` returns
+after the session and prompt have started, without waiting for completion.
+When invoked from an agent session, its
 completion, cancellation, or failure is delivered back as an internal
 `<automation_result>` message, so the caller never needs to wait or poll.
 

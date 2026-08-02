@@ -100,13 +100,16 @@ pub struct AutomationRunRecord {
 #[serde(rename_all = "camelCase")]
 pub struct AutomationJobStatus {
     pub job: AutomationJob,
+    pub scheduler_enabled: bool,
     pub next_run_at: Option<String>,
     pub active_runs: Vec<AutomationRunRecord>,
+    pub recent_runs: Vec<AutomationRunRecord>,
+    pub effective_model: String,
+    pub bound_session_id: Option<String>,
 }
 
 #[derive(Default)]
 struct RuntimeState {
-    source: String,
     config: AutomationConfig,
     next_runs: BTreeMap<String, DateTime<Utc>>,
     active: BTreeMap<String, AutomationRunRecord>,
@@ -119,6 +122,13 @@ struct AutomationBindings {
     sessions: BTreeMap<String, String>,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutomationHistory {
+    #[serde(default)]
+    runs: Vec<AutomationRunRecord>,
+}
+
 struct AutomationExecution {
     record: AutomationRunRecord,
     agent: Arc<SessionAgent>,
@@ -127,23 +137,23 @@ struct AutomationExecution {
     turn_id: TurnId,
 }
 
-#[derive(Deserialize)]
-struct ProfileAutomation {
-    #[serde(default)]
-    automation: AutomationConfig,
+#[derive(Clone)]
+struct AutomationDefaults {
+    model: String,
+    mode: SessionMode,
+    max_model_steps: usize,
 }
 
 pub struct AutomationRuntime {
     service: Arc<AgentService>,
     profile_root: PathBuf,
-    profile_path: PathBuf,
     bindings_path: PathBuf,
-    default_model: String,
-    default_mode: SessionMode,
-    default_max_model_steps: usize,
+    history_path: PathBuf,
+    defaults: Mutex<AutomationDefaults>,
     shutdown: CancellationToken,
     state: Mutex<RuntimeState>,
     bindings: Mutex<AutomationBindings>,
+    history: Mutex<AutomationHistory>,
 }
 
 impl AutomationRuntime {
@@ -157,26 +167,37 @@ impl AutomationRuntime {
         shutdown: CancellationToken,
     ) -> Result<Arc<Self>> {
         validate_config(&config)?;
-        let source = std::fs::read_to_string(profile_root.join("profile.yaml"))?;
         let next_runs = build_next_runs(&config)?;
         let bindings_path = profile_root.join("runtime/automation.yaml");
         let bindings = read_bindings(&bindings_path)?;
+        let history_path = profile_root.join("runtime/automation-runs.yaml");
+        let mut history = read_history(&history_path)?;
+        for run in &mut history.runs {
+            if run.status == AutomationRunStatus::Running {
+                run.status = AutomationRunStatus::Failed;
+                run.finished_at = Some(Utc::now().to_rfc3339());
+                run.error =
+                    Some("daemon restarted before the automation run completed".to_string());
+            }
+        }
         Ok(Arc::new(Self {
             service,
-            profile_path: profile_root.join("profile.yaml"),
             bindings_path,
+            history_path,
             profile_root,
-            default_model,
-            default_mode,
-            default_max_model_steps,
+            defaults: Mutex::new(AutomationDefaults {
+                model: default_model,
+                mode: default_mode,
+                max_model_steps: default_max_model_steps,
+            }),
             shutdown,
             state: Mutex::new(RuntimeState {
-                source,
                 config,
                 next_runs,
                 active: BTreeMap::new(),
             }),
             bindings: Mutex::new(bindings),
+            history: Mutex::new(history),
         }))
     }
 
@@ -186,23 +207,93 @@ impl AutomationRuntime {
     }
 
     pub async fn list(&self) -> Vec<AutomationJobStatus> {
-        let state = self.state.lock().await;
-        state
-            .config
-            .jobs
-            .iter()
+        let (scheduler_enabled, jobs, next_runs, active) = {
+            let state = self.state.lock().await;
+            (
+                state.config.enabled,
+                state.config.jobs.clone(),
+                state.next_runs.clone(),
+                state.active.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let history = self.history.lock().await.runs.clone();
+        let bindings = self.bindings.lock().await.sessions.clone();
+        let default_model = self.defaults.lock().await.model.clone();
+        let session_models = self
+            .service
+            .list()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| (record.info.id.to_string(), record.llm.model))
+            .collect::<BTreeMap<_, _>>();
+        jobs.iter()
             .cloned()
-            .map(|job| AutomationJobStatus {
-                next_run_at: state.next_runs.get(&job.name).map(DateTime::to_rfc3339),
-                active_runs: state
-                    .active
-                    .values()
-                    .filter(|record| record.job == job.name)
+            .map(|job| {
+                let bound_session_id =
+                    bindings
+                        .get(&job.name)
+                        .cloned()
+                        .or_else(|| match &job.session {
+                            AutomationSession::Fixed { session_id } => Some(session_id.clone()),
+                            AutomationSession::New { .. } => None,
+                        });
+                let effective_model = bound_session_id
+                    .as_ref()
+                    .and_then(|session_id| session_models.get(session_id))
                     .cloned()
-                    .collect(),
-                job,
+                    .unwrap_or_else(|| default_model.clone());
+                AutomationJobStatus {
+                    scheduler_enabled,
+                    next_run_at: next_runs.get(&job.name).map(DateTime::to_rfc3339),
+                    active_runs: active
+                        .iter()
+                        .filter(|record| record.job == job.name)
+                        .cloned()
+                        .collect(),
+                    recent_runs: history
+                        .iter()
+                        .rev()
+                        .filter(|record| record.job == job.name)
+                        .take(10)
+                        .cloned()
+                        .collect(),
+                    bound_session_id,
+                    effective_model,
+                    job,
+                }
             })
             .collect()
+    }
+
+    pub async fn status(&self, name: &str) -> Result<AutomationJobStatus> {
+        self.list()
+            .await
+            .into_iter()
+            .find(|status| status.job.name == name)
+            .with_context(|| format!("automation job not found: {name}"))
+    }
+
+    pub async fn remove_job_state(&self, name: Option<&str>, all: bool) -> Result<()> {
+        {
+            let mut bindings = self.bindings.lock().await;
+            if all {
+                bindings.sessions.clear();
+            } else if let Some(name) = name {
+                bindings.sessions.remove(name);
+            }
+            write_bindings(&self.bindings_path, &bindings).await?;
+        }
+        {
+            let mut history = self.history.lock().await;
+            if all {
+                history.runs.clear();
+            } else if let Some(name) = name {
+                history.runs.retain(|run| run.job != name);
+            }
+            write_history(&self.history_path, &history).await?;
+        }
+        Ok(())
     }
 
     pub async fn run_now(
@@ -220,7 +311,7 @@ impl AutomationRuntime {
                 .cloned()
                 .with_context(|| format!("automation job not found: {name}"))?
         };
-        Ok(self.queue_job(job, false, caller).await)
+        self.start_job(job, false, caller).await
     }
 
     async fn scheduler_loop(self: Arc<Self>) {
@@ -229,33 +320,38 @@ impl AutomationRuntime {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    if let Err(error) = self.reload_if_changed().await {
-                        tracing::warn!(
-                            event = "automation.reload_failed",
-                            error = %format!("{error:#}"),
-                            "reload automation configuration failed"
-                        );
-                    }
                     for job in self.take_due_jobs().await {
-                        self.queue_job(job, true, None).await;
+                        if let Err(error) = self.start_job(job, true, None).await {
+                            tracing::error!(
+                                event = "automation.job_start_failed",
+                                error = %format!("{error:#}"),
+                                "start scheduled automation job failed"
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    async fn reload_if_changed(&self) -> Result<()> {
-        let source = std::fs::read_to_string(&self.profile_path)?;
-        if self.state.lock().await.source == source {
-            return Ok(());
-        }
-        let profile: ProfileAutomation = serde_yaml::from_str(&source)?;
-        validate_config(&profile.automation)?;
-        let next_runs = build_next_runs(&profile.automation)?;
+    pub async fn apply_profile(
+        &self,
+        config: AutomationConfig,
+        default_model: String,
+        default_mode: SessionMode,
+        default_max_model_steps: usize,
+    ) -> Result<()> {
+        validate_config(&config)?;
+        let next_runs = build_next_runs(&config)?;
         let mut state = self.state.lock().await;
-        state.source = source;
-        state.config = profile.automation;
+        state.config = config;
         state.next_runs = next_runs;
+        drop(state);
+        *self.defaults.lock().await = AutomationDefaults {
+            model: default_model,
+            mode: default_mode,
+            max_model_steps: default_max_model_steps,
+        };
         Ok(())
     }
 
@@ -294,12 +390,12 @@ impl AutomationRuntime {
         jobs
     }
 
-    async fn queue_job(
+    async fn start_job(
         self: &Arc<Self>,
         job: AutomationJob,
         scheduled: bool,
         caller: Option<SessionId>,
-    ) -> AutomationRunRecord {
+    ) -> Result<AutomationRunRecord> {
         let run_id = format!("run-{}", Uuid::new_v4().simple());
         let record = AutomationRunRecord {
             run_id,
@@ -314,10 +410,36 @@ impl AutomationRuntime {
             error: None,
         };
         self.set_active(record.clone()).await;
+        let mut started = record;
+        let (agent, endpoint, subscription, turn_id) =
+            match self.start_execution(&job, &mut started).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    started.status = AutomationRunStatus::Failed;
+                    started.finished_at = Some(Utc::now().to_rfc3339());
+                    started.error = Some(format!("{error:#}"));
+                    self.clear_active(&started.run_id).await;
+                    self.append_history(started).await?;
+                    return Err(error);
+                }
+            };
+        let returned = started.clone();
         let runtime = self.clone();
-        let queued = record.clone();
-        tokio::spawn(async move { runtime.run_job(queued, job, caller).await });
-        record
+        tokio::spawn(async move {
+            runtime
+                .run_job(
+                    AutomationExecution {
+                        record: started,
+                        agent,
+                        endpoint,
+                        subscription,
+                        turn_id,
+                    },
+                    caller,
+                )
+                .await
+        });
+        Ok(returned)
     }
 
     async fn start_execution(
@@ -361,6 +483,7 @@ impl AutomationRuntime {
         } else {
             self.profile_root.join(cwd)
         };
+        let defaults = self.defaults.lock().await.clone();
         Ok(self
             .service
             .create(NewSession {
@@ -372,10 +495,10 @@ impl AutomationRuntime {
                         .unwrap_or_else(|| format!("automation/{}", job.name)),
                 ),
                 cwd,
-                mode: self.default_mode,
-                max_model_steps: self.default_max_model_steps,
+                mode: defaults.mode,
+                max_model_steps: defaults.max_model_steps,
                 llm: SessionLlmSettings {
-                    model: self.default_model.clone(),
+                    model: defaults.model,
                     reasoning: None,
                 },
             })
@@ -414,25 +537,11 @@ impl AutomationRuntime {
 
     async fn run_job(
         self: &Arc<Self>,
-        mut record: AutomationRunRecord,
-        job: AutomationJob,
+        mut execution: AutomationExecution,
         caller: Option<SessionId>,
     ) {
-        let result = match self.start_execution(&job, &mut record).await {
-            Ok((agent, endpoint, subscription, turn_id)) => {
-                let mut execution = AutomationExecution {
-                    record,
-                    agent,
-                    endpoint,
-                    subscription,
-                    turn_id,
-                };
-                let result = self.monitor_execution(&mut execution).await;
-                record = execution.record;
-                result
-            }
-            Err(error) => Err(error),
-        };
+        let result = self.monitor_execution(&mut execution).await;
+        let mut record = execution.record;
         if let Err(error) = result {
             record.status = AutomationRunStatus::Failed;
             record.error = Some(format!("{error:#}"));
@@ -446,6 +555,14 @@ impl AutomationRuntime {
         }
         record.finished_at = Some(Utc::now().to_rfc3339());
         self.clear_active(&record.run_id).await;
+        if let Err(error) = self.append_history(record.clone()).await {
+            tracing::error!(
+                event = "automation.history_write_failed",
+                run_id = %record.run_id,
+                error = %format!("{error:#}"),
+                "persist automation run history failed"
+            );
+        }
         if let Some(caller) = caller {
             self.deliver_result(caller, &record).await;
         }
@@ -540,6 +657,17 @@ impl AutomationRuntime {
     async fn clear_active(&self, run_id: &str) {
         self.state.lock().await.active.remove(run_id);
     }
+
+    async fn append_history(&self, mut record: AutomationRunRecord) -> Result<()> {
+        record.response = answer_preview(&record.response);
+        let mut history = self.history.lock().await;
+        history.runs.push(record);
+        if history.runs.len() > 100 {
+            let remove = history.runs.len() - 100;
+            history.runs.drain(..remove);
+        }
+        write_history(&self.history_path, &history).await
+    }
 }
 
 fn automation_result_notification(record: &AutomationRunRecord) -> String {
@@ -579,6 +707,43 @@ async fn write_bindings(path: &Path, bindings: &AutomationBindings) -> Result<()
     }
     tokio::fs::rename(temporary, path).await?;
     Ok(())
+}
+
+fn read_history(path: &Path) -> Result<AutomationHistory> {
+    if !path.is_file() {
+        return Ok(AutomationHistory::default());
+    }
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("read automation history from {}", path.display()))?;
+    serde_yaml::from_str(&source)
+        .with_context(|| format!("parse automation history from {}", path.display()))
+}
+
+async fn write_history(path: &Path, history: &AutomationHistory) -> Result<()> {
+    let source = serde_yaml::to_string(history)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension(format!("yaml.{}.tmp", Uuid::new_v4()));
+    tokio::fs::write(&temporary, source).await?;
+    if tokio::fs::try_exists(path).await? {
+        tokio::fs::remove_file(path).await?;
+    }
+    tokio::fs::rename(temporary, path).await?;
+    Ok(())
+}
+
+fn answer_preview(content: &str) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = normalized.chars().count() > 100;
+    let mut preview = normalized
+        .chars()
+        .take(if truncated { 97 } else { 100 })
+        .collect::<String>();
+    if truncated {
+        preview.push_str("...");
+    }
+    preview
 }
 
 pub fn parse_config(value: serde_yaml::Value) -> Result<AutomationConfig> {
@@ -669,6 +834,15 @@ fn default_cwd() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_preview_is_normalized_and_never_exceeds_one_hundred_characters() {
+        let source = format!("  first\n\n{}  ", "x".repeat(120));
+        let preview = answer_preview(&source);
+        assert_eq!(preview.chars().count(), 100);
+        assert!(preview.starts_with("first "));
+        assert!(preview.ends_with("..."));
+    }
     use async_trait::async_trait;
     use dwo_agent_service::{
         CompactionView, ContextMessage, MemorySessionRepository, ModelClient, ModelClientError,

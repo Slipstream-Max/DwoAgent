@@ -52,7 +52,7 @@ pub(crate) fn render_status(snapshot: &SessionSnapshot) -> String {
 pub(crate) fn render_live_user_prompt(content: &MessageContent) -> Option<String> {
     let content = content.to_string();
     let content = content.trim();
-    (!content.is_empty()).then(|| content.to_string())
+    (!content.is_empty()).then(|| format!("User: {content}"))
 }
 
 pub(crate) fn render_session_replay(snapshot: &SessionSnapshot, turns: usize) -> Vec<String> {
@@ -275,10 +275,14 @@ mod tests {
     }
 
     #[test]
-    fn live_user_prompt_is_forwarded_without_extra_wrapping() {
+    fn live_user_prompt_is_labeled_for_channel_observers() {
         assert_eq!(
             render_live_user_prompt(&MessageContent::text("  inspect the project  ")).as_deref(),
-            Some("inspect the project")
+            Some("User: inspect the project")
+        );
+        assert_eq!(
+            render_live_user_prompt(&MessageContent::text("first line\nsecond line")).as_deref(),
+            Some("User: first line\nsecond line")
         );
         assert_eq!(render_live_user_prompt(&MessageContent::text("  ")), None);
     }

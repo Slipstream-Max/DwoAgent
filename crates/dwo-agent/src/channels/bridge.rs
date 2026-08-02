@@ -548,6 +548,9 @@ mod tests {
         drop(events_tx);
         task.await.unwrap();
 
-        assert_eq!(*transport.messages.lock().await, ["question", "answer"]);
+        assert_eq!(
+            *transport.messages.lock().await,
+            ["User: question", "answer"]
+        );
     }
 }

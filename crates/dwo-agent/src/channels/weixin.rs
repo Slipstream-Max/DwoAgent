@@ -269,9 +269,36 @@ impl WeixinHandler {
     }
 
     async fn handle_prompt(&self, ctx: &MessageContext, text: &str) -> Result<()> {
-        let session_id = self.bridge.ensure_prompt_session().await?;
-        let content = self.prompt_content(ctx, text, &session_id).await?;
-        self.bridge.submit_prompt(content).await
+        let typing_started = match ctx.send_typing().await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    event = "channel.typing_send_failed",
+                    channel = "weixin",
+                    error = %error,
+                    "send channel typing indicator failed"
+                );
+                false
+            }
+        };
+        let result = async {
+            let session_id = self.bridge.ensure_prompt_session().await?;
+            let content = self.prompt_content(ctx, text, &session_id).await?;
+            self.bridge.submit_prompt(content).await
+        }
+        .await;
+        if result.is_err()
+            && typing_started
+            && let Err(error) = ctx.cancel_typing().await
+        {
+            tracing::warn!(
+                event = "channel.typing_cancel_failed",
+                channel = "weixin",
+                error = %error,
+                "cancel channel typing indicator failed"
+            );
+        }
+        result
     }
 
     async fn prompt_content(

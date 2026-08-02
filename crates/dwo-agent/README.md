@@ -281,13 +281,18 @@ waking another model step after the cancelled turn.
 ## Automation
 
 The daemon watches the `automation` section in `profile.yaml`. Jobs use a
-standard five-field cron expression and either create a fresh session for every
-run or target a fixed session. A fixed-session run uses the same FIFO prompt
-semantics as other clients and joins an active turn at its next safe boundary.
+standard five-field cron expression. New sessions require an explicit
+`behavior`: `every_time` creates one per run, while `once` persists a sticky
+job-to-session binding in `runtime/automation.yaml`. A fixed-session run targets
+an explicit ID and uses the same FIFO prompt semantics as other clients.
 
 Automation is unattended. Tool confirmation requests are denied automatically
 instead of waiting forever. Automation does not create a separate state or
 history directory; execution is persisted only through the target session.
+Manual `automation run` returns a run ID immediately and starts the configured
+session and turn in the background. When invoked from an agent session, its
+completion, cancellation, or failure is delivered back as an internal
+`<automation_result>` message, so the caller never needs to wait or poll.
 
 ```yaml
 automation:
@@ -299,6 +304,7 @@ automation:
         timezone: Asia/Shanghai
       session:
         mode: new
+        behavior: every_time
         cwd: .
       prompt: Summarize the current project status.
 ```

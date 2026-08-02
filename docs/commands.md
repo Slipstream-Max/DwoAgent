@@ -120,6 +120,8 @@ dwo automation run <job> [--json]
 
 默认输出为可读文本；仅指定 `--json` 时保留机器读取的 JSON 输出。
 
+`automation run` 登记后立即返回运行 ID，session 创建和 prompt 提交也在后台进行。在 Agent session 内调用时，最终结果或错误会作为 `<automation_result>` 内部消息自动进入调用方上下文，无需等待或轮询。
+
 ## ACP
 
 客户端配置、session 协作、权限和内容类型限制见 [ACP 使用指南](acp.md)。

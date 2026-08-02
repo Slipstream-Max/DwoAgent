@@ -156,6 +156,7 @@ struct McpAuthParam {
 #[derive(Deserialize)]
 struct AutomationJobParam {
     job: String,
+    caller_session_id: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -494,8 +495,12 @@ impl Host {
             }
             "automation.run" => {
                 let params: AutomationJobParam = serde_json::from_value(params)?;
+                let caller = parse_optional_session(params.caller_session_id)?;
+                if let Some(caller) = &caller {
+                    self.service.load(caller).await?;
+                }
                 Ok(serde_json::to_value(
-                    self.automation.run_now(&params.job).await?,
+                    self.automation.run_now(&params.job, caller).await?,
                 )?)
             }
             other => anyhow::bail!("unknown RPC method: {other}"),
@@ -1211,7 +1216,7 @@ mod tests {
         );
         assert_eq!(
             yaml_keys(&document["automation"]["jobs"][0]["session"]),
-            ["cwd", "mode", "title"]
+            ["behavior", "cwd", "mode", "title"]
         );
         assert_eq!(
             yaml_keys(&document["automation"]["jobs"][1]["session"]),
@@ -1359,6 +1364,45 @@ model:
         );
         host.delete_session(&custom_id).await.unwrap();
         assert!(explicit.is_dir(), "an explicit cwd must never be deleted");
+
+        host.shutdown.cancel();
+        host.service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn automation_run_returns_before_background_startup() {
+        let profile = tempfile::tempdir().unwrap();
+        let config = write_test_profile(profile.path());
+        let mut source = std::fs::read_to_string(&config).unwrap();
+        source.push_str(
+            r#"
+automation:
+  enabled: false
+  jobs:
+    - name: background-failure
+      schedule: { cron: "0 9 * * *", timezone: Asia/Shanghai }
+      session: { mode: new, behavior: every_time, cwd: definitely-missing }
+      prompt: this must be submitted in the background
+"#,
+        );
+        std::fs::write(&config, source).unwrap();
+        let host = Host::load(&config).await.unwrap();
+
+        let value = host
+            .dispatch(
+                "automation.run",
+                json!({"job": "background-failure", "caller_session_id": null}),
+            )
+            .await
+            .unwrap();
+        let record: crate::automation::AutomationRunRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            record.status,
+            crate::automation::AutomationRunStatus::Running
+        );
+        assert!(record.run_id.starts_with("run-"));
+        assert!(record.session_id.is_none());
+        assert!(record.turn_id.is_none());
 
         host.shutdown.cancel();
         host.service.shutdown().await;

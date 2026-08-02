@@ -94,6 +94,7 @@ automation:
         timezone: Asia/Shanghai
       session:
         mode: new
+        behavior: every_time
         cwd: .
         title: Daily report
       prompt: Summarize the current project status.

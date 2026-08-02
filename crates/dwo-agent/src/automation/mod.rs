@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -8,7 +8,8 @@ use chrono::{DateTime, Local, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 use dwo_agent_service::{
-    AgentService, EndpointId, NewSession, SessionEventPayload, SessionId, SessionLlmSettings,
+    AgentService, AgentServiceError, EndpointId, NewSession, SessionAgent, SessionEventPayload,
+    SessionId, SessionLlmSettings, SessionSubscription, TurnId,
 };
 use dwo_tools::{ConfirmationDecision, SessionMode};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,7 @@ pub struct AutomationSchedule {
 )]
 pub enum AutomationSession {
     New {
+        behavior: AutomationNewBehavior,
         #[serde(default = "default_cwd")]
         cwd: PathBuf,
         #[serde(default)]
@@ -61,6 +63,13 @@ pub enum AutomationSession {
     Fixed {
         session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationNewBehavior {
+    EveryTime,
+    Once,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +112,21 @@ struct RuntimeState {
     active: BTreeMap<String, AutomationRunRecord>,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutomationBindings {
+    #[serde(default)]
+    sessions: BTreeMap<String, String>,
+}
+
+struct AutomationExecution {
+    record: AutomationRunRecord,
+    agent: Arc<SessionAgent>,
+    endpoint: EndpointId,
+    subscription: SessionSubscription,
+    turn_id: TurnId,
+}
+
 #[derive(Deserialize)]
 struct ProfileAutomation {
     #[serde(default)]
@@ -113,11 +137,13 @@ pub struct AutomationRuntime {
     service: Arc<AgentService>,
     profile_root: PathBuf,
     profile_path: PathBuf,
+    bindings_path: PathBuf,
     default_model: String,
     default_mode: SessionMode,
     default_max_model_steps: usize,
     shutdown: CancellationToken,
     state: Mutex<RuntimeState>,
+    bindings: Mutex<AutomationBindings>,
 }
 
 impl AutomationRuntime {
@@ -133,9 +159,12 @@ impl AutomationRuntime {
         validate_config(&config)?;
         let source = std::fs::read_to_string(profile_root.join("profile.yaml"))?;
         let next_runs = build_next_runs(&config)?;
+        let bindings_path = profile_root.join("runtime/automation.yaml");
+        let bindings = read_bindings(&bindings_path)?;
         Ok(Arc::new(Self {
             service,
             profile_path: profile_root.join("profile.yaml"),
+            bindings_path,
             profile_root,
             default_model,
             default_mode,
@@ -147,6 +176,7 @@ impl AutomationRuntime {
                 next_runs,
                 active: BTreeMap::new(),
             }),
+            bindings: Mutex::new(bindings),
         }))
     }
 
@@ -175,7 +205,11 @@ impl AutomationRuntime {
             .collect()
     }
 
-    pub async fn run_now(self: &Arc<Self>, name: &str) -> Result<AutomationRunRecord> {
+    pub async fn run_now(
+        self: &Arc<Self>,
+        name: &str,
+        caller: Option<SessionId>,
+    ) -> Result<AutomationRunRecord> {
         let job = {
             let state = self.state.lock().await;
             state
@@ -186,7 +220,7 @@ impl AutomationRuntime {
                 .cloned()
                 .with_context(|| format!("automation job not found: {name}"))?
         };
-        self.run_job(job, false).await
+        Ok(self.queue_job(job, false, caller).await)
     }
 
     async fn scheduler_loop(self: Arc<Self>) {
@@ -203,17 +237,7 @@ impl AutomationRuntime {
                         );
                     }
                     for job in self.take_due_jobs().await {
-                        let runtime = self.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = runtime.run_job(job.clone(), true).await {
-                                tracing::error!(
-                                    event = "automation.job_failed",
-                                    job = %job.name,
-                                    error = %format!("{error:#}"),
-                                    "automation job failed"
-                                );
-                            }
-                        });
+                        self.queue_job(job, true, None).await;
                     }
                 }
             }
@@ -270,14 +294,15 @@ impl AutomationRuntime {
         jobs
     }
 
-    async fn run_job(
+    async fn queue_job(
         self: &Arc<Self>,
         job: AutomationJob,
         scheduled: bool,
-    ) -> Result<AutomationRunRecord> {
+        caller: Option<SessionId>,
+    ) -> AutomationRunRecord {
         let run_id = format!("run-{}", Uuid::new_v4().simple());
-        let mut record = AutomationRunRecord {
-            run_id: run_id.clone(),
+        let record = AutomationRunRecord {
+            run_id,
             job: job.name.clone(),
             session_id: None,
             turn_id: None,
@@ -289,48 +314,26 @@ impl AutomationRuntime {
             error: None,
         };
         self.set_active(record.clone()).await;
-
-        let result = self.execute_job(&job, &mut record).await;
-        if let Err(error) = result {
-            record.status = AutomationRunStatus::Failed;
-            record.error = Some(format!("{error:#}"));
-        }
-        record.finished_at = Some(Utc::now().to_rfc3339());
-        self.clear_active(&run_id).await;
-        Ok(record)
+        let runtime = self.clone();
+        let queued = record.clone();
+        tokio::spawn(async move { runtime.run_job(queued, job, caller).await });
+        record
     }
 
-    async fn execute_job(
+    async fn start_execution(
         &self,
         job: &AutomationJob,
         record: &mut AutomationRunRecord,
-    ) -> Result<()> {
+    ) -> Result<(Arc<SessionAgent>, EndpointId, SessionSubscription, TurnId)> {
         let agent = match &job.session {
-            AutomationSession::New { cwd, title } => {
-                let cwd = if cwd.is_absolute() {
-                    cwd.clone()
-                } else {
-                    self.profile_root.join(cwd)
-                };
-                self.service
-                    .create(NewSession {
-                        id: None,
-                        parent_session_id: None,
-                        title: Some(
-                            title
-                                .clone()
-                                .unwrap_or_else(|| format!("automation/{}", job.name)),
-                        ),
-                        cwd,
-                        mode: self.default_mode,
-                        max_model_steps: self.default_max_model_steps,
-                        llm: SessionLlmSettings {
-                            model: self.default_model.clone(),
-                            reasoning: None,
-                        },
-                    })
-                    .await?
-            }
+            AutomationSession::New {
+                behavior,
+                cwd,
+                title,
+            } => match behavior {
+                AutomationNewBehavior::EveryTime => self.create_session(job, cwd, title).await?,
+                AutomationNewBehavior::Once => self.once_session(job, cwd, title).await?,
+            },
             AutomationSession::Fixed { session_id } => {
                 let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
                 self.service.load(&id).await?
@@ -340,11 +343,122 @@ impl AutomationRuntime {
         self.set_active(record.clone()).await;
 
         let endpoint = EndpointId::new();
-        let mut subscription = agent.attach(endpoint.clone()).await?;
+        let subscription = agent.attach(endpoint.clone()).await?;
         let turn_id = agent.prompt(endpoint.clone(), job.prompt.clone()).await?;
         record.turn_id = Some(turn_id.to_string());
         self.set_active(record.clone()).await;
+        Ok((agent, endpoint, subscription, turn_id))
+    }
 
+    async fn create_session(
+        &self,
+        job: &AutomationJob,
+        cwd: &Path,
+        title: &Option<String>,
+    ) -> Result<Arc<SessionAgent>> {
+        let cwd = if cwd.is_absolute() {
+            cwd.to_path_buf()
+        } else {
+            self.profile_root.join(cwd)
+        };
+        Ok(self
+            .service
+            .create(NewSession {
+                id: None,
+                parent_session_id: None,
+                title: Some(
+                    title
+                        .clone()
+                        .unwrap_or_else(|| format!("automation/{}", job.name)),
+                ),
+                cwd,
+                mode: self.default_mode,
+                max_model_steps: self.default_max_model_steps,
+                llm: SessionLlmSettings {
+                    model: self.default_model.clone(),
+                    reasoning: None,
+                },
+            })
+            .await?)
+    }
+
+    async fn once_session(
+        &self,
+        job: &AutomationJob,
+        cwd: &Path,
+        title: &Option<String>,
+    ) -> Result<Arc<SessionAgent>> {
+        let mut bindings = self.bindings.lock().await;
+        if let Some(session_id) = bindings.sessions.get(&job.name) {
+            let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
+            match self.service.load(&id).await {
+                Ok(agent) => return Ok(agent),
+                Err(AgentServiceError::SessionNotFound(_)) => {
+                    bindings.sessions.remove(&job.name);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let agent = self.create_session(job, cwd, title).await?;
+        bindings
+            .sessions
+            .insert(job.name.clone(), agent.id().to_string());
+        if let Err(error) = write_bindings(&self.bindings_path, &bindings).await {
+            bindings.sessions.remove(&job.name);
+            let _ = self.service.delete(agent.id()).await;
+            return Err(error);
+        }
+        Ok(agent)
+    }
+
+    async fn run_job(
+        self: &Arc<Self>,
+        mut record: AutomationRunRecord,
+        job: AutomationJob,
+        caller: Option<SessionId>,
+    ) {
+        let result = match self.start_execution(&job, &mut record).await {
+            Ok((agent, endpoint, subscription, turn_id)) => {
+                let mut execution = AutomationExecution {
+                    record,
+                    agent,
+                    endpoint,
+                    subscription,
+                    turn_id,
+                };
+                let result = self.monitor_execution(&mut execution).await;
+                record = execution.record;
+                result
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            record.status = AutomationRunStatus::Failed;
+            record.error = Some(format!("{error:#}"));
+            tracing::error!(
+                event = "automation.job_failed",
+                job = %record.job,
+                run_id = %record.run_id,
+                error = %format!("{error:#}"),
+                "automation job failed"
+            );
+        }
+        record.finished_at = Some(Utc::now().to_rfc3339());
+        self.clear_active(&record.run_id).await;
+        if let Some(caller) = caller {
+            self.deliver_result(caller, &record).await;
+        }
+    }
+
+    async fn monitor_execution(&self, execution: &mut AutomationExecution) -> Result<()> {
+        let AutomationExecution {
+            record,
+            agent,
+            endpoint,
+            subscription,
+            turn_id,
+        } = execution;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
@@ -358,9 +472,9 @@ impl AutomationRuntime {
                     };
                     match event.payload {
                         SessionEventPayload::AssistantCompleted { turn_id: event_turn, content, .. }
-                            if event_turn == turn_id => record.response = content,
+                            if event_turn == *turn_id => record.response = content,
                         SessionEventPayload::PermissionRequested { turn_id: event_turn, permission }
-                            if event_turn == turn_id => {
+                            if event_turn == *turn_id => {
                                 agent.respond_permission(
                                     endpoint.clone(),
                                     permission.request_id,
@@ -371,21 +485,47 @@ impl AutomationRuntime {
                                 ).await?;
                             }
                         SessionEventPayload::TurnCompleted { turn_id: event_turn }
-                            if event_turn == turn_id => {
+                            if event_turn == *turn_id => {
                                 record.status = AutomationRunStatus::Completed;
                                 return Ok(());
                             }
                         SessionEventPayload::TurnCancelled { turn_id: event_turn }
-                            if event_turn == turn_id => {
+                            if event_turn == *turn_id => {
                                 record.status = AutomationRunStatus::Cancelled;
                                 return Ok(());
                             }
                         SessionEventPayload::TurnFailed { turn_id: event_turn, error }
-                            if event_turn == turn_id => bail!(error),
+                            if event_turn == *turn_id => bail!(error),
                         _ => {}
                     }
                 }
             }
+        }
+    }
+
+    async fn deliver_result(&self, caller: SessionId, record: &AutomationRunRecord) {
+        let notification = automation_result_notification(record);
+        let agent = match self.service.load(&caller).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::error!(
+                    event = "automation.caller_load_failed",
+                    caller_session_id = %caller,
+                    run_id = %record.run_id,
+                    error = %format!("{error:#}"),
+                    "load automation caller failed"
+                );
+                return;
+            }
+        };
+        if let Err(error) = agent.notify_internal(notification).await {
+            tracing::error!(
+                event = "automation.result_delivery_failed",
+                caller_session_id = %caller,
+                run_id = %record.run_id,
+                error = %format!("{error:#}"),
+                "deliver automation result failed"
+            );
         }
     }
 
@@ -400,6 +540,45 @@ impl AutomationRuntime {
     async fn clear_active(&self, run_id: &str) {
         self.state.lock().await.active.remove(run_id);
     }
+}
+
+fn automation_result_notification(record: &AutomationRunRecord) -> String {
+    format!(
+        "<automation_result>\n{}\n</automation_result>",
+        serde_json::json!({
+            "run_id": record.run_id,
+            "job": record.job,
+            "session_id": record.session_id,
+            "turn_id": record.turn_id,
+            "status": record.status,
+            "content": record.response,
+            "error": record.error,
+        })
+    )
+}
+
+fn read_bindings(path: &Path) -> Result<AutomationBindings> {
+    if !path.is_file() {
+        return Ok(AutomationBindings::default());
+    }
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("read automation bindings from {}", path.display()))?;
+    serde_yaml::from_str(&source)
+        .with_context(|| format!("parse automation bindings from {}", path.display()))
+}
+
+async fn write_bindings(path: &Path, bindings: &AutomationBindings) -> Result<()> {
+    let source = serde_yaml::to_string(bindings)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension(format!("yaml.{}.tmp", Uuid::new_v4()));
+    tokio::fs::write(&temporary, source).await?;
+    if tokio::fs::try_exists(path).await? {
+        tokio::fs::remove_file(path).await?;
+    }
+    tokio::fs::rename(temporary, path).await?;
+    Ok(())
 }
 
 pub fn parse_config(value: serde_yaml::Value) -> Result<AutomationConfig> {
@@ -490,6 +669,56 @@ fn default_cwd() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use dwo_agent_service::{
+        CompactionView, ContextMessage, MemorySessionRepository, ModelClient, ModelClientError,
+        ModelLimits, ModelReply, ModelSelection, ModelStreamEvent, SummaryReply,
+    };
+    use serde_json::Value;
+    use tokio::sync::mpsc;
+
+    struct UnusedModel;
+
+    #[async_trait]
+    impl ModelClient for UnusedModel {
+        fn model_limits(&self, _model: &str) -> Result<ModelLimits, ModelClientError> {
+            Ok(ModelLimits {
+                context_window_tokens: 16_000,
+                max_output_tokens: 1_000,
+                max_input_tokens: 15_000,
+                compact_trigger_tokens: 12_000,
+            })
+        }
+
+        async fn stream_turn(
+            &self,
+            _selection: ModelSelection,
+            _messages: &[ContextMessage],
+            _tools: &[Value],
+            _events: mpsc::UnboundedSender<ModelStreamEvent>,
+            _cancellation: &CancellationToken,
+        ) -> Result<ModelReply, ModelClientError> {
+            unreachable!("once-session resolution does not call the model")
+        }
+
+        async fn complete(
+            &self,
+            _selection: ModelSelection,
+            _messages: Vec<ContextMessage>,
+            _cancellation: CancellationToken,
+        ) -> Result<ModelReply, ModelClientError> {
+            unreachable!("once-session resolution does not call the model")
+        }
+
+        async fn summarize(
+            &self,
+            _selection: ModelSelection,
+            _view: CompactionView,
+            _cancellation: CancellationToken,
+        ) -> Result<SummaryReply, ModelClientError> {
+            unreachable!("once-session resolution does not call the model")
+        }
+    }
 
     #[test]
     fn parses_new_and_fixed_jobs() {
@@ -499,7 +728,7 @@ enabled: true
 jobs:
   - name: fresh
     schedule: { cron: "0 9 * * *", timezone: Asia/Shanghai }
-    session: { mode: new, cwd: projects/demo }
+    session: { mode: new, behavior: once, cwd: projects/demo }
     prompt: report status
   - name: fixed
     schedule: { cron: "*/5 * * * *" }
@@ -511,7 +740,10 @@ jobs:
         validate_config(&config).unwrap();
         assert!(matches!(
             config.jobs[0].session,
-            AutomationSession::New { .. }
+            AutomationSession::New {
+                behavior: AutomationNewBehavior::Once,
+                ..
+            }
         ));
         assert!(matches!(
             config.jobs[1].session,
@@ -536,5 +768,109 @@ jobs:
             jobs: Vec::new(),
         };
         assert!(build_next_runs(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_session_requires_an_explicit_behavior() {
+        let error = serde_yaml::from_str::<AutomationSession>("mode: new\ncwd: .\n").unwrap_err();
+        assert!(error.to_string().contains("behavior"));
+    }
+
+    #[tokio::test]
+    async fn automation_bindings_round_trip() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runtime/automation.yaml");
+        let mut bindings = AutomationBindings::default();
+        bindings
+            .sessions
+            .insert("daily-report".to_string(), "session-test".to_string());
+        write_bindings(&path, &bindings).await.unwrap();
+        let loaded = read_bindings(&path).unwrap();
+        assert_eq!(loaded.sessions, bindings.sessions);
+    }
+
+    #[tokio::test]
+    async fn once_behavior_reuses_the_persisted_session_after_runtime_restart() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("profile.yaml"),
+            "automation: { enabled: false, jobs: [] }\n",
+        )
+        .unwrap();
+        let service = Arc::new(AgentService::new(
+            Arc::new(MemorySessionRepository::default()),
+            Arc::new(UnusedModel),
+            dwo_tools::PolicyConfig::default(),
+        ));
+        let job = AutomationJob {
+            name: "sticky".to_string(),
+            enabled: true,
+            schedule: AutomationSchedule {
+                cron: "0 9 * * *".to_string(),
+                timezone: "Asia/Shanghai".to_string(),
+            },
+            session: AutomationSession::New {
+                behavior: AutomationNewBehavior::Once,
+                cwd: PathBuf::from("."),
+                title: None,
+            },
+            prompt: "continue".to_string(),
+        };
+        let build_runtime = || {
+            AutomationRuntime::new(
+                service.clone(),
+                root.path().to_path_buf(),
+                AutomationConfig {
+                    enabled: false,
+                    jobs: vec![job.clone()],
+                },
+                "test-model".to_string(),
+                SessionMode::Watch,
+                10,
+                CancellationToken::new(),
+            )
+            .unwrap()
+        };
+
+        let first_runtime = build_runtime();
+        let first = first_runtime
+            .once_session(&job, Path::new("."), &None)
+            .await
+            .unwrap();
+        drop(first_runtime);
+        let second = build_runtime()
+            .once_session(&job, Path::new("."), &None)
+            .await
+            .unwrap();
+
+        assert_eq!(first.id(), second.id());
+        assert_eq!(service.list().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn automation_result_contains_terminal_state_and_ids() {
+        let notification = automation_result_notification(&AutomationRunRecord {
+            run_id: "run-test".to_string(),
+            job: "daily-report".to_string(),
+            session_id: Some("session-test".to_string()),
+            turn_id: Some("turn-test".to_string()),
+            status: AutomationRunStatus::Failed,
+            scheduled: false,
+            started_at: "2026-08-01T00:00:00Z".to_string(),
+            finished_at: Some("2026-08-01T00:00:01Z".to_string()),
+            response: "partial response".to_string(),
+            error: Some("model failed".to_string()),
+        });
+        let json = notification
+            .strip_prefix("<automation_result>\n")
+            .and_then(|value| value.strip_suffix("\n</automation_result>"))
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["run_id"], "run-test");
+        assert_eq!(value["session_id"], "session-test");
+        assert_eq!(value["turn_id"], "turn-test");
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["content"], "partial response");
+        assert_eq!(value["error"], "model failed");
     }
 }

@@ -350,4 +350,23 @@ mod tests {
         .unwrap_err();
         assert!(error.message.contains("between 1 and 500"));
     }
+
+    #[test]
+    fn read_file_accepts_a_unicode_character_offset() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id": "call-offset",
+            "name": "read_file",
+            "arguments": {"path":"big.html", "cursor":8, "line_count":3, "offset":12000},
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed.call,
+            ToolCall::ReadFile(ReadFileArgs {
+                cursor: 8,
+                line_count: 3,
+                offset: 12000,
+                ..
+            })
+        ));
+    }
 }

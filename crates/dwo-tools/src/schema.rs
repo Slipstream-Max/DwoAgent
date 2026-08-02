@@ -11,7 +11,7 @@ pub fn read_file_schema() -> Value {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a selected range from a UTF-8 text file, or add a PNG, JPEG, GIF, or WebP image directly to model context. Lines longer than 20000 bytes are truncated keeping head and tail, matching terminal output truncation; truncated lines are listed in truncated_lines. Page through a long line with offset and line_count 1; the result reports offset, line_chars, and remaining_chars. Examples: {\"path\":\"src/main.rs\"} reads the first 500 lines; {\"path\":\"big.html\",\"cursor\":3844,\"line_count\":1,\"offset\":300000} reads line 3844 starting at character 300000.",
+            "description": "Read UTF-8 text or add a PNG, JPEG, GIF, or WebP image to model context. Text output is contiguous and capped at 20000 UTF-8 bytes across the entire result. Start at a 1-based line with cursor and an optional 0-based Unicode character offset. If more text remains, pass the returned next_cursor and next_offset unchanged to continue.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -22,7 +22,8 @@ pub fn read_file_schema() -> Value {
                     "cursor": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional 1-based start line. Continue with the previous end_line + 1."
+                        "default": 1,
+                        "description": "Optional 1-based start line. Defaults to 1. For continuation, use the returned next_cursor."
                     },
                     "line_count": {
                         "type": "integer",
@@ -35,7 +36,7 @@ pub fn read_file_schema() -> Value {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
-                        "description": "Optional 0-based character offset into the single line at cursor. Requires line_count 1; use it to page through lines longer than 20000 bytes."
+                        "description": "Optional 0-based Unicode character offset within cursor. Defaults to 0. For continuation, use the returned next_offset."
                     }
                 },
                 "required": ["path"],
@@ -91,16 +92,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_file_schema_accepts_optional_line_count() {
+    fn read_file_schema_describes_line_and_offset_paging() {
         let schema = read_file_schema();
         let parameters = &schema["function"]["parameters"];
         assert_eq!(parameters["required"], json!(["path"]));
         assert_eq!(parameters["additionalProperties"], false);
         assert!(parameters["properties"].get("path").is_some());
         assert!(parameters["properties"].get("cursor").is_some());
+        assert_eq!(parameters["properties"]["cursor"]["default"], 1);
         assert_eq!(parameters["properties"]["line_count"]["minimum"], 1);
         assert_eq!(parameters["properties"]["line_count"]["maximum"], 500);
         assert_eq!(parameters["properties"]["line_count"]["default"], 500);
-        assert!(parameters["properties"].get("next_cursor").is_none());
+        assert_eq!(parameters["properties"]["offset"]["minimum"], 0);
+        assert_eq!(parameters["properties"]["offset"]["default"], 0);
     }
 }

@@ -298,23 +298,20 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
             }
         }
         AutomationCommand::Run { job, json } => {
-            let value = ipc::request(config_path, "automation.run", json!({"job": job})).await?;
+            let value = ipc::request(
+                config_path,
+                "automation.run",
+                json!({"job": job, "caller_session_id": current_session_id()}),
+            )
+            .await?;
             if json {
                 render::write_value(&value)?;
             } else {
                 let record: AutomationRunRecord = serde_json::from_value(value)?;
                 output::line(format_args!(
-                    "{}  {:?}  session={}",
-                    record.job,
-                    record.status,
-                    record.session_id.as_deref().unwrap_or("-")
+                    "{}  {:?}  run={}",
+                    record.job, record.status, record.run_id
                 ))?;
-                if let Some(error) = record.error {
-                    output::line(format_args!("error: {error}"))?;
-                }
-                if !record.response.is_empty() {
-                    output::line(format_args!("\n{}", record.response))?;
-                }
             }
         }
     }

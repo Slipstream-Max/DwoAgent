@@ -48,7 +48,7 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 | `resource/prompts/` | 是 | System prompt 和 profile 级规则。 |
 | `resource/skills/` | 是 | 本地 skill。 |
 | `resource/mcp.json` | 是 | MCP server。 |
-| `runtime/` | 通常不需要 | Session、附件、catalog、OAuth 和日志。 |
+| `runtime/` | 通常不需要 | Session、附件、catalog、OAuth、automation sticky binding 和日志。 |
 | `channels/` | 由命令管理 | 绑定信息和当前选择的 session。 |
 
 ## 完整 profile.yaml
@@ -231,6 +231,7 @@ automation:
         timezone: Asia/Shanghai
       session:
         mode: new
+        behavior: every_time
         cwd: projects/demo
       prompt: 检查项目状态。
 ```
@@ -304,6 +305,7 @@ dwo mcp auth <server> [--logout]
 | 文件 | 内容 |
 | --- | --- |
 | `channels/<channel>/runtime.yaml` | 当前选择的 session 等运行状态。 |
+| `runtime/automation.yaml` | `new + once` automation job 的 sticky session 绑定。 |
 | `channels/<channel>/secret.yaml` | 绑定用户和私聊目标。 |
 | `runtime/channel-capabilities/<channel>.md` | 已绑定 channel 提供给模型的能力说明，不含凭据。 |
 | `runtime/attachments/<channel>/...` | 从 channel 下载的图片和文件。 |

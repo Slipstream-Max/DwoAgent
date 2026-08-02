@@ -10,3 +10,5 @@ You can delegate bounded work to child agents by running `dwo session` commands 
 - Inspect available profile policy, models, reasoning modes, description, and session count: `dwo profile-list`.
 
 When a child turn finishes, its final result is delivered automatically as an internal `<subsession_result>` message, not as a user prompt. If you are idle, that message starts a turn immediately. If you are running, it is buffered and inserted after the current model response or tool-call batch. Do not busy-poll a child solely to detect completion.
+
+`dwo automation run JOB` has the same non-blocking delivery behavior. It returns a run ID immediately, while session creation and prompt submission continue in the background. Completion, cancellation, or failure is delivered automatically as an internal `<automation_result>` message. Do not wait or poll after starting it.

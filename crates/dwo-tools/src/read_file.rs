@@ -6,7 +6,8 @@ use dwo_context::{ContentBlock, MessageContent};
 use serde_json::{Map, Value, json};
 
 use crate::call::{DEFAULT_READ_FILE_LINES, ReadFileArgs};
-use crate::terminal::{DEFAULT_MODEL_CAP_BYTES, render_capped};
+
+const MAX_TEXT_OUTPUT_BYTES: usize = 20_000;
 
 pub(crate) struct ReadFileOutput {
     pub output: Value,
@@ -32,6 +33,9 @@ pub(crate) async fn execute(
         }
         if args.line_count != DEFAULT_READ_FILE_LINES {
             bail!("line_count is only valid when reading text files");
+        }
+        if args.offset != 0 {
+            bail!("offset is only valid when reading text files");
         }
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         return Ok(ReadFileOutput {
@@ -73,112 +77,145 @@ fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn text_page(text: &str, cursor: usize, line_count: usize, offset: usize) -> Result<Value> {
+    text_page_with_budget(text, cursor, line_count, offset, MAX_TEXT_OUTPUT_BYTES)
+}
+
+fn text_page_with_budget(
+    text: &str,
+    cursor: usize,
+    line_count: usize,
+    offset: usize,
+    byte_budget: usize,
+) -> Result<Value> {
+    if byte_budget == 0 {
+        bail!("text output byte budget must be positive");
+    }
     let lines = text.lines().collect::<Vec<_>>();
     let total_lines = lines.len();
     if cursor > total_lines && !(cursor == 1 && total_lines == 0) {
         bail!("cursor {cursor} is past the end of the file ({total_lines} lines)");
     }
-    let mut output = Map::new();
-    output.insert("start_line".to_string(), json!(cursor));
-    if total_lines > line_count {
-        output.insert("total_lines".to_string(), json!(total_lines));
+    if total_lines == 0 {
+        if offset != 0 {
+            bail!("offset {offset} is past the end of an empty file");
+        }
+        return Ok(json!({
+            "content": "",
+            "start_line": 1,
+            "start_offset": 0,
+            "end_line": 0,
+            "end_offset": 0,
+            "total_lines": 0,
+        }));
     }
 
-    if offset > 0 {
-        if line_count != 1 {
-            bail!("offset is only valid with line_count 1");
-        }
-        if lines.is_empty() {
-            bail!("cannot page an empty file with offset");
-        }
-        let line = lines[cursor - 1];
+    let start_line = cursor;
+    let start_offset = offset;
+    let mut line_index = cursor - 1;
+    let mut current_offset = offset;
+    let mut lines_read = 1usize;
+    let mut content = String::new();
+
+    let (end_line, end_offset, next) = loop {
+        let line = lines[line_index];
         let line_chars = line.chars().count();
-        if offset >= line_chars {
-            bail!("offset {offset} is past the end of the line ({line_chars} chars)");
+        if current_offset > line_chars {
+            bail!(
+                "offset {current_offset} is past the end of line {} ({line_chars} chars)",
+                line_index + 1
+            );
         }
-        let slice: String = line.chars().skip(offset).collect();
-        output.insert(
-            "content".to_string(),
-            json!(render_capped(slice.as_bytes(), DEFAULT_MODEL_CAP_BYTES)),
-        );
-        output.insert("end_line".to_string(), json!(cursor));
-        output.insert("offset".to_string(), json!(offset));
-        output.insert("line_chars".to_string(), json!(line_chars));
-        output.insert("remaining_chars".to_string(), json!(line_chars - offset));
-        return Ok(Value::Object(output));
-    }
 
-    let start = cursor.saturating_sub(1);
-    let end = start.saturating_add(line_count).min(total_lines);
-    let mut truncated_lines = Vec::new();
-    let content = lines[start..end]
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            if line.len() > DEFAULT_MODEL_CAP_BYTES {
-                truncated_lines.push(json!({
-                    "line": start + index + 1,
-                    "chars": line.chars().count(),
-                }));
+        if current_offset == line_chars {
+            if line_index + 1 == total_lines {
+                break (line_index + 1, line_chars, None);
             }
-            render_capped(line.as_bytes(), DEFAULT_MODEL_CAP_BYTES)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+            if content.len() == byte_budget {
+                break (
+                    line_index + 1,
+                    line_chars,
+                    Some((line_index + 1, line_chars)),
+                );
+            }
+            content.push('\n');
+            let completed_line = line_index + 1;
+            line_index += 1;
+            current_offset = 0;
+            if content.len() == byte_budget {
+                break (completed_line, line_chars, Some((line_index + 1, 0)));
+            }
+            if lines_read == line_count {
+                break (completed_line, line_chars, Some((line_index + 1, 0)));
+            }
+            lines_read += 1;
+            continue;
+        }
+
+        let byte_offset = char_offset_to_byte(line, current_offset);
+        let suffix = &line[byte_offset..];
+        let available = byte_budget - content.len();
+        let chunk = utf8_prefix(suffix, available);
+        content.push_str(chunk);
+        let consumed_chars = chunk.chars().count();
+        current_offset += consumed_chars;
+
+        if current_offset < line_chars {
+            break (
+                line_index + 1,
+                current_offset,
+                Some((line_index + 1, current_offset)),
+            );
+        }
+
+        if line_index + 1 == total_lines {
+            break (line_index + 1, current_offset, None);
+        }
+        if lines_read == line_count || content.len() == byte_budget {
+            break (
+                line_index + 1,
+                current_offset,
+                Some((line_index + 1, current_offset)),
+            );
+        }
+        content.push('\n');
+        let completed_line = line_index + 1;
+        line_index += 1;
+        current_offset = 0;
+        if content.len() == byte_budget {
+            break (completed_line, line_chars, Some((line_index + 1, 0)));
+        }
+        lines_read += 1;
+    };
+
+    let mut output = Map::new();
     output.insert("content".to_string(), json!(content));
-    output.insert("end_line".to_string(), json!(end));
-    if !truncated_lines.is_empty() {
-        output.insert("truncated_lines".to_string(), json!(truncated_lines));
+    output.insert("start_line".to_string(), json!(start_line));
+    output.insert("start_offset".to_string(), json!(start_offset));
+    output.insert("end_line".to_string(), json!(end_line));
+    output.insert("end_offset".to_string(), json!(end_offset));
+    output.insert("total_lines".to_string(), json!(total_lines));
+    if let Some((next_cursor, next_offset)) = next {
+        output.insert("next_cursor".to_string(), json!(next_cursor));
+        output.insert("next_offset".to_string(), json!(next_offset));
     }
     Ok(Value::Object(output))
 }
 
-#[test]
-fn offset_pages_through_a_long_line() {
-    let text = "0123456789".repeat(10);
-    let page = text_page(&text, 1, 1, 50).unwrap();
-    assert!(page["content"].as_str().unwrap().starts_with("01234"));
-    assert_eq!(page["offset"], 50);
-    assert_eq!(page["line_chars"], 100);
-    assert_eq!(page["remaining_chars"], 50);
+fn char_offset_to_byte(text: &str, offset: usize) -> usize {
+    text.char_indices()
+        .nth(offset)
+        .map_or(text.len(), |(index, _)| index)
 }
 
-#[test]
-fn offset_requires_single_line_and_valid_range() {
-    let text = "short\n";
-    assert!(text_page(&text, 1, 2, 10).is_err());
-    assert!(text_page(&text, 1, 1, 100).is_err());
-    assert!(text_page("", 1, 1, 10).is_err());
-}
-
-#[test]
-fn reports_truncated_lines_metadata() {
-    let text = format!("{}short", "x".repeat(50_000));
-    let page = text_page(&text, 1, 1, 0).unwrap();
-    assert_eq!(
-        page["truncated_lines"],
-        json!([{"line": 1, "chars": 50_005}])
-    );
-
-    let short = text_page("fine\n", 1, 1, 0).unwrap();
-    assert!(short.get("truncated_lines").is_none());
-}
-
-#[test]
-fn truncates_long_lines_like_terminal_output() {
-    let text = format!("HEAD{}TAIL", "x".repeat(50_000));
-    let page = text_page(&text, 1, 1, 0).unwrap();
-    let content = page["content"].as_str().unwrap();
-    assert!(content.starts_with("HEAD"));
-    assert!(content.ends_with("TAIL"));
-    assert!(content.contains("output omitted"));
-    assert!(content.len() <= DEFAULT_MODEL_CAP_BYTES);
-}
-
-#[test]
-fn keeps_short_lines_untouched() {
-    let page = text_page("short line\n", 1, 1, 0).unwrap();
-    assert_eq!(page["content"], "short line");
+fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 #[cfg(test)]
@@ -186,27 +223,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pages_text_and_only_reports_total_for_long_files() {
+    fn pages_text_by_line_count_with_explicit_next_position() {
         let short = text_page("one\ntwo\n", 1, 500, 0).unwrap();
         assert_eq!(
             short,
-            json!({"content":"one\ntwo", "start_line":1, "end_line":2})
+            json!({
+                "content":"one\ntwo",
+                "start_line":1,
+                "start_offset":0,
+                "end_line":2,
+                "end_offset":3,
+                "total_lines":2,
+            })
         );
 
-        let long = (1..=1203)
+        let long = (1..=6)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let first = text_page(&long, 1, 500, 0).unwrap();
+        let first = text_page(&long, 1, 3, 0).unwrap();
+        assert_eq!(first["content"], "line 1\nline 2\nline 3");
         assert_eq!(first["start_line"], 1);
-        assert_eq!(first["end_line"], 500);
-        assert_eq!(first["total_lines"], 1203);
-        assert!(first.get("line_count").is_none());
-        assert!(first.get("next_cursor").is_none());
+        assert_eq!(first["end_line"], 3);
+        assert_eq!(first["next_cursor"], 3);
+        assert_eq!(first["next_offset"], 6);
 
-        let next = text_page(&long, 501, 500, 0).unwrap();
-        assert_eq!(next["start_line"], 501);
-        assert_eq!(next["end_line"], 1000);
+        let next = text_page(&long, 3, 3, 6).unwrap();
+        assert_eq!(next["content"], "\nline 4\nline 5");
+        assert_eq!(next["next_cursor"], 5);
+        assert_eq!(next["next_offset"], 6);
     }
 
     #[test]
@@ -219,7 +264,57 @@ mod tests {
         assert_eq!(page["content"], "line 20\nline 21\nline 22");
         assert_eq!(page["start_line"], 20);
         assert_eq!(page["end_line"], 22);
+        assert_eq!(page["end_offset"], 7);
         assert_eq!(page["total_lines"], 100);
+    }
+
+    #[test]
+    fn byte_budget_is_global_and_pages_a_unicode_line_without_loss() {
+        let text = format!("prefix:{}:suffix", "界".repeat(30));
+        let mut cursor = 1usize;
+        let mut offset = 0usize;
+        let mut rebuilt = String::new();
+        loop {
+            let page = text_page_with_budget(&text, cursor, 500, offset, 19).unwrap();
+            let content = page["content"].as_str().unwrap();
+            assert!(content.len() <= 19);
+            rebuilt.push_str(content);
+            let Some(next_cursor) = page.get("next_cursor").and_then(Value::as_u64) else {
+                break;
+            };
+            cursor = next_cursor as usize;
+            offset = page["next_offset"].as_u64().unwrap() as usize;
+        }
+        assert_eq!(rebuilt, text);
+    }
+
+    #[test]
+    fn starts_at_a_character_offset_and_can_continue_across_lines() {
+        let page = text_page_with_budget("alpha\n世界\nomega", 1, 3, 2, 11).unwrap();
+        assert_eq!(page["content"], "pha\n世界\n");
+        assert_eq!(page["start_line"], 1);
+        assert_eq!(page["start_offset"], 2);
+        assert_eq!(page["next_cursor"], 3);
+        assert_eq!(page["next_offset"], 0);
+    }
+
+    #[test]
+    fn rejects_offsets_past_the_selected_line() {
+        assert!(text_page("short", 1, 1, 6).is_err());
+        assert!(text_page("", 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn line_count_includes_empty_and_boundary_start_lines() {
+        let empty_start = text_page("\none\ntwo", 1, 1, 0).unwrap();
+        assert_eq!(empty_start["content"], "\n");
+        assert_eq!(empty_start["next_cursor"], 2);
+        assert_eq!(empty_start["next_offset"], 0);
+
+        let boundary_start = text_page("one\ntwo\nthree", 1, 2, 3).unwrap();
+        assert_eq!(boundary_start["content"], "\ntwo");
+        assert_eq!(boundary_start["next_cursor"], 2);
+        assert_eq!(boundary_start["next_offset"], 3);
     }
 
     #[test]
@@ -227,5 +322,29 @@ mod tests {
         assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
         assert_eq!(image_mime_type(b"GIF89arest"), Some("image/gif"));
         assert_eq!(image_mime_type(b"RIFFxxxxWEBPrest"), Some("image/webp"));
+    }
+
+    #[tokio::test]
+    async fn images_reject_text_paging_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("image.bin"),
+            b"\x89PNG\r\n\x1a\nimage",
+        )
+        .unwrap();
+        let error = execute(
+            ReadFileArgs {
+                path: PathBuf::from("image.bin"),
+                cursor: 1,
+                line_count: DEFAULT_READ_FILE_LINES,
+                offset: 1,
+            },
+            directory.path(),
+            true,
+        )
+        .await
+        .err()
+        .expect("image offset should fail");
+        assert!(error.to_string().contains("offset is only valid"));
     }
 }

@@ -2317,7 +2317,7 @@ async fn filesystem_delete_survives_service_restart() {
 }
 
 #[tokio::test]
-async fn unified_config_persists_mode_model_and_reasoning() {
+async fn model_change_persists_mode_and_model_but_resets_reasoning() {
     let dir = tempfile::tempdir().unwrap();
     let service = AgentService::new(
         Arc::new(MemorySessionRepository::default()),
@@ -2359,7 +2359,7 @@ async fn unified_config_persists_mode_model_and_reasoning() {
         .config();
     assert_eq!(config.mode, SessionMode::Watch);
     assert_eq!(config.model, "next-model");
-    assert_eq!(config.reasoning.as_deref(), Some("high"));
+    assert_eq!(config.reasoning, None);
 }
 
 #[tokio::test]

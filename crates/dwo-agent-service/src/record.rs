@@ -193,6 +193,9 @@ impl SessionRecord {
                     return Err("model must not be empty".to_string());
                 }
                 self.llm.model = model.to_string();
+                // Reasoning modes belong to the selected model. Resolve the new
+                // model's default when config options are rebuilt.
+                self.llm.reasoning = None;
             }
             SessionConfigUpdate::Reasoning(reasoning) => {
                 self.llm.reasoning = reasoning

@@ -1,6 +1,7 @@
 //! Standalone multi-session agent daemon core for the dwoagent rewrite.
 
 mod agent_loop;
+pub mod atomic_file;
 mod error;
 mod events;
 mod permission;
@@ -25,8 +26,8 @@ pub use dwo_model_client::{
 pub use dwo_tools::{ConfirmationDecision, ConfirmationRequest, SessionMode};
 pub use error::AgentServiceError;
 pub use events::{
-    ActiveToolCall, ClientTranscriptEvent, PendingPermission, RuntimePhase, SessionEvent,
-    SessionEventPayload, SessionSnapshot, SessionStatusSnapshot, SessionSubscription,
+    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, PendingPermission, RuntimePhase,
+    SessionEvent, SessionEventPayload, SessionSnapshot, SessionStatusSnapshot, SessionSubscription,
     SessionUsageSnapshot,
 };
 pub use profile::{AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, load_profile};

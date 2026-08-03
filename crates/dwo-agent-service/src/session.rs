@@ -17,8 +17,8 @@ use crate::TurnId;
 use crate::agent_loop::{self, RunTurn, TurnActorMessage, TurnEvent, TurnOutcome};
 use crate::error::AgentServiceError;
 use crate::events::{
-    ActiveToolCall, ClientTranscriptEvent, RuntimePhase, SessionEvent, SessionEventPayload,
-    SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
+    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, RuntimePhase, SessionEvent,
+    SessionEventPayload, SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord, title_from_user_content};
@@ -118,14 +118,30 @@ impl SessionAgent {
         &self,
         endpoint: EndpointId,
     ) -> Result<SessionSubscription, AgentServiceError> {
+        self.attach_from(endpoint, None).await
+    }
+
+    pub async fn attach_from(
+        &self,
+        endpoint: EndpointId,
+        checkpoint_cursor: Option<usize>,
+    ) -> Result<SessionSubscription, AgentServiceError> {
         let (response, wait) = oneshot::channel();
-        self.send(Control::Attach { response }).await?;
+        self.send(Control::Attach {
+            checkpoint_cursor,
+            response,
+        })
+        .await?;
         let (snapshot, mut source) = wait
             .await
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?;
         let watermark = snapshot.seq;
-        let (events, receiver) = mpsc::unbounded_channel();
+        let (events, receiver) = mpsc::channel(256);
+        let event_session_id = self.id.clone();
+        let mut active_step = snapshot.active_step.clone();
+        let mut step_seq = watermark;
         tokio::spawn(async move {
+            let mut needs_step_snapshot = false;
             loop {
                 match source.recv().await {
                     Ok(event) if event.seq > watermark => {
@@ -136,11 +152,62 @@ impl SessionAgent {
                         ) {
                             continue;
                         }
-                        if events.send(event).is_err() {
+                        if apply_step_delta(&mut active_step, &event.payload) {
+                            step_seq = event.seq;
+                            if needs_step_snapshot {
+                                match try_send_step_snapshot(
+                                    &events,
+                                    &event.session_id,
+                                    step_seq,
+                                    active_step.as_ref(),
+                                ) {
+                                    StepSnapshotSend::Sent => needs_step_snapshot = false,
+                                    StepSnapshotSend::Full => continue,
+                                    StepSnapshotSend::Closed => break,
+                                }
+                                continue;
+                            }
+                            match events.try_send(event) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    needs_step_snapshot = true;
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            }
+                            continue;
+                        }
+                        if needs_step_snapshot {
+                            if let Some(step) = active_step.as_ref()
+                                && events
+                                    .send(SessionEvent {
+                                        seq: step_seq,
+                                        session_id: event.session_id.clone(),
+                                        payload: SessionEventPayload::StepSnapshot {
+                                            step: step.clone(),
+                                        },
+                                    })
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
+                            needs_step_snapshot = false;
+                        }
+                        update_step_checkpoint(&mut active_step, &event.payload);
+                        if events.send(event).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            event = "session.subscription_lagged",
+                            session_id = %event_session_id,
+                            skipped,
+                            "disconnect lagging session subscription; client must resync"
+                        );
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -169,6 +236,40 @@ impl SessionAgent {
         self.send(Control::Prompt {
             origin,
             content,
+            only_if_idle: false,
+            response,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
+    pub async fn try_prompt(
+        &self,
+        origin: EndpointId,
+        content: impl Into<String>,
+    ) -> Result<TurnId, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::Prompt {
+            origin,
+            content: MessageContent::text(content),
+            only_if_idle: true,
+            response,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
+    pub async fn append_internal(
+        &self,
+        turn_id: TurnId,
+        content: impl Into<String>,
+    ) -> Result<(), AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::AppendInternal {
+            turn_id,
+            content: MessageContent::text(content),
             response,
         })
         .await?;
@@ -244,6 +345,7 @@ impl SessionAgent {
 
 enum Control {
     Attach {
+        checkpoint_cursor: Option<usize>,
         response: oneshot::Sender<(SessionSnapshot, broadcast::Receiver<SessionEvent>)>,
     },
     Snapshot {
@@ -252,7 +354,13 @@ enum Control {
     Prompt {
         origin: EndpointId,
         content: MessageContent,
+        only_if_idle: bool,
         response: oneshot::Sender<Result<TurnId, AgentServiceError>>,
+    },
+    AppendInternal {
+        turn_id: TurnId,
+        content: MessageContent,
+        response: oneshot::Sender<Result<(), AgentServiceError>>,
     },
     Cancel {
         expected_turn_id: Option<TurnId>,
@@ -282,6 +390,9 @@ struct ActiveTurn {
     id: TurnId,
     cancellation: CancellationToken,
     partial_message: String,
+    partial_reasoning: String,
+    step_id: u64,
+    step_revision: u64,
     tools: Vec<ActiveToolCall>,
 }
 
@@ -318,6 +429,9 @@ enum PendingMessage {
         content: MessageContent,
         wake: bool,
         response: oneshot::Sender<Result<Option<TurnId>, AgentServiceError>>,
+    },
+    StepInternal {
+        content: MessageContent,
     },
 }
 
@@ -356,9 +470,17 @@ impl SessionActor {
 
     async fn handle_control(&mut self, control: Control) -> bool {
         match control {
-            Control::Attach { response } => {
+            Control::Attach {
+                checkpoint_cursor,
+                response,
+            } => {
                 let receiver = self.events.subscribe();
-                let _ = response.send((self.snapshot(), receiver));
+                let mut snapshot = self.snapshot();
+                if let Some(cursor) = checkpoint_cursor {
+                    let cursor = cursor.min(snapshot.transcript.len());
+                    snapshot.transcript.drain(..cursor);
+                }
+                let _ = response.send((snapshot, receiver));
             }
             Control::Snapshot { response } => {
                 let _ = response.send(self.snapshot());
@@ -366,6 +488,7 @@ impl SessionActor {
             Control::Prompt {
                 origin,
                 content,
+                only_if_idle,
                 response,
             } => {
                 if self.phase == RuntimePhase::Closing {
@@ -375,14 +498,23 @@ impl SessionActor {
                     return false;
                 }
                 if self.phase == RuntimePhase::Cancelling {
-                    let _ = response.send(Err(AgentServiceError::PromptCancelled(
-                        self.record.info.id.clone(),
-                    )));
+                    let error = if only_if_idle {
+                        AgentServiceError::SessionBusy(self.record.info.id.clone())
+                    } else {
+                        AgentServiceError::PromptCancelled(self.record.info.id.clone())
+                    };
+                    let _ = response.send(Err(error));
                     return false;
                 }
                 if self.active.is_none() {
                     let result = self.start_prompt(origin, content).await;
                     let _ = response.send(result);
+                    return false;
+                }
+                if only_if_idle {
+                    let _ = response.send(Err(AgentServiceError::SessionBusy(
+                        self.record.info.id.clone(),
+                    )));
                     return false;
                 }
                 if let Err(error) = self.validate_message_content(&content) {
@@ -394,6 +526,23 @@ impl SessionActor {
                     content,
                     response,
                 });
+            }
+            Control::AppendInternal {
+                turn_id,
+                content,
+                response,
+            } => {
+                if self
+                    .active
+                    .as_ref()
+                    .is_none_or(|active| active.id != turn_id)
+                {
+                    let _ = response.send(Err(AgentServiceError::TurnNotActive(turn_id)));
+                    return false;
+                }
+                self.pending_messages
+                    .push_back(PendingMessage::StepInternal { content });
+                let _ = response.send(Ok(()));
             }
             Control::Cancel {
                 expected_turn_id,
@@ -655,6 +804,9 @@ impl SessionActor {
             id: turn_id.clone(),
             cancellation: cancellation.clone(),
             partial_message: String::new(),
+            partial_reasoning: String::new(),
+            step_id: 1,
+            step_revision: 0,
             tools: Vec::new(),
         });
         self.phase = RuntimePhase::Running;
@@ -807,25 +959,41 @@ impl SessionActor {
     async fn handle_turn_event(&mut self, event: TurnEvent) -> bool {
         match event {
             TurnEvent::AssistantDelta { turn_id, delta } => {
-                let accepted = if let Some(active) =
+                let step = if let Some(active) =
                     self.active.as_mut().filter(|active| active.id == turn_id)
                 {
                     active.partial_message.push_str(&delta);
-                    true
+                    active.step_revision = active.step_revision.saturating_add(1);
+                    Some((active.step_id, active.step_revision))
                 } else {
-                    false
+                    None
                 };
-                if accepted {
-                    self.emit(SessionEventPayload::AssistantDelta { turn_id, delta });
+                if let Some((step_id, revision)) = step {
+                    self.emit(SessionEventPayload::AssistantDelta {
+                        turn_id,
+                        step_id,
+                        revision,
+                        delta,
+                    });
                 }
             }
             TurnEvent::AssistantReasoningDelta { turn_id, delta } => {
-                let accepted = self
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.id == turn_id);
-                if accepted {
-                    self.emit(SessionEventPayload::AssistantReasoningDelta { turn_id, delta });
+                let step = if let Some(active) =
+                    self.active.as_mut().filter(|active| active.id == turn_id)
+                {
+                    active.partial_reasoning.push_str(&delta);
+                    active.step_revision = active.step_revision.saturating_add(1);
+                    Some((active.step_id, active.step_revision))
+                } else {
+                    None
+                };
+                if let Some((step_id, revision)) = step {
+                    self.emit(SessionEventPayload::AssistantReasoningDelta {
+                        turn_id,
+                        step_id,
+                        revision,
+                        delta,
+                    });
                 }
             }
             TurnEvent::AssistantCompleted {
@@ -838,6 +1006,9 @@ impl SessionActor {
                     self.active.as_mut().filter(|active| active.id == turn_id)
                 {
                     active.partial_message.clear();
+                    active.partial_reasoning.clear();
+                    active.step_id = active.step_id.saturating_add(1);
+                    active.step_revision = 0;
                     true
                 } else {
                     false
@@ -954,6 +1125,10 @@ impl SessionActor {
                     should_continue |= wake;
                     let _ = response.send(Ok(None));
                 }
+                PendingMessage::StepInternal { content } => {
+                    messages.push(PendingContextMessage::Internal(content));
+                    should_continue = true;
+                }
             }
         }
         PendingMessageBatch {
@@ -994,6 +1169,7 @@ impl SessionActor {
                         let _ = response.send(result);
                     }
                 }
+                PendingMessage::StepInternal { .. } => {}
             }
         }
     }
@@ -1023,6 +1199,7 @@ impl SessionActor {
                 PendingMessage::Internal { response, .. } => {
                     let _ = response.send(Err(error()));
                 }
+                PendingMessage::StepInternal { .. } => {}
             }
         }
     }
@@ -1105,9 +1282,17 @@ impl SessionActor {
         SessionSnapshot {
             record: self.record.clone(),
             transcript: self.transcript.clone(),
+            checkpoint_cursor: self.transcript.len(),
             usage: self.usage_snapshot(),
             phase: self.phase,
             active_turn_id: self.active.as_ref().map(|active| active.id.clone()),
+            active_step: self.active.as_ref().map(|active| ActiveStepSnapshot {
+                turn_id: active.id.clone(),
+                step_id: active.step_id,
+                revision: active.step_revision,
+                reasoning: active.partial_reasoning.clone(),
+                response: active.partial_message.clone(),
+            }),
             partial_message: self
                 .active
                 .as_ref()
@@ -1166,6 +1351,105 @@ impl SessionActor {
             session_id: self.record.info.id.clone(),
             payload,
         });
+    }
+}
+
+fn apply_step_delta(step: &mut Option<ActiveStepSnapshot>, payload: &SessionEventPayload) -> bool {
+    let (turn_id, step_id, revision, delta, reasoning) = match payload {
+        SessionEventPayload::AssistantDelta {
+            turn_id,
+            step_id,
+            revision,
+            delta,
+        } => (turn_id, *step_id, *revision, delta, false),
+        SessionEventPayload::AssistantReasoningDelta {
+            turn_id,
+            step_id,
+            revision,
+            delta,
+        } => (turn_id, *step_id, *revision, delta, true),
+        _ => return false,
+    };
+    if step
+        .as_ref()
+        .is_none_or(|current| current.turn_id != *turn_id || current.step_id != step_id)
+    {
+        *step = Some(ActiveStepSnapshot {
+            turn_id: turn_id.clone(),
+            step_id,
+            revision: 0,
+            reasoning: String::new(),
+            response: String::new(),
+        });
+    }
+    let current = step.as_mut().expect("active step was initialized");
+    current.revision = revision;
+    if reasoning {
+        current.reasoning.push_str(delta);
+    } else {
+        current.response.push_str(delta);
+    }
+    true
+}
+
+enum StepSnapshotSend {
+    Sent,
+    Full,
+    Closed,
+}
+
+fn try_send_step_snapshot(
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: &crate::SessionId,
+    seq: u64,
+    step: Option<&ActiveStepSnapshot>,
+) -> StepSnapshotSend {
+    let Some(step) = step else {
+        return StepSnapshotSend::Sent;
+    };
+    match events.try_send(SessionEvent {
+        seq,
+        session_id: session_id.clone(),
+        payload: SessionEventPayload::StepSnapshot { step: step.clone() },
+    }) {
+        Ok(()) => StepSnapshotSend::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => StepSnapshotSend::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => StepSnapshotSend::Closed,
+    }
+}
+
+fn update_step_checkpoint(step: &mut Option<ActiveStepSnapshot>, payload: &SessionEventPayload) {
+    match payload {
+        SessionEventPayload::TurnStarted { turn_id } => {
+            *step = Some(ActiveStepSnapshot {
+                turn_id: turn_id.clone(),
+                step_id: 1,
+                revision: 0,
+                reasoning: String::new(),
+                response: String::new(),
+            });
+        }
+        SessionEventPayload::AssistantCompleted { turn_id, .. }
+            if step
+                .as_ref()
+                .is_some_and(|current| current.turn_id == *turn_id) =>
+        {
+            let current = step.as_mut().expect("matching active step exists");
+            current.step_id = current.step_id.saturating_add(1);
+            current.revision = 0;
+            current.reasoning.clear();
+            current.response.clear();
+        }
+        SessionEventPayload::TurnCompleted { turn_id }
+        | SessionEventPayload::TurnCancelled { turn_id }
+        | SessionEventPayload::TurnFailed { turn_id, .. }
+            if step
+                .as_ref()
+                .is_some_and(|current| current.turn_id == *turn_id) =>
+        {
+            *step = None;
+        }
+        _ => {}
     }
 }
 

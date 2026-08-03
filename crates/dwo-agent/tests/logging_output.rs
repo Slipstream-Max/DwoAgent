@@ -3,7 +3,9 @@ use std::process::Command;
 #[test]
 fn daemon_startup_failure_is_written_as_jsonl() {
     let profile = tempfile::tempdir().unwrap();
-    let config_path = profile.path().join("profile.yaml");
+    let root = profile.path().join(".dwoagent");
+    std::fs::create_dir(&root).unwrap();
+    let config_path = root.join("profile.yaml");
     std::fs::write(
         &config_path,
         r#"
@@ -27,14 +29,18 @@ model:
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_dwo"))
-        .args(["--config-path", config_path.to_str().unwrap(), "serve"])
+        .arg("serve")
+        .env(
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" },
+            profile.path(),
+        )
         .env_remove("DWO_LOG")
         .output()
         .unwrap();
 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    let log_dir = profile.path().join("runtime/logs");
+    let log_dir = root.join("runtime/logs");
     let files = std::fs::read_dir(&log_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())

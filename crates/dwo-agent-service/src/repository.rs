@@ -200,13 +200,7 @@ impl FsSessionRepository {
 
     async fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(value)?;
-        let temporary = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&temporary, bytes).await?;
-        if tokio::fs::try_exists(path).await? {
-            tokio::fs::remove_file(path).await?;
-        }
-        tokio::fs::rename(&temporary, path).await?;
-        Ok(())
+        crate::atomic_file::write(path, bytes).await
     }
 
     async fn read_record(session_dir: &Path) -> Result<SessionRecord> {
@@ -338,16 +332,52 @@ impl SessionRepository for FsSessionRepository {
         if !tokio::fs::try_exists(&path).await? {
             return Ok(Vec::new());
         }
-        let text = tokio::fs::read_to_string(&path).await?;
-        text.lines()
-            .map(str::trim)
+        let bytes = tokio::fs::read(&path).await?;
+        let complete_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let mut events = bytes[..complete_len]
+            .split(|byte| *byte == b'\n')
+            .map(trim_ascii)
             .filter(|line| !line.is_empty())
             .map(|line| {
-                serde_json::from_str(line)
+                serde_json::from_slice(line)
                     .with_context(|| format!("parse transcript event in {}", path.display()))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let tail = trim_ascii(&bytes[complete_len..]);
+        if !tail.is_empty() {
+            match serde_json::from_slice(tail) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "session.transcript_tail_truncated",
+                        path = %path.display(),
+                        error = %error,
+                        "truncate incomplete final transcript record"
+                    );
+                    tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .await?
+                        .set_len(complete_len as u64)
+                        .await?;
+                }
+            }
+        }
+        Ok(events)
     }
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 #[cfg(test)]
@@ -394,6 +424,8 @@ mod tests {
         repository.save(&record).await.unwrap();
         let event = ClientTranscriptEvent::new(SessionEventPayload::AssistantDelta {
             turn_id: TurnId::parse("turn-test").unwrap(),
+            step_id: 1,
+            revision: 1,
             delta: "hello".to_string(),
         });
         repository
@@ -423,6 +455,8 @@ mod tests {
                 &record.info.id,
                 &ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
                     turn_id: TurnId::parse("turn-test").unwrap(),
+                    step_id: 1,
+                    revision: 2,
                     delta: "reasoning".to_string(),
                 }),
             )
@@ -466,5 +500,75 @@ mod tests {
         assert!(repository.delete(&record.info.id).await.unwrap());
         assert!(repository.load(&record.info.id).await.unwrap().is_none());
         assert!(!root.path().join("2026").exists());
+    }
+
+    #[tokio::test]
+    async fn filesystem_repository_truncates_only_an_incomplete_transcript_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = FsSessionRepository::new(root.path()).await.unwrap();
+        let record = SessionRecord::new(
+            SessionId::new(),
+            "tail".to_string(),
+            root.path().to_path_buf(),
+            dwo_tools::SessionMode::Confirm,
+            SessionLlmSettings::default(),
+            crate::record::DEFAULT_MAX_MODEL_STEPS,
+        );
+        repository.save(&record).await.unwrap();
+        repository
+            .append_transcript_event(
+                &record.info.id,
+                &ClientTranscriptEvent::new(SessionEventPayload::TurnCompleted {
+                    turn_id: TurnId::parse("turn-test").unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        let path = repository
+            .find_dir(&record.info.id)
+            .await
+            .unwrap()
+            .join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        let complete_len = std::fs::metadata(&path).unwrap().len();
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.write_all(br#"{"recorded_at_ms":123,"payload"#)
+            .await
+            .unwrap();
+        file.flush().await.unwrap();
+
+        let events = repository.load_transcript(&record.info.id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), complete_len);
+    }
+
+    #[tokio::test]
+    async fn filesystem_repository_rejects_corruption_before_the_transcript_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = FsSessionRepository::new(root.path()).await.unwrap();
+        let record = SessionRecord::new(
+            SessionId::new(),
+            "middle".to_string(),
+            root.path().to_path_buf(),
+            dwo_tools::SessionMode::Confirm,
+            SessionLlmSettings::default(),
+            crate::record::DEFAULT_MAX_MODEL_STEPS,
+        );
+        repository.save(&record).await.unwrap();
+        let path = repository
+            .find_dir(&record.info.id)
+            .await
+            .unwrap()
+            .join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        std::fs::write(path, b"not-json\n{\"still\":\"a tail\"}").unwrap();
+
+        let error = repository
+            .load_transcript(&record.info.id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("parse transcript event"));
     }
 }

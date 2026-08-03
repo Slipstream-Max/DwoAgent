@@ -6,6 +6,8 @@ pub enum AgentServiceError {
     SessionNotFound(SessionId),
     #[error("queued prompt was cancelled: {0}")]
     PromptCancelled(SessionId),
+    #[error("session is busy: {0}")]
+    SessionBusy(SessionId),
     #[error("turn is not active: {0}")]
     TurnNotActive(TurnId),
     #[error("permission request not found: {0}")]

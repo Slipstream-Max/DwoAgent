@@ -651,12 +651,8 @@ impl Host {
         profile.validate()?;
 
         let path = self.profile_root.join("profile.yaml");
-        let temporary = path.with_extension(format!("yaml.{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&temporary, serde_yaml::to_string(&profile)?).await?;
-        if tokio::fs::try_exists(&path).await? {
-            tokio::fs::remove_file(&path).await?;
-        }
-        tokio::fs::rename(&temporary, &path).await?;
+        dwo_agent_service::atomic_file::write(&path, serde_yaml::to_string(&profile)?.into_bytes())
+            .await?;
         drop(reload);
         self.reload_profile_if_changed().await?;
         Ok(())
@@ -1191,10 +1187,16 @@ impl Host {
         &self,
         session_id: &str,
         endpoint_id: &str,
+        checkpoint_cursor: Option<usize>,
     ) -> Result<dwo_agent_service::SessionSubscription> {
         let id = SessionId::parse(session_id.to_string()).map_err(anyhow::Error::msg)?;
         let endpoint = EndpointId::parse(endpoint_id.to_string()).map_err(anyhow::Error::msg)?;
-        Ok(self.service.load(&id).await?.attach(endpoint).await?)
+        Ok(self
+            .service
+            .load(&id)
+            .await?
+            .attach_from(endpoint, checkpoint_cursor)
+            .await?)
     }
 }
 
@@ -1468,7 +1470,10 @@ mod tests {
                 "replayTurns"
             ]
         );
-        assert_eq!(yaml_keys(&document["automation"]), ["enabled", "jobs"]);
+        assert_eq!(
+            yaml_keys(&document["automation"]),
+            ["enabled", "jobs", "timeoutSeconds"]
+        );
         assert_eq!(
             yaml_keys(&document["automation"]["jobs"][0]),
             ["enabled", "name", "prompt", "schedule", "session"]
@@ -1774,7 +1779,7 @@ automation:
     }
 
     #[tokio::test]
-    async fn automation_run_returns_after_session_and_prompt_start() {
+    async fn automation_run_returns_after_the_run_is_queued() {
         let profile = tempfile::tempdir().unwrap();
         let config = write_test_profile(profile.path());
         let mut source = std::fs::read_to_string(&config).unwrap();
@@ -1815,11 +1820,11 @@ automation:
         let record: crate::automation::AutomationRunRecord = serde_json::from_value(value).unwrap();
         assert_eq!(
             record.status,
-            crate::automation::AutomationRunStatus::Running
+            crate::automation::AutomationRunStatus::Queued
         );
         assert!(record.run_id.starts_with("run-"));
         assert!(record.session_id.is_some());
-        assert!(record.turn_id.is_some());
+        assert!(record.turn_id.is_none());
 
         host.shutdown.cancel();
         host.service.shutdown().await;

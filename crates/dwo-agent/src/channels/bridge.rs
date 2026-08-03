@@ -504,14 +504,16 @@ mod tests {
             SessionLlmSettings::default(),
             dwo_agent_service::DEFAULT_MAX_MODEL_STEPS,
         );
-        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (events_tx, events) = tokio::sync::mpsc::channel(8);
         let subscription = SessionSubscription {
             snapshot: SessionSnapshot {
                 record,
                 transcript: Vec::<ClientTranscriptEvent>::new(),
+                checkpoint_cursor: 0,
                 usage: SessionUsageSnapshot { used: 1, size: 2 },
                 phase: RuntimePhase::Running,
                 active_turn_id: Some(turn_id.clone()),
+                active_step: None,
                 partial_message: String::new(),
                 active_tool_calls: Vec::new(),
                 pending_permission: None,
@@ -543,6 +545,7 @@ mod tests {
                     session_id: session_id.clone(),
                     payload,
                 })
+                .await
                 .unwrap();
         }
         drop(events_tx);

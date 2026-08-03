@@ -56,6 +56,7 @@ impl RunningWebsocket {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn serve_connection(
     stream: TcpStream,
     config_path: std::path::PathBuf,

@@ -28,8 +28,6 @@ use install::{install, unregister_service};
 #[derive(Parser)]
 #[command(name = "dwo", version, about = "dwoagent host and control CLI")]
 struct Cli {
-    #[arg(long, global = true, alias = "configpath")]
-    config_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -249,15 +247,16 @@ enum AutomationSessionArg {
 
 pub(crate) async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config_path.unwrap_or(default_config_path()?);
+    let config_path = default_config_path()?;
     match cli.command {
         Command::Install { start } => {
+            let restart = stop_daemon_for_upgrade(&config_path).await?;
             install(&config_path)?;
             output::line(format_args!(
                 "Installed profile at {}",
                 config_path.display()
             ))?;
-            if start {
+            if start || restart {
                 daemon_start(&config_path).await?;
             }
         }
@@ -747,8 +746,6 @@ async fn daemon_start(config_path: &Path) -> Result<()> {
         let executable = std::env::current_exe()?;
         let mut command = ProcessCommand::new(executable);
         command
-            .arg("--config-path")
-            .arg(config_path)
             .arg("serve")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -772,6 +769,27 @@ async fn daemon_start(config_path: &Path) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("daemon process started but did not become healthy")
+}
+
+async fn stop_daemon_for_upgrade(config_path: &Path) -> Result<bool> {
+    if ipc::request(config_path, "daemon.status", json!({}))
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    let _ = ipc::request(config_path, "daemon.shutdown", json!({})).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if ipc::request(config_path, "daemon.status", json!({}))
+            .await
+            .is_err()
+        {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("daemon did not stop within 30 seconds")
 }
 
 #[cfg(windows)]
@@ -923,6 +941,7 @@ channels:
     port: 8765
 automation:
   enabled: false
+  timeoutSeconds: 900
   jobs: []
 model:
   defaultModelId: deepseek-v4-pro

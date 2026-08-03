@@ -1179,16 +1179,7 @@ async fn write_yaml(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 async fn write_text(path: &Path, source: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    tokio::fs::write(&temporary, source).await?;
-    if path.is_file() {
-        tokio::fs::remove_file(path).await?;
-    }
-    tokio::fs::rename(temporary, path).await?;
-    Ok(())
+    dwo_agent_service::atomic_file::write(path, source.as_bytes().to_vec()).await
 }
 
 #[cfg(unix)]

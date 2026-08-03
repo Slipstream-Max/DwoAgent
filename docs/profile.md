@@ -324,14 +324,3 @@ dwo mcp auth <server> [--logout]
 | `runtime/attachments/<channel>/...` | 从 channel 下载的图片和文件。 |
 
 Telegram token 和飞书 App ID/Secret 不写入 `secret.yaml`。它们始终从 `profile.yaml` 指定的环境变量读取。
-
-## 使用其他 Profile
-
-全局参数 `--config-path` 可以指定另一个 `profile.yaml`：
-
-```text
-dwo --config-path /path/to/profile.yaml daemon status
-dwo --config-path /path/to/profile.yaml acp
-```
-
-同一组 CLI 命令需要使用相同的配置路径，才能连接对应 daemon 和 session 数据。

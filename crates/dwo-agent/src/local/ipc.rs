@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::host::Host;
+
+// TODO(gui): version these DTOs and add structured errors/capabilities before Flutter consumes IPC.
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RpcRequest {
@@ -147,7 +149,14 @@ where
                 .get("endpoint_id")
                 .and_then(Value::as_str)
                 .context("endpoint_id is required")?;
-            match host.watch(session_id, endpoint_id).await {
+            let checkpoint_cursor = request
+                .params
+                .get("checkpoint_cursor")
+                .and_then(Value::as_u64)
+                .map(usize::try_from)
+                .transpose()
+                .context("checkpoint_cursor exceeds usize")?;
+            match host.watch(session_id, endpoint_id, checkpoint_cursor).await {
                 Ok(mut subscription) => {
                     tracing::info!(
                         event = "ipc.watch_attached",
@@ -169,11 +178,15 @@ where
                     )
                     .await?;
                     while let Some(event) = subscription.events.recv().await {
-                        write_json_line(
-                            &mut write,
-                            &json!({"method":"session.event", "params": event}),
+                        tokio::time::timeout(
+                            Duration::from_secs(30),
+                            write_json_line(
+                                &mut write,
+                                &json!({"method":"session.event", "params": event}),
+                            ),
                         )
-                        .await?;
+                        .await
+                        .context("session watch client stopped reading")??;
                     }
                     tracing::info!(
                         event = "ipc.watch_closed",
@@ -281,7 +294,7 @@ pub async fn subscribe(
     config_path: &Path,
     session_id: &str,
     endpoint_id: &str,
-) -> Result<(Value, mpsc::UnboundedReceiver<Value>)> {
+) -> Result<(Value, mpsc::Receiver<Value>)> {
     let endpoint = endpoint(config_path);
     let request = RpcRequest {
         id: 1,
@@ -323,7 +336,7 @@ where
 async fn subscribe_stream<S>(
     stream: S,
     request: &RpcRequest,
-) -> Result<(Value, mpsc::UnboundedReceiver<Value>)>
+) -> Result<(Value, mpsc::Receiver<Value>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -339,7 +352,7 @@ where
         bail!(error);
     }
     let snapshot = response.result.unwrap_or(Value::Null);
-    let (events, receiver) = mpsc::unbounded_channel();
+    let (events, receiver) = mpsc::channel(256);
     tokio::spawn(async move {
         let mut line = String::new();
         loop {
@@ -351,7 +364,7 @@ where
                 break;
             }
             if let Ok(value) = serde_json::from_str(&line)
-                && events.send(value).is_err()
+                && events.send(value).await.is_err()
             {
                 break;
             }

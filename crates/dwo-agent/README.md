@@ -34,7 +34,7 @@ session behavior, while rendering remains independent from channel SDK types.
 ```text
 dwo install [--start]
 dwo uninstall [--purge]
-dwo serve --config-path <profile.yaml>
+dwo serve
 dwo daemon start|stop|status
 
 dwo profile-list
@@ -299,6 +299,9 @@ an explicit ID and uses the same FIFO prompt semantics as other clients.
 
 Automation is unattended. Tool confirmation requests are denied automatically
 instead of waiting forever. Full execution remains in the target session; a
+profile-level `timeoutSeconds` limit asks an overdue turn to stop using tools
+and provide its final answer on the next model step. Runs targeting the same
+session are queued by the Automation runtime and submitted as separate turns.
 bounded `runtime/automation-runs.yaml` keeps the latest run status, session and
 turn IDs, and a 100-character answer preview. Manual `automation run` returns
 after the session and prompt have started, without waiting for completion.
@@ -309,6 +312,7 @@ completion, cancellation, or failure is delivered back as an internal
 ```yaml
 automation:
   enabled: true
+  timeoutSeconds: 900
   jobs:
     - name: daily-report
       schedule:

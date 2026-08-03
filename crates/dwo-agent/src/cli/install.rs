@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, bail};
+#[cfg(not(windows))]
 use uuid::Uuid;
 
 use super::DEFAULT_PROFILE;
@@ -43,19 +44,41 @@ fn install_executable(root: &Path) -> Result<PathBuf> {
         return Ok(destination);
     }
 
-    let temporary = bin.join(format!(".{executable_name}.{}.tmp", Uuid::new_v4()));
-    std::fs::copy(&source, &temporary)
-        .with_context(|| format!("install executable at {}", destination.display()))?;
-    if destination.exists() {
-        std::fs::remove_file(&destination)
-            .with_context(|| format!("replace executable at {}", destination.display()))?;
-    }
-    if let Err(error) = std::fs::rename(&temporary, &destination) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error)
-            .with_context(|| format!("install executable at {}", destination.display()));
-    }
+    install_executable_file(&source, &destination, executable_name)?;
     Ok(destination)
+}
+
+#[cfg(windows)]
+fn install_executable_file(source: &Path, destination: &Path, _name: &str) -> Result<()> {
+    let contents = std::fs::read(source)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match dwo_agent_service::atomic_file::write_sync(destination, &contents) {
+            Ok(()) => return Ok(()),
+            Err(error) if std::time::Instant::now() < deadline => {
+                tracing::debug!(
+                    event = "install.executable_locked",
+                    error = %format!("{error:#}"),
+                    "wait for installed executable to become replaceable"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn install_executable_file(source: &Path, destination: &Path, name: &str) -> Result<()> {
+    let temporary = destination.with_file_name(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    std::fs::copy(source, &temporary)
+        .with_context(|| format!("install executable at {}", destination.display()))?;
+    let result = std::fs::rename(&temporary, destination)
+        .with_context(|| format!("install executable at {}", destination.display()));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(windows)]
@@ -90,11 +113,7 @@ fn write_if_missing(path: &Path, content: &str) -> Result<()> {
 fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
     let root = config_path.parent().context("config path has no parent")?;
     let launcher = root.join("runtime/dwo-daemon.vbs");
-    let command = format!(
-        "\"{}\" --config-path \"{}\" serve",
-        executable.display(),
-        config_path.display()
-    );
+    let command = format!("\"{}\" serve", executable.display());
     let script = format!(
         "Set shell = CreateObject(\"WScript.Shell\")\r\nexitCode = shell.Run(\"{}\", 0, True)\r\nWScript.Quit exitCode\r\n",
         command.replace('"', "\"\"")
@@ -133,7 +152,7 @@ fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
+fn register_service(_config_path: &Path, executable: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let launch_agents = home_dir()?.join("Library/LaunchAgents");
@@ -144,11 +163,10 @@ fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.dwoagent.host</string>
-<key>ProgramArguments</key><array><string>{}</string><string>--config-path</string><string>{}</string><string>serve</string></array>
+<key>ProgramArguments</key><array><string>{}</string><string>serve</string></array>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 </dict></plist>"#,
-        executable.display(),
-        config_path.display()
+        executable.display()
     );
     std::fs::write(&plist, body)?;
     std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o600))?;

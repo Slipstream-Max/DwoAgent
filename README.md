@@ -143,13 +143,6 @@ command: dwo
 args: [acp]
 ```
 
-使用自定义 profile：
-
-```text
-command: dwo
-args: [--config-path, /path/to/profile.yaml, acp]
-```
-
 `dwo acp` 通过 stdio 接入现有 daemon，共享 session、模型配置、工具事件和权限请求。具体能力、客户端配置要点与限制见 [ACP 使用指南](docs/acp.md)。
 
 ### Channels：从聊天应用连接

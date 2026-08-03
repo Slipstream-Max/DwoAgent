@@ -85,7 +85,7 @@ fn render_running_turn_replay(snapshot: &SessionSnapshot) -> Option<String> {
             } if turn_id == active_turn_id && prompt.is_none() => {
                 prompt = Some(content.to_string());
             }
-            SessionEventPayload::AssistantReasoningDelta { turn_id, delta }
+            SessionEventPayload::AssistantReasoningDelta { turn_id, delta, .. }
                 if turn_id == active_turn_id =>
             {
                 current_reasoning.push_str(delta);
@@ -109,6 +109,11 @@ fn render_running_turn_replay(snapshot: &SessionSnapshot) -> Option<String> {
     if !current_reasoning.trim().is_empty() {
         latest_reasoning = Some(current_reasoning.trim().to_string());
     }
+    if let Some(step) = snapshot.active_step.as_ref()
+        && !step.reasoning.trim().is_empty()
+    {
+        latest_reasoning = Some(step.reasoning.trim().to_string());
+    }
 
     let mut sections = Vec::new();
     if let Some(prompt) = prompt.filter(|prompt| !prompt.trim().is_empty()) {
@@ -116,6 +121,14 @@ fn render_running_turn_replay(snapshot: &SessionSnapshot) -> Option<String> {
     }
     if let Some(reasoning) = latest_reasoning {
         sections.push(format!("Reasoning:\n{reasoning}"));
+    }
+    if let Some(response) = snapshot
+        .active_step
+        .as_ref()
+        .map(|step| step.response.trim())
+        .filter(|response| !response.is_empty())
+    {
+        sections.push(format!("Assistant:\n{response}"));
     }
     sections.push("Prompt turn is running".to_string());
     Some(sections.join("\n\n"))
@@ -353,6 +366,8 @@ mod tests {
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
                     turn_id: turn_id.clone(),
+                    step_id: 1,
+                    revision: 1,
                     delta: "old reasoning".to_string(),
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
@@ -363,16 +378,22 @@ mod tests {
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
                     turn_id: turn_id.clone(),
+                    step_id: 2,
+                    revision: 1,
                     delta: "latest ".to_string(),
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
                     turn_id: turn_id.clone(),
+                    step_id: 2,
+                    revision: 2,
                     delta: "reasoning".to_string(),
                 }),
             ],
+            checkpoint_cursor: 5,
             usage: SessionUsageSnapshot { used: 1, size: 2 },
             phase: dwo_agent_service::RuntimePhase::Running,
             active_turn_id: Some(turn_id),
+            active_step: None,
             partial_message: "ignored partial answer".to_string(),
             active_tool_calls: Vec::new(),
             pending_permission: None,

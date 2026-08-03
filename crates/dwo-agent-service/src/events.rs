@@ -34,6 +34,16 @@ pub struct SessionUsageSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveStepSnapshot {
+    pub turn_id: TurnId,
+    pub step_id: u64,
+    pub revision: u64,
+    pub reasoning: String,
+    pub response: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEvent {
     pub seq: u64,
     pub session_id: SessionId,
@@ -74,11 +84,18 @@ pub enum SessionEventPayload {
     },
     AssistantDelta {
         turn_id: TurnId,
+        step_id: u64,
+        revision: u64,
         delta: String,
     },
     AssistantReasoningDelta {
         turn_id: TurnId,
+        step_id: u64,
+        revision: u64,
         delta: String,
+    },
+    StepSnapshot {
+        step: ActiveStepSnapshot,
     },
     AssistantCompleted {
         turn_id: TurnId,
@@ -133,9 +150,11 @@ pub enum SessionEventPayload {
 pub struct SessionSnapshot {
     pub record: SessionRecord,
     pub transcript: Vec<ClientTranscriptEvent>,
+    pub checkpoint_cursor: usize,
     pub usage: SessionUsageSnapshot,
     pub phase: RuntimePhase,
     pub active_turn_id: Option<TurnId>,
+    pub active_step: Option<ActiveStepSnapshot>,
     pub partial_message: String,
     pub active_tool_calls: Vec<ActiveToolCall>,
     pub pending_permission: Option<PendingPermission>,
@@ -154,5 +173,5 @@ pub struct SessionStatusSnapshot {
 
 pub struct SessionSubscription {
     pub snapshot: SessionSnapshot,
-    pub events: mpsc::UnboundedReceiver<SessionEvent>,
+    pub events: mpsc::Receiver<SessionEvent>,
 }

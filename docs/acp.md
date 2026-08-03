@@ -31,15 +31,6 @@ Windows: C:\Users\<user>\.dwoagent\bin\dwo.exe
 macOS/Linux: /home/<user>/.dwoagent/bin/dwo
 ```
 
-指定另一个 profile 时，全局参数要放在 `acp` 之前：
-
-```json
-{
-  "command": "dwo",
-  "args": ["--config-path", "/path/to/profile.yaml", "acp"]
-}
-```
-
 不同客户端的配置文件名和 UI 不同，但最终都应启动同一个命令。客户端关闭 stdin 后，`dwo acp` 会正常退出；daemon 继续运行。
 
 ## WebSocket 客户端
@@ -107,5 +98,4 @@ Session policy 有三种：
 1. `dwo daemon status`：确认 daemon 可连接。
 2. `dwo profile-list`：确认模型和默认配置可解析。
 3. 检查客户端启动的命令是否为安装后的 `dwo ... acp`。
-4. 自定义 profile 时，确认客户端和 daemon 使用同一个 `--config-path`。
-5. 查看 `~/.dwoagent/runtime/logs/` 中的 daemon 日志。
+4. 查看 `~/.dwoagent/runtime/logs/` 中的 daemon 日志。

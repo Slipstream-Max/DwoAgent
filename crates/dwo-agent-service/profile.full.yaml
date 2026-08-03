@@ -86,6 +86,8 @@ channels:
 # Cron uses the standard five fields: minute hour day-of-month month weekday.
 automation:
   enabled: false
+  # After this many seconds, the active turn is told to stop using tools and answer.
+  timeoutSeconds: 900
   jobs:
     - name: daily-report
       enabled: true

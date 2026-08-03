@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dwo_agent_service::{
-    AgentService, ConfirmationDecision, ContentBlock, EndpointId, FsSessionRepository,
-    MemorySessionRepository, MessageContent, MessageKind, ModelLimits, NewSession, RuntimePhase,
-    SessionConfigUpdate, SessionEventPayload, SessionLlmSettings, SessionMode, SessionRepository,
+    AgentService, AgentServiceError, ConfirmationDecision, ContentBlock, EndpointId,
+    FsSessionRepository, MemorySessionRepository, MessageContent, MessageKind, ModelLimits,
+    NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload, SessionLlmSettings,
+    SessionMode, SessionRepository,
 };
 use dwo_tools::PolicyConfig;
 use serde_json::json;
@@ -25,7 +26,7 @@ fn new_session(cwd: &std::path::Path, mode: SessionMode) -> NewSession {
 }
 
 async fn wait_for_turn_end(
-    events: &mut tokio::sync::mpsc::UnboundedReceiver<dwo_agent_service::SessionEvent>,
+    events: &mut tokio::sync::mpsc::Receiver<dwo_agent_service::SessionEvent>,
 ) -> SessionEventPayload {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -464,6 +465,98 @@ async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
         snapshot.record.context.messages.last().unwrap().content,
         "replacement"
     );
+}
+
+#[tokio::test]
+async fn try_prompt_never_joins_an_active_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::delayed_text("first answer", 150),
+        ScriptedStep::text("second answer"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    let first = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    while model.requests().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let error = agent
+        .try_prompt(EndpointId::new(), "second")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentServiceError::SessionBusy(_)));
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { turn_id } if turn_id == first
+    ));
+
+    let second = agent.try_prompt(EndpointId::new(), "second").await.unwrap();
+    assert_ne!(first, second);
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { turn_id } if turn_id == second
+    ));
+    assert_eq!(model.requests().await.len(), 2);
+}
+
+#[tokio::test]
+async fn targeted_internal_message_continues_only_the_expected_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::delayed_text("not final", 100),
+        ScriptedStep::text("final answer"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    let turn = agent.prompt(EndpointId::new(), "work").await.unwrap();
+    while model.requests().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    agent
+        .append_internal(turn.clone(), "time is up; answer now")
+        .await
+        .unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { turn_id } if turn_id == turn
+    ));
+    let requests = model.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content == "time is up; answer now")
+    );
+
+    let error = agent
+        .append_internal(turn.clone(), "too late")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AgentServiceError::TurnNotActive(turn_id) if turn_id == turn
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(model.requests().await.len(), 2);
 }
 
 #[tokio::test]
@@ -1574,6 +1667,10 @@ async fn attach_while_running_returns_partial_state_then_gapless_live_events() {
     let mut attached = agent.attach(EndpointId::new()).await.unwrap();
     assert_eq!(attached.snapshot.phase, RuntimePhase::Running);
     assert_eq!(attached.snapshot.partial_message, "hel");
+    let step = attached.snapshot.active_step.as_ref().unwrap();
+    assert_eq!(step.step_id, 1);
+    assert_eq!(step.revision, 1);
+    assert_eq!(step.response, "hel");
     assert!(attached.snapshot.seq >= first_delta_seq);
 
     let next = attached.events.recv().await.unwrap();
@@ -1581,6 +1678,78 @@ async fn attach_while_running_returns_partial_state_then_gapless_live_events() {
     assert!(matches!(
         wait_for_turn_end(&mut attached.events).await,
         SessionEventPayload::TurnCompleted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn slow_observer_receives_a_full_step_snapshot_before_the_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::Response {
+        chunks: vec!["x".to_string(); 300],
+        tool_calls: Vec::new(),
+        finish_reason: dwo_agent_service::FinishReason::Stop,
+        delay_ms: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+    }]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
+    agent.prompt(EndpointId::new(), "stream").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut recovered = None;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = subscription.events.recv().await {
+            match event.payload {
+                SessionEventPayload::StepSnapshot { step } => recovered = Some(step),
+                SessionEventPayload::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let recovered = recovered.expect("slow observer must receive a step snapshot");
+    assert_eq!(recovered.step_id, 1);
+    assert_eq!(recovered.revision, 300);
+    assert_eq!(recovered.response.len(), 300);
+}
+
+#[tokio::test]
+async fn reconnect_replays_only_checkpoints_after_the_requested_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::text("answer")]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "question").await.unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let replay = agent
+        .attach_from(EndpointId::new(), Some(1))
+        .await
+        .unwrap()
+        .snapshot;
+    assert_eq!(replay.checkpoint_cursor, 2);
+    assert_eq!(replay.transcript.len(), 1);
+    assert!(matches!(
+        replay.transcript[0].payload,
+        SessionEventPayload::AssistantCompleted { .. }
     ));
 }
 

@@ -212,6 +212,7 @@ fn phase_name(phase: RuntimePhase) -> &'static str {
 
 fn run_status_name(status: AutomationRunStatus) -> &'static str {
     match status {
+        AutomationRunStatus::Queued => "queued",
         AutomationRunStatus::Running => "running",
         AutomationRunStatus::Completed => "completed",
         AutomationRunStatus::Failed => "failed",

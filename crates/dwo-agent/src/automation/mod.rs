@@ -17,13 +17,25 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
     #[serde(default)]
     pub jobs: Vec<AutomationJob>,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_seconds: default_timeout_seconds(),
+            jobs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +87,7 @@ pub enum AutomationNewBehavior {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationRunStatus {
+    Queued,
     Running,
     Completed,
     Failed,
@@ -154,6 +167,7 @@ pub struct AutomationRuntime {
     state: Mutex<RuntimeState>,
     bindings: Mutex<AutomationBindings>,
     history: Mutex<AutomationHistory>,
+    session_queues: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
 impl AutomationRuntime {
@@ -173,7 +187,10 @@ impl AutomationRuntime {
         let history_path = profile_root.join("runtime/automation-runs.yaml");
         let mut history = read_history(&history_path)?;
         for run in &mut history.runs {
-            if run.status == AutomationRunStatus::Running {
+            if matches!(
+                run.status,
+                AutomationRunStatus::Queued | AutomationRunStatus::Running
+            ) {
                 run.status = AutomationRunStatus::Failed;
                 run.finished_at = Some(Utc::now().to_rfc3339());
                 run.error =
@@ -198,6 +215,7 @@ impl AutomationRuntime {
             }),
             bindings: Mutex::new(bindings),
             history: Mutex::new(history),
+            session_queues: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -402,7 +420,7 @@ impl AutomationRuntime {
             job: job.name.clone(),
             session_id: None,
             turn_id: None,
-            status: AutomationRunStatus::Running,
+            status: AutomationRunStatus::Queued,
             scheduled,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
@@ -411,42 +429,45 @@ impl AutomationRuntime {
         };
         self.set_active(record.clone()).await;
         let mut started = record;
-        let (agent, endpoint, subscription, turn_id) =
-            match self.start_execution(&job, &mut started).await {
-                Ok(execution) => execution,
-                Err(error) => {
-                    started.status = AutomationRunStatus::Failed;
-                    started.finished_at = Some(Utc::now().to_rfc3339());
-                    started.error = Some(format!("{error:#}"));
-                    self.clear_active(&started.run_id).await;
-                    self.append_history(started).await?;
-                    return Err(error);
-                }
-            };
+        let agent = match self.resolve_session(&job).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                started.status = AutomationRunStatus::Failed;
+                started.finished_at = Some(Utc::now().to_rfc3339());
+                started.error = Some(format!("{error:#}"));
+                self.clear_active(&started.run_id).await;
+                self.append_history(started).await?;
+                return Err(error);
+            }
+        };
+        started.session_id = Some(agent.id().to_string());
+        self.set_active(started.clone()).await;
+        let session_queue = if matches!(
+            &job.session,
+            AutomationSession::New {
+                behavior: AutomationNewBehavior::EveryTime,
+                ..
+            }
+        ) {
+            Arc::new(Mutex::new(()))
+        } else {
+            let mut queues = self.session_queues.lock().await;
+            queues
+                .entry(agent.id().to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
         let returned = started.clone();
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime
-                .run_job(
-                    AutomationExecution {
-                        record: started,
-                        agent,
-                        endpoint,
-                        subscription,
-                        turn_id,
-                    },
-                    caller,
-                )
+                .run_queued_job(started, job.prompt, agent, session_queue, caller)
                 .await
         });
         Ok(returned)
     }
 
-    async fn start_execution(
-        &self,
-        job: &AutomationJob,
-        record: &mut AutomationRunRecord,
-    ) -> Result<(Arc<SessionAgent>, EndpointId, SessionSubscription, TurnId)> {
+    async fn resolve_session(&self, job: &AutomationJob) -> Result<Arc<SessionAgent>> {
         let agent = match &job.session {
             AutomationSession::New {
                 behavior,
@@ -461,15 +482,50 @@ impl AutomationRuntime {
                 self.service.load(&id).await?
             }
         };
-        record.session_id = Some(agent.id().to_string());
-        self.set_active(record.clone()).await;
+        Ok(agent)
+    }
 
+    async fn start_execution(
+        &self,
+        agent: Arc<SessionAgent>,
+        prompt: String,
+        record: &mut AutomationRunRecord,
+    ) -> Result<AutomationExecution> {
         let endpoint = EndpointId::new();
-        let subscription = agent.attach(endpoint.clone()).await?;
-        let turn_id = agent.prompt(endpoint.clone(), job.prompt.clone()).await?;
+        let mut subscription = agent.attach(endpoint.clone()).await?;
+        let turn_id = loop {
+            match agent.try_prompt(endpoint.clone(), prompt.clone()).await {
+                Ok(turn_id) => break turn_id,
+                Err(AgentServiceError::SessionBusy(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+            tokio::select! {
+                _ = self.shutdown.cancelled() => bail!("automation runtime is shutting down"),
+                event = subscription.events.recv() => {
+                    let Some(event) = event else {
+                        bail!("session event stream closed while automation waited for idle");
+                    };
+                    if !matches!(
+                        event.payload,
+                        SessionEventPayload::TurnCompleted { .. }
+                            | SessionEventPayload::TurnCancelled { .. }
+                            | SessionEventPayload::TurnFailed { .. }
+                    ) {
+                        continue;
+                    }
+                }
+            }
+        };
+        record.status = AutomationRunStatus::Running;
         record.turn_id = Some(turn_id.to_string());
         self.set_active(record.clone()).await;
-        Ok((agent, endpoint, subscription, turn_id))
+        Ok(AutomationExecution {
+            record: record.clone(),
+            agent,
+            endpoint,
+            subscription,
+            turn_id,
+        })
     }
 
     async fn create_session(
@@ -535,16 +591,38 @@ impl AutomationRuntime {
         Ok(agent)
     }
 
-    async fn run_job(
+    async fn run_queued_job(
         self: &Arc<Self>,
-        mut execution: AutomationExecution,
+        mut record: AutomationRunRecord,
+        prompt: String,
+        agent: Arc<SessionAgent>,
+        session_queue: Arc<Mutex<()>>,
         caller: Option<SessionId>,
     ) {
-        let result = self.monitor_execution(&mut execution).await;
-        let mut record = execution.record;
+        let queue = tokio::select! {
+            _ = self.shutdown.cancelled() => None,
+            guard = session_queue.lock_owned() => Some(guard),
+        };
+        let result = if queue.is_some() {
+            match self.start_execution(agent, prompt, &mut record).await {
+                Ok(mut execution) => {
+                    let result = self.monitor_execution(&mut execution).await;
+                    record = execution.record;
+                    result
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            record.status = AutomationRunStatus::Cancelled;
+            Ok(())
+        };
         if let Err(error) = result {
-            record.status = AutomationRunStatus::Failed;
-            record.error = Some(format!("{error:#}"));
+            if self.shutdown.is_cancelled() {
+                record.status = AutomationRunStatus::Cancelled;
+            } else {
+                record.status = AutomationRunStatus::Failed;
+                record.error = Some(format!("{error:#}"));
+            }
             tracing::error!(
                 event = "automation.job_failed",
                 job = %record.job,
@@ -576,12 +654,26 @@ impl AutomationRuntime {
             subscription,
             turn_id,
         } = execution;
+        let timeout_seconds = self.state.lock().await.config.timeout_seconds;
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_seconds));
+        tokio::pin!(timeout);
+        let mut timeout_sent = false;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
                     let _ = agent.cancel(Some(turn_id.clone())).await;
                     record.status = AutomationRunStatus::Cancelled;
                     return Ok(());
+                }
+                _ = &mut timeout, if !timeout_sent => {
+                    timeout_sent = true;
+                    match agent.append_internal(
+                        turn_id.clone(),
+                        automation_timeout_notification(timeout_seconds),
+                    ).await {
+                        Ok(()) | Err(AgentServiceError::TurnNotActive(_)) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 event = subscription.events.recv() => {
                     let Some(event) = event else {
@@ -685,6 +777,12 @@ fn automation_result_notification(record: &AutomationRunRecord) -> String {
     )
 }
 
+fn automation_timeout_notification(timeout_seconds: u64) -> String {
+    format!(
+        "<automation_timeout>\nThe automation time limit of {timeout_seconds} seconds has been reached. Stop using tools and provide the final answer now using the information already available.\n</automation_timeout>"
+    )
+}
+
 fn read_bindings(path: &Path) -> Result<AutomationBindings> {
     if !path.is_file() {
         return Ok(AutomationBindings::default());
@@ -697,16 +795,7 @@ fn read_bindings(path: &Path) -> Result<AutomationBindings> {
 
 async fn write_bindings(path: &Path, bindings: &AutomationBindings) -> Result<()> {
     let source = serde_yaml::to_string(bindings)?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = path.with_extension(format!("yaml.{}.tmp", Uuid::new_v4()));
-    tokio::fs::write(&temporary, source).await?;
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::remove_file(path).await?;
-    }
-    tokio::fs::rename(temporary, path).await?;
-    Ok(())
+    dwo_agent_service::atomic_file::write(path, source.into_bytes()).await
 }
 
 fn read_history(path: &Path) -> Result<AutomationHistory> {
@@ -721,16 +810,7 @@ fn read_history(path: &Path) -> Result<AutomationHistory> {
 
 async fn write_history(path: &Path, history: &AutomationHistory) -> Result<()> {
     let source = serde_yaml::to_string(history)?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = path.with_extension(format!("yaml.{}.tmp", Uuid::new_v4()));
-    tokio::fs::write(&temporary, source).await?;
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::remove_file(path).await?;
-    }
-    tokio::fs::rename(temporary, path).await?;
-    Ok(())
+    dwo_agent_service::atomic_file::write(path, source.into_bytes()).await
 }
 
 fn answer_preview(content: &str) -> String {
@@ -756,6 +836,10 @@ pub fn parse_config(value: serde_yaml::Value) -> Result<AutomationConfig> {
 }
 
 fn validate_config(config: &AutomationConfig) -> Result<()> {
+    anyhow::ensure!(
+        (1..=86_400).contains(&config.timeout_seconds),
+        "automation.timeoutSeconds must be between 1 and 86400"
+    );
     let mut names = std::collections::BTreeSet::new();
     for job in &config.jobs {
         validate_name(&job.name)?;
@@ -821,6 +905,10 @@ fn next_run(config: &AutomationSchedule) -> Result<DateTime<Utc>> {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_timeout_seconds() -> u64 {
+    900
 }
 
 fn default_timezone() -> String {
@@ -912,6 +1000,7 @@ jobs:
         )
         .unwrap();
         validate_config(&config).unwrap();
+        assert_eq!(config.timeout_seconds, 900);
         assert!(matches!(
             config.jobs[0].session,
             AutomationSession::New {
@@ -936,9 +1025,18 @@ jobs:
     }
 
     #[test]
+    fn rejects_invalid_timeout() {
+        let config: AutomationConfig =
+            serde_yaml::from_str("enabled: false\ntimeoutSeconds: 0\njobs: []\n").unwrap();
+        let error = validate_config(&config).unwrap_err();
+        assert!(error.to_string().contains("timeoutSeconds"));
+    }
+
+    #[test]
     fn disabled_config_has_no_next_runs() {
         let config = AutomationConfig {
             enabled: false,
+            timeout_seconds: default_timeout_seconds(),
             jobs: Vec::new(),
         };
         assert!(build_next_runs(&config).unwrap().is_empty());
@@ -996,6 +1094,7 @@ jobs:
                 root.path().to_path_buf(),
                 AutomationConfig {
                     enabled: false,
+                    timeout_seconds: default_timeout_seconds(),
                     jobs: vec![job.clone()],
                 },
                 "test-model".to_string(),

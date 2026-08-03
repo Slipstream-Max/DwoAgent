@@ -120,7 +120,7 @@ model:
   # Transport policy, headers and request fields stay in the model catalog.
   providers:
     deepseek:
-      # Provider type from dwo-model-client/resources/models.yaml.
+      # Provider type from dwo-model-client/resources/providers/*.yaml.
       type: deepseek
 
       # Optional complete Chat Completions URL override.

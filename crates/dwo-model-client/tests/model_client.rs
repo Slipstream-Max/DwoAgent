@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use dwo_context::{CompactionView, ContentBlock, ContextMessage, MessageContent};
 use dwo_model_client::{
-    AgentModelConfig, ConfiguredModelClient, FinishReason, ModelCatalog, ModelClient,
-    ModelClientConfig, ModelClientError, ModelSelection, ModelStreamEvent,
+    AgentModelConfig, ConfiguredModelClient, FinishReason, MaxOutputTokensField, ModelCatalog,
+    ModelClient, ModelClientConfig, ModelClientError, ModelSelection, ModelStreamEvent,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -261,6 +261,43 @@ async fn completion_uses_non_streaming_request_without_tools() {
 }
 
 #[tokio::test]
+async fn provider_selects_the_max_output_tokens_request_field() {
+    let payload = json!({
+        "choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]
+    });
+    let body = payload.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (endpoint, request_rx) = one_response_server(response).await;
+    let catalog = catalog(&endpoint).replacen(
+        "endpoint:",
+        "maxOutputTokensField: max_completion_tokens\n    endpoint:",
+        1,
+    );
+    let client = ConfiguredModelClient::from_yaml(&catalog, agent()).unwrap();
+    client
+        .complete(
+            ModelSelection {
+                model: "chat".to_string(),
+                reasoning: None,
+            },
+            vec![
+                ContextMessage::system("system"),
+                ContextMessage::user("hello"),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let request = request_rx.await.unwrap();
+    assert_eq!(request["max_completion_tokens"], 4096);
+    assert!(request.get("max_tokens").is_none());
+}
+
+#[tokio::test]
 async fn cancellation_interrupts_an_in_flight_request() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -353,6 +390,140 @@ models:
             reasoning: Some("high".to_string()),
         })
         .unwrap();
+}
+
+#[test]
+fn builtin_openai_provider_exposes_verified_model_capabilities() {
+    let catalog = ModelCatalog::builtin().unwrap();
+    let openai = &catalog.providers["openai"];
+    assert_eq!(
+        openai.max_output_tokens_field,
+        MaxOutputTokensField::MaxCompletionTokens
+    );
+
+    for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4"] {
+        let model = &openai.models[id];
+        assert_eq!(model.context_window_tokens, 1_050_000, "{id}");
+        assert_eq!(model.max_output_tokens, 128_000, "{id}");
+        assert!(model.capabilities.image_input, "{id}");
+        assert!(model.capabilities.tool_calls, "{id}");
+        assert_eq!(model.default_reasoning_mode, "medium", "{id}");
+        for effort in ["low", "medium", "high", "xhigh"] {
+            assert_eq!(model.reasoning[effort]["reasoning_effort"], effort, "{id}");
+        }
+    }
+
+    for id in ["gpt-5.6-sol", "gpt-5.6-terra"] {
+        assert_eq!(
+            openai.models[id].reasoning["max"]["reasoning_effort"],
+            "max"
+        );
+    }
+    for id in ["gpt-5.5", "gpt-5.4"] {
+        assert!(!openai.models[id].reasoning.contains_key("max"), "{id}");
+    }
+}
+
+#[test]
+fn openai_provider_instance_only_overrides_endpoint_and_credentials() {
+    let catalog = ModelCatalog::builtin().unwrap();
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+defaultModelId: gpt-5.6-terra
+providers:
+  relay:
+    type: openai
+    baseUrl: https://relay.example.com/v1/chat/completions
+    apiKeyEnv: RELAY_API_KEY
+models:
+  - modelName: gpt-5.6-terra
+    provider: relay
+    modelId: gpt-5.6-terra
+"#,
+    )
+    .unwrap();
+    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
+
+    let provider = &resolved.providers["relay"];
+    assert_eq!(
+        provider.endpoint,
+        "https://relay.example.com/v1/chat/completions"
+    );
+    assert_eq!(provider.api_key_env.as_deref(), Some("RELAY_API_KEY"));
+    assert_eq!(
+        provider.max_output_tokens_field,
+        MaxOutputTokensField::MaxCompletionTokens
+    );
+    let model = &resolved.models["gpt-5.6-terra"];
+    assert!(model.capabilities.image_input);
+    assert_eq!(model.default_reasoning_mode, "medium");
+}
+
+#[test]
+fn custom_provider_directory_adds_one_provider_per_yaml_file() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("newapi.yaml"),
+        r#"
+protocol: open_ai_chat_completions
+endpoint: https://gateway.example.com/v1/chat/completions
+maxOutputTokensField: max_completion_tokens
+models:
+  chat:
+    contextWindowTokens: 100000
+    maxOutputTokens: 4096
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    defaultReasoningMode: medium
+    reasoning:
+      medium:
+        reasoning_effort: medium
+"#,
+    )
+    .unwrap();
+
+    let mut catalog = ModelCatalog::builtin().unwrap();
+    catalog.merge_provider_directory(directory.path()).unwrap();
+    assert!(catalog.providers.contains_key("newapi"));
+
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+defaultModelId: chat
+providers:
+  relay:
+    type: newapi
+models:
+  - modelName: chat
+    provider: relay
+    modelId: chat
+"#,
+    )
+    .unwrap();
+    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
+    assert_eq!(
+        resolved.providers["relay"].max_output_tokens_field,
+        MaxOutputTokensField::MaxCompletionTokens
+    );
+}
+
+#[test]
+fn custom_provider_directory_rejects_builtin_name_collisions() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("openai.yaml"),
+        "endpoint: https://example.com/v1/chat/completions\nmodels: {}\n",
+    )
+    .unwrap();
+    let error = ModelCatalog::builtin()
+        .unwrap()
+        .merge_provider_directory(directory.path())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with a built-in provider")
+    );
 }
 
 #[test]

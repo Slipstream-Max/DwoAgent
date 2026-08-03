@@ -8,7 +8,13 @@ use serde_json::{Map, Value};
 
 use crate::ModelClientError;
 
-const BUILTIN_MODEL_CATALOG_YAML: &str = include_str!("../resources/models.yaml");
+const BUILTIN_PROVIDER_YAMLS: &[(&str, &str)] = &[
+    (
+        "deepseek",
+        include_str!("../resources/providers/deepseek.yaml"),
+    ),
+    ("openai", include_str!("../resources/providers/openai.yaml")),
+];
 const RESERVED_BODY_FIELDS: &[&str] = &[
     "model",
     "messages",
@@ -16,6 +22,7 @@ const RESERVED_BODY_FIELDS: &[&str] = &[
     "stream",
     "stream_options",
     "max_tokens",
+    "max_completion_tokens",
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +30,23 @@ const RESERVED_BODY_FIELDS: &[&str] = &[
 pub enum ProviderProtocol {
     #[default]
     OpenAiChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxOutputTokensField {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl MaxOutputTokensField {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +120,18 @@ pub struct ModelCatalog {
 
 impl ModelCatalog {
     pub fn builtin() -> Result<Self, ModelClientError> {
-        Self::from_yaml(BUILTIN_MODEL_CATALOG_YAML)
+        let mut providers = BTreeMap::new();
+        for (provider_type, source) in BUILTIN_PROVIDER_YAMLS {
+            let provider: ProviderSpec = serde_yaml::from_str(source).map_err(|error| {
+                ModelClientError::config(format!(
+                    "parse built-in provider {provider_type}: {error}"
+                ))
+            })?;
+            providers.insert((*provider_type).to_string(), provider);
+        }
+        let catalog = Self { providers };
+        catalog.validate()?;
+        Ok(catalog)
     }
 
     pub fn from_yaml(source: &str) -> Result<Self, ModelClientError> {
@@ -104,6 +139,73 @@ impl ModelCatalog {
             .map_err(|error| ModelClientError::config(error.to_string()))?;
         catalog.validate()?;
         Ok(catalog)
+    }
+
+    pub fn merge_provider_directory(
+        &mut self,
+        directory: impl AsRef<Path>,
+    ) -> Result<(), ModelClientError> {
+        let directory = directory.as_ref();
+        if !directory.exists() {
+            return Ok(());
+        }
+        if !directory.is_dir() {
+            return Err(ModelClientError::config(format!(
+                "provider catalog path is not a directory: {}",
+                directory.display()
+            )));
+        }
+
+        let mut paths = std::fs::read_dir(directory)
+            .map_err(|error| ModelClientError::config(format!("read provider catalog: {error}")))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ModelClientError::config(format!("read provider catalog: {error}")))?;
+        paths.sort();
+
+        for path in paths {
+            if !path.is_file()
+                || !path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+            {
+                continue;
+            }
+            let provider_type = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    ModelClientError::config(format!(
+                        "provider catalog filename is not valid UTF-8: {}",
+                        path.display()
+                    ))
+                })?
+                .to_string();
+            validate_identifier(&provider_type, "provider type")?;
+            if self.providers.contains_key(&provider_type) {
+                return Err(ModelClientError::config(format!(
+                    "provider type {provider_type} from {} conflicts with a built-in provider",
+                    path.display()
+                )));
+            }
+            let source = std::fs::read_to_string(&path).map_err(|error| {
+                ModelClientError::config(format!(
+                    "read provider catalog {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let provider: ProviderSpec = serde_yaml::from_str(&source).map_err(|error| {
+                ModelClientError::config(format!(
+                    "parse provider catalog {}: {error}",
+                    path.display()
+                ))
+            })?;
+            provider.validate(&provider_type)?;
+            self.providers.insert(provider_type, provider);
+        }
+
+        self.validate()
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ModelClientError> {
@@ -136,6 +238,8 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub protocol: ProviderProtocol,
     pub endpoint: String,
+    #[serde(default)]
+    pub max_output_tokens_field: MaxOutputTokensField,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -364,6 +468,7 @@ impl ModelClientConfig {
                     .base_url
                     .clone()
                     .unwrap_or_else(|| spec.endpoint.clone()),
+                max_output_tokens_field: spec.max_output_tokens_field,
                 api_key_env: agent_provider.api_key_env.clone(),
                 api_key: agent_provider.api_key.clone(),
                 headers: spec.headers.clone(),
@@ -418,6 +523,7 @@ impl ModelClientConfig {
 pub struct ProviderConfig {
     pub protocol: ProviderProtocol,
     pub endpoint: String,
+    pub max_output_tokens_field: MaxOutputTokensField,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
     pub headers: BTreeMap<String, String>,

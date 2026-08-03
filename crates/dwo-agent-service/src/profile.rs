@@ -86,10 +86,12 @@ impl LoadedAgentProfile {
     pub fn load(root: impl AsRef<Path>) -> Result<Self, AgentServiceError> {
         let root = std::fs::canonicalize(root.as_ref()).map_err(anyhow::Error::from)?;
         let config = AgentProfileConfig::load(&root)?;
-        let models = config.resolve_models(
-            &ModelCatalog::builtin()
-                .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?,
-        )?;
+        let mut catalog = ModelCatalog::builtin()
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+        catalog
+            .merge_provider_directory(root.join("resource/providers"))
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+        let models = config.resolve_models(&catalog)?;
         SystemPromptBuilder::new(Some(root.clone()), root.clone())
             .build_initial()
             .map_err(anyhow::Error::from)?;
@@ -408,5 +410,63 @@ model:
         assert!(loaded.root.is_absolute());
         assert_eq!(loaded.config.name, "coder");
         assert_eq!(loaded.models.default_model_id, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn load_profile_merges_custom_provider_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("resource/prompts")).unwrap();
+        std::fs::create_dir_all(root.path().join("resource/providers")).unwrap();
+        std::fs::write(
+            root.path().join("resource/prompts/System.md"),
+            "You are a coding agent.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("resource/providers/newapi.yaml"),
+            r#"
+endpoint: https://gateway.example.com/v1/chat/completions
+maxOutputTokensField: max_completion_tokens
+models:
+  custom-model:
+    contextWindowTokens: 100000
+    maxOutputTokens: 4096
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    defaultReasoningMode: medium
+    reasoning:
+      medium:
+        reasoning_effort: medium
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("profile.yaml"),
+            r#"
+name: coder
+description: coding agent
+policyMode: confirm
+model:
+  defaultModelId: custom
+  providers:
+    relay:
+      type: newapi
+      apiKeyEnv: NEW_API_KEY
+  models:
+    - modelName: custom
+      provider: relay
+      modelId: custom-model
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_profile(root.path()).unwrap();
+        assert_eq!(loaded.models.default_model_id, "custom");
+        assert!(loaded.models.models["custom"].capabilities.image_input);
+        assert_eq!(
+            loaded.models.providers["relay"].endpoint,
+            "https://gateway.example.com/v1/chat/completions"
+        );
     }
 }

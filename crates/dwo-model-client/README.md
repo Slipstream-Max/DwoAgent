@@ -36,10 +36,11 @@ message; there is no parallel `system_prompt` request field.
 
 ## Configuration
 
-The built-in catalog is read from `resources/models.yaml`. It owns provider
-transport policy, headers, request fields, model capabilities, and reasoning
-request parameters. The profile selects provider/model entries, supplies
-credentials, and may override a complete provider URL or model limits.
+The built-in catalog is assembled from one file per provider under
+`resources/providers/`. Each file owns one provider's transport policy,
+headers, request fields, model capabilities, limits, and reasoning request
+parameters. The profile selects provider/model entries, supplies credentials,
+and may override a complete provider URL or model limits.
 
 ```yaml
 defaultModelId: deepseek-v4-pro
@@ -64,9 +65,36 @@ models:
 One provider entry produces one shared `BaseClient`, so every model using that
 provider shares its API key, endpoint, headers, HTTP pool, and retry policy.
 Only `baseUrl`, `apiKeyEnv`, and `apiKey` are profile-level provider settings;
-headers, retry policy, and provider request fields remain catalog-owned.
+headers, retry policy, output-token field, and provider request fields remain
+catalog-owned. DeepSeek uses `max_tokens`; the OpenAI-compatible preset uses
+`max_completion_tokens`.
 Catalog provider body, catalog model body, and the selected reasoning map are
 deep-merged in that order. Reasoning never changes the model output limit.
+
+The built-in `openai` preset currently uses the Chat Completions transport. A
+NewAPI-compatible gateway can inherit it by overriding the complete endpoint:
+
+```yaml
+defaultModelId: gpt-5.6-terra
+providers:
+  newapi:
+    type: openai
+    baseUrl: https://gateway.example.com/v1/chat/completions
+    apiKeyEnv: NEW_API_KEY
+models:
+  - modelName: gpt-5.6-terra
+    provider: newapi
+    modelId: gpt-5.6-terra
+```
+
+Native Responses API transport is a separate protocol adapter; changing only
+`baseUrl` does not switch the wire format.
+
+Profiles may add provider types as individual files under
+`resource/providers/`. The filename stem becomes the provider type, so
+`resource/providers/newapi.yaml` is selected with `type: newapi`. Each file has
+the same shape as a built-in provider file and contains one provider only.
+Custom provider names may not replace built-in names.
 
 The model input budget is derived rather than configured separately:
 

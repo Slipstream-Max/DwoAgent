@@ -15,6 +15,8 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 |  |- prompts/
 |  |  |- System.md
 |  |  `- AGENTS.md
+|  |- providers/
+|  |  `- <provider-type>.yaml
 |  |- skills/
 |  |  `- <skill>/SKILL.md
 |  `- mcp.json
@@ -46,6 +48,7 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 | --- | --- | --- |
 | `profile.yaml` | 是 | 模型、默认权限、channels 和 automation。 |
 | `resource/prompts/` | 是 | System prompt 和 profile 级规则。 |
+| `resource/providers/` | 是 | 每个文件定义一个自定义模型 provider type。 |
 | `resource/skills/` | 是 | 本地 skill。 |
 | `resource/mcp.json` | 是 | MCP server。 |
 | `runtime/` | 通常不需要 | Session、附件、catalog、OAuth、automation sticky binding 和日志。 |
@@ -187,6 +190,55 @@ model:
 | `apiKey` | 可直接填写 key，使用环境变量更方便管理。 |
 
 请求 headers、retry、request body 和模型 capabilities 来自内置 catalog。Profile 可以覆盖 provider 地址和凭据。
+
+内置 catalog 按 provider 分文件维护在
+`dwo-model-client/resources/providers/`。OpenAI-compatible 网关可以继承
+`openai`，只覆盖完整的 Chat Completions URL：
+
+```yaml
+model:
+  defaultModelId: gpt-5.6-terra
+  providers:
+    newapi:
+      type: openai
+      baseUrl: https://gateway.example.com/v1/chat/completions
+      apiKeyEnv: NEW_API_KEY
+  models:
+    - modelName: gpt-5.6-terra
+      provider: newapi
+      modelId: gpt-5.6-terra
+```
+
+`openai` 当前使用 Chat Completions transport，并按 provider 配置发送
+`max_completion_tokens`；DeepSeek provider 继续发送 `max_tokens`。Responses
+API 需要独立的 protocol adapter，不能只靠修改 `baseUrl` 切换。
+
+用户自定义 provider 放在 `resource/providers/<type>.yaml`。文件名（不含扩展名）
+就是 `profile.yaml` 中引用的 `type`；文件内容只定义一个 provider，不再包含顶层
+`providers` map。例如：
+
+```yaml
+# resource/providers/newapi.yaml
+protocol: open_ai_chat_completions
+endpoint: https://gateway.example.com/v1/chat/completions
+maxOutputTokensField: max_completion_tokens
+models:
+  custom-model:
+    contextWindowTokens: 200000
+    maxOutputTokens: 32000
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    defaultReasoningMode: medium
+    reasoning:
+      low: {reasoning_effort: low}
+      medium: {reasoning_effort: medium}
+      high: {reasoning_effort: high}
+```
+
+自定义文件不能覆盖 `openai`、`deepseek` 等内置 type；需要修改时应使用新的文件名，
+再在 profile provider instance 中引用它。无效文件会使整次 profile reload 失败，
+daemon 会继续保留上一份有效配置。
 
 ### Model Alias
 

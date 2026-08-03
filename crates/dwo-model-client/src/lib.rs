@@ -10,9 +10,9 @@ mod types;
 pub use base::BaseClient;
 pub use client::ConfiguredModelClient;
 pub use config::{
-    AgentModelConfig, AgentModelEntry, AgentProviderConfig, ModelCapabilities, ModelCatalog,
-    ModelClientConfig, ModelConfig, ModelSpec, ProviderConfig, ProviderProtocol, ProviderSpec,
-    RequestPolicy,
+    AgentModelConfig, AgentModelEntry, AgentProviderConfig, MaxOutputTokensField,
+    ModelCapabilities, ModelCatalog, ModelClientConfig, ModelConfig, ModelSpec, ProviderConfig,
+    ProviderProtocol, ProviderSpec, RequestPolicy,
 };
 pub use error::ModelClientError;
 pub use types::{

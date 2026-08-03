@@ -106,7 +106,10 @@ impl BaseClient {
         if let Some(top_p) = model.top_p {
             body.insert("top_p".to_string(), json!(top_p));
         }
-        body.insert("max_tokens".to_string(), json!(model.max_output_tokens));
+        body.insert(
+            self.provider.max_output_tokens_field.as_str().to_string(),
+            json!(model.max_output_tokens),
+        );
         let mode = reasoning.unwrap_or(&model.default_reasoning_mode);
         if let Some(override_body) = model.reasoning.get(mode) {
             merge_map(&mut body, override_body);

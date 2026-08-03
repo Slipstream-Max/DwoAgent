@@ -7,7 +7,7 @@ use crate::env_watcher::DynamicEnvironmentSnapshot;
 use super::environment::EnvironmentSnapshot;
 use super::mcp::McpSnapshot;
 use super::skills::{self, SkillSnapshot};
-use super::{ChannelCapabilitySnapshot, xml_block};
+use super::{ChannelCapabilitySnapshot, xml_block, xml_escape};
 
 const FALLBACK_AGENT_PROMPT: &str =
     "You are an agent. Follow the user request and use the available tools when needed.";
@@ -83,6 +83,9 @@ pub struct SystemPromptBuilder {
     profile: Option<AgentProfilePaths>,
     cwd: PathBuf,
     tool_prompt: Option<String>,
+    subsession_prompt: Option<String>,
+    automation_prompt: Option<String>,
+    channel_prompt: Option<String>,
 }
 
 impl SystemPromptBuilder {
@@ -91,11 +94,29 @@ impl SystemPromptBuilder {
             profile: profile_root.map(AgentProfilePaths::new),
             cwd: cwd.into(),
             tool_prompt: None,
+            subsession_prompt: None,
+            automation_prompt: None,
+            channel_prompt: None,
         }
     }
 
     pub fn with_tool_prompt(mut self, tool_prompt: impl Into<String>) -> Self {
         self.tool_prompt = Some(tool_prompt.into());
+        self
+    }
+
+    pub fn with_subsession_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.subsession_prompt = Some(prompt.into());
+        self
+    }
+
+    pub fn with_automation_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.automation_prompt = Some(prompt.into());
+        self
+    }
+
+    pub fn with_channel_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.channel_prompt = Some(prompt.into());
         self
     }
 
@@ -132,7 +153,13 @@ impl SystemPromptBuilder {
             mcp: dynamic.mcp,
             environment: dynamic.environment,
         };
-        let content = render_prompt(&snapshot, self.tool_prompt.as_deref());
+        let content = render_prompt(
+            &snapshot,
+            self.tool_prompt.as_deref(),
+            self.subsession_prompt.as_deref(),
+            self.automation_prompt.as_deref(),
+            self.channel_prompt.as_deref(),
+        );
         Ok(SystemPromptBlock {
             content,
             snapshot: Some(snapshot),
@@ -190,7 +217,13 @@ impl SystemPromptBuilder {
     }
 }
 
-fn render_prompt(snapshot: &PromptSnapshot, tool_prompt: Option<&str>) -> String {
+fn render_prompt(
+    snapshot: &PromptSnapshot,
+    tool_prompt: Option<&str>,
+    subsession_prompt: Option<&str>,
+    automation_prompt: Option<&str>,
+    channel_prompt: Option<&str>,
+) -> String {
     let mut blocks = vec![xml_block("agent_prompt", &snapshot.agent_prompt)];
     if !snapshot.rules.is_empty() {
         let rules = snapshot
@@ -202,7 +235,31 @@ fn render_prompt(snapshot: &PromptSnapshot, tool_prompt: Option<&str>) -> String
         blocks.push(xml_block("rules", &rules));
     }
     if let Some(tool_prompt) = tool_prompt.filter(|prompt| !prompt.trim().is_empty()) {
-        blocks.push(format!("<tools>\n{}\n</tools>", tool_prompt.trim()));
+        blocks.push(xml_block("tools", tool_prompt));
+    }
+    if let Some(prompt) = subsession_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        blocks.push(xml_block("subsession", prompt));
+    }
+    if let Some(prompt) = automation_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        blocks.push(xml_block("automation", prompt));
+    }
+    if channel_prompt.is_some_and(|prompt| !prompt.trim().is_empty())
+        || !snapshot.channels.is_empty()
+    {
+        let mut channel_blocks = Vec::new();
+        if let Some(prompt) = channel_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+            channel_blocks.push(xml_escape(prompt.trim()));
+        }
+        channel_blocks.extend(
+            snapshot
+                .channels
+                .iter()
+                .map(ChannelCapabilitySnapshot::render),
+        );
+        blocks.push(format!(
+            "<channels>\n{}\n</channels>",
+            channel_blocks.join("\n\n")
+        ));
     }
     let skills = skills::render_catalog(&snapshot.skills);
     if !skills.is_empty() {
@@ -211,12 +268,6 @@ fn render_prompt(snapshot: &PromptSnapshot, tool_prompt: Option<&str>) -> String
     if let Some(mcp) = &snapshot.mcp {
         blocks.push(mcp.render());
     }
-    blocks.extend(
-        snapshot
-            .channels
-            .iter()
-            .map(ChannelCapabilitySnapshot::render),
-    );
     blocks.push(snapshot.environment.render());
     format!("<agent_context>\n{}\n</agent_context>", blocks.join("\n\n"))
 }

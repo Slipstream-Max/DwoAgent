@@ -43,7 +43,7 @@ impl ChannelCapabilitySnapshot {
 
     pub fn render(&self) -> String {
         format!(
-            "<channel name=\"{}\">\n{}\n</channel>",
+            "<channel name=\"{}\" state=\"available\">\n{}\n</channel>",
             xml_escape(&self.name),
             xml_escape(&self.content)
         )

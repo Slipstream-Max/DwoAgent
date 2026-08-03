@@ -103,13 +103,12 @@ fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
         "You are an agent.",
     )
     .unwrap();
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd);
+    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd)
+        .with_channel_prompt("Channel command guidance");
     let mut manager = ContextManager::initialize(&builder).unwrap();
-    assert!(
-        !manager
-            .system_prompt()
-            .contains("<channel name=\"weixin\">")
-    );
+    assert!(manager.system_prompt().contains("<channels>"));
+    assert!(manager.system_prompt().contains("Channel command guidance"));
+    assert!(!manager.system_prompt().contains("name=\"weixin\""));
 
     write(
         &profile.join("runtime/channel-capabilities/weixin.md"),
@@ -121,16 +120,36 @@ fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
     );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let added = &manager.model_messages().last().unwrap().content;
-    assert!(added.contains("<channel name=\"weixin\">"));
+    assert!(added.contains("<channels>"));
+    assert!(added.contains("The available channel adapters changed:"));
+    assert!(added.contains("<channel name=\"weixin\" state=\"available\">"));
     assert!(added.contains("dwo channel weixin send-message"));
-    assert!(added.contains("<channel name=\"telegram\">"));
+    assert!(added.contains("<channel name=\"telegram\" state=\"available\">"));
     assert!(added.contains("dwo channel telegram send-message"));
 
     std::fs::remove_file(profile.join("runtime/channel-capabilities/weixin.md")).unwrap();
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let removed = &manager.model_messages().last().unwrap().content;
+    assert!(removed.contains("<channels>"));
     assert!(removed.contains("<channel name=\"weixin\" state=\"removed\">"));
-    assert!(removed.contains("<channel name=\"telegram\">"));
+    assert!(removed.contains("<channel name=\"telegram\" state=\"available\">"));
+}
+
+#[test]
+fn prompt_renders_command_guidance_in_separate_xml_blocks() {
+    let root = tempfile::tempdir().unwrap();
+    let builder = SystemPromptBuilder::new(None, root.path())
+        .with_tool_prompt("tool guidance")
+        .with_subsession_prompt("subsession guidance")
+        .with_automation_prompt("automation guidance")
+        .with_channel_prompt("channel guidance");
+    let manager = ContextManager::initialize(&builder).unwrap();
+    let prompt = manager.system_prompt();
+
+    assert!(prompt.contains("<tools>\ntool guidance\n</tools>"));
+    assert!(prompt.contains("<subsession>\nsubsession guidance\n</subsession>"));
+    assert!(prompt.contains("<automation>\nautomation guidance\n</automation>"));
+    assert!(prompt.contains("<channels>\nchannel guidance\n</channels>"));
 }
 
 #[test]

@@ -452,7 +452,10 @@ impl AgentService {
 
     fn prompt_builder(&self, cwd: PathBuf) -> SystemPromptBuilder {
         SystemPromptBuilder::new(self.profile_root.clone(), cwd)
-            .with_tool_prompt(dwo_tools::prompt::combined())
+            .with_tool_prompt(dwo_tools::prompt::tools())
+            .with_subsession_prompt(dwo_tools::prompt::SUBSESSIONS)
+            .with_automation_prompt(dwo_tools::prompt::AUTOMATION)
+            .with_channel_prompt(dwo_tools::prompt::CHANNELS)
     }
 
     async fn session_operation(&self, id: &SessionId) -> Arc<Mutex<()>> {

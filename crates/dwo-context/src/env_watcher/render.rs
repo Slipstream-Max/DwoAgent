@@ -68,7 +68,10 @@ fn render_channels(
             .filter(|old| !current.iter().any(|new| new.name == old.name))
             .map(|channel| ChannelCapabilitySnapshot::render_removed(&channel.name)),
     );
-    blocks.join("\n\n")
+    format!(
+        "<channels>\nThe available channel adapters changed:\n{}\n</channels>",
+        blocks.join("\n\n")
+    )
 }
 
 fn render_skills(skills: &[SkillSnapshot]) -> String {

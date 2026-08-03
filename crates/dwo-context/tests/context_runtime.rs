@@ -371,7 +371,7 @@ fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
 }
 
 #[test]
-fn normal_summary_preserves_images_and_image_downgrade_removes_them() {
+fn compaction_projection_preserves_images_only_for_image_capable_models() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
@@ -383,7 +383,7 @@ fn normal_summary_preserves_images_and_image_downgrade_removes_them() {
         manager.append_assistant(format!("answer {index}"), Vec::new());
     }
 
-    let normal = manager.plan_compaction(&CompactionPlanner::new(10, 5_000));
+    let normal = manager.plan_compaction(&CompactionPlanner::new(1_500, 5_000));
     assert!(normal.view.messages.iter().any(|message| {
         message
             .content
@@ -391,20 +391,44 @@ fn normal_summary_preserves_images_and_image_downgrade_removes_them() {
             .iter()
             .any(|block| matches!(block, ContentBlock::Image { .. }))
     }));
+    assert!(normal.reserved_messages.iter().any(|message| {
+        message
+            .content
+            .as_blocks()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }));
 
-    let downgrade = manager.plan_image_downgrade();
-    let summary_images = downgrade
+    let image_projection = normal.clone().project_for_image_input(true);
+    assert!(image_projection.view.messages.iter().any(|message| {
+        message
+            .content
+            .as_blocks()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }));
+    assert!(image_projection.reserved_messages.iter().any(|message| {
+        message
+            .content
+            .as_blocks()
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+    }));
+
+    let text_projection = normal.project_for_image_input(false);
+    let projected_images = text_projection
         .view
         .messages
         .iter()
+        .chain(&text_projection.front_user_messages)
+        .chain(&text_projection.reserved_messages)
         .flat_map(|message| message.content.as_blocks())
         .filter(|block| matches!(block, ContentBlock::Image { .. }))
         .count();
-    assert_eq!(summary_images, 2);
-    assert!(downgrade.reserved_messages.is_empty());
+    assert_eq!(projected_images, 0);
 
     manager
-        .apply_compaction(downgrade, "text description of both images", &builder, &[])
+        .apply_compaction(text_projection, "text-only summary", &builder, &[])
         .unwrap();
     assert!(!manager.contains_images());
     assert!(manager.context().usage.current_tokens > 0);

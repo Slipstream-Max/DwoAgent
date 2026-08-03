@@ -1284,7 +1284,7 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
 }
 
 #[tokio::test]
-async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
+async fn switching_models_projects_images_without_rewriting_context() {
     let dir = tempfile::tempdir().unwrap();
     let unlimited = ModelLimits {
         context_window_tokens: u64::MAX,
@@ -1296,12 +1296,9 @@ async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
         [
             ScriptedStep::text("vision answer"),
             ScriptedStep::text("text answer"),
+            ScriptedStep::text("vision answer again"),
         ],
-        [ScriptedSummaryStep {
-            summary: "the screenshot shows a compiler error".to_string(),
-            input_tokens: 30,
-            output_tokens: 8,
-        }],
+        [],
         [
             ("scripted-test-model".to_string(), unlimited),
             (
@@ -1310,7 +1307,7 @@ async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
                     context_window_tokens: 5_000,
                     max_output_tokens: 1_000,
                     max_input_tokens: 4_000,
-                    compact_trigger_tokens: 3_000,
+                    compact_trigger_tokens: u64::MAX,
                 },
             ),
         ],
@@ -1343,38 +1340,19 @@ async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
         .set_config(SessionConfigUpdate::Model("text-model".to_string()))
         .await
         .unwrap();
-    let migrated_usage = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if let SessionEventPayload::UsageChanged { used, size } =
-                subscription.events.recv().await.unwrap().payload
-            {
-                break (used, size);
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert!(migrated_usage.0 > 0);
-    assert_eq!(migrated_usage.1, 5_000);
 
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.llm.model, "text-model");
-    assert_eq!(
-        snapshot.record.context.usage.current_tokens,
-        migrated_usage.0
-    );
     assert!(
         snapshot
             .record
             .context
             .messages
             .iter()
-            .all(|message| !message.content.contains_images())
+            .any(|message| message.content.contains_images())
     );
-    assert_eq!(
-        snapshot.record.context.compaction.summary.as_deref(),
-        Some("the screenshot shows a compiler error")
-    );
+    assert_eq!(snapshot.record.context.compaction.count, 0);
+    assert_eq!(snapshot.record.context.compaction.summary, None);
     assert!(matches!(
         snapshot.transcript.iter().find_map(|event| match &event.payload {
             SessionEventPayload::UserPromptSubmitted { content, .. }
@@ -1383,20 +1361,11 @@ async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
         }),
         Some(content) if content == &image_prompt
     ));
-    let summaries = model.summary_requests().await;
-    assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].selection.model, "scripted-test-model");
-    assert!(
-        summaries[0]
-            .view
-            .messages
-            .iter()
-            .any(|message| message.content.contains_images())
-    );
+    assert_eq!(model.summary_request_count().await, 0);
 
     agent.prompt(EndpointId::new(), "continue").await.unwrap();
     wait_for_turn_end(&mut subscription.events).await;
-    let requests = model.requests().await;
+    let mut requests = model.requests().await;
     assert_eq!(requests[1].selection.model, "text-model");
     assert!(
         requests[1]
@@ -1404,10 +1373,30 @@ async fn switching_to_text_model_summarizes_images_and_preserves_transcript() {
             .iter()
             .all(|message| !message.content.contains_images())
     );
+
+    agent
+        .set_config(SessionConfigUpdate::Model(
+            "scripted-test-model".to_string(),
+        ))
+        .await
+        .unwrap();
+    agent
+        .prompt(EndpointId::new(), "continue again")
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut subscription.events).await;
+    requests = model.requests().await;
+    assert_eq!(requests[2].selection.model, "scripted-test-model");
+    assert!(
+        requests[2]
+            .messages
+            .iter()
+            .any(|message| message.content.contains_images())
+    );
 }
 
 #[tokio::test]
-async fn failed_image_summary_leaves_model_and_context_unchanged() {
+async fn text_model_compaction_removes_images_from_active_context() {
     let dir = tempfile::tempdir().unwrap();
     let limits = ModelLimits {
         context_window_tokens: 1_000,
@@ -1416,7 +1405,10 @@ async fn failed_image_summary_leaves_model_and_context_unchanged() {
         compact_trigger_tokens: 800,
     };
     let model = ScriptedModelGateway::with_model_limits_and_capabilities(
-        [ScriptedStep::text("vision answer")],
+        [
+            ScriptedStep::text("vision answer"),
+            ScriptedStep::text("text answer"),
+        ],
         [],
         [
             ("scripted-test-model".to_string(), limits),
@@ -1429,7 +1421,7 @@ async fn failed_image_summary_leaves_model_and_context_unchanged() {
     );
     let service = AgentService::new(
         Arc::new(MemorySessionRepository::default()),
-        model,
+        model.clone(),
         PolicyConfig::default(),
     );
     let agent = service
@@ -1445,24 +1437,39 @@ async fn failed_image_summary_leaves_model_and_context_unchanged() {
         .await
         .unwrap();
     wait_for_turn_end(&mut subscription.events).await;
-    let before = agent.attach(EndpointId::new()).await.unwrap().snapshot;
-    let before_context = serde_json::to_value(&before.record.context).unwrap();
-
-    let error = agent
+    agent
         .set_config(SessionConfigUpdate::Model("text-model".to_string()))
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("prepare image context"));
-    let after = agent.attach(EndpointId::new()).await.unwrap().snapshot;
-    assert_eq!(after.record.llm.model, "scripted-test-model");
-    assert_eq!(
-        serde_json::to_value(&after.record.context).unwrap(),
-        before_context
+        .unwrap();
+    let before = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(
+        before
+            .record
+            .context
+            .messages
+            .iter()
+            .any(|message| message.content.contains_images())
     );
+
+    agent.prompt(EndpointId::new(), "continue").await.unwrap();
+    wait_for_turn_end(&mut subscription.events).await;
+    let after = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(after.record.llm.model, "text-model");
+    assert_eq!(after.record.context.compaction.count, 1);
+    assert_eq!(after.record.context.compaction.summary, None);
+    assert!(
+        after
+            .record
+            .context
+            .messages
+            .iter()
+            .all(|message| !message.content.contains_images())
+    );
+    assert_eq!(model.summary_request_count().await, 0);
 }
 
 #[tokio::test]
-async fn text_model_switch_is_rejected_while_an_image_turn_is_active() {
+async fn model_switch_is_allowed_while_an_image_turn_is_active() {
     let dir = tempfile::tempdir().unwrap();
     let limits = ModelLimits {
         context_window_tokens: 1_000,
@@ -1500,11 +1507,10 @@ async fn text_model_switch_is_rejected_while_an_image_turn_is_active() {
         .await
         .unwrap();
 
-    let error = agent
+    agent
         .set_config(SessionConfigUpdate::Model("text-model".to_string()))
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("image turn is active"));
+        .unwrap();
     assert_eq!(
         agent
             .attach(EndpointId::new())
@@ -1514,7 +1520,7 @@ async fn text_model_switch_is_rejected_while_an_image_turn_is_active() {
             .record
             .llm
             .model,
-        "scripted-test-model"
+        "text-model"
     );
     agent.cancel(Some(turn_id)).await.unwrap();
     assert!(matches!(

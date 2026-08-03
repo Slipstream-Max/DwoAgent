@@ -10,7 +10,6 @@ use super::{COMPACT_INSTRUCTION, compact_tool_exchanges};
 
 pub const DEFAULT_RECENT_CONTEXT_TOKENS: u64 = 20_000;
 pub const DEFAULT_RECENT_USER_TOKENS: u64 = 5_000;
-pub const IMAGE_DOWNGRADE_INSTRUCTION: &str = r#"Convert this conversation into a precise text-only summary for a model that cannot receive images. Describe all relevant information visible in images, including text, UI state, errors, diagrams, and spatial relationships. Preserve user requirements, decisions, completed work, tool results, file paths, identifiers, unresolved problems, and next steps. Do not refer to inaccessible image data."#;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionView {
@@ -33,6 +32,23 @@ impl CompactionPlan {
 
     pub fn needs_replacement(&self) -> bool {
         self.has_compactable_history() || self.reserve_was_filtered
+    }
+
+    pub fn project_for_image_input(mut self, allow_image_input: bool) -> Self {
+        if allow_image_input {
+            return self;
+        }
+        let (view_messages, view_was_filtered) = project_messages(self.view.messages, false);
+        let (front_user_messages, front_was_filtered) =
+            project_messages(self.front_user_messages, false);
+        let (reserved_messages, reserve_was_filtered) =
+            project_messages(self.reserved_messages, false);
+        self.reserve_was_filtered |=
+            view_was_filtered || front_was_filtered || reserve_was_filtered;
+        self.view.messages = view_messages;
+        self.front_user_messages = front_user_messages;
+        self.reserved_messages = reserved_messages;
+        self
     }
 
     pub(crate) fn into_replacement(
@@ -143,18 +159,22 @@ impl CompactionPlanner {
         }
         .build(context)
     }
+}
 
-    pub fn build_image_downgrade(&self, context: &SessionContext) -> CompactionPlan {
-        CompactionPlan {
-            view: CompactionView {
-                instruction: IMAGE_DOWNGRADE_INSTRUCTION.to_string(),
-                messages: without_initial_system(&context.messages).to_vec(),
-            },
-            front_user_messages: Vec::new(),
-            reserved_messages: Vec::new(),
-            reserve_was_filtered: false,
-        }
-    }
+fn project_messages(
+    messages: Vec<ContextMessage>,
+    allow_image_input: bool,
+) -> (Vec<ContextMessage>, bool) {
+    let mut was_filtered = false;
+    let projected = messages
+        .into_iter()
+        .filter_map(|message| {
+            let projected = message.project_for_image_input(allow_image_input);
+            was_filtered |= projected.as_ref() != Some(&message);
+            projected
+        })
+        .collect();
+    (projected, was_filtered)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

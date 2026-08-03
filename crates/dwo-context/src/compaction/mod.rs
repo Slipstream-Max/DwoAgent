@@ -3,7 +3,7 @@ mod tools;
 
 pub use plan::{
     CompactionPlan, CompactionPlanner, CompactionView, DEFAULT_RECENT_CONTEXT_TOKENS,
-    DEFAULT_RECENT_USER_TOKENS, IMAGE_DOWNGRADE_INSTRUCTION,
+    DEFAULT_RECENT_USER_TOKENS,
 };
 
 use tools::compact_tool_exchanges;

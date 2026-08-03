@@ -118,6 +118,14 @@ impl ContextManager {
         &self.context.messages
     }
 
+    pub fn projected_model_messages(&self, allow_image_input: bool) -> Vec<ContextMessage> {
+        self.context
+            .messages
+            .iter()
+            .filter_map(|message| message.project_for_image_input(allow_image_input))
+            .collect()
+    }
+
     pub fn contains_images(&self) -> bool {
         self.context
             .messages
@@ -245,10 +253,6 @@ impl ContextManager {
 
     pub fn recovery_compaction(&self) -> CompactionPlan {
         CompactionPlanner::default().build_recovery(&self.context)
-    }
-
-    pub fn plan_image_downgrade(&self) -> CompactionPlan {
-        CompactionPlanner::default().build_image_downgrade(&self.context)
     }
 
     /// Replace model context and estimate the complete rebuilt request.

@@ -307,7 +307,11 @@ async fn request_with_context_recovery(
         Ok(response) => Ok(response),
         Err(error) if error.is_context_length_exceeded() => {
             let recovery = recovery_selection(turn, selection);
-            let plan = turn.context.recovery_compaction();
+            let allow_image_input = turn.model.supports_image_input(&selection.model)?;
+            let plan = turn
+                .context
+                .recovery_compaction()
+                .project_for_image_input(allow_image_input);
             if !compact_context(turn, plan, recovery).await? {
                 return Err(error.into());
             }
@@ -322,7 +326,9 @@ async fn request_model(
     selection: &ModelSelection,
 ) -> Result<ModelReply, dwo_model_client::ModelClientError> {
     let started = Instant::now();
-    let message_count = turn.context.model_messages().len();
+    let allow_image_input = turn.model.supports_image_input(&selection.model)?;
+    let messages = turn.context.projected_model_messages(allow_image_input);
+    let message_count = messages.len();
     let tool_count = turn.tools.schemas().len();
     tracing::debug!(
         event = "model.request_started",
@@ -340,7 +346,7 @@ async fn request_model(
     let cancellation = turn.cancellation.clone();
     let model_call = turn.model.stream_turn(
         selection.clone(),
-        turn.context.model_messages(),
+        &messages,
         turn.tools.schemas(),
         chunk_tx,
         &cancellation,
@@ -456,6 +462,8 @@ async fn compact_if_needed(turn: &mut RunTurn) -> anyhow::Result<()> {
     let Some(plan) = turn.context.scheduled_compaction(trigger_tokens, schemas) else {
         return Ok(());
     };
+    let allow_image_input = turn.model.supports_image_input(&desired.model)?;
+    let plan = plan.project_for_image_input(allow_image_input);
     let recovery = recovery_selection(turn, &desired);
     compact_context(turn, plan, recovery).await?;
     Ok(())

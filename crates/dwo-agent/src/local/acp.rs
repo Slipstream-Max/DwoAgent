@@ -22,6 +22,7 @@ use agent_client_protocol::{
     on_receive_request,
 };
 use anyhow::{Context, Result};
+use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -128,7 +129,7 @@ where
                                 .load_session(true)
                                 .prompt_capabilities(
                                     PromptCapabilities::new()
-                                        .image(false)
+                                        .image(true)
                                         .audio(false)
                                         .embedded_context(true),
                                 )
@@ -326,8 +327,8 @@ async fn run_prompt(
     cx: ConnectionTo<Client>,
 ) {
     let session_id = request.session_id.to_string();
-    let text = match prompt_text(&request.prompt) {
-        Ok(text) => text,
+    let content = match prompt_content(&request.prompt) {
+        Ok(content) => content,
         Err(error) => {
             let _ = responder.respond_with_error(invalid_params(error));
             return;
@@ -347,7 +348,7 @@ async fn run_prompt(
         json!({
             "session_id": session_id,
             "endpoint_id": observer.endpoint_id,
-            "message": text,
+            "message": content,
         }),
     )
     .await
@@ -967,32 +968,42 @@ fn snapshot_usage(snapshot: &Value) -> Option<(u64, u64)> {
     Some((usage.get("used")?.as_u64()?, usage.get("size")?.as_u64()?))
 }
 
-fn prompt_text(prompt: &[ContentBlock]) -> Result<String> {
+fn prompt_content(prompt: &[ContentBlock]) -> Result<MessageContent> {
     let mut output = Vec::with_capacity(prompt.len());
     for block in prompt {
-        let text = match block {
-            ContentBlock::Text(content) => content.text.clone(),
-            ContentBlock::ResourceLink(resource) => resource_link_text(resource),
+        let projected = match block {
+            ContentBlock::Text(content) => DwoContentBlock::text(content.text.clone()),
+            ContentBlock::ResourceLink(resource) => {
+                DwoContentBlock::text(resource_link_text(resource))
+            }
             ContentBlock::Resource(resource) => match &resource.resource {
-                EmbeddedResourceResource::TextResourceContents(resource) => embedded_resource_text(
-                    &resource.uri,
-                    resource.mime_type.as_deref(),
-                    &resource.text,
-                ),
+                EmbeddedResourceResource::TextResourceContents(resource) => {
+                    DwoContentBlock::text(embedded_resource_text(
+                        &resource.uri,
+                        resource.mime_type.as_deref(),
+                        &resource.text,
+                    ))
+                }
                 EmbeddedResourceResource::BlobResourceContents(_) => {
                     anyhow::bail!("binary embedded resources are not supported")
                 }
                 _ => anyhow::bail!("unsupported embedded resource type"),
             },
-            ContentBlock::Image(_) => anyhow::bail!("image input is not supported"),
+            ContentBlock::Image(image) => DwoContentBlock::Image {
+                mime_type: image.mime_type.clone(),
+                data: image.data.clone(),
+                uri: image.uri.clone(),
+                annotations: None,
+                meta: None,
+            },
             ContentBlock::Audio(_) => anyhow::bail!("audio input is not supported"),
             _ => anyhow::bail!("unsupported ACP content block"),
         };
-        if !text.is_empty() {
-            output.push(text);
+        if !matches!(&projected, DwoContentBlock::Text { text, .. } if text.is_empty()) {
+            output.push(projected);
         }
     }
-    Ok(output.join("\n"))
+    Ok(MessageContent::blocks(output))
 }
 
 fn resource_link_text(resource: &ResourceLink) -> String {
@@ -1078,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_prompt_flattens_text_embedded_text_and_resource_links_in_order() {
+    fn acp_prompt_projects_text_embedded_text_and_resource_links_in_order() {
         let prompt = vec![
             ContentBlock::Text(TextContent::new("explain")),
             ContentBlock::ResourceLink(
@@ -1094,22 +1105,34 @@ mod tests {
             )),
         ];
 
-        assert_eq!(
-            prompt_text(&prompt).unwrap(),
-            "explain\nReferenced resource:\nName: README.md\nURI: file:///C:/workspace/README.md\nMIME type: text/markdown\nDescription: Project documentation\nEmbedded resource:\nURI: file:///C:/workspace/main.rs\nMIME type: text/plain\nContent:\nfn main() {}"
-        );
+        let content = prompt_content(&prompt).unwrap();
+        assert_eq!(content.as_blocks().len(), 3);
+        assert_eq!(content.as_blocks()[0], DwoContentBlock::text("explain"));
+        assert!(matches!(
+            &content.as_blocks()[1],
+            DwoContentBlock::Text { text, .. } if text.contains("README.md")
+        ));
+        assert!(matches!(
+            &content.as_blocks()[2],
+            DwoContentBlock::Text { text, .. } if text.contains("fn main() {}")
+        ));
     }
 
     #[test]
-    fn acp_prompt_rejects_images_and_binary_embedded_resources() {
+    fn acp_prompt_accepts_images_and_rejects_binary_embedded_resources() {
         let image = [ContentBlock::Image(ImageContent::new(
             "aGVsbG8=",
             "image/png",
         ))];
-        assert_eq!(
-            prompt_text(&image).unwrap_err().to_string(),
-            "image input is not supported"
-        );
+        let content = prompt_content(&image).unwrap();
+        assert!(matches!(
+            &content.as_blocks()[0],
+            DwoContentBlock::Image {
+                mime_type,
+                data,
+                ..
+            } if mime_type == "image/png" && data == "aGVsbG8="
+        ));
 
         let blob = [ContentBlock::Resource(EmbeddedResource::new(
             EmbeddedResourceResource::BlobResourceContents(BlobResourceContents::new(
@@ -1118,7 +1141,7 @@ mod tests {
             )),
         ))];
         assert_eq!(
-            prompt_text(&blob).unwrap_err().to_string(),
+            prompt_content(&blob).unwrap_err().to_string(),
             "binary embedded resources are not supported"
         );
     }

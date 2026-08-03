@@ -9,7 +9,7 @@ mod token;
 
 pub use compaction::{
     COMPACT_INSTRUCTION, CompactionPlan, CompactionPlanner, CompactionView,
-    DEFAULT_RECENT_CONTEXT_TOKENS, DEFAULT_RECENT_USER_TOKENS, IMAGE_DOWNGRADE_INSTRUCTION,
+    DEFAULT_RECENT_CONTEXT_TOKENS, DEFAULT_RECENT_USER_TOKENS,
 };
 pub use env_watcher::{DynamicEnvironmentSnapshot, EnvChange, EnvWatcherState};
 pub use manager::{

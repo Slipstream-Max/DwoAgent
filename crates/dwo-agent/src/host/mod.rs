@@ -6,6 +6,7 @@ use dwo_agent_service::{
     AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession, SessionConfig,
     SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings,
 };
+use dwo_context::MessageContent;
 use dwo_mcp::McpRuntime;
 use dwo_tools::{ConfirmationDecision, PolicyConfig, SessionMode};
 use serde::{Deserialize, Serialize};
@@ -62,12 +63,28 @@ struct PromptParam {
     session_id: Option<String>,
     caller_session_id: Option<String>,
     endpoint_id: String,
-    message: String,
+    message: PromptMessage,
     title: Option<String>,
     cwd: Option<PathBuf>,
     policy: Option<SessionMode>,
     model: Option<String>,
     reasoning: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PromptMessage {
+    Text(String),
+    Content(MessageContent),
+}
+
+impl PromptMessage {
+    fn into_content(self) -> MessageContent {
+        match self {
+            Self::Text(text) => MessageContent::text(text),
+            Self::Content(content) => content,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -387,7 +404,9 @@ impl Host {
                 let (agent, parent_id) = self.resolve_prompt_session(&params, caller).await?;
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
                 let subscription = agent.attach(EndpointId::new()).await?;
-                let turn_id = agent.prompt(endpoint, params.message).await?;
+                let turn_id = agent
+                    .prompt_content(endpoint, params.message.into_content())
+                    .await?;
                 if let Some(parent_id) = parent_id {
                     self.spawn_result_delivery(
                         subscription,
@@ -1384,6 +1403,21 @@ pub fn profile_root(config_path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_message_accepts_text_and_structured_content() {
+        let text: PromptMessage = serde_json::from_value(json!("hello")).unwrap();
+        assert_eq!(text.into_content(), MessageContent::text("hello"));
+
+        let content: PromptMessage = serde_json::from_value(json!([
+            {"type": "text", "text": "inspect"},
+            {"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}
+        ]))
+        .unwrap();
+        let content = content.into_content();
+        assert_eq!(content.as_blocks().len(), 2);
+        assert!(content.contains_images());
+    }
 
     #[test]
     fn managed_channel_actions_share_one_rpc_route() {

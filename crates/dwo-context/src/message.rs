@@ -172,6 +172,19 @@ impl MessageContent {
             .any(|block| matches!(block, ContentBlock::Image { .. }))
     }
 
+    pub fn project_for_image_input(&self, allow_image_input: bool) -> Self {
+        if allow_image_input {
+            return self.clone();
+        }
+        Self(
+            self.0
+                .iter()
+                .filter(|block| !matches!(block, ContentBlock::Image { .. }))
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn len(&self) -> usize {
         self.text_bytes()
     }
@@ -300,6 +313,18 @@ fn is_conversation(kind: &MessageKind) -> bool {
 }
 
 impl ContextMessage {
+    pub fn project_for_image_input(&self, allow_image_input: bool) -> Option<Self> {
+        let mut projected = self.clone();
+        projected.content = self.content.project_for_image_input(allow_image_input);
+        if projected.content.is_empty()
+            && projected.tool_calls.is_empty()
+            && projected.tool_call_id.is_none()
+        {
+            return None;
+        }
+        Some(projected)
+    }
+
     pub fn system(content: impl Into<MessageContent>) -> Self {
         Self::plain(MessageRole::System, content)
     }

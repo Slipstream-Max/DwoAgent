@@ -2317,7 +2317,7 @@ async fn filesystem_delete_survives_service_restart() {
 }
 
 #[tokio::test]
-async fn model_change_persists_mode_and_model_but_resets_reasoning() {
+async fn model_change_remembers_reasoning_per_model() {
     let dir = tempfile::tempdir().unwrap();
     let service = AgentService::new(
         Arc::new(MemorySessionRepository::default()),
@@ -2341,6 +2341,57 @@ async fn model_change_persists_mode_and_model_but_resets_reasoning() {
         .set_config(&id, SessionConfigUpdate::Model("next-model".to_string()))
         .await
         .unwrap();
+    assert_eq!(
+        agent
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record
+            .llm
+            .reasoning
+            .as_deref(),
+        Some("high")
+    );
+    service
+        .set_config(&id, SessionConfigUpdate::Reasoning(Some("low".to_string())))
+        .await
+        .unwrap();
+    service
+        .set_config(
+            &id,
+            SessionConfigUpdate::Model("scripted-test-model".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record
+            .llm
+            .reasoning
+            .as_deref(),
+        Some("high")
+    );
+    service
+        .set_config(&id, SessionConfigUpdate::Model("next-model".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .record
+            .llm
+            .reasoning
+            .as_deref(),
+        Some("low")
+    );
     service
         .set_config(&id, SessionConfigUpdate::Mode(SessionMode::Watch))
         .await
@@ -2359,7 +2410,7 @@ async fn model_change_persists_mode_and_model_but_resets_reasoning() {
         .config();
     assert_eq!(config.mode, SessionMode::Watch);
     assert_eq!(config.model, "next-model");
-    assert_eq!(config.reasoning, None);
+    assert_eq!(config.reasoning.as_deref(), Some("low"));
 }
 
 #[tokio::test]

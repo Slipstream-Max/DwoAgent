@@ -553,10 +553,7 @@ impl AutomationRuntime {
                 cwd,
                 mode: defaults.mode,
                 max_model_steps: defaults.max_model_steps,
-                llm: SessionLlmSettings {
-                    model: defaults.model,
-                    reasoning: None,
-                },
+                llm: SessionLlmSettings::new(defaults.model, None),
             })
             .await?)
     }

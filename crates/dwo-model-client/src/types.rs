@@ -81,6 +81,14 @@ pub trait ModelClient: Send + Sync {
         Ok(false)
     }
 
+    /// Return the reasoning modes configured for a model, in any order.
+    ///
+    /// Clients that do not expose a model catalog may return an empty list;
+    /// callers should then use the provider's implicit default.
+    fn reasoning_modes(&self, _model: &str) -> Result<Vec<String>, ModelClientError> {
+        Ok(Vec::new())
+    }
+
     fn validate_selection(&self, _selection: &ModelSelection) -> Result<(), ModelClientError> {
         Ok(())
     }

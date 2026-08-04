@@ -80,6 +80,10 @@ impl ModelClient for ReloadableModelClient {
         self.current().supports_image_input(model)
     }
 
+    fn reasoning_modes(&self, model: &str) -> Result<Vec<String>, ModelClientError> {
+        self.current().reasoning_modes(model)
+    }
+
     fn validate_selection(&self, selection: &ModelSelection) -> Result<(), ModelClientError> {
         self.current().validate_selection(selection)
     }

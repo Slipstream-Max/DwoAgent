@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,6 +85,12 @@ pub struct SessionInfo {
 pub struct SessionLlmSettings {
     pub model: String,
     pub reasoning: Option<String>,
+    /// The last reasoning selection for each model in this session.
+    ///
+    /// `None` means that the model's configured default should be used. The
+    /// map is persisted with the session so switching away and back restores
+    /// the previous selection.
+    pub reasoning_by_model: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,10 +111,22 @@ pub enum SessionConfigUpdate {
 
 impl Default for SessionLlmSettings {
     fn default() -> Self {
+        Self::new("scripted-test-model", None)
+    }
+}
+
+impl SessionLlmSettings {
+    pub fn new(model: impl Into<String>, reasoning: Option<String>) -> Self {
         Self {
-            model: "scripted-test-model".to_string(),
-            reasoning: None,
+            model: model.into(),
+            reasoning,
+            reasoning_by_model: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn remember_current_reasoning(&mut self) {
+        self.reasoning_by_model
+            .insert(self.model.clone(), self.reasoning.clone());
     }
 }
 
@@ -132,10 +151,11 @@ impl SessionRecord {
         title: String,
         cwd: PathBuf,
         mode: SessionMode,
-        llm: SessionLlmSettings,
+        mut llm: SessionLlmSettings,
         max_model_steps: usize,
     ) -> Self {
         let now = unix_time_ms();
+        llm.remember_current_reasoning();
         Self {
             info: SessionInfo {
                 id,
@@ -184,7 +204,11 @@ impl SessionRecord {
         }
     }
 
-    pub(crate) fn apply_config(&mut self, update: SessionConfigUpdate) -> Result<(), String> {
+    pub(crate) fn apply_config(
+        &mut self,
+        update: SessionConfigUpdate,
+        new_model_reasoning: Option<String>,
+    ) -> Result<(), String> {
         match update {
             SessionConfigUpdate::Mode(mode) => self.info.mode = mode,
             SessionConfigUpdate::Model(model) => {
@@ -192,10 +216,18 @@ impl SessionRecord {
                 if model.is_empty() {
                     return Err("model must not be empty".to_string());
                 }
+                let previous_model = self.llm.model.clone();
+                let previous_reasoning = self.llm.reasoning.clone();
+                self.llm
+                    .reasoning_by_model
+                    .insert(previous_model, previous_reasoning);
                 self.llm.model = model.to_string();
-                // Reasoning modes belong to the selected model. Resolve the new
-                // model's default when config options are rebuilt.
-                self.llm.reasoning = None;
+                self.llm.reasoning = self
+                    .llm
+                    .reasoning_by_model
+                    .get(&self.llm.model)
+                    .cloned()
+                    .unwrap_or(new_model_reasoning);
             }
             SessionConfigUpdate::Reasoning(reasoning) => {
                 self.llm.reasoning = reasoning
@@ -208,6 +240,9 @@ impl SessionRecord {
                         }
                     })
                     .transpose()?;
+                self.llm
+                    .reasoning_by_model
+                    .insert(self.llm.model.clone(), self.llm.reasoning.clone());
             }
         }
         Ok(())

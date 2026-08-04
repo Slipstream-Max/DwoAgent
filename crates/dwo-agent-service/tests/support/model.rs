@@ -246,6 +246,13 @@ impl ModelClient for ScriptedModelGateway {
             .unwrap_or(true))
     }
 
+    fn reasoning_modes(&self, _model: &str) -> Result<Vec<String>, ModelClientError> {
+        Ok(["low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(str::to_string)
+            .collect())
+    }
+
     async fn stream_turn(
         &self,
         selection: ModelSelection,

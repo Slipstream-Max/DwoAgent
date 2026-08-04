@@ -489,10 +489,7 @@ fn recovery_selection(turn: &RunTurn, desired: &ModelSelection) -> ModelSelectio
 }
 
 fn llm_settings(config: &SessionConfig) -> SessionLlmSettings {
-    SessionLlmSettings {
-        model: config.model.clone(),
-        reasoning: config.reasoning.clone(),
-    }
+    SessionLlmSettings::new(config.model.clone(), config.reasoning.clone())
 }
 
 fn cancelled_results(calls: &[Value]) -> Vec<ToolResult> {

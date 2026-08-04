@@ -10,12 +10,12 @@ use agent_client_protocol::schema::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
     PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, ResourceLink, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionId, SessionInfo,
-    SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
-    ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind, UsageUpdate,
+    RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
+    SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification,
@@ -110,6 +110,7 @@ where
     let new_config = config_path.clone();
     let list_config = config_path.clone();
     let load_runtime = runtime.clone();
+    let resume_runtime = runtime.clone();
     let prompt_runtime = runtime.clone();
     let set_runtime = runtime;
     let cancel_config = config_path;
@@ -134,7 +135,9 @@ where
                                         .embedded_context(true),
                                 )
                                 .session_capabilities(
-                                    SessionCapabilities::new().list(SessionListCapabilities::new()),
+                                    SessionCapabilities::new()
+                                        .list(SessionListCapabilities::new())
+                                        .resume(SessionResumeCapabilities::new()),
                                 ),
                         ),
                 )
@@ -223,6 +226,29 @@ where
                                 .respond(LoadSessionResponse::new().config_options(options)),
                             Err(error) => responder.respond_with_error(internal_error(error)),
                         },
+                        Err(error) => responder.respond_with_error(internal_error(error)),
+                    }?;
+                    Ok(())
+                })?;
+                Ok(())
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ResumeSessionRequest,
+                        responder: Responder<ResumeSessionResponse>,
+                        cx: ConnectionTo<Client>| {
+                let runtime = resume_runtime.clone();
+                cx.clone().spawn(async move {
+                    let session_id = request.session_id.to_string();
+                    match ensure_observer(&runtime, &session_id, &cx, false).await {
+                        Ok(_) => {
+                            match session_config_options(&runtime.config_path, &session_id).await {
+                                Ok(options) => responder
+                                    .respond(ResumeSessionResponse::new().config_options(options)),
+                                Err(error) => responder.respond_with_error(internal_error(error)),
+                            }
+                        }
                         Err(error) => responder.respond_with_error(internal_error(error)),
                     }?;
                     Ok(())

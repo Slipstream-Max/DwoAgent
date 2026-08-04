@@ -870,10 +870,7 @@ impl Host {
                 cwd,
                 mode: default_mode,
                 max_model_steps: default_max_model_steps,
-                llm: SessionLlmSettings {
-                    model: default_model,
-                    reasoning: None,
-                },
+                llm: SessionLlmSettings::new(default_model, None),
             })
             .await;
         match created {
@@ -988,7 +985,7 @@ impl Host {
                 cwd,
                 mode,
                 max_model_steps: default_max_model_steps,
-                llm: SessionLlmSettings { model, reasoning },
+                llm: SessionLlmSettings::new(model, reasoning),
             })
             .await;
         match created {

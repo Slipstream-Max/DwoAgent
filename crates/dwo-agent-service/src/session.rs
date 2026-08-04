@@ -575,9 +575,17 @@ impl SessionActor {
                     return false;
                 }
                 let model_changed = matches!(&update, SessionConfigUpdate::Model(_));
+                let new_model_reasoning = match &update {
+                    SessionConfigUpdate::Model(model) => self
+                        .model
+                        .reasoning_modes(model)
+                        .ok()
+                        .and_then(|modes| middle_reasoning_mode(&modes)),
+                    _ => None,
+                };
                 let mut updated = self.record.clone();
                 let result = updated
-                    .apply_config(update)
+                    .apply_config(update, new_model_reasoning)
                     .map_err(AgentServiceError::InvalidConfig);
                 let result = match result {
                     Ok(()) => {
@@ -587,11 +595,41 @@ impl SessionActor {
                         };
                         match self.model.validate_selection(&selection) {
                             Ok(()) => {
+                                updated.llm.remember_current_reasoning();
                                 updated.touch();
                                 self.repository
                                     .save(&updated)
                                     .await
                                     .map_err(AgentServiceError::from)
+                            }
+                            Err(error) if model_changed && updated.llm.reasoning.is_some() => {
+                                // A remembered mode may not exist on the target
+                                // model. Keep the memory, but use that model's
+                                // default for the active selection.
+                                updated.llm.reasoning = None;
+                                let fallback = ModelSelection {
+                                    model: updated.llm.model.clone(),
+                                    reasoning: None,
+                                };
+                                match self.model.validate_selection(&fallback) {
+                                    Ok(()) => {
+                                        if !updated
+                                            .llm
+                                            .reasoning_by_model
+                                            .contains_key(&updated.llm.model)
+                                        {
+                                            updated.llm.remember_current_reasoning();
+                                        }
+                                        updated.touch();
+                                        self.repository
+                                            .save(&updated)
+                                            .await
+                                            .map_err(AgentServiceError::from)
+                                    }
+                                    Err(_) => {
+                                        Err(AgentServiceError::InvalidConfig(error.to_string()))
+                                    }
+                                }
                             }
                             Err(error) => Err(AgentServiceError::InvalidConfig(error.to_string())),
                         }
@@ -1306,6 +1344,51 @@ enum StepSnapshotSend {
     Sent,
     Full,
     Closed,
+}
+
+fn middle_reasoning_mode(modes: &[String]) -> Option<String> {
+    let mut modes = modes.to_vec();
+    modes.sort_by_key(|mode| reasoning_mode_rank(mode));
+    modes.get(modes.len() / 2).cloned()
+}
+
+fn reasoning_mode_rank(mode: &str) -> u8 {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "none" | "nonthink" => 0,
+        "auto" => 1,
+        "minimal" => 2,
+        "low" => 3,
+        "medium" => 4,
+        "high" => 5,
+        "xhigh" => 6,
+        "max" => 7,
+        _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod reasoning_mode_tests {
+    use super::middle_reasoning_mode;
+
+    fn modes(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn middle_mode_uses_the_center_or_upper_center() {
+        assert_eq!(
+            middle_reasoning_mode(&modes(&["low", "medium", "high", "xhigh", "max"])),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            middle_reasoning_mode(&modes(&["low", "medium", "high", "xhigh"])),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            middle_reasoning_mode(&modes(&["nonthink", "auto", "high", "max"])),
+            Some("high".to_string())
+        );
+    }
 }
 
 fn try_send_step_snapshot(

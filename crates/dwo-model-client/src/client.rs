@@ -80,6 +80,10 @@ impl ModelClient for ConfiguredModelClient {
         Ok(self.resolve(model)?.1.capabilities.image_input)
     }
 
+    fn reasoning_modes(&self, model: &str) -> Result<Vec<String>, ModelClientError> {
+        Ok(self.resolve(model)?.1.reasoning.keys().cloned().collect())
+    }
+
     fn validate_selection(&self, selection: &ModelSelection) -> Result<(), ModelClientError> {
         let (_, model) = self.resolve(&selection.model)?;
         let mode = selection

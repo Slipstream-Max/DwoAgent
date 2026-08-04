@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dwo_context::{
-    CompactionPlan, ContextManager, PendingMessageBatch, SessionContext, SystemPromptBuilder,
-    TurnId,
+    CompactionPlan, CompactionPlanner, ContextManager, PendingMessageBatch, SessionContext,
+    SystemPromptBuilder, TurnId,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection, ModelStreamEvent};
 use dwo_tools::{ExecutionContext, ParsedToolCall, ToolEvent, ToolManager, ToolResult};
@@ -150,6 +150,85 @@ pub(crate) async fn run(mut turn: RunTurn) {
         turn_id: turn.turn_id.clone(),
         outcome,
     });
+}
+
+pub(crate) async fn run_manual_compaction(mut turn: RunTurn) {
+    let started = Instant::now();
+    tracing::info!(
+        event = "turn.manual_compaction_started",
+        session_id = %turn.session_id,
+        turn_id = %turn.turn_id,
+        "manual context compaction started"
+    );
+    let outcome = manual_compaction_inner(&mut turn).await;
+    match &outcome {
+        TurnOutcome::Completed => tracing::info!(
+            event = "turn.manual_compaction_completed",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "manual context compaction completed"
+        ),
+        TurnOutcome::Cancelled => tracing::info!(
+            event = "turn.manual_compaction_cancelled",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "manual context compaction cancelled"
+        ),
+        TurnOutcome::Failed(error) => tracing::error!(
+            event = "turn.manual_compaction_failed",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            error = %error,
+            "manual context compaction failed"
+        ),
+    }
+    turn.emit(TurnEvent::Finished {
+        turn_id: turn.turn_id.clone(),
+        outcome,
+    });
+}
+
+async fn manual_compaction_inner(turn: &mut RunTurn) -> TurnOutcome {
+    if turn.cancellation.is_cancelled() {
+        return TurnOutcome::Cancelled;
+    }
+    let before = turn.context.context().usage.current_tokens;
+    let desired = current_selection(turn);
+    let allow_image_input = match turn.model.supports_image_input(&desired.model) {
+        Ok(value) => value,
+        Err(error) => {
+            return TurnOutcome::Failed(format!("resolve model image capability: {error:#}"));
+        }
+    };
+    let plan = turn
+        .context
+        .plan_compaction(&CompactionPlanner::default())
+        .project_for_image_input(allow_image_input);
+    let recovery = recovery_selection(turn, &desired);
+    match compact_context(turn, plan, recovery).await {
+        Ok(compacted) => {
+            let content = if compacted {
+                format!(
+                    "Context compacted from {before} to {} estimated tokens.",
+                    turn.context.context().usage.current_tokens
+                )
+            } else {
+                "Nothing to compact.".to_string()
+            };
+            turn.emit(TurnEvent::AssistantCompleted {
+                turn_id: turn.turn_id.clone(),
+                content,
+                reasoning: None,
+                tool_calls: Vec::new(),
+            });
+            TurnOutcome::Completed
+        }
+        Err(_) if turn.cancellation.is_cancelled() => TurnOutcome::Cancelled,
+        Err(error) => TurnOutcome::Failed(format!("compact context: {error:#}")),
+    }
 }
 
 async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {

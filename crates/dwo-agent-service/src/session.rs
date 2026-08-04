@@ -54,7 +54,7 @@ impl fmt::Display for EndpointId {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MessageId(String);
 
@@ -70,21 +70,11 @@ impl MessageId {
         }
         Ok(Self(value))
     }
+}
 
-    pub(crate) fn legacy(session_id: &crate::SessionId, transcript_index: usize) -> Self {
-        Self(format!("message-{session_id}-{transcript_index}"))
-    }
-
-    pub(crate) fn legacy_part(
-        session_id: &crate::SessionId,
-        transcript_index: usize,
-        part: &str,
-    ) -> Self {
-        Self(format!("message-{session_id}-{transcript_index}-{part}"))
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+impl Default for MessageId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -300,6 +290,23 @@ impl SessionAgent {
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub async fn compact(&self, origin: EndpointId) -> Result<PromptAccepted, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::Compact { origin, response }).await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
+    pub async fn resume(
+        &self,
+        origin: EndpointId,
+    ) -> Result<Option<PromptAccepted>, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::Resume { origin, response }).await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
     pub async fn append_internal(
         &self,
         turn_id: TurnId,
@@ -396,6 +403,14 @@ enum Control {
         only_if_idle: bool,
         response: oneshot::Sender<Result<PromptAccepted, AgentServiceError>>,
     },
+    Compact {
+        origin: EndpointId,
+        response: oneshot::Sender<Result<PromptAccepted, AgentServiceError>>,
+    },
+    Resume {
+        origin: EndpointId,
+        response: oneshot::Sender<Result<Option<PromptAccepted>, AgentServiceError>>,
+    },
     AppendInternal {
         turn_id: TurnId,
         content: MessageContent,
@@ -427,6 +442,7 @@ enum Control {
 
 struct ActiveTurn {
     id: TurnId,
+    kind: ActiveTurnKind,
     cancellation: CancellationToken,
     partial_message: String,
     partial_reasoning: String,
@@ -435,6 +451,12 @@ struct ActiveTurn {
     message_id: MessageId,
     thought_message_id: MessageId,
     tools: Vec<ActiveToolCall>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveTurnKind {
+    Agent,
+    ManualCompaction,
 }
 
 struct SessionActor {
@@ -550,6 +572,16 @@ impl SessionActor {
                     let _ = response.send(result);
                     return false;
                 }
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.kind == ActiveTurnKind::ManualCompaction)
+                {
+                    let _ = response.send(Err(AgentServiceError::SessionBusy(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
                 if only_if_idle {
                     let _ = response.send(Err(AgentServiceError::SessionBusy(
                         self.record.info.id.clone(),
@@ -580,6 +612,42 @@ impl SessionActor {
                     message_id,
                     turn_id,
                 }));
+            }
+            Control::Compact { origin, response } => {
+                if self.phase == RuntimePhase::Closing {
+                    let _ = response.send(Err(AgentServiceError::SessionClosed(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                if self.phase == RuntimePhase::Cancelling {
+                    let _ = response.send(Err(AgentServiceError::PromptCancelled(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                if self.active.is_some() {
+                    let _ = response.send(Err(AgentServiceError::SessionBusy(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                let result = self.start_manual_compaction(origin).await;
+                let _ = response.send(result);
+            }
+            Control::Resume { origin, response } => {
+                if self.phase == RuntimePhase::Closing {
+                    let _ = response.send(Err(AgentServiceError::SessionClosed(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                if self.active.is_some() || self.phase != RuntimePhase::Idle {
+                    let _ = response.send(Ok(None));
+                    return false;
+                }
+                let result = self.start_resume(origin).await.map(Some);
+                let _ = response.send(result);
             }
             Control::AppendInternal {
                 turn_id,
@@ -843,6 +911,62 @@ impl SessionActor {
         })
     }
 
+    async fn start_manual_compaction(
+        &mut self,
+        origin: EndpointId,
+    ) -> Result<PromptAccepted, AgentServiceError> {
+        let turn_id = TurnId::new();
+        let message_id = MessageId::new();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
+            message_id: message_id.clone(),
+            turn_id: turn_id.clone(),
+            origin,
+            content: MessageContent::text("/compact"),
+        })
+        .await;
+        let turn = self.prepare_turn(turn_id.clone(), ActiveTurnKind::ManualCompaction);
+        tokio::spawn(agent_loop::run_manual_compaction(turn));
+        Ok(PromptAccepted {
+            message_id,
+            turn_id,
+        })
+    }
+
+    async fn start_resume(
+        &mut self,
+        origin: EndpointId,
+    ) -> Result<PromptAccepted, AgentServiceError> {
+        let previous_usage = self.usage_snapshot();
+        let turn_id = TurnId::new();
+        let message_id = MessageId::new();
+        let mut context = ContextManager::new(self.record.context.clone());
+        context.append_internal(
+            MessageKind::Runtime,
+            "<resume>Continue the previous task from the current session state.</resume>",
+        );
+        context.refresh_usage(self.tools.schemas());
+        self.record.context = context.into_context();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
+            message_id: message_id.clone(),
+            turn_id: turn_id.clone(),
+            origin,
+            content: MessageContent::text("/resume"),
+        })
+        .await;
+        if self.usage_snapshot() != previous_usage {
+            self.emit_usage_changed();
+        }
+        self.activate_turn(turn_id.clone());
+        Ok(PromptAccepted {
+            message_id,
+            turn_id,
+        })
+    }
+
     async fn start_internal(
         &mut self,
         content: MessageContent,
@@ -899,9 +1023,15 @@ impl SessionActor {
     }
 
     fn activate_turn(&mut self, turn_id: TurnId) {
+        let turn = self.prepare_turn(turn_id, ActiveTurnKind::Agent);
+        tokio::spawn(agent_loop::run(turn));
+    }
+
+    fn prepare_turn(&mut self, turn_id: TurnId, kind: ActiveTurnKind) -> RunTurn {
         let cancellation = CancellationToken::new();
         self.active = Some(ActiveTurn {
             id: turn_id.clone(),
+            kind,
             cancellation: cancellation.clone(),
             partial_message: String::new(),
             partial_reasoning: String::new(),
@@ -920,9 +1050,9 @@ impl SessionActor {
             cancellation.clone(),
             self.permission_tx.clone(),
         );
-        tokio::spawn(agent_loop::run(RunTurn {
+        RunTurn {
             session_id: self.record.info.id.clone(),
-            turn_id: turn_id.clone(),
+            turn_id,
             context: ContextManager::new(self.record.context.clone()),
             prompt_builder: self.prompt_builder.clone(),
             model: self.model.clone(),
@@ -931,7 +1061,7 @@ impl SessionActor {
             permission,
             cancellation,
             actor: self.turn_tx.clone(),
-        }));
+        }
     }
 
     fn validate_message_content(&self, content: &MessageContent) -> Result<(), AgentServiceError> {

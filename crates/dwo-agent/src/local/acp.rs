@@ -5,21 +5,21 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use agent_client_protocol::schema::v2::{
-    AgentCapabilities, AgentMessage, AgentThought, CancelSessionNotification, CloseSessionRequest,
-    CloseSessionResponse, ConfigOptionUpdate, Content as ToolContent, ContentBlock, ContentChunk,
-    DeleteSessionRequest, DeleteSessionResponse, Diff, EmbeddedResourceResource, IdleStateUpdate,
-    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptCapabilities, PromptEmbeddedContextCapabilities,
-    PromptImageCapabilities, PromptRequest, PromptResponse, ReplayFrom, RequestPermissionOutcome,
-    RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
-    RunningStateUpdate, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionDeleteCapabilities, SessionId, SessionInfo,
-    SessionInfoUpdate, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StateUpdate, StopReason, Terminal, TerminalExitStatus,
-    TerminalOutput, TerminalOutputChunk, TerminalUpdate, TextContent, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind, UpdateSessionNotification,
-    UsageUpdate, UserMessage,
+    AgentCapabilities, AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate,
+    CancelSessionNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
+    Content as ToolContent, ContentBlock, ContentChunk, DeleteSessionRequest,
+    DeleteSessionResponse, Diff, EmbeddedResourceResource, IdleStateUpdate, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
+    PromptCapabilities, PromptEmbeddedContextCapabilities, PromptImageCapabilities, PromptRequest,
+    PromptResponse, ReplayFrom, RequestPermissionOutcome, RequestPermissionRequest, ResourceLink,
+    ResumeSessionRequest, ResumeSessionResponse, RunningStateUpdate, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionDeleteCapabilities, SessionId, SessionInfo, SessionInfoUpdate, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StateUpdate, StopReason,
+    Terminal, TerminalExitStatus, TerminalOutput, TerminalOutputChunk, TerminalUpdate, TextContent,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind,
+    UpdateSessionNotification, UsageUpdate, UserMessage,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Error as AcpError, Responder,
@@ -154,6 +154,7 @@ where
                                 if let Some((used, size)) = snapshot_usage(&value) {
                                     send_usage_update(&cx, id, used, size);
                                 }
+                                send_available_commands(&cx, id);
                                 result
                             }
                             Err(error) => responder.respond_with_error(internal_error(error)),
@@ -216,8 +217,13 @@ where
                     match ensure_observer(&runtime, &session_id, &cx, replay).await {
                         Ok(_) => {
                             match session_config_options(&runtime.config_path, &session_id).await {
-                                Ok(options) => responder
-                                    .respond(ResumeSessionResponse::new().config_options(options)),
+                                Ok(options) => {
+                                    let result = responder.respond(
+                                        ResumeSessionResponse::new().config_options(options),
+                                    );
+                                    send_available_commands(&cx, &session_id);
+                                    result
+                                }
                                 Err(error) => responder.respond_with_error(internal_error(error)),
                             }
                         }
@@ -380,6 +386,13 @@ async fn run_prompt(
             return;
         }
     };
+    let command = match parse_slash_command(&content) {
+        Ok(command) => command,
+        Err(error) => {
+            let _ = responder.respond_with_error(invalid_params(error));
+            return;
+        }
+    };
     let observer = match ensure_observer(&runtime, &session_id, &cx, false).await {
         Ok(observer) => observer,
         Err(error) => {
@@ -387,17 +400,43 @@ async fn run_prompt(
             return;
         }
     };
-    match ipc::request(
-        &runtime.config_path,
-        "session.prompt",
-        json!({
-            "session_id": session_id,
-            "endpoint_id": observer.endpoint_id,
-            "message": content,
-        }),
-    )
-    .await
-    {
+    let request = match command {
+        Some(SlashCommand::Compact) => {
+            ipc::request(
+                &runtime.config_path,
+                "session.compact",
+                json!({
+                    "session_id": session_id,
+                    "endpoint_id": observer.endpoint_id,
+                }),
+            )
+            .await
+        }
+        Some(SlashCommand::Resume) => {
+            ipc::request(
+                &runtime.config_path,
+                "session.resume-turn",
+                json!({
+                    "session_id": session_id,
+                    "endpoint_id": observer.endpoint_id,
+                }),
+            )
+            .await
+        }
+        None => {
+            ipc::request(
+                &runtime.config_path,
+                "session.prompt",
+                json!({
+                    "session_id": session_id,
+                    "endpoint_id": observer.endpoint_id,
+                    "message": content,
+                }),
+            )
+            .await
+        }
+    };
+    match request {
         Ok(value) => {
             let _ = responder.respond(PromptResponse::new());
             if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
@@ -409,6 +448,33 @@ async fn run_prompt(
         Err(error) => {
             let _ = responder.respond_with_error(internal_error(error));
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCommand {
+    Compact,
+    Resume,
+}
+
+fn parse_slash_command(content: &MessageContent) -> Result<Option<SlashCommand>> {
+    let Some(text) = content.as_text() else {
+        return Ok(None);
+    };
+    let mut parts = text.split_whitespace();
+    let Some(name) = parts.next() else {
+        return Ok(None);
+    };
+    match name {
+        "/compact" => {
+            anyhow::ensure!(parts.next().is_none(), "/compact does not accept input");
+            Ok(Some(SlashCommand::Compact))
+        }
+        "/resume" => {
+            anyhow::ensure!(parts.next().is_none(), "/resume does not accept input");
+            Ok(Some(SlashCommand::Resume))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -803,6 +869,21 @@ fn send_update(cx: &ConnectionTo<Client>, session_id: &str, update: SessionUpdat
         Client,
         UpdateSessionNotification::new(SessionId::new(session_id), update),
     );
+}
+
+fn send_available_commands(cx: &ConnectionTo<Client>, session_id: &str) {
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands())),
+    );
+}
+
+fn available_commands() -> Vec<AvailableCommand> {
+    vec![
+        AvailableCommand::new("compact", "Compact the current session context"),
+        AvailableCommand::new("resume", "Continue the current session when it is idle"),
+    ]
 }
 
 fn send_user_message(
@@ -1430,6 +1511,50 @@ mod tests {
             prompt_content(&blob).unwrap_err().to_string(),
             "binary embedded resources are not supported"
         );
+    }
+
+    #[test]
+    fn acp_recognizes_session_commands_without_claiming_other_slash_prompts() {
+        assert!(matches!(
+            parse_slash_command(&MessageContent::text(" /compact ")).unwrap(),
+            Some(SlashCommand::Compact)
+        ));
+        assert!(matches!(
+            parse_slash_command(&MessageContent::text("/resume")).unwrap(),
+            Some(SlashCommand::Resume)
+        ));
+        assert!(
+            parse_slash_command(&MessageContent::text("/custom value"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            parse_slash_command(&MessageContent::text("/compact now"))
+                .unwrap_err()
+                .to_string(),
+            "/compact does not accept input"
+        );
+        assert_eq!(
+            parse_slash_command(&MessageContent::text("/resume now"))
+                .unwrap_err()
+                .to_string(),
+            "/resume does not accept input"
+        );
+    }
+
+    #[test]
+    fn acp_advertises_session_commands_as_v2_slash_commands() {
+        let update = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+            available_commands(),
+        ));
+        let json = serde_json::to_value(update).unwrap();
+        assert_eq!(json["sessionUpdate"], "available_commands_update");
+        assert_eq!(json["availableCommands"][0]["name"], "compact");
+        assert_eq!(
+            json["availableCommands"][0]["description"],
+            "Compact the current session context"
+        );
+        assert_eq!(json["availableCommands"][1]["name"], "resume");
     }
 
     #[test]

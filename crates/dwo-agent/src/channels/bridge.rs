@@ -168,6 +168,23 @@ impl SessionBridge {
                     .await?;
                 vec!["Cancellation requested".to_string()]
             }
+            ChannelCommand::Compact => {
+                let id = self.selected_session_id().await?;
+                self.ensure_observer(&id).await?;
+                self.host
+                    .compact_session(&id, self.endpoint.clone())
+                    .await?;
+                Vec::new()
+            }
+            ChannelCommand::Resume => {
+                let id = self.selected_session_id().await?;
+                self.ensure_observer(&id).await?;
+                let _ = self
+                    .host
+                    .resume_session_turn(&id, self.endpoint.clone())
+                    .await?;
+                Vec::new()
+            }
             ChannelCommand::Model { name: model } => {
                 let id = self.selected_session_id().await?;
                 self.host

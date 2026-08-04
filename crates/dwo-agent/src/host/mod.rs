@@ -73,6 +73,12 @@ struct PromptParam {
 }
 
 #[derive(Deserialize)]
+struct SessionCommandParam {
+    session_id: String,
+    endpoint_id: String,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum PromptMessage {
     Text(String),
@@ -380,6 +386,22 @@ impl Host {
             .await?)
     }
 
+    pub async fn compact_session(
+        &self,
+        id: &SessionId,
+        endpoint: EndpointId,
+    ) -> Result<PromptAccepted> {
+        Ok(self.service.load(id).await?.compact(endpoint).await?)
+    }
+
+    pub async fn resume_session_turn(
+        &self,
+        id: &SessionId,
+        endpoint: EndpointId,
+    ) -> Result<Option<PromptAccepted>> {
+        Ok(self.service.load(id).await?.resume(endpoint).await?)
+    }
+
     pub async fn cancel_session(
         &self,
         id: &SessionId,
@@ -531,6 +553,35 @@ impl Host {
                     "message_id": accepted.message_id,
                     "turn_id": accepted.turn_id,
                 }))
+            }
+            "session.compact" => {
+                let params: SessionCommandParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
+                let accepted = self.compact_session(&id, endpoint).await?;
+                Ok(json!({
+                    "session_id": id,
+                    "message_id": accepted.message_id,
+                    "turn_id": accepted.turn_id,
+                }))
+            }
+            "session.resume-turn" => {
+                let params: SessionCommandParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
+                let accepted = self.resume_session_turn(&id, endpoint).await?;
+                Ok(match accepted {
+                    Some(accepted) => json!({
+                        "accepted": true,
+                        "session_id": id,
+                        "message_id": accepted.message_id,
+                        "turn_id": accepted.turn_id,
+                    }),
+                    None => json!({
+                        "accepted": false,
+                        "session_id": id,
+                    }),
+                })
             }
             "session.read" => {
                 let params: ReadSessionParam = serde_json::from_value(params)?;

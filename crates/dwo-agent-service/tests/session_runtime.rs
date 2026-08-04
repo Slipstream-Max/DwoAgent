@@ -913,6 +913,132 @@ async fn waking_internal_message_starts_an_idle_session_immediately() {
 }
 
 #[tokio::test]
+async fn resume_continues_idle_context_and_is_silent_while_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::text("initial answer"),
+        ScriptedStep::delayed_text("resumed answer", 5_000),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "start work").await.unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let resumed = agent.resume(EndpointId::new()).await.unwrap().unwrap();
+    while model.requests().await.len() < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(agent.resume(EndpointId::new()).await.unwrap().is_none());
+    agent.cancel(Some(resumed.turn_id.clone())).await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCancelled { turn_id } if turn_id == resumed.turn_id
+    ));
+
+    let requests = model.requests().await;
+    assert!(requests[1].messages.iter().any(|message| {
+        message.kind == MessageKind::Runtime && message.content.contains("<resume>")
+    }));
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(snapshot.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::UserPromptSubmitted { content, .. }
+            if content.as_text() == Some("/resume")
+    )));
+    assert!(!snapshot.record.context.messages.iter().any(|message| {
+        message.role == dwo_agent_service::MessageRole::User && message.content == "/resume"
+    }));
+}
+
+#[tokio::test]
+async fn manual_compaction_uses_the_command_turn_without_adding_it_to_model_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::with_compaction(
+        [
+            ScriptedStep::text("old answer"),
+            ScriptedStep::text("recent answer"),
+        ],
+        [ScriptedSummaryStep {
+            summary: "older work summary".to_string(),
+            input_tokens: 100,
+            output_tokens: 10,
+        }],
+        ModelLimits {
+            context_window_tokens: 200_000,
+            max_output_tokens: 20_000,
+            max_input_tokens: 180_000,
+            compact_trigger_tokens: u64::MAX,
+        },
+    );
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent
+        .prompt(
+            EndpointId::new(),
+            format!("old work {}", "x".repeat(100_000)),
+        )
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    agent
+        .prompt(EndpointId::new(), "recent work")
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    let before = agent.snapshot().await.unwrap().usage.used;
+
+    let compact = agent.compact(EndpointId::new()).await.unwrap();
+    let mut response = None;
+    loop {
+        match events.recv().await.unwrap().payload {
+            SessionEventPayload::AssistantCompleted {
+                turn_id, content, ..
+            } if turn_id == compact.turn_id => response = Some(content),
+            SessionEventPayload::TurnCompleted { turn_id } if turn_id == compact.turn_id => break,
+            SessionEventPayload::TurnFailed { turn_id, error } if turn_id == compact.turn_id => {
+                panic!("manual compaction failed: {error}")
+            }
+            _ => {}
+        }
+    }
+
+    let snapshot = agent.snapshot().await.unwrap();
+    assert!(snapshot.usage.used < before);
+    assert_eq!(snapshot.record.context.compaction.count, 1);
+    assert!(
+        response
+            .as_deref()
+            .is_some_and(|content| content.starts_with("Context compacted from "))
+    );
+    assert!(snapshot.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::UserPromptSubmitted { content, .. }
+            if content.as_text() == Some("/compact")
+    )));
+    assert!(!snapshot.record.context.messages.iter().any(|message| {
+        message.role == dwo_agent_service::MessageRole::User && message.content == "/compact"
+    }));
+    assert_eq!(model.requests().await.len(), 2);
+    assert_eq!(model.summary_request_count().await, 1);
+}
+
+#[tokio::test]
 async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_model() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::with_compaction(

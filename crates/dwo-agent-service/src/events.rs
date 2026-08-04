@@ -85,7 +85,6 @@ impl ClientTranscriptEvent {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventPayload {
     UserPromptSubmitted {
-        #[serde(default)]
         message_id: MessageId,
         turn_id: TurnId,
         origin: EndpointId,
@@ -112,9 +111,7 @@ pub enum SessionEventPayload {
         step: ActiveStepSnapshot,
     },
     AssistantCompleted {
-        #[serde(default)]
         message_id: MessageId,
-        #[serde(default)]
         thought_message_id: MessageId,
         turn_id: TurnId,
         content: String,

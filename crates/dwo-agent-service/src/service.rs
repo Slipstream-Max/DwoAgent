@@ -410,8 +410,7 @@ impl AgentService {
                 return Ok(agent);
             }
         }
-        let mut transcript = self.repository.load_transcript(&record.info.id).await?;
-        assign_legacy_message_ids(&record.info.id, &mut transcript);
+        let transcript = self.repository.load_transcript(&record.info.id).await?;
         let prompt_builder = self.prompt_builder(record.info.cwd.clone());
         let mut record_changed = repair_empty_title(&mut record, &transcript);
         if !record.context.system_prompt.is_initialized() {
@@ -478,32 +477,6 @@ fn default_session_title(cwd: &std::path::Path) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "session".to_string())
-}
-
-fn assign_legacy_message_ids(session_id: &SessionId, transcript: &mut [ClientTranscriptEvent]) {
-    for (index, event) in transcript.iter_mut().enumerate() {
-        match &mut event.payload {
-            SessionEventPayload::UserPromptSubmitted { message_id, .. }
-                if message_id.is_empty() =>
-            {
-                *message_id = crate::MessageId::legacy(session_id, index);
-            }
-            SessionEventPayload::AssistantCompleted {
-                message_id,
-                thought_message_id,
-                ..
-            } => {
-                if message_id.is_empty() {
-                    *message_id = crate::MessageId::legacy_part(session_id, index, "answer");
-                }
-                if thought_message_id.is_empty() {
-                    *thought_message_id =
-                        crate::MessageId::legacy_part(session_id, index, "thought");
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 fn repair_empty_title(record: &mut SessionRecord, transcript: &[ClientTranscriptEvent]) -> bool {

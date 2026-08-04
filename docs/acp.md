@@ -58,6 +58,17 @@ channels:
 
 ACP client 传入的 `mcpServers` 不会创建客户端专属 MCP runtime。赤铎的 MCP server 统一在 `~/.dwoagent/resource/mcp.json` 配置，由 daemon 托管。
 
+## Slash Commands
+
+创建或恢复 session 后，Agent 通过 ACP v2 `available_commands_update` 宣告以下命令：
+
+| 命令 | 行为 |
+| --- | --- |
+| `/compact` | 手动压缩当前 session context，并返回压缩前后的估算 token；命令文本不进入模型上下文 |
+| `/resume` | session idle 时加入内部继续指令并启动新 turn；运行中静默忽略，不排队也不报错 |
+
+Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执行。ACP 协议自身的 `session/resume` 是重新接入已有 session、恢复 observer 和可选回放历史，不会启动模型；它与自定义 `/resume` 命令不是同一功能。
+
 ## 输入与输出能力
 
 当前 ACP adapter 支持：

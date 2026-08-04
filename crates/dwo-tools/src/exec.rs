@@ -4,10 +4,12 @@ use std::pin::Pin;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{Value, json};
 
+use crate::ToolEvent;
 use crate::call::{ParsedToolCall, TerminalArgs, ToolCall};
 use crate::manager::{ConfirmationRequest, ExecutionContext, ToolManager};
 use crate::policy::Authorization;
 use crate::result::ToolResult;
+use crate::terminal::TerminalTelemetry;
 
 pub(crate) async fn execute(
     manager: &ToolManager,
@@ -57,7 +59,14 @@ pub(crate) async fn execute(
             timeout_ms,
         }) => manager
             .terminals
-            .run(command, cwd.as_deref(), tty, yield_ms, timeout_ms)
+            .run_with_events(
+                command,
+                cwd.as_deref(),
+                tty,
+                yield_ms,
+                timeout_ms,
+                Some(TerminalTelemetry::new(id.clone(), context.events.clone())),
+            )
             .await
             .map(terminal_output),
         ToolCall::Terminal(TerminalArgs::Input {
@@ -79,6 +88,14 @@ pub(crate) async fn execute(
             .execute(args.patch, manager.cwd.clone())
             .await
             .map(|result| {
+                emit(
+                    context,
+                    ToolEvent::FileChanged {
+                        tool_call_id: id.clone(),
+                        changes: result.changes.clone(),
+                        patch: result.patch,
+                    },
+                );
                 json!({
                     "tool": "file_edit",
                     "kind": "file_edit",
@@ -87,9 +104,21 @@ pub(crate) async fn execute(
                 })
             }),
         ToolCall::ReadFile(args) => {
+            let path = if args.path.is_absolute() {
+                args.path.clone()
+            } else {
+                manager.cwd.join(&args.path)
+            };
             crate::read_file::execute(args, &manager.cwd, context.allow_image_input)
                 .await
                 .map(|result| {
+                    emit(
+                        context,
+                        ToolEvent::FileRead {
+                            tool_call_id: id.clone(),
+                            path: std::fs::canonicalize(&path).unwrap_or(path),
+                        },
+                    );
                     model_context = result.model_context;
                     result.output
                 })
@@ -101,6 +130,12 @@ pub(crate) async fn execute(
         tool_name: name.clone(),
         output: output.unwrap_or_else(|error| error_output(&name, format!("{error:#}"))),
         model_context,
+    }
+}
+
+fn emit(context: &ExecutionContext, event: ToolEvent) {
+    if let Some(events) = &context.events {
+        events(event);
     }
 }
 

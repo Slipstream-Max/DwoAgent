@@ -18,6 +18,12 @@ pub struct PatchChange {
     pub moved_to: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+pub struct PatchApplication {
+    pub changes: Vec<PatchChange>,
+    pub git_patch: String,
+}
+
 struct TextFile {
     text: String,
     bom: bool,
@@ -43,7 +49,7 @@ enum PreparedChange {
 /// Parser and matching behavior derived from OpenAI Codex `codex-rs/apply-patch`.
 /// Filesystem application is local-only and intentionally omits its CLI, shell
 /// interception, streaming parser, sandbox adapters, and remote filesystem API.
-pub fn apply_patch(patch: &str, cwd: &Path) -> Result<Vec<PatchChange>> {
+pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
     let hunks = parse_patch(patch)?;
     let mut prepared = Vec::with_capacity(hunks.len());
     let mut changes = Vec::with_capacity(hunks.len());
@@ -120,6 +126,7 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<Vec<PatchChange>> {
         }
     }
 
+    let git_patch = render_git_patch(&prepared);
     for change in prepared {
         match change {
             PreparedChange::Add { path, bytes } => write_file(&path, &bytes)?,
@@ -140,7 +147,39 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<Vec<PatchChange>> {
             }
         }
     }
-    Ok(changes)
+    Ok(PatchApplication { changes, git_patch })
+}
+
+fn render_git_patch(changes: &[PreparedChange]) -> String {
+    changes
+        .iter()
+        .filter_map(|change| {
+            let (old_path, new_path, old, new) = match change {
+                PreparedChange::Add { path, bytes } => (path, path, Vec::new(), bytes.clone()),
+                PreparedChange::Delete { path } => (path, path, fs::read(path).ok()?, Vec::new()),
+                PreparedChange::Update {
+                    source,
+                    destination,
+                    bytes,
+                } => (source, destination, fs::read(source).ok()?, bytes.clone()),
+            };
+            let old = String::from_utf8(old).ok()?;
+            let new = String::from_utf8(new).ok()?;
+            let old_name = git_path(old_path);
+            let new_name = git_path(new_path);
+            let mut options = diffy::DiffOptions::new();
+            options
+                .set_original_filename(old_name.clone())
+                .set_modified_filename(new_name.clone());
+            let patch = options.create_patch(&old, &new).to_string();
+            Some(format!("diff --git {old_name} {new_name}\n{patch}"))
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn git_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn apply_chunks(content: &str, chunks: &[UpdateChunk]) -> Result<String> {

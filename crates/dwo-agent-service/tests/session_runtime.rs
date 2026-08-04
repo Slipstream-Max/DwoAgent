@@ -360,7 +360,7 @@ async fn reasoning_and_answer_deltas_are_broadcast_separately() {
 }
 
 #[tokio::test]
-async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
+async fn accepted_prompt_is_broadcast_to_origin_and_other_observers() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([ScriptedStep::text("done")]);
     let service = AgentService::new(
@@ -377,7 +377,7 @@ async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
     let mut origin_events = agent.attach(origin.clone()).await.unwrap().events;
     let mut observer_events = agent.attach(observer).await.unwrap().events;
 
-    let turn_id = agent
+    let accepted = agent
         .prompt(origin.clone(), "hello observers")
         .await
         .unwrap();
@@ -387,6 +387,7 @@ async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
                 turn_id,
                 origin,
                 content,
+                ..
             } = observer_events.recv().await.unwrap().payload
             {
                 break (turn_id, origin, content);
@@ -395,31 +396,33 @@ async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
     })
     .await
     .unwrap();
-    assert_eq!(observed.0, turn_id);
+    assert_eq!(observed.0, accepted.turn_id);
     assert_eq!(observed.1, origin);
     assert_eq!(observed.2, "hello observers");
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let observed_origin = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let event = origin_events.recv().await.unwrap();
-            assert!(!matches!(
-                &event.payload,
-                SessionEventPayload::UserPromptSubmitted { .. }
-            ));
-            if matches!(&event.payload, SessionEventPayload::TurnCompleted { .. }) {
-                break;
+            if let SessionEventPayload::UserPromptSubmitted {
+                message_id,
+                content,
+                ..
+            } = origin_events.recv().await.unwrap().payload
+            {
+                break (message_id, content);
             }
         }
     })
     .await
     .unwrap();
+    assert_eq!(observed_origin.0, accepted.message_id);
+    assert_eq!(observed_origin.1, "hello observers");
 }
 
 #[tokio::test]
-async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
+async fn prompt_is_accepted_before_the_current_step_finishes() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([
-        ScriptedStep::delayed_text("first answer", 200),
+        ScriptedStep::delayed_text("first answer", 500),
         ScriptedStep::text("replacement"),
     ]);
     let service = AgentService::new(
@@ -433,7 +436,11 @@ async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
         .unwrap();
     let endpoint = EndpointId::new();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let first = agent.prompt(endpoint.clone(), "first").await.unwrap();
+    let first = agent
+        .prompt(endpoint.clone(), "first")
+        .await
+        .unwrap()
+        .turn_id;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         while model.requests().await.is_empty() {
@@ -442,11 +449,11 @@ async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
     })
     .await
     .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(2), agent.prompt(endpoint, "second"))
+    let second = tokio::time::timeout(Duration::from_millis(100), agent.prompt(endpoint, "second"))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first, second);
+    assert_eq!(first, second.turn_id);
     assert!(matches!(
         wait_for_turn_end(&mut events).await,
         SessionEventPayload::TurnCompleted { turn_id } if turn_id == first
@@ -468,7 +475,7 @@ async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
 }
 
 #[tokio::test]
-async fn try_prompt_never_joins_an_active_turn() {
+async fn prompt_idle_rejects_an_active_turn() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([
         ScriptedStep::delayed_text("first answer", 150),
@@ -484,13 +491,17 @@ async fn try_prompt_never_joins_an_active_turn() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let first = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    let first = agent
+        .prompt(EndpointId::new(), "first")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let error = agent
-        .try_prompt(EndpointId::new(), "second")
+        .prompt_idle(EndpointId::new(), "second")
         .await
         .unwrap_err();
     assert!(matches!(error, AgentServiceError::SessionBusy(_)));
@@ -499,7 +510,11 @@ async fn try_prompt_never_joins_an_active_turn() {
         SessionEventPayload::TurnCompleted { turn_id } if turn_id == first
     ));
 
-    let second = agent.try_prompt(EndpointId::new(), "second").await.unwrap();
+    let second = agent
+        .prompt_idle(EndpointId::new(), "second")
+        .await
+        .unwrap()
+        .turn_id;
     assert_ne!(first, second);
     assert!(matches!(
         wait_for_turn_end(&mut events).await,
@@ -525,7 +540,11 @@ async fn targeted_internal_message_continues_only_the_expected_turn() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let turn = agent.prompt(EndpointId::new(), "work").await.unwrap();
+    let turn = agent
+        .prompt(EndpointId::new(), "work")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -560,7 +579,7 @@ async fn targeted_internal_message_continues_only_the_expected_turn() {
 }
 
 #[tokio::test]
-async fn cancel_clears_queued_user_prompts() {
+async fn cancel_keeps_an_already_accepted_queued_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([ScriptedStep::delayed_text("late", 5_000)]);
     let service = AgentService::new(
@@ -573,32 +592,36 @@ async fn cancel_clears_queued_user_prompts() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let first = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    let first = agent
+        .prompt(EndpointId::new(), "first")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let queued_agent = agent.clone();
-    let queued =
-        tokio::spawn(async move { queued_agent.prompt(EndpointId::new(), "queued").await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let queued = agent.prompt(EndpointId::new(), "queued").await.unwrap();
     agent.cancel(Some(first.clone())).await.unwrap();
-    let error = queued.await.unwrap().unwrap_err();
-    assert!(matches!(
-        error,
-        dwo_agent_service::AgentServiceError::PromptCancelled(_)
-    ));
     assert!(matches!(
         wait_for_turn_end(&mut events).await,
         SessionEventPayload::TurnCancelled { turn_id } if turn_id == first
     ));
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
-    assert!(snapshot.transcript.iter().all(|event| {
-        !matches!(
+    assert!(snapshot.transcript.iter().any(|event| {
+        matches!(
             &event.payload,
-            SessionEventPayload::UserPromptSubmitted { content, .. }
-                if content.as_text() == Some("queued")
+            SessionEventPayload::UserPromptSubmitted { message_id, content, .. }
+                if message_id == &queued.message_id && content.as_text() == Some("queued")
         )
     }));
+    assert!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .any(|message| message.content == "queued")
+    );
 }
 
 #[tokio::test]
@@ -618,7 +641,11 @@ async fn queued_prompts_are_delivered_fifo_in_the_same_turn() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let turn = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    let turn = agent
+        .prompt(EndpointId::new(), "first")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -628,8 +655,8 @@ async fn queued_prompts_are_delivered_fifo_in_the_same_turn() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let third_agent = agent.clone();
     let third = tokio::spawn(async move { third_agent.prompt(EndpointId::new(), "third").await });
-    assert_eq!(second.await.unwrap().unwrap(), turn);
-    assert_eq!(third.await.unwrap().unwrap(), turn);
+    assert_eq!(second.await.unwrap().unwrap().turn_id, turn);
+    assert_eq!(third.await.unwrap().unwrap().turn_id, turn);
     wait_for_turn_end(&mut events).await;
 
     let requests = model.requests().await;
@@ -659,7 +686,11 @@ async fn cancel_keeps_internal_messages_without_waking_another_step() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let turn = agent.prompt(EndpointId::new(), "work").await.unwrap();
+    let turn = agent
+        .prompt(EndpointId::new(), "work")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1505,7 +1536,8 @@ async fn model_switch_is_allowed_while_an_image_turn_is_active() {
             MessageContent::blocks(vec![ContentBlock::image("image/png", "aGVsbG8=")]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .turn_id;
 
     agent
         .set_config(SessionConfigUpdate::Model("text-model".to_string()))
@@ -1773,7 +1805,11 @@ async fn another_endpoint_can_cancel_the_current_turn() {
         .await
         .unwrap();
     let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
-    let turn_id = agent.prompt(EndpointId::new(), "wait").await.unwrap();
+    let turn_id = agent
+        .prompt(EndpointId::new(), "wait")
+        .await
+        .unwrap()
+        .turn_id;
     agent.cancel(Some(turn_id)).await.unwrap();
 
     assert!(matches!(
@@ -2246,6 +2282,7 @@ async fn filesystem_repository_loads_context_after_service_restart() {
             SessionEventPayload::AssistantReasoningDelta { .. } => "reasoning_delta",
             SessionEventPayload::AssistantCompleted { .. } => "assistant_completed",
             SessionEventPayload::ToolStarted { .. } => "tool_started",
+            SessionEventPayload::FileChanged { .. } => "file_changed",
             SessionEventPayload::ToolCompleted { .. } => "tool_completed",
             _ => "other",
         })
@@ -2256,6 +2293,7 @@ async fn filesystem_repository_loads_context_after_service_restart() {
             "user",
             "assistant_completed",
             "tool_started",
+            "file_changed",
             "tool_completed",
             "assistant_completed",
         ]

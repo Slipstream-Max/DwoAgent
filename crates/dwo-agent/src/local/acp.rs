@@ -4,29 +4,35 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
-use agent_client_protocol::schema::{
-    AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk,
-    EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
+use agent_client_protocol::schema::v2::{
+    AgentCapabilities, AgentMessage, AgentThought, CancelSessionNotification, CloseSessionRequest,
+    CloseSessionResponse, ConfigOptionUpdate, Content as ToolContent, ContentBlock, ContentChunk,
+    DeleteSessionRequest, DeleteSessionResponse, Diff, EmbeddedResourceResource, IdleStateUpdate,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptCapabilities, PromptEmbeddedContextCapabilities,
+    PromptImageCapabilities, PromptRequest, PromptResponse, ReplayFrom, RequestPermissionOutcome,
     RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
-    SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
-    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    RunningStateUpdate, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionDeleteCapabilities, SessionId, SessionInfo,
+    SessionInfoUpdate, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StateUpdate, StopReason, Terminal, TerminalExitStatus,
+    TerminalOutput, TerminalOutputChunk, TerminalUpdate, TextContent, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind, UpdateSessionNotification,
+    UsageUpdate, UserMessage,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification,
-    on_receive_request,
+    Agent, ByteStreams, Client, ConnectionTo, Error as AcpError, Responder,
+    on_receive_notification, on_receive_request,
 };
 use anyhow::{Context, Result};
+use base64::Engine;
+use chrono::{DateTime, SecondsFormat, Utc};
 use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -41,25 +47,6 @@ struct AcpRuntime {
 
 struct SessionObserver {
     endpoint_id: String,
-    terminals: broadcast::Sender<TurnTerminal>,
-}
-
-#[derive(Clone, Debug)]
-enum TurnTerminal {
-    Completed(String),
-    Cancelled(String),
-    Failed { turn_id: String, error: String },
-    StreamClosed,
-}
-
-impl TurnTerminal {
-    fn turn_id(&self) -> Option<&str> {
-        match self {
-            Self::Completed(turn_id) | Self::Cancelled(turn_id) => Some(turn_id),
-            Self::Failed { turn_id, .. } => Some(turn_id),
-            Self::StreamClosed => None,
-        }
-    }
 }
 
 pub async fn run(config_path: PathBuf) -> Result<()> {
@@ -109,37 +96,35 @@ where
     };
     let new_config = config_path.clone();
     let list_config = config_path.clone();
-    let load_runtime = runtime.clone();
     let resume_runtime = runtime.clone();
     let prompt_runtime = runtime.clone();
-    let set_runtime = runtime;
-    let cancel_config = config_path;
+    let close_runtime = runtime.clone();
+    let delete_runtime = runtime.clone();
+    let set_runtime = runtime.clone();
+    let cancel_runtime = runtime;
 
     let agent = Agent
-        .builder()
-        .name("dwo")
+        .v2()
         .on_receive_request(
             async move |request: InitializeRequest,
                         responder: Responder<InitializeResponse>,
                         _cx: ConnectionTo<Client>| {
                 responder.respond(
-                    InitializeResponse::new(request.protocol_version)
-                        .agent_info(Implementation::new("dwo", env!("CARGO_PKG_VERSION")))
-                        .agent_capabilities(
-                            AgentCapabilities::new()
-                                .load_session(true)
-                                .prompt_capabilities(
+                    InitializeResponse::new(
+                        request.protocol_version,
+                        Implementation::new("dwo", env!("CARGO_PKG_VERSION")),
+                    )
+                    .capabilities(
+                        AgentCapabilities::new().session(
+                            SessionCapabilities::new()
+                                .prompt(
                                     PromptCapabilities::new()
-                                        .image(true)
-                                        .audio(false)
-                                        .embedded_context(true),
+                                        .image(PromptImageCapabilities::new())
+                                        .embedded_context(PromptEmbeddedContextCapabilities::new()),
                                 )
-                                .session_capabilities(
-                                    SessionCapabilities::new()
-                                        .list(SessionListCapabilities::new())
-                                        .resume(SessionResumeCapabilities::new()),
-                                ),
+                                .delete(SessionDeleteCapabilities::new()),
                         ),
+                    ),
                 )
             },
             on_receive_request!(),
@@ -148,10 +133,13 @@ where
             async move |request: NewSessionRequest,
                         responder: Responder<NewSessionResponse>,
                         cx: ConnectionTo<Client>| {
+                if let Err(error) = validate_new_session(&request) {
+                    return responder.respond_with_error(invalid_params(error));
+                }
                 match ipc::request(
                     &new_config,
                     "session.new",
-                    json!({"cwd": request.cwd, "title": Value::Null}),
+                    json!({"cwd": request.cwd.into_inner(), "title": Value::Null}),
                 )
                 .await
                 {
@@ -183,21 +171,24 @@ where
                 if request.cursor.is_some() {
                     return responder.respond(ListSessionsResponse::new(Vec::new()));
                 }
-                match ipc::request(&list_config, "session.list", json!({})).await {
+                match ipc::request(&list_config, "session.list", json!({"all": true})).await {
                     Ok(value) => {
                         let records: Vec<dwo_agent_service::SessionRecord> =
                             serde_json::from_value(value).unwrap_or_default();
                         let cwd = request.cwd;
                         let sessions = records
                             .into_iter()
-                            .filter(|record| cwd.as_ref().is_none_or(|cwd| record.info.cwd == *cwd))
+                            .filter(|record| {
+                                cwd.as_ref()
+                                    .is_none_or(|cwd| record.info.cwd == AsRef::<Path>::as_ref(cwd))
+                            })
                             .map(|record| {
                                 SessionInfo::new(
                                     SessionId::new(record.info.id.as_str()),
                                     record.info.cwd,
                                 )
                                 .title(record.info.title)
-                                .updated_at(record.info.updated_at_ms.to_string())
+                                .updated_at(timestamp_rfc3339(record.info.updated_at_ms))
                             })
                             .collect();
                         responder.respond(ListSessionsResponse::new(sessions))
@@ -208,40 +199,21 @@ where
             on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: LoadSessionRequest,
-                        responder: Responder<LoadSessionResponse>,
-                        cx: ConnectionTo<Client>| {
-                let runtime = load_runtime.clone();
-                cx.clone().spawn(async move {
-                    match ensure_observer(&runtime, &request.session_id.to_string(), &cx, true)
-                        .await
-                    {
-                        Ok(_) => match session_config_options(
-                            &runtime.config_path,
-                            &request.session_id.to_string(),
-                        )
-                        .await
-                        {
-                            Ok(options) => responder
-                                .respond(LoadSessionResponse::new().config_options(options)),
-                            Err(error) => responder.respond_with_error(internal_error(error)),
-                        },
-                        Err(error) => responder.respond_with_error(internal_error(error)),
-                    }?;
-                    Ok(())
-                })?;
-                Ok(())
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
             async move |request: ResumeSessionRequest,
                         responder: Responder<ResumeSessionResponse>,
                         cx: ConnectionTo<Client>| {
                 let runtime = resume_runtime.clone();
                 cx.clone().spawn(async move {
                     let session_id = request.session_id.to_string();
-                    match ensure_observer(&runtime, &session_id, &cx, false).await {
+                    match validate_resume(&runtime, &request).await {
+                        Ok(()) => {}
+                        Err(error) => {
+                            responder.respond_with_error(invalid_params(error))?;
+                            return Ok(());
+                        }
+                    }
+                    let replay = request.replay_from.is_some();
+                    match ensure_observer(&runtime, &session_id, &cx, replay).await {
                         Ok(_) => {
                             match session_config_options(&runtime.config_path, &session_id).await {
                                 Ok(options) => responder
@@ -254,6 +226,50 @@ where
                     Ok(())
                 })?;
                 Ok(())
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: CloseSessionRequest,
+                        responder: Responder<CloseSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                let runtime = close_runtime.clone();
+                let session_id = request.session_id.to_string();
+                match ipc::request(
+                    &runtime.config_path,
+                    "session.close",
+                    json!({"session_id": session_id}),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        runtime.observers.lock().await.remove(&session_id);
+                        responder.respond(CloseSessionResponse::new())
+                    }
+                    Err(error) => responder.respond_with_error(internal_error(error)),
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: DeleteSessionRequest,
+                        responder: Responder<DeleteSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                let runtime = delete_runtime.clone();
+                let session_id = request.session_id.to_string();
+                match ipc::request(
+                    &runtime.config_path,
+                    "session.delete",
+                    json!({"session_id": session_id}),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        runtime.observers.lock().await.remove(&session_id);
+                        responder.respond(DeleteSessionResponse::new())
+                    }
+                    Err(error) => responder.respond_with_error(internal_error(error)),
+                }
             },
             on_receive_request!(),
         )
@@ -276,7 +292,10 @@ where
                         cx: ConnectionTo<Client>| {
                 let session_id = request.session_id.to_string();
                 let config_id = request.config_id.to_string();
-                let value = request.value.to_string();
+                let Some(value) = request.value.as_id().map(ToString::to_string) else {
+                    return responder
+                        .respond_with_error(invalid_params("session config value must be an id"));
+                };
                 match ipc::request(
                     &set_runtime.config_path,
                     "session.set_config_option",
@@ -312,9 +331,9 @@ where
             on_receive_request!(),
         )
         .on_receive_notification(
-            async move |notification: CancelNotification, _cx: ConnectionTo<Client>| {
+            async move |notification: CancelSessionNotification, _cx: ConnectionTo<Client>| {
                 let _ = ipc::request(
-                    &cancel_config,
+                    &cancel_runtime.config_path,
                     "session.cancel",
                     json!({"session_id": notification.session_id}),
                 )
@@ -353,6 +372,7 @@ async fn run_prompt(
     cx: ConnectionTo<Client>,
 ) {
     let session_id = request.session_id.to_string();
+    let prompt_blocks = request.prompt.clone();
     let content = match prompt_content(&request.prompt) {
         Ok(content) => content,
         Err(error) => {
@@ -367,8 +387,7 @@ async fn run_prompt(
             return;
         }
     };
-    let mut terminals = observer.terminals.subscribe();
-    let prompt = match ipc::request(
+    match ipc::request(
         &runtime.config_path,
         "session.prompt",
         json!({
@@ -379,39 +398,65 @@ async fn run_prompt(
     )
     .await
     {
-        Ok(prompt) => prompt,
+        Ok(value) => {
+            let _ = responder.respond(PromptResponse::new());
+            if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
+                let prompt = serde_json::to_value(prompt_blocks)
+                    .unwrap_or_else(|_| Value::Array(Vec::new()));
+                send_user_message(&cx, &session_id, message_id, &prompt);
+            }
+        }
         Err(error) => {
             let _ = responder.respond_with_error(internal_error(error));
-            return;
-        }
-    };
-    let Some(turn_id) = prompt.get("turn_id").and_then(Value::as_str) else {
-        let _ = responder.respond_with_error(internal_error("daemon omitted turn_id"));
-        return;
-    };
-
-    loop {
-        match terminals.recv().await {
-            Ok(terminal) if terminal.turn_id().is_some_and(|id| id != turn_id) => continue,
-            Ok(TurnTerminal::Completed(_)) => {
-                let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
-                return;
-            }
-            Ok(TurnTerminal::Cancelled(_)) => {
-                let _ = responder.respond(PromptResponse::new(StopReason::Cancelled));
-                return;
-            }
-            Ok(TurnTerminal::Failed { error, .. }) => {
-                let _ = responder.respond_with_error(internal_error(error));
-                return;
-            }
-            Ok(TurnTerminal::StreamClosed) | Err(broadcast::error::RecvError::Closed) => {
-                let _ = responder.respond_with_error(internal_error("session event stream closed"));
-                return;
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
         }
     }
+}
+
+fn validate_new_session(request: &NewSessionRequest) -> Result<()> {
+    anyhow::ensure!(
+        request.additional_directories.is_empty(),
+        "additionalDirectories are not supported"
+    );
+    anyhow::ensure!(
+        request.mcp_servers.is_empty(),
+        "MCP session setup is not supported"
+    );
+    Ok(())
+}
+
+async fn validate_resume(runtime: &AcpRuntime, request: &ResumeSessionRequest) -> Result<()> {
+    anyhow::ensure!(
+        request.additional_directories.is_empty(),
+        "additionalDirectories are not supported"
+    );
+    anyhow::ensure!(
+        request.mcp_servers.is_empty(),
+        "MCP session setup is not supported"
+    );
+    if let Some(replay_from) = &request.replay_from {
+        anyhow::ensure!(
+            matches!(replay_from, ReplayFrom::Start(_)),
+            "unsupported replay cursor"
+        );
+    }
+    let value = ipc::request(
+        &runtime.config_path,
+        "session.snapshot",
+        json!({"session_id": request.session_id}),
+    )
+    .await?;
+    let snapshot: dwo_agent_service::SessionSnapshot = serde_json::from_value(value)?;
+    let requested = normalize_path(AsRef::<Path>::as_ref(&request.cwd));
+    let stored = normalize_path(&snapshot.record.info.cwd);
+    anyhow::ensure!(
+        requested == stored,
+        "resume cwd does not match the session cwd"
+    );
+    Ok(())
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 async fn ensure_observer(
@@ -441,17 +486,14 @@ async fn ensure_observer(
     if replay {
         replay_snapshot(cx, session_id, &snapshot);
     }
-    let (terminals, _) = broadcast::channel(32);
     let observer = Arc::new(SessionObserver {
         endpoint_id: endpoint_id.clone(),
-        terminals,
     });
     observers.insert(session_id.to_string(), observer.clone());
 
     let observer_runtime = runtime.clone();
     let observer_session_id = session_id.to_string();
     let observer_endpoint_id = endpoint_id;
-    let observer_state = observer.clone();
     let observer_cx = cx.clone();
     if let Err(error) = cx.spawn(async move {
         while let Some(frame) = events.recv().await {
@@ -460,11 +502,9 @@ async fn ensure_observer(
                 &observer_cx,
                 &observer_session_id,
                 &observer_endpoint_id,
-                &observer_state,
                 frame,
             );
         }
-        let _ = observer_state.terminals.send(TurnTerminal::StreamClosed);
         let mut observers = observer_runtime.observers.lock().await;
         if observers
             .get(&observer_session_id)
@@ -485,7 +525,6 @@ fn handle_session_event(
     cx: &ConnectionTo<Client>,
     session_id: &str,
     endpoint_id: &str,
-    observer: &SessionObserver,
     frame: Value,
 ) {
     let Some(payload) = frame.get("params").and_then(|event| event.get("payload")) else {
@@ -494,23 +533,53 @@ fn handle_session_event(
     let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("");
     match kind {
         "assistant_delta" => {
-            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                send_chunk(cx, session_id, delta, false);
+            if let (Some(message_id), Some(delta)) = (
+                payload.get("message_id").and_then(Value::as_str),
+                payload.get("delta").and_then(Value::as_str),
+            ) {
+                send_agent_chunk(cx, session_id, message_id, delta);
             }
         }
         "assistant_reasoning_delta" => {
-            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                send_thought_chunk(cx, session_id, delta);
+            if let (Some(message_id), Some(delta)) = (
+                payload.get("message_id").and_then(Value::as_str),
+                payload.get("delta").and_then(Value::as_str),
+            ) {
+                send_thought_chunk(cx, session_id, message_id, delta);
             }
         }
         "user_prompt_submitted" => {
-            if let Some(content) = payload.get("content") {
-                send_chunk(cx, session_id, &content_text(content), true);
+            if payload.get("origin").and_then(Value::as_str) == Some(endpoint_id) {
+                return;
+            }
+            if let (Some(message_id), Some(content)) = (
+                payload.get("message_id").and_then(Value::as_str),
+                payload.get("content"),
+            ) {
+                send_user_message(cx, session_id, message_id, content);
             }
         }
+        "assistant_completed" => send_assistant_completed(cx, session_id, payload),
+        "turn_started" => send_state(
+            cx,
+            session_id,
+            StateUpdate::Running(RunningStateUpdate::new()),
+        ),
         "tool_started" => send_tool_started(cx, session_id, payload),
         "tool_completed" => send_tool_completed(cx, session_id, payload),
+        "terminal_opened" => send_terminal_opened(cx, session_id, payload),
+        "terminal_output" => send_terminal_output(cx, session_id, payload),
+        "terminal_exited" => send_terminal_exited(cx, session_id, payload),
+        "file_read" => send_file_read(cx, session_id, payload),
+        "file_changed" => send_file_changed(cx, session_id, payload),
         "permission_requested" => {
+            send_state(
+                cx,
+                session_id,
+                StateUpdate::RequiresAction(
+                    agent_client_protocol::schema::v2::RequiresActionStateUpdate::new(),
+                ),
+            );
             let config_path = runtime.config_path.clone();
             let cx = cx.clone();
             let session_id = session_id.to_string();
@@ -529,21 +598,14 @@ fn handle_session_event(
                 Ok(())
             });
         }
-        "turn_completed" => send_terminal(payload, &observer.terminals, TurnTerminal::Completed),
-        "turn_cancelled" => send_terminal(payload, &observer.terminals, TurnTerminal::Cancelled),
-        "turn_failed" => {
-            if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
-                let error = payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("turn failed")
-                    .to_string();
-                let _ = observer.terminals.send(TurnTerminal::Failed {
-                    turn_id: turn_id.to_string(),
-                    error,
-                });
-            }
-        }
+        "permission_resolved" => send_state(
+            cx,
+            session_id,
+            StateUpdate::Running(RunningStateUpdate::new()),
+        ),
+        "turn_completed" => send_idle(cx, session_id, StopReason::EndTurn),
+        "turn_cancelled" => send_idle(cx, session_id, StopReason::Cancelled),
+        "turn_failed" => send_idle(cx, session_id, StopReason::Other("_error".to_string())),
         "config_changed" => {
             let config_path = runtime.config_path.clone();
             let cx = cx.clone();
@@ -551,12 +613,10 @@ fn handle_session_event(
             let _ = cx.clone().spawn(async move {
                 match session_config_options(&config_path, &session_id).await {
                     Ok(options) => {
-                        let _ = cx.send_notification_to(
-                            Client,
-                            SessionNotification::new(
-                                SessionId::new(session_id),
-                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                            ),
+                        send_update(
+                            &cx,
+                            &session_id,
+                            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
                         );
                     }
                     Err(error) => tracing::warn!(
@@ -675,16 +735,6 @@ fn build_session_config_options(
     ])
 }
 
-fn send_terminal(
-    payload: &Value,
-    terminals: &broadcast::Sender<TurnTerminal>,
-    event: impl FnOnce(String) -> TurnTerminal,
-) {
-    if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
-        let _ = terminals.send(event(turn_id.to_string()));
-    }
-}
-
 async fn resolve_permission(
     config_path: &Path,
     cx: &ConnectionTo<Client>,
@@ -701,23 +751,16 @@ async fn resolve_permission(
         .unwrap_or("unknown")
         .to_string()
         .into();
-    let tool = ToolCallUpdate::new(
-        tool_call_id,
-        ToolCallUpdateFields::new()
-            .title(
-                permission["tool_name"]
-                    .as_str()
-                    .unwrap_or("tool")
-                    .to_string(),
-            )
-            .status(ToolCallStatus::Pending),
-    );
+    let tool_name = permission["tool_name"].as_str().unwrap_or("tool");
+    let tool = ToolCallUpdate::new(tool_call_id)
+        .title(tool_name.to_string())
+        .status(ToolCallStatus::Pending);
     let response = cx
         .send_request_to(
             Client,
             RequestPermissionRequest::new(
                 SessionId::new(session_id),
-                tool,
+                format!("Allow {tool_name}?"),
                 vec![
                     PermissionOption::new(
                         "allow_once",
@@ -730,7 +773,8 @@ async fn resolve_permission(
                         PermissionOptionKind::RejectOnce,
                     ),
                 ],
-            ),
+            )
+            .subject(Some(tool.into())),
         )
         .block_task()
         .await?;
@@ -754,27 +798,86 @@ async fn resolve_permission(
     Ok(())
 }
 
-fn send_chunk(cx: &ConnectionTo<Client>, session_id: &str, text: &str, user: bool) {
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-    let update = if user {
-        SessionUpdate::UserMessageChunk(chunk)
-    } else {
-        SessionUpdate::AgentMessageChunk(chunk)
-    };
+fn send_update(cx: &ConnectionTo<Client>, session_id: &str, update: SessionUpdate) {
     let _ = cx.send_notification_to(
         Client,
-        SessionNotification::new(SessionId::new(session_id), update),
+        UpdateSessionNotification::new(SessionId::new(session_id), update),
     );
 }
 
-fn send_thought_chunk(cx: &ConnectionTo<Client>, session_id: &str, text: &str) {
-    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text.to_string())));
-    let _ = cx.send_notification_to(
-        Client,
-        SessionNotification::new(
-            SessionId::new(session_id),
-            SessionUpdate::AgentThoughtChunk(chunk),
+fn send_user_message(
+    cx: &ConnectionTo<Client>,
+    session_id: &str,
+    message_id: &str,
+    content: &Value,
+) {
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::UserMessage(
+            UserMessage::new(message_id.to_string()).content(acp_content_blocks(content)),
         ),
+    );
+}
+
+fn send_agent_chunk(cx: &ConnectionTo<Client>, session_id: &str, message_id: &str, text: &str) {
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text.to_string())),
+            message_id.to_string(),
+        )),
+    );
+}
+
+fn send_thought_chunk(cx: &ConnectionTo<Client>, session_id: &str, message_id: &str, text: &str) {
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text.to_string())),
+            message_id.to_string(),
+        )),
+    );
+}
+
+fn send_assistant_completed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let (reasoning, content) = assistant_completed_text(payload);
+    if let (Some(message_id), Some(reasoning)) = (
+        payload.get("thought_message_id").and_then(Value::as_str),
+        reasoning,
+    ) {
+        send_update(
+            cx,
+            session_id,
+            SessionUpdate::AgentThought(AgentThought::new(message_id.to_string()).content(vec![
+                ContentBlock::Text(TextContent::new(reasoning.to_string())),
+            ])),
+        );
+    }
+    if let (Some(message_id), Some(content)) =
+        (payload.get("message_id").and_then(Value::as_str), content)
+    {
+        send_update(
+            cx,
+            session_id,
+            SessionUpdate::AgentMessage(AgentMessage::new(message_id.to_string()).content(vec![
+                ContentBlock::Text(TextContent::new(content.to_string())),
+            ])),
+        );
+    }
+}
+
+fn send_state(cx: &ConnectionTo<Client>, session_id: &str, state: StateUpdate) {
+    send_update(cx, session_id, SessionUpdate::StateUpdate(state));
+}
+
+fn send_idle(cx: &ConnectionTo<Client>, session_id: &str, reason: StopReason) {
+    send_state(
+        cx,
+        session_id,
+        StateUpdate::Idle(IdleStateUpdate::new().stop_reason(reason)),
     );
 }
 
@@ -785,25 +888,19 @@ fn send_session_info_update(
     updated_at_ms: Option<u64>,
 ) {
     let update = session_info_update(title, updated_at_ms);
-    let _ = cx.send_notification_to(
-        Client,
-        SessionNotification::new(SessionId::new(session_id), update),
-    );
+    send_update(cx, session_id, update);
 }
 
 fn session_info_update(title: &str, updated_at_ms: Option<u64>) -> SessionUpdate {
     let mut update = SessionInfoUpdate::new().title(title.to_string());
     if let Some(updated_at_ms) = updated_at_ms {
-        update = update.updated_at(updated_at_ms.to_string());
+        update = update.updated_at(timestamp_rfc3339(updated_at_ms));
     }
     SessionUpdate::SessionInfoUpdate(update)
 }
 
 fn send_usage_update(cx: &ConnectionTo<Client>, session_id: &str, used: u64, size: u64) {
-    let _ = cx.send_notification_to(
-        Client,
-        SessionNotification::new(SessionId::new(session_id), usage_update(used, size)),
-    );
+    send_update(cx, session_id, usage_update(used, size));
 }
 
 fn usage_update(used: u64, size: u64) -> SessionUpdate {
@@ -812,24 +909,144 @@ fn usage_update(used: u64, size: u64) -> SessionUpdate {
 
 fn send_tool_started(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
     let tool = tool_started(payload);
-    let _ = cx.send_notification_to(
-        Client,
-        SessionNotification::new(SessionId::new(session_id), SessionUpdate::ToolCall(tool)),
-    );
+    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(tool));
 }
 
 fn send_tool_completed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let result = &payload["result"];
+    if result["tool_name"].as_str() == Some("terminal")
+        && let Some(terminal_id) = result["output"]["terminal_id"].as_str()
+    {
+        let mut terminal = TerminalUpdate::new(terminal_id.to_string());
+        if let Some(output) = result["output"]["output"].as_str() {
+            terminal = terminal.output(TerminalOutput::new(
+                base64::engine::general_purpose::STANDARD.encode(output.as_bytes()),
+            ));
+        }
+        send_update(cx, session_id, SessionUpdate::TerminalUpdate(terminal));
+    }
     let update = tool_completed(payload);
-    let _ = cx.send_notification_to(
-        Client,
-        SessionNotification::new(
-            SessionId::new(session_id),
-            SessionUpdate::ToolCallUpdate(update),
+    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+}
+
+fn send_terminal_opened(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let terminal_id = payload["terminal_id"].as_str().unwrap_or("terminal");
+    let mut terminal = TerminalUpdate::new(terminal_id.to_string())
+        .command(payload["command"].as_str().unwrap_or_default().to_string());
+    if let Some(cwd) = payload["cwd"].as_str() {
+        terminal = terminal.cwd(PathBuf::from(cwd));
+    }
+    send_update(cx, session_id, SessionUpdate::TerminalUpdate(terminal));
+    if let Some(tool_call_id) = payload["tool_call_id"].as_str() {
+        send_update(
+            cx,
+            session_id,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id.to_string()).content(
+                vec![ToolCallContent::Terminal(Terminal::new(
+                    terminal_id.to_string(),
+                ))],
+            )),
+        );
+    }
+}
+
+fn send_terminal_output(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let Some(terminal_id) = payload["terminal_id"].as_str() else {
+        return;
+    };
+    let Some(data) = payload["data"].as_array() else {
+        return;
+    };
+    let bytes = data
+        .iter()
+        .filter_map(Value::as_u64)
+        .filter_map(|value| u8::try_from(value).ok())
+        .collect::<Vec<_>>();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::TerminalOutputChunk(TerminalOutputChunk::new(
+            terminal_id.to_string(),
+            encoded,
+        )),
+    );
+}
+
+fn send_terminal_exited(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let Some(terminal_id) = payload["terminal_id"].as_str() else {
+        return;
+    };
+    let mut status = TerminalExitStatus::new();
+    if let Some(code) = payload["exit_code"]
+        .as_i64()
+        .and_then(|code| u32::try_from(code).ok())
+    {
+        status = status.exit_code(code);
+    }
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::TerminalUpdate(
+            TerminalUpdate::new(terminal_id.to_string()).exit_status(status),
         ),
     );
 }
 
-fn tool_started(payload: &Value) -> ToolCall {
+fn send_file_read(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let (Some(tool_call_id), Some(path)) =
+        (payload["tool_call_id"].as_str(), payload["path"].as_str())
+    else {
+        return;
+    };
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(tool_call_id.to_string())
+                .kind(ToolKind::Read)
+                .status(ToolCallStatus::Completed)
+                .locations(vec![ToolCallLocation::new(PathBuf::from(path))]),
+        ),
+    );
+}
+
+fn send_file_changed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+    let (Some(tool_call_id), Some(changes)) = (
+        payload["tool_call_id"].as_str(),
+        payload["changes"].as_array(),
+    ) else {
+        return;
+    };
+    let changes = changes
+        .iter()
+        .filter_map(|change| {
+            let path = PathBuf::from(change["path"].as_str()?);
+            let kind = change["kind"].as_str().unwrap_or("update");
+            Some(match kind {
+                "add" => agent_client_protocol::schema::v2::DiffChange::add(path),
+                "delete" => agent_client_protocol::schema::v2::DiffChange::delete(path),
+                "move" => {
+                    let moved_to = PathBuf::from(change["movedTo"].as_str()?);
+                    agent_client_protocol::schema::v2::DiffChange::move_file(path, moved_to)
+                }
+                _ => agent_client_protocol::schema::v2::DiffChange::modify(path),
+            })
+        })
+        .collect::<Vec<_>>();
+    let patch = payload["patch"].as_str().filter(|patch| !patch.is_empty());
+    let diff = match patch {
+        Some(patch) => Diff::patch(patch, changes),
+        None => Diff::new(changes),
+    };
+    let update = ToolCallUpdate::new(tool_call_id.to_string())
+        .kind(ToolKind::Edit)
+        .status(ToolCallStatus::Completed)
+        .content(vec![ToolCallContent::Diff(diff)]);
+    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+}
+
+fn tool_started(payload: &Value) -> ToolCallUpdate {
     let call = &payload["call"];
     let id: ToolCallId = call["tool_call_id"]
         .as_str()
@@ -838,8 +1055,9 @@ fn tool_started(payload: &Value) -> ToolCall {
         .into();
     let name = call["tool_name"].as_str().unwrap_or("tool");
     let raw_input = call.get("raw_input").cloned().unwrap_or(Value::Null);
-    let mut tool = ToolCall::new(id, name.to_string())
-        .kind(tool_kind())
+    let mut tool = ToolCallUpdate::new(id)
+        .title(name.to_string())
+        .kind(tool_kind(name))
         .status(ToolCallStatus::InProgress)
         .raw_input(raw_input.clone());
     if let Some(text) = render_tool_input(name, &raw_input) {
@@ -859,7 +1077,7 @@ fn tool_completed(payload: &Value) -> ToolCallUpdate {
         .as_str()
         .is_some_and(|status| matches!(status, "error" | "cancelled" | "blocked_by_policy"));
     let output = result.get("output").cloned().unwrap_or(Value::Null);
-    let mut fields = ToolCallUpdateFields::new()
+    let mut update = ToolCallUpdate::new(id)
         .status(if failed {
             ToolCallStatus::Failed
         } else {
@@ -867,13 +1085,18 @@ fn tool_completed(payload: &Value) -> ToolCallUpdate {
         })
         .raw_output(output.clone());
     if let Some(text) = render_tool_output(&output) {
-        fields = fields.content(text_content(text));
+        update = update.content(text_content(text));
     }
-    ToolCallUpdate::new(id, fields)
+    update
 }
 
-fn tool_kind() -> ToolKind {
-    ToolKind::Other
+fn tool_kind(name: &str) -> ToolKind {
+    match name {
+        "terminal" => ToolKind::Execute,
+        "file_edit" => ToolKind::Edit,
+        "read_file" => ToolKind::Read,
+        _ => ToolKind::Other,
+    }
 }
 
 fn render_tool_input(name: &str, input: &Value) -> Option<String> {
@@ -916,8 +1139,8 @@ fn truncate_tool_text(text: &str) -> String {
 }
 
 fn text_content(text: String) -> Vec<ToolCallContent> {
-    vec![ToolCallContent::from(ContentBlock::Text(TextContent::new(
-        text,
+    vec![ToolCallContent::Content(Box::new(ToolContent::new(
+        ContentBlock::Text(TextContent::new(text)),
     )))]
 }
 
@@ -951,31 +1174,50 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
         };
         match payload.get("kind").and_then(Value::as_str) {
             Some("user_prompt_submitted") => {
-                send_chunk(cx, session_id, &content_text(&payload["content"]), true)
+                if let Some(message_id) = payload.get("message_id").and_then(Value::as_str) {
+                    send_user_message(cx, session_id, message_id, &payload["content"]);
+                }
             }
             Some("assistant_delta") => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                    send_chunk(cx, session_id, delta, false);
+                if let (Some(message_id), Some(delta)) = (
+                    payload.get("message_id").and_then(Value::as_str),
+                    payload.get("delta").and_then(Value::as_str),
+                ) {
+                    send_agent_chunk(cx, session_id, message_id, delta);
                 }
             }
             Some("assistant_reasoning_delta") => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                    send_thought_chunk(cx, session_id, delta);
+                if let (Some(message_id), Some(delta)) = (
+                    payload.get("message_id").and_then(Value::as_str),
+                    payload.get("delta").and_then(Value::as_str),
+                ) {
+                    send_thought_chunk(cx, session_id, message_id, delta);
                 }
             }
-            Some("assistant_completed") => {
-                let (reasoning, content) = assistant_completed_text(payload);
-                if let Some(reasoning) = reasoning {
-                    send_thought_chunk(cx, session_id, reasoning);
-                }
-                if let Some(content) = content {
-                    send_chunk(cx, session_id, content, false);
-                }
-            }
+            Some("assistant_completed") => send_assistant_completed(cx, session_id, payload),
             Some("tool_started") => send_tool_started(cx, session_id, payload),
             Some("tool_completed") => send_tool_completed(cx, session_id, payload),
+            Some("terminal_opened") => send_terminal_opened(cx, session_id, payload),
+            Some("terminal_exited") => send_terminal_exited(cx, session_id, payload),
+            Some("file_read") => send_file_read(cx, session_id, payload),
+            Some("file_changed") => send_file_changed(cx, session_id, payload),
             _ => {}
         }
+    }
+    match snapshot.get("phase").and_then(Value::as_str) {
+        Some("running" | "cancelling") => send_state(
+            cx,
+            session_id,
+            StateUpdate::Running(RunningStateUpdate::new()),
+        ),
+        Some("waiting_permission") => send_state(
+            cx,
+            session_id,
+            StateUpdate::RequiresAction(
+                agent_client_protocol::schema::v2::RequiresActionStateUpdate::new(),
+            ),
+        ),
+        _ => send_state(cx, session_id, StateUpdate::Idle(IdleStateUpdate::new())),
     }
 }
 
@@ -994,6 +1236,24 @@ fn snapshot_usage(snapshot: &Value) -> Option<(u64, u64)> {
     Some((usage.get("used")?.as_u64()?, usage.get("size")?.as_u64()?))
 }
 
+fn timestamp_rfc3339(timestamp_ms: u64) -> String {
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn acp_content_blocks(value: &Value) -> Vec<ContentBlock> {
+    serde_json::from_value(value.clone()).unwrap_or_else(|_| {
+        let text = content_text(value);
+        (!text.is_empty())
+            .then(|| ContentBlock::Text(TextContent::new(text)))
+            .into_iter()
+            .collect()
+    })
+}
+
 fn prompt_content(prompt: &[ContentBlock]) -> Result<MessageContent> {
     let mut output = Vec::with_capacity(prompt.len());
     for block in prompt {
@@ -1006,7 +1266,7 @@ fn prompt_content(prompt: &[ContentBlock]) -> Result<MessageContent> {
                 EmbeddedResourceResource::TextResourceContents(resource) => {
                     DwoContentBlock::text(embedded_resource_text(
                         &resource.uri,
-                        resource.mime_type.as_deref(),
+                        resource.mime_type.as_ref().map(AsRef::as_ref),
                         &resource.text,
                     ))
                 }
@@ -1016,7 +1276,7 @@ fn prompt_content(prompt: &[ContentBlock]) -> Result<MessageContent> {
                 _ => anyhow::bail!("unsupported embedded resource type"),
             },
             ContentBlock::Image(image) => DwoContentBlock::Image {
-                mime_type: image.mime_type.clone(),
+                mime_type: image.mime_type.to_string(),
                 data: image.data.clone(),
                 uri: image.uri.clone(),
                 annotations: None,
@@ -1075,18 +1335,18 @@ fn content_text(value: &Value) -> String {
     }
 }
 
-fn internal_error(error: impl std::fmt::Display) -> agent_client_protocol::schema::Error {
-    agent_client_protocol::schema::Error::internal_error().data(error.to_string())
+fn internal_error(error: impl std::fmt::Display) -> AcpError {
+    AcpError::internal_error().data(error.to_string())
 }
 
-fn invalid_params(error: impl std::fmt::Display) -> agent_client_protocol::schema::Error {
-    agent_client_protocol::schema::Error::invalid_params().data(error.to_string())
+fn invalid_params(error: impl std::fmt::Display) -> AcpError {
+    AcpError::invalid_params().data(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v2::{
         BlobResourceContents, EmbeddedResource, ImageContent, TextResourceContents,
     };
 
@@ -1099,7 +1359,7 @@ mod tests {
             agent_stdout.compat_write(),
             EofReader::new(agent_stdin, eof.clone()).compat(),
         );
-        let agent = Agent.builder().with_spawned(|cx| async move {
+        let agent = Agent.v2().with_spawned(|cx| async move {
             let _connection_held_by_observer = cx;
             std::future::pending().await
         });
@@ -1189,11 +1449,14 @@ mod tests {
         })
         .unwrap();
         let json = serde_json::to_value(options).unwrap();
-        assert_eq!(json[0]["id"], "model");
+        assert_eq!(json[0]["configId"], "model");
+        assert_eq!(json[0]["type"], "select");
         assert_eq!(json[0]["currentValue"], "deepseek-v4-flash");
-        assert_eq!(json[1]["id"], "reasoning_mode");
+        assert_eq!(json[1]["configId"], "reasoning_mode");
+        assert_eq!(json[1]["type"], "select");
         assert_eq!(json[1]["currentValue"], "max");
-        assert_eq!(json[2]["id"], "policy_mode");
+        assert_eq!(json[2]["configId"], "policy_mode");
+        assert_eq!(json[2]["type"], "select");
         assert_eq!(json[2]["currentValue"], "full_access");
     }
 
@@ -1203,7 +1466,7 @@ mod tests {
             serde_json::to_value(session_info_update("Generated title", Some(42))).unwrap();
         assert_eq!(update["sessionUpdate"], "session_info_update");
         assert_eq!(update["title"], "Generated title");
-        assert_eq!(update["updatedAt"], "42");
+        assert_eq!(update["updatedAt"], "1970-01-01T00:00:00.042Z");
     }
 
     #[test]
@@ -1251,8 +1514,8 @@ mod tests {
             }
         }));
 
-        assert_eq!(tool.kind, ToolKind::Other);
         let json = serde_json::to_value(tool).unwrap();
+        assert_eq!(json["kind"], "execute");
         assert_eq!(json["rawInput"]["command"], "cargo test --workspace");
         assert_eq!(
             json["content"][0]["content"]["text"],
@@ -1289,8 +1552,8 @@ mod tests {
             }
         }));
 
-        assert_eq!(tool.kind, ToolKind::Other);
         let json = serde_json::to_value(tool).unwrap();
+        assert_eq!(json["kind"], "edit");
         assert_eq!(json["rawInput"]["patch"], "*** Begin Patch\n*** End Patch");
     }
 }

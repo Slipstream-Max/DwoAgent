@@ -6,7 +6,7 @@ use dwo_context::{
     TurnId,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection, ModelStreamEvent};
-use dwo_tools::{ExecutionContext, ParsedToolCall, ToolManager, ToolResult};
+use dwo_tools::{ExecutionContext, ParsedToolCall, ToolEvent, ToolManager, ToolResult};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -52,6 +52,10 @@ pub(crate) enum TurnEvent {
     ToolCompleted {
         turn_id: TurnId,
         result: ToolResult,
+    },
+    ToolTelemetry {
+        turn_id: TurnId,
+        event: ToolEvent,
     },
     Finished {
         turn_id: TurnId,
@@ -241,6 +245,14 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                 return TurnOutcome::Failed(format!("resolve model image capability: {error:#}"));
             }
         };
+        let actor = turn.actor.clone();
+        let telemetry_turn_id = turn.turn_id.clone();
+        execution.events = Some(Arc::new(move |event| {
+            let _ = actor.send(TurnActorMessage::Event(TurnEvent::ToolTelemetry {
+                turn_id: telemetry_turn_id.clone(),
+                event,
+            }));
+        }));
         let calls = response.tool_calls;
         let tools_started = Instant::now();
         tracing::info!(

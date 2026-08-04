@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::ToolEventHandler;
 use crate::call::ParsedToolCall;
 use crate::file_edit::FileEditManager;
 use crate::policy::{SessionMode, ToolPolicyEngine};
@@ -38,6 +39,7 @@ pub struct ExecutionContext {
     pub mode: SessionMode,
     pub confirmation: Option<ConfirmationHandler>,
     pub allow_image_input: bool,
+    pub events: Option<ToolEventHandler>,
 }
 
 impl ExecutionContext {
@@ -46,6 +48,7 @@ impl ExecutionContext {
             mode,
             confirmation: None,
             allow_image_input: false,
+            events: None,
         }
     }
 }
@@ -110,13 +113,14 @@ impl ToolManager {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use serde_json::json;
 
     use super::*;
-    use crate::PolicyConfig;
+    use crate::{PolicyConfig, ToolEvent};
 
     fn manager(cwd: PathBuf) -> ToolManager {
         ToolManager::new(
@@ -233,6 +237,48 @@ mod tests {
             std::fs::read_to_string(dir.path().join("y")).unwrap(),
             "y\n"
         );
+    }
+
+    #[tokio::test]
+    async fn file_edit_telemetry_contains_absolute_changes_and_git_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let mut context = ExecutionContext::new(SessionMode::FullAccess);
+        context.events = Some(Arc::new({
+            let recorded = recorded.clone();
+            move |event| recorded.lock().unwrap().push(event)
+        }));
+        let call = ParsedToolCall::parse(json!({
+            "id": "edit-1",
+            "name": "file_edit",
+            "arguments": {
+                "patch": "*** Begin Patch\n*** Add File: telemetry.txt\n+observed\n*** End Patch"
+            }
+        }))
+        .unwrap();
+
+        let result = manager(dir.path().to_path_buf())
+            .execute(call, &context)
+            .await;
+        assert_eq!(result.output["status"], "completed");
+
+        let events = recorded.lock().unwrap();
+        let [
+            ToolEvent::FileChanged {
+                tool_call_id,
+                changes,
+                patch,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("unexpected telemetry: {events:?}");
+        };
+        assert_eq!(tool_call_id, "edit-1");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, "add");
+        assert!(changes[0].path.is_absolute());
+        assert!(patch.starts_with("diff --git "));
+        assert!(patch.contains("+observed"));
     }
 
     #[tokio::test]

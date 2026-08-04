@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+diffy.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
 dwo-context = { path = "../dwo-context" }

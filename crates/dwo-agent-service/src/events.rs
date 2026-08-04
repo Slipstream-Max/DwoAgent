@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::{EndpointId, MessageContent, SessionId, SessionRecord, TurnId};
+use crate::{EndpointId, MessageContent, MessageId, SessionId, SessionRecord, TurnId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,11 +35,20 @@ pub struct SessionUsageSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: PathBuf,
+    pub kind: String,
+    pub moved_to: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveStepSnapshot {
     pub turn_id: TurnId,
     pub step_id: u64,
     pub revision: u64,
+    pub message_id: MessageId,
+    pub thought_message_id: MessageId,
     pub reasoning: String,
     pub response: String,
 }
@@ -75,6 +85,8 @@ impl ClientTranscriptEvent {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventPayload {
     UserPromptSubmitted {
+        #[serde(default)]
+        message_id: MessageId,
         turn_id: TurnId,
         origin: EndpointId,
         content: MessageContent,
@@ -83,12 +95,14 @@ pub enum SessionEventPayload {
         turn_id: TurnId,
     },
     AssistantDelta {
+        message_id: MessageId,
         turn_id: TurnId,
         step_id: u64,
         revision: u64,
         delta: String,
     },
     AssistantReasoningDelta {
+        message_id: MessageId,
         turn_id: TurnId,
         step_id: u64,
         revision: u64,
@@ -98,6 +112,10 @@ pub enum SessionEventPayload {
         step: ActiveStepSnapshot,
     },
     AssistantCompleted {
+        #[serde(default)]
+        message_id: MessageId,
+        #[serde(default)]
+        thought_message_id: MessageId,
         turn_id: TurnId,
         content: String,
         reasoning: Option<String>,
@@ -110,6 +128,35 @@ pub enum SessionEventPayload {
     ToolCompleted {
         turn_id: TurnId,
         result: dwo_tools::ToolResult,
+    },
+    TerminalOpened {
+        turn_id: TurnId,
+        tool_call_id: String,
+        terminal_id: String,
+        command: String,
+        cwd: PathBuf,
+    },
+    TerminalOutput {
+        turn_id: TurnId,
+        terminal_id: String,
+        data: Vec<u8>,
+    },
+    TerminalExited {
+        turn_id: TurnId,
+        terminal_id: String,
+        exit_code: Option<i32>,
+        status: String,
+    },
+    FileRead {
+        turn_id: TurnId,
+        tool_call_id: String,
+        path: PathBuf,
+    },
+    FileChanged {
+        turn_id: TurnId,
+        tool_call_id: String,
+        changes: Vec<FileChange>,
+        patch: String,
     },
     PermissionRequested {
         turn_id: TurnId,

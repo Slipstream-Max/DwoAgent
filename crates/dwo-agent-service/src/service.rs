@@ -410,7 +410,8 @@ impl AgentService {
                 return Ok(agent);
             }
         }
-        let transcript = self.repository.load_transcript(&record.info.id).await?;
+        let mut transcript = self.repository.load_transcript(&record.info.id).await?;
+        assign_legacy_message_ids(&record.info.id, &mut transcript);
         let prompt_builder = self.prompt_builder(record.info.cwd.clone());
         let mut record_changed = repair_empty_title(&mut record, &transcript);
         if !record.context.system_prompt.is_initialized() {
@@ -479,6 +480,32 @@ fn default_session_title(cwd: &std::path::Path) -> String {
         .unwrap_or_else(|| "session".to_string())
 }
 
+fn assign_legacy_message_ids(session_id: &SessionId, transcript: &mut [ClientTranscriptEvent]) {
+    for (index, event) in transcript.iter_mut().enumerate() {
+        match &mut event.payload {
+            SessionEventPayload::UserPromptSubmitted { message_id, .. }
+                if message_id.is_empty() =>
+            {
+                *message_id = crate::MessageId::legacy(session_id, index);
+            }
+            SessionEventPayload::AssistantCompleted {
+                message_id,
+                thought_message_id,
+                ..
+            } => {
+                if message_id.is_empty() {
+                    *message_id = crate::MessageId::legacy_part(session_id, index, "answer");
+                }
+                if thought_message_id.is_empty() {
+                    *thought_message_id =
+                        crate::MessageId::legacy_part(session_id, index, "thought");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn repair_empty_title(record: &mut SessionRecord, transcript: &[ClientTranscriptEvent]) -> bool {
     if !record.info.title.trim().is_empty() {
         return false;
@@ -525,6 +552,8 @@ mod status_tests {
     fn last_answer_preview_is_bounded_to_one_hundred_characters() {
         let transcript = vec![ClientTranscriptEvent::new(
             SessionEventPayload::AssistantCompleted {
+                message_id: crate::MessageId::new(),
+                thought_message_id: crate::MessageId::new(),
                 turn_id: TurnId::new(),
                 content: format!("answer\n{}", "x".repeat(120)),
                 reasoning: None,

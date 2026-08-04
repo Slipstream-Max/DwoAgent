@@ -185,7 +185,11 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "initialize",
-                    "params": {"protocolVersion": 1}
+                    "params": {
+                        "protocolVersion": 2,
+                        "info": {"name": "websocket-test", "version": "0.1.0"},
+                        "capabilities": {}
+                    }
                 })
                 .to_string()
                 .into(),
@@ -195,7 +199,9 @@ mod tests {
         let response = socket.next().await.unwrap().unwrap().into_text().unwrap();
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["id"], 1);
-        assert_eq!(response["result"]["protocolVersion"], 1);
+        assert_eq!(response["result"]["protocolVersion"], 2);
+        assert_eq!(response["result"]["info"]["name"], "dwo");
+        assert!(response["result"]["capabilities"]["session"]["prompt"].is_object());
 
         socket.close(None).await.unwrap();
         shutdown.cancel();

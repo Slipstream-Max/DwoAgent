@@ -16,7 +16,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [workspace.dependencies]
-agent-client-protocol = { version = "0.11", features = ["unstable_session_resume", "unstable_session_usage"] }
+agent-client-protocol = { version = "2.0", features = ["unstable_protocol_v2"] }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 cron = "0.15"
+diffy = "0.5"
 eventsource-stream = "0.2"
 futures = "0.3"
 getrandom = "0.4"

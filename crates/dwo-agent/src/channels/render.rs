@@ -269,7 +269,9 @@ fn fenced(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dwo_agent_service::{EndpointId, SessionLlmSettings, SessionRecord, SessionUsageSnapshot};
+    use dwo_agent_service::{
+        EndpointId, MessageId, SessionLlmSettings, SessionRecord, SessionUsageSnapshot,
+    };
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -306,28 +308,36 @@ mod tests {
         let second = dwo_agent_service::TurnId::new();
         let transcript = vec![
             ClientTranscriptEvent::new(SessionEventPayload::UserPromptSubmitted {
+                message_id: MessageId::new(),
                 turn_id: first.clone(),
                 origin: EndpointId::new(),
                 content: MessageContent::text("first question"),
             }),
             ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
+                message_id: MessageId::new(),
+                thought_message_id: MessageId::new(),
                 turn_id: first.clone(),
                 content: "intermediate".to_string(),
                 reasoning: None,
                 tool_calls: Vec::new(),
             }),
             ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
+                message_id: MessageId::new(),
+                thought_message_id: MessageId::new(),
                 turn_id: first,
                 content: "first answer".to_string(),
                 reasoning: None,
                 tool_calls: Vec::new(),
             }),
             ClientTranscriptEvent::new(SessionEventPayload::UserPromptSubmitted {
+                message_id: MessageId::new(),
                 turn_id: second.clone(),
                 origin: EndpointId::new(),
                 content: MessageContent::text("second question"),
             }),
             ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
+                message_id: MessageId::new(),
+                thought_message_id: MessageId::new(),
                 turn_id: second,
                 content: "second answer".to_string(),
                 reasoning: None,
@@ -360,29 +370,35 @@ mod tests {
             ),
             transcript: vec![
                 ClientTranscriptEvent::new(SessionEventPayload::UserPromptSubmitted {
+                    message_id: MessageId::new(),
                     turn_id: turn_id.clone(),
                     origin: EndpointId::new(),
                     content: MessageContent::text("inspect the project"),
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    message_id: MessageId::new(),
                     turn_id: turn_id.clone(),
                     step_id: 1,
                     revision: 1,
                     delta: "old reasoning".to_string(),
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
+                    message_id: MessageId::new(),
+                    thought_message_id: MessageId::new(),
                     turn_id: turn_id.clone(),
                     content: String::new(),
                     reasoning: Some("duplicated old reasoning".to_string()),
                     tool_calls: Vec::new(),
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    message_id: MessageId::new(),
                     turn_id: turn_id.clone(),
                     step_id: 2,
                     revision: 1,
                     delta: "latest ".to_string(),
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    message_id: MessageId::new(),
                     turn_id: turn_id.clone(),
                     step_id: 2,
                     revision: 2,

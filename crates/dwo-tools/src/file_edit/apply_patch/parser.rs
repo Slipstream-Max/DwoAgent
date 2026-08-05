@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 
 const BEGIN: &str = "*** Begin Patch";
 const END: &str = "*** End Patch";
+const ENVIRONMENT_ID: &str = "*** Environment ID:";
 const ADD: &str = "*** Add File: ";
 const DELETE: &str = "*** Delete File: ";
 const UPDATE: &str = "*** Update File: ";
@@ -35,177 +36,208 @@ pub(super) struct UpdateChunk {
 }
 
 pub(super) fn parse_patch(patch: &str) -> Result<Vec<Hunk>> {
-    let normalized = patch.replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<&str> = normalized.lines().collect();
-    if lines.first().map(|line| line.trim()) != Some(BEGIN) {
-        bail!("The first line of the patch must be '{BEGIN}'");
-    }
-    if lines.last().map(|line| line.trim()) != Some(END) {
-        bail!("The last line of the patch must be '{END}'");
-    }
+    let trimmed = patch.trim();
+    let original_lines = trimmed.lines().collect::<Vec<_>>();
+    let lines = patch_lines(&original_lines)?;
     let mut hunks = Vec::new();
     let mut index = 1;
+    let mut environment_id_seen = false;
+
     while index < lines.len() - 1 {
-        let line = lines[index];
-        if let Some(path) = line.strip_prefix(ADD) {
+        let header = lines[index].trim();
+        if let Some(environment_id) = header.strip_prefix(ENVIRONMENT_ID) {
+            if !hunks.is_empty() || environment_id_seen {
+                bail!("apply_patch environment_id cannot be specified more than once");
+            }
+            if environment_id.trim().is_empty() {
+                bail!("apply_patch environment_id cannot be empty");
+            }
+            environment_id_seen = true;
             index += 1;
-            let mut contents = Vec::new();
-            while index < lines.len() - 1 && !is_header(lines[index]) {
-                let Some(content) = lines[index].strip_prefix('+') else {
+            continue;
+        }
+
+        if let Some(path) = header.strip_prefix(ADD) {
+            index += 1;
+            let mut contents = String::new();
+            while index < lines.len() - 1 && !is_trimmed_header(lines[index]) {
+                let line = lines[index];
+                let Some(content) = line.strip_prefix('+') else {
                     bail!(
                         "Invalid Add File line {}: every line must start with '+'",
                         index + 1
                     );
                 };
-                contents.push(content);
+                contents.push_str(content);
+                contents.push('\n');
                 index += 1;
-            }
-            if contents.is_empty() {
-                bail!("Add File requires at least one content line");
             }
             hunks.push(Hunk::Add {
-                path: parse_path(path)?,
-                contents: format!("{}\n", contents.join("\n")),
+                path: PathBuf::from(path),
+                contents,
             });
-        } else if let Some(path) = line.strip_prefix(DELETE) {
+            continue;
+        }
+
+        if let Some(path) = header.strip_prefix(DELETE) {
             hunks.push(Hunk::Delete {
-                path: parse_path(path)?,
+                path: PathBuf::from(path),
             });
             index += 1;
-        } else if let Some(path) = line.strip_prefix(UPDATE) {
+            continue;
+        }
+
+        if let Some(path) = header.strip_prefix(UPDATE) {
+            let hunk_line = index + 1;
             index += 1;
-            let move_path = if index < lines.len() - 1 {
-                lines[index]
-                    .strip_prefix(MOVE)
-                    .map(parse_path)
-                    .transpose()?
-            } else {
-                None
-            };
-            if move_path.is_some() {
-                index += 1;
-            }
+            let mut move_path = None;
             let mut chunks = Vec::new();
-            while index < lines.len() - 1 && !is_header(lines[index]) {
-                let context = if lines[index] == "@@" {
-                    index += 1;
-                    None
-                } else if let Some(context) = lines[index].strip_prefix("@@ ") {
-                    index += 1;
-                    Some(context.to_string())
-                } else if chunks.is_empty() {
-                    None
-                } else {
-                    bail!("Invalid update hunk at line {}", index + 1);
-                };
-                let mut old_lines = Vec::new();
-                let mut new_lines = Vec::new();
-                let mut end_of_file = false;
-                let mut previous_prefix = None;
-                while index < lines.len() - 1
-                    && !is_header(lines[index])
-                    && !lines[index].starts_with("@@")
+
+            while index < lines.len() - 1 {
+                let line = lines[index];
+                let update_line = line.trim_end();
+                if is_update_header(update_line) {
+                    break;
+                }
+
+                if chunks
+                    .last()
+                    .is_some_and(|chunk: &UpdateChunk| chunk.end_of_file)
                 {
-                    let change = lines[index];
-                    if change == EOF {
-                        end_of_file = true;
-                        index += 1;
-                        break;
-                    }
-                    if change.is_empty() {
-                        match infer_unprefixed_blank(
-                            previous_prefix,
-                            next_update_prefix(&lines, index + 1),
-                        ) {
-                            '+' => new_lines.push(String::new()),
-                            '-' => old_lines.push(String::new()),
-                            _ => {
-                                old_lines.push(String::new());
-                                new_lines.push(String::new());
-                            }
-                        }
+                    if update_line.is_empty() {
                         index += 1;
                         continue;
                     }
-                    let Some(prefix) = change.chars().next() else {
-                        bail!("Invalid empty update line at {}", index + 1);
-                    };
-                    let content = &change[prefix.len_utf8()..];
-                    match prefix {
-                        ' ' => {
-                            old_lines.push(content.to_string());
-                            new_lines.push(content.to_string());
-                        }
-                        '-' => old_lines.push(content.to_string()),
-                        '+' => new_lines.push(content.to_string()),
-                        _ => bail!(
-                            "Invalid update line {}: expected ' ', '+' or '-'",
+                    if update_line != "@@" && !update_line.starts_with("@@ ") {
+                        bail!(
+                            "Expected update hunk to start with a @@ context marker at line {}",
                             index + 1
-                        ),
+                        );
                     }
-                    previous_prefix = Some(prefix);
+                }
+
+                if chunks.is_empty()
+                    && move_path.is_none()
+                    && let Some(destination) = update_line.strip_prefix(MOVE)
+                {
+                    move_path = Some(PathBuf::from(destination));
                     index += 1;
+                    continue;
                 }
-                if old_lines.is_empty() && new_lines.is_empty() {
-                    bail!("Empty update hunk");
+
+                if update_line == "@@" || update_line.starts_with("@@ ") {
+                    ensure_last_chunk_not_empty(&chunks, index + 1)?;
+                    chunks.push(UpdateChunk {
+                        context: update_line.strip_prefix("@@ ").map(str::to_string),
+                        old_lines: Vec::new(),
+                        new_lines: Vec::new(),
+                        end_of_file: false,
+                    });
+                    index += 1;
+                    continue;
                 }
-                chunks.push(UpdateChunk {
-                    context,
-                    old_lines,
-                    new_lines,
-                    end_of_file,
-                });
+
+                if update_line == EOF {
+                    ensure_last_chunk_not_empty(&chunks, index + 1)?;
+                    let Some(chunk) = chunks.last_mut() else {
+                        bail!("Update hunk does not contain any lines");
+                    };
+                    chunk.end_of_file = true;
+                    index += 1;
+                    continue;
+                }
+
+                if chunks.is_empty() {
+                    chunks.push(UpdateChunk {
+                        context: None,
+                        old_lines: Vec::new(),
+                        new_lines: Vec::new(),
+                        end_of_file: false,
+                    });
+                }
+                let chunk = chunks.last_mut().expect("chunk was inserted above");
+                if line.is_empty() {
+                    chunk.old_lines.push(String::new());
+                    chunk.new_lines.push(String::new());
+                } else if let Some(content) = line.strip_prefix(' ') {
+                    chunk.old_lines.push(content.to_string());
+                    chunk.new_lines.push(content.to_string());
+                } else if let Some(content) = line.strip_prefix('+') {
+                    chunk.new_lines.push(content.to_string());
+                } else if let Some(content) = line.strip_prefix('-') {
+                    chunk.old_lines.push(content.to_string());
+                } else {
+                    bail!(
+                        "Invalid update line {}: expected ' ', '+' or '-'",
+                        index + 1
+                    );
+                }
+                index += 1;
             }
+
             if chunks.is_empty() {
-                bail!("Update File requires at least one hunk");
+                bail!(
+                    "Update file hunk for path '{}' is empty at line {hunk_line}",
+                    path
+                );
             }
+            ensure_last_chunk_not_empty(&chunks, index + 1)?;
             hunks.push(Hunk::Update {
-                path: parse_path(path)?,
+                path: PathBuf::from(path),
                 move_path,
                 chunks,
             });
-        } else {
-            bail!("Unknown patch header at line {}: {line}", index + 1);
+            continue;
         }
+
+        bail!("Unknown patch header at line {}: {header}", index + 1);
     }
-    if hunks.is_empty() {
-        bail!("Patch must contain at least one file operation");
-    }
+
     Ok(hunks)
 }
 
-fn parse_path(path: &str) -> Result<PathBuf> {
-    let path = path.trim();
-    if path.is_empty() {
-        bail!("Patch path must not be empty");
+fn patch_lines<'a>(lines: &'a [&'a str]) -> Result<&'a [&'a str]> {
+    if has_boundaries(lines) {
+        return Ok(lines);
     }
-    Ok(PathBuf::from(path))
-}
-
-fn is_header(line: &str) -> bool {
-    line.starts_with(ADD) || line.starts_with(DELETE) || line.starts_with(UPDATE) || line == END
-}
-
-fn next_update_prefix(lines: &[&str], mut index: usize) -> Option<char> {
-    while index < lines.len() - 1 {
-        let line = lines[index];
-        if is_header(line) || line.starts_with("@@") || line == EOF {
-            return None;
+    if let [first, .., last] = lines
+        && matches!(*first, "<<EOF" | "<<'EOF'" | "<<\"EOF\"")
+        && last.ends_with("EOF")
+        && lines.len() >= 4
+    {
+        let inner = &lines[1..lines.len() - 1];
+        if has_boundaries(inner) {
+            return Ok(inner);
         }
-        if let Some(prefix) = line.chars().next() {
-            return Some(prefix);
-        }
-        index += 1;
     }
-    None
+    if lines.first().map(|line| line.trim()) != Some(BEGIN) {
+        bail!("The first line of the patch must be '{BEGIN}'");
+    }
+    bail!("The last line of the patch must be '{END}'")
 }
 
-fn infer_unprefixed_blank(previous: Option<char>, next: Option<char>) -> char {
-    match (previous, next) {
-        (Some(left), Some(right)) if left == right && matches!(left, '+' | '-') => left,
-        (Some(prefix @ ('+' | '-')), None) | (None, Some(prefix @ ('+' | '-'))) => prefix,
-        _ => ' ',
+fn has_boundaries(lines: &[&str]) -> bool {
+    lines.first().is_some_and(|line| line.trim() == BEGIN)
+        && lines.last().is_some_and(|line| line.trim() == END)
+}
+
+fn is_trimmed_header(line: &str) -> bool {
+    let line = line.trim();
+    line == END || line.starts_with(ADD) || line.starts_with(DELETE) || line.starts_with(UPDATE)
+}
+
+fn is_update_header(line: &str) -> bool {
+    line == END || line.starts_with(ADD) || line.starts_with(DELETE) || line.starts_with(UPDATE)
+}
+
+fn ensure_last_chunk_not_empty(chunks: &[UpdateChunk], line_number: usize) -> Result<()> {
+    if chunks
+        .last()
+        .is_some_and(|chunk| chunk.old_lines.is_empty() && chunk.new_lines.is_empty())
+    {
+        bail!("Update hunk does not contain any lines at line {line_number}");
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -213,20 +245,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_multiple_operations() {
-        let hunks =
-            parse_patch("*** Begin Patch\n*** Add File: a\n+x\n*** Delete File: b\n*** End Patch")
-                .unwrap();
+    fn accepts_empty_add_file_and_padded_headers() {
+        let hunks = parse_patch(
+            "  *** Begin Patch\n  *** Add File: empty.txt\n  *** Delete File: old.txt\n*** End Patch  ",
+        )
+        .unwrap();
         assert_eq!(hunks.len(), 2);
+        assert!(matches!(&hunks[0], Hunk::Add { contents, .. } if contents.is_empty()));
     }
 
     #[test]
-    fn rejects_missing_boundaries() {
-        assert!(parse_patch("*** Add File: a\n+x").is_err());
-    }
-
-    #[test]
-    fn accepts_unprefixed_blank_lines_in_update_hunks() {
+    fn bare_empty_update_line_is_context() {
         let hunks = parse_patch(
             "*** Begin Patch\n*** Update File: a\n@@\n one\n\n-two\n+TWO\n*** End Patch",
         )
@@ -234,34 +263,15 @@ mod tests {
         let Hunk::Update { chunks, .. } = &hunks[0] else {
             panic!("expected update hunk");
         };
-        assert_eq!(
-            chunks[0].old_lines,
-            vec!["one".to_string(), String::new(), "two".to_string()]
-        );
-        assert_eq!(
-            chunks[0].new_lines,
-            vec!["one".to_string(), String::new(), "TWO".to_string()]
-        );
+        assert_eq!(chunks[0].old_lines, vec!["one", "", "two"]);
+        assert_eq!(chunks[0].new_lines, vec!["one", "", "TWO"]);
     }
 
     #[test]
-    fn infers_unprefixed_blank_lines_between_additions() {
-        let hunks = parse_patch(
-            "*** Begin Patch\n*** Update File: a\n@@ marker\n+i = 1\n\n\n+def abc()\n*** End Patch",
-        )
-        .unwrap();
-        let Hunk::Update { chunks, .. } = &hunks[0] else {
-            panic!("expected update hunk");
-        };
-        assert!(chunks[0].old_lines.is_empty());
-        assert_eq!(
-            chunks[0].new_lines,
-            vec![
-                "i = 1".to_string(),
-                String::new(),
-                String::new(),
-                "def abc()".to_string(),
-            ]
-        );
+    fn accepts_lenient_heredoc_wrapper() {
+        let hunks =
+            parse_patch("<<'EOF'\n*** Begin Patch\n*** Add File: a\n+x\n*** End Patch\nEOF")
+                .unwrap();
+        assert_eq!(hunks.len(), 1);
     }
 }

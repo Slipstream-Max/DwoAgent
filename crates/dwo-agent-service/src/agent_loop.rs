@@ -276,18 +276,50 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             .iter()
             .map(active_tool_call)
             .collect::<Vec<_>>();
-        turn.context.append_assistant_with_reasoning(
+        let remote_tool_calls = response
+            .remote_tool_calls
+            .iter()
+            .map(active_tool_call)
+            .collect::<Vec<_>>();
+        turn.context.append_assistant_response(
             response.content.clone(),
             response.reasoning.clone(),
             response.tool_calls.clone(),
+            response.output_items.clone(),
         );
         turn.context.record_model_success(selection.model.clone());
         turn.emit(TurnEvent::AssistantCompleted {
             turn_id: turn.turn_id.clone(),
             content: response.content,
             reasoning: response.reasoning,
-            tool_calls: active_tool_calls.clone(),
+            tool_calls: active_tool_calls
+                .iter()
+                .chain(remote_tool_calls.iter())
+                .cloned()
+                .collect(),
         });
+        for call in &remote_tool_calls {
+            turn.emit(TurnEvent::ToolStarted {
+                turn_id: turn.turn_id.clone(),
+                call: call.clone(),
+            });
+            let raw_output = response
+                .remote_tool_calls
+                .iter()
+                .find(|raw| raw.get("id").and_then(Value::as_str) == Some(&call.tool_call_id))
+                .and_then(|raw| raw.get("arguments"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            turn.emit(TurnEvent::ToolCompleted {
+                turn_id: turn.turn_id.clone(),
+                result: ToolResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    output: raw_output,
+                    model_context: Vec::new(),
+                },
+            });
+        }
         if response.tool_calls.is_empty() {
             let pending = match turn.take_pending_messages().await {
                 Ok(pending) => pending,

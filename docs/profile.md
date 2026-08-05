@@ -193,7 +193,7 @@ model:
 
 内置 catalog 按 provider 分文件维护在
 `dwo-model-client/resources/providers/`。OpenAI-compatible 网关可以继承
-`openai`，只覆盖完整的 Chat Completions URL：
+`openai`，只覆盖完整的 Responses URL：
 
 ```yaml
 model:
@@ -201,7 +201,7 @@ model:
   providers:
     newapi:
       type: openai
-      baseUrl: https://gateway.example.com/v1/chat/completions
+      baseUrl: https://gateway.example.com/v1/responses
       apiKeyEnv: NEW_API_KEY
   models:
     - modelName: gpt-5.6-terra
@@ -209,9 +209,9 @@ model:
       modelId: gpt-5.6-terra
 ```
 
-`openai` 当前使用 Chat Completions transport，并按 provider 配置发送
-`max_completion_tokens`；DeepSeek provider 继续发送 `max_tokens`。Responses
-API 需要独立的 protocol adapter，不能只靠修改 `baseUrl` 切换。
+`openai` 与 `deepseek` 都使用 Responses transport，并统一发送
+`input`、`max_output_tokens` 和 Responses SSE 事件。Provider catalog 可以通过
+模型级 `hostedTools` 声明服务端工具；本地 function tools 会在请求时与其合并。
 
 用户自定义 provider 放在 `resource/providers/<type>.yaml`。文件名（不含扩展名）
 就是 `profile.yaml` 中引用的 `type`；文件内容只定义一个 provider，不再包含顶层
@@ -219,9 +219,8 @@ API 需要独立的 protocol adapter，不能只靠修改 `baseUrl` 切换。
 
 ```yaml
 # resource/providers/newapi.yaml
-protocol: open_ai_chat_completions
-endpoint: https://gateway.example.com/v1/chat/completions
-maxOutputTokensField: max_completion_tokens
+protocol: open_ai_responses
+endpoint: https://gateway.example.com/v1/responses
 models:
   custom-model:
     contextWindowTokens: 200000
@@ -229,11 +228,13 @@ models:
     capabilities:
       imageInput: true
       toolCalls: true
+    hostedTools:
+      - type: web_search_preview
     defaultReasoningMode: medium
     reasoning:
-      low: {reasoning_effort: low}
-      medium: {reasoning_effort: medium}
-      high: {reasoning_effort: high}
+      low: {reasoning: {effort: low}}
+      medium: {reasoning: {effort: medium}}
+      high: {reasoning: {effort: high}}
 ```
 
 自定义文件不能覆盖 `openai`、`deepseek` 等内置 type；需要修改时应使用新的文件名，

@@ -56,6 +56,9 @@ fn push_compacted_tool_exchange(
         .collect::<Vec<_>>();
     let mut normalized = assistant.clone();
     normalized.tool_calls = tool_calls;
+    // The native items contain the unabridged function calls. Clear them so the
+    // Responses adapter reconstructs input from the compacted canonical calls.
+    normalized.response_items.clear();
 
     if !normalized.content.is_empty()
         || normalized.reasoning.is_some()

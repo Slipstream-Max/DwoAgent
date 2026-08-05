@@ -300,6 +300,10 @@ pub struct ContextMessage {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<Value>,
+    /// Provider-native Responses API output items. These are replayed verbatim so
+    /// hosted tool state and opaque reasoning items survive subsequent turns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_items: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,6 +322,7 @@ impl ContextMessage {
         projected.content = self.content.project_for_image_input(allow_image_input);
         if projected.content.is_empty()
             && projected.tool_calls.is_empty()
+            && projected.response_items.is_empty()
             && projected.tool_call_id.is_none()
         {
             return None;
@@ -347,6 +352,25 @@ impl ContextMessage {
             content: content.into(),
             reasoning,
             tool_calls,
+            response_items: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            kind: MessageKind::Conversation,
+        }
+    }
+
+    pub fn assistant_response(
+        content: impl Into<MessageContent>,
+        reasoning: Option<String>,
+        tool_calls: Vec<Value>,
+        response_items: Vec<Value>,
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            reasoning,
+            tool_calls,
+            response_items,
             tool_call_id: None,
             tool_name: None,
             kind: MessageKind::Conversation,
@@ -359,6 +383,7 @@ impl ContextMessage {
             content: result.output.to_string().into(),
             reasoning: None,
             tool_calls: Vec::new(),
+            response_items: Vec::new(),
             tool_call_id: Some(result.tool_call_id.clone()),
             tool_name: Some(result.tool_name.clone()),
             kind: MessageKind::Conversation,
@@ -386,6 +411,7 @@ impl ContextMessage {
             content: content.into(),
             reasoning: None,
             tool_calls: Vec::new(),
+            response_items: Vec::new(),
             tool_call_id: None,
             tool_name: None,
             kind: MessageKind::Conversation,

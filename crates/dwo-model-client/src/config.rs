@@ -17,36 +17,22 @@ const BUILTIN_PROVIDER_YAMLS: &[(&str, &str)] = &[
 ];
 const RESERVED_BODY_FIELDS: &[&str] = &[
     "model",
-    "messages",
+    "input",
+    "instructions",
+    "previous_response_id",
     "tools",
     "stream",
     "stream_options",
     "max_tokens",
     "max_completion_tokens",
+    "max_output_tokens",
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderProtocol {
     #[default]
-    OpenAiChatCompletions,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaxOutputTokensField {
-    #[default]
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-impl MaxOutputTokensField {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::MaxTokens => "max_tokens",
-            Self::MaxCompletionTokens => "max_completion_tokens",
-        }
-    }
+    OpenAiResponses,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,8 +225,6 @@ pub struct ProviderSpec {
     pub protocol: ProviderProtocol,
     pub endpoint: String,
     #[serde(default)]
-    pub max_output_tokens_field: MaxOutputTokensField,
-    #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub request: RequestPolicy,
@@ -284,6 +268,8 @@ pub struct ModelSpec {
     pub top_p: Option<f64>,
     #[serde(default)]
     pub body: Map<String, Value>,
+    #[serde(default)]
+    pub hosted_tools: Vec<Value>,
     #[serde(default)]
     pub reasoning: BTreeMap<String, Map<String, Value>>,
     #[serde(default = "default_reasoning_mode")]
@@ -468,7 +454,6 @@ impl ModelClientConfig {
                     .base_url
                     .clone()
                     .unwrap_or_else(|| spec.endpoint.clone()),
-                max_output_tokens_field: spec.max_output_tokens_field,
                 api_key_env: agent_provider.api_key_env.clone(),
                 api_key: agent_provider.api_key.clone(),
                 headers: spec.headers.clone(),
@@ -500,6 +485,7 @@ impl ModelClientConfig {
                 temperature: spec.temperature,
                 top_p: spec.top_p,
                 body: spec.body.clone(),
+                hosted_tools: spec.hosted_tools.clone(),
                 reasoning: spec.reasoning.clone(),
                 default_reasoning_mode: entry
                     .default_reasoning_mode
@@ -523,7 +509,6 @@ impl ModelClientConfig {
 pub struct ProviderConfig {
     pub protocol: ProviderProtocol,
     pub endpoint: String,
-    pub max_output_tokens_field: MaxOutputTokensField,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
     pub headers: BTreeMap<String, String>,
@@ -578,6 +563,7 @@ pub struct ModelConfig {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub body: Map<String, Value>,
+    pub hosted_tools: Vec<Value>,
     pub reasoning: BTreeMap<String, Map<String, Value>>,
     pub default_reasoning_mode: String,
     pub capabilities: ModelCapabilities,

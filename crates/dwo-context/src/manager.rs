@@ -157,6 +157,22 @@ impl ContextManager {
         )]);
     }
 
+    pub fn append_assistant_response(
+        &mut self,
+        content: impl Into<String>,
+        reasoning: Option<String>,
+        tool_calls: Vec<Value>,
+        response_items: Vec<Value>,
+    ) {
+        let content = content.into();
+        self.extend_messages([ContextMessage::assistant_response(
+            content,
+            reasoning,
+            tool_calls,
+            response_items,
+        )]);
+    }
+
     pub fn append_tool(&mut self, result: ToolResultRecord) {
         let messages = std::iter::once(ContextMessage::tool(&result))
             .chain(result.model_context.into_iter().map(ContextMessage::user));

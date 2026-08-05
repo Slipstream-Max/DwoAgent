@@ -43,19 +43,6 @@ pub enum FinishReason {
     Other(String),
 }
 
-impl FinishReason {
-    pub(crate) fn from_provider(value: Option<&str>, has_tool_calls: bool) -> Self {
-        match value {
-            Some("stop") if has_tool_calls => Self::ToolCalls,
-            Some("stop") | None if !has_tool_calls => Self::Stop,
-            Some("tool_calls" | "function_call") => Self::ToolCalls,
-            Some("length" | "max_tokens") => Self::Length,
-            Some(other) => Self::Other(other.to_string()),
-            None => Self::ToolCalls,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelReply {
     pub content: String,
@@ -63,6 +50,10 @@ pub struct ModelReply {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_tool_calls: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_items: Vec<Value>,
     pub finish_reason: FinishReason,
     pub usage: ModelUsage,
 }

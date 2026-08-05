@@ -294,6 +294,8 @@ impl ModelClient for ScriptedModelGateway {
                     content,
                     reasoning: None,
                     tool_calls,
+                    remote_tool_calls: Vec::new(),
+                    output_items: Vec::new(),
                     finish_reason,
                     usage: ModelUsage {
                         input_tokens,
@@ -309,6 +311,8 @@ impl ModelClient for ScriptedModelGateway {
                     content,
                     reasoning: Some(reasoning),
                     tool_calls: Vec::new(),
+                    remote_tool_calls: Vec::new(),
+                    output_items: Vec::new(),
                     finish_reason: FinishReason::Stop,
                     usage: ModelUsage::default(),
                 })
@@ -350,6 +354,8 @@ impl ModelClient for ScriptedModelGateway {
             content: step.content,
             reasoning: None,
             tool_calls: Vec::new(),
+            remote_tool_calls: Vec::new(),
+            output_items: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: ModelUsage {
                 input_tokens: step.input_tokens,

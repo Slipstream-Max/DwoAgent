@@ -1,4 +1,4 @@
-use dwo_context::{ContextMessage, ToolResultRecord};
+use dwo_context::{ContextManager, ContextMessage, SessionContext, ToolResultRecord};
 use dwo_model_client::{
     AgentModelConfig, ConfiguredModelClient, ModelCatalog, ModelClient, ModelSelection,
 };
@@ -91,18 +91,18 @@ models:
     let called = stream(&client, "deepseek-v4-flash", &messages, &tools).await;
     assert_eq!(called.tool_calls.len(), 1);
     let call_id = called.tool_calls[0]["id"].as_str().unwrap().to_string();
-    messages.push(ContextMessage::assistant_response(
-        called.content,
-        called.reasoning,
-        called.tool_calls,
-        called.output_items,
-    ));
-    messages.push(ContextMessage::tool(&ToolResultRecord {
+    let mut context = ContextManager::new(SessionContext {
+        messages,
+        ..SessionContext::default()
+    });
+    context.append_response_items("deepseek", called.context_output_items());
+    context.append_tool(ToolResultRecord {
         tool_call_id: call_id,
         tool_name: "lookup_code".to_string(),
         output: json!({"code":"A-17"}),
         model_context: Vec::new(),
-    }));
+    });
+    messages = context.into_context().messages;
     let completed = stream(&client, "deepseek-v4-flash", &messages, &tools).await;
     assert!(completed.content.contains("A-17"));
 }

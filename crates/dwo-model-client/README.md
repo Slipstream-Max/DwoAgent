@@ -17,6 +17,7 @@ operations:
 
 ```text
 model_limits(model_alias) -> context/output/input limits + compact trigger
+provider_id(model_alias) -> configured provider-instance id
 supports_image_input(model_alias) -> bool
 stream_turn(selection, messages, tools, event_sender, cancellation) -> ModelReply
 summarize(selection, compaction_view, cancellation)                  -> SummaryReply
@@ -28,13 +29,15 @@ tools. Both paths resolve the session's model alias through the same model and
 provider configuration.
 
 The session runtime consults `supports_image_input` before accepting an image
-prompt or committing a model switch. Provider message shaping still validates
-the capability as a final boundary check.
+prompt. A model switch normalizes stored context immediately, permanently
+removing unsupported images. Provider message shaping still validates the
+capability as a final boundary check.
 
-The model context is one canonical message sequence. The transport projects it
-to Responses `input` items. Native response output items are persisted and
-replayed verbatim so hosted-tool state, reasoning items, and function calls
-remain valid across turns.
+The model context is one canonical item-first sequence. Each native Responses
+output item is persisted as its own ordered context entry and replayed verbatim.
+Reasoning and hosted-tool calls are owned by the configured provider instance;
+switching provider instances removes those private items while retaining
+visible messages and local function call/output pairs.
 
 ## Configuration
 

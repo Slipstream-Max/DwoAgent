@@ -9,10 +9,38 @@ use super::OMITTED_MARKER;
 const FILE_PATCH_OMITTED_MARKER: &str = "file patch omitted";
 
 pub(super) fn compact_tool_exchanges(messages: &[ContextMessage]) -> Vec<ContextMessage> {
+    let result_ids = messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect::<HashSet<_>>();
+    let response_call_ids = messages
+        .iter()
+        .filter_map(response_function_call_id)
+        .filter(|id| result_ids.contains(*id))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
     let mut output = Vec::new();
     let mut index = 0;
     while index < messages.len() {
         let message = &messages[index];
+        if let Some(call_id) = response_function_call_id(message) {
+            if response_call_ids.contains(call_id) {
+                output.push(compact_response_function_call(message));
+            }
+            index += 1;
+            continue;
+        }
+        if message.role == MessageRole::Tool {
+            if message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| response_call_ids.contains(id))
+            {
+                output.push(compact_tool_result(message));
+            }
+            index += 1;
+            continue;
+        }
         if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
             let mut end = index + 1;
             while end < messages.len() && messages[end].role == MessageRole::Tool {
@@ -28,6 +56,22 @@ pub(super) fn compact_tool_exchanges(messages: &[ContextMessage]) -> Vec<Context
         index += 1;
     }
     output
+}
+
+fn response_function_call_id(message: &ContextMessage) -> Option<&str> {
+    let item = message.response_item_value()?;
+    (item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .then(|| tool_call_id(item))
+        .flatten()
+}
+
+fn compact_response_function_call(message: &ContextMessage) -> ContextMessage {
+    let mut compacted = message.clone();
+    let Some(item) = compacted.response_item.as_mut() else {
+        return compacted;
+    };
+    omit_response_file_patch(item);
+    compacted
 }
 
 fn push_compacted_tool_exchange(
@@ -58,7 +102,7 @@ fn push_compacted_tool_exchange(
     normalized.tool_calls = tool_calls;
     // The native items contain the unabridged function calls. Clear them so the
     // Responses adapter reconstructs input from the compacted canonical calls.
-    normalized.response_items.clear();
+    normalized.response_item = None;
 
     if !normalized.content.is_empty()
         || normalized.reasoning.is_some()
@@ -99,8 +143,9 @@ fn compact_tool_result(result: &ContextMessage) -> ContextMessage {
 }
 
 fn tool_call_id(call: &Value) -> Option<&str> {
-    call.get("id")
+    call.get("call_id")
         .and_then(Value::as_str)
+        .or_else(|| call.get("id").and_then(Value::as_str))
         .or_else(|| call.get("tool_call_id").and_then(Value::as_str))
 }
 
@@ -120,6 +165,28 @@ fn omit_file_patch(call: &mut Value) -> bool {
     }
     call.get_mut("arguments")
         .and_then(|arguments| arguments.get_mut("patch"))
+        .is_some_and(replace_with_omission)
+}
+
+fn omit_response_file_patch(call: &mut Value) -> bool {
+    if call.get("name").and_then(Value::as_str) != Some("file_edit") {
+        return false;
+    }
+    let Some(arguments) = call.get_mut("arguments") else {
+        return false;
+    };
+    if let Some(encoded) = arguments.as_str() {
+        let Ok(mut parsed) = serde_json::from_str::<Value>(encoded) else {
+            return false;
+        };
+        let changed = parsed.get_mut("patch").is_some_and(replace_with_omission);
+        if changed {
+            *arguments = Value::String(parsed.to_string());
+        }
+        return changed;
+    }
+    arguments
+        .get_mut("patch")
         .is_some_and(replace_with_omission)
 }
 

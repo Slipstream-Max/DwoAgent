@@ -293,6 +293,7 @@ pub enum MessageKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextMessage {
     pub role: MessageRole,
     pub content: MessageContent,
@@ -300,10 +301,13 @@ pub struct ContextMessage {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<Value>,
-    /// Provider-native Responses API output items. These are replayed verbatim so
-    /// hosted tool state and opaque reasoning items survive subsequent turns.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub response_items: Vec<Value>,
+    /// One provider-native Responses API output item, replayed verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_item: Option<Value>,
+    /// Configured provider instance that owns this opaque Responses item.
+    /// Only reasoning and hosted-tool items are provider-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,7 +326,7 @@ impl ContextMessage {
         projected.content = self.content.project_for_image_input(allow_image_input);
         if projected.content.is_empty()
             && projected.tool_calls.is_empty()
-            && projected.response_items.is_empty()
+            && projected.response_item.is_none()
             && projected.tool_call_id.is_none()
         {
             return None;
@@ -352,29 +356,53 @@ impl ContextMessage {
             content: content.into(),
             reasoning,
             tool_calls,
-            response_items: Vec::new(),
+            response_item: None,
+            provider: None,
             tool_call_id: None,
             tool_name: None,
             kind: MessageKind::Conversation,
         }
     }
 
-    pub fn assistant_response(
-        content: impl Into<MessageContent>,
-        reasoning: Option<String>,
-        tool_calls: Vec<Value>,
-        response_items: Vec<Value>,
-    ) -> Self {
+    pub fn response_item(item: Value, provider: Option<String>) -> Self {
         Self {
             role: MessageRole::Assistant,
-            content: content.into(),
-            reasoning,
-            tool_calls,
-            response_items,
+            content: MessageContent::default(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            response_item: Some(item),
+            provider,
             tool_call_id: None,
             tool_name: None,
             kind: MessageKind::Conversation,
         }
+    }
+
+    pub fn response_item_value(&self) -> Option<&Value> {
+        self.response_item.as_ref()
+    }
+
+    pub(crate) fn response_item_requires_provider(item: &Value) -> bool {
+        item.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                kind == "reasoning" || (kind.ends_with("_call") && kind != "function_call")
+            })
+    }
+
+    pub fn is_provider_owned(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    pub fn calls_tool(&self, tool_call_id: &str) -> bool {
+        self.response_item_value()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .and_then(response_call_id)
+            .is_some_and(|id| id == tool_call_id)
+            || self
+                .tool_calls
+                .iter()
+                .any(|call| response_call_id(call).is_some_and(|id| id == tool_call_id))
     }
 
     pub fn tool(result: &ToolResultRecord) -> Self {
@@ -383,7 +411,8 @@ impl ContextMessage {
             content: result.output.to_string().into(),
             reasoning: None,
             tool_calls: Vec::new(),
-            response_items: Vec::new(),
+            response_item: None,
+            provider: None,
             tool_call_id: Some(result.tool_call_id.clone()),
             tool_name: Some(result.tool_name.clone()),
             kind: MessageKind::Conversation,
@@ -411,7 +440,8 @@ impl ContextMessage {
             content: content.into(),
             reasoning: None,
             tool_calls: Vec::new(),
-            response_items: Vec::new(),
+            response_item: None,
+            provider: None,
             tool_call_id: None,
             tool_name: None,
             kind: MessageKind::Conversation,
@@ -430,4 +460,10 @@ pub struct ToolResultRecord {
     pub output: Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_context: Vec<MessageContent>,
+}
+
+fn response_call_id(item: &Value) -> Option<&str> {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
 }

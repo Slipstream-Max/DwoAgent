@@ -82,12 +82,19 @@ pub(crate) struct RunTurn {
     pub actor: mpsc::UnboundedSender<TurnActorMessage>,
 }
 
+struct ModelStep {
+    selection: ModelSelection,
+    provider: String,
+    allow_image_input: bool,
+}
+
 impl RunTurn {
     fn emit(&self, event: TurnEvent) {
         let _ = self.actor.send(TurnActorMessage::Event(event));
     }
 
     async fn checkpoint(&mut self) -> anyhow::Result<()> {
+        normalize_context_for_current_step(self)?;
         let context = self.context.checkpoint(self.tools.schemas());
         let (completed, wait) = oneshot::channel();
         self.actor
@@ -196,18 +203,15 @@ async fn manual_compaction_inner(turn: &mut RunTurn) -> TurnOutcome {
         return TurnOutcome::Cancelled;
     }
     let before = turn.context.context().usage.current_tokens;
-    let desired = current_selection(turn);
-    let allow_image_input = match turn.model.supports_image_input(&desired.model) {
-        Ok(value) => value,
-        Err(error) => {
-            return TurnOutcome::Failed(format!("resolve model image capability: {error:#}"));
-        }
+    let step = match current_model_step(turn) {
+        Ok(step) => step,
+        Err(error) => return TurnOutcome::Failed(format!("resolve model: {error:#}")),
     };
-    let plan = turn
-        .context
-        .plan_compaction(&CompactionPlanner::default())
-        .project_for_image_input(allow_image_input);
-    let recovery = recovery_selection(turn, &desired);
+    if let Err(error) = prepare_context_for_step(turn, &step).await {
+        return TurnOutcome::Failed(format!("normalize model context: {error:#}"));
+    }
+    let plan = turn.context.plan_compaction(&CompactionPlanner::default());
+    let recovery = recovery_selection(turn, &step.selection);
     match compact_context(turn, plan, recovery).await {
         Ok(compacted) => {
             let content = if compacted {
@@ -256,7 +260,14 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             }
         };
         turn.context.refresh_environment_snapshot(current);
-        if let Err(error) = compact_if_needed(turn).await {
+        let model_step = match current_model_step(turn) {
+            Ok(step) => step,
+            Err(error) => return TurnOutcome::Failed(format!("resolve model: {error:#}")),
+        };
+        if let Err(error) = prepare_context_for_step(turn, &model_step).await {
+            return TurnOutcome::Failed(format!("normalize model context: {error:#}"));
+        }
+        if let Err(error) = compact_if_needed(turn, &model_step).await {
             return if turn.cancellation.is_cancelled() {
                 TurnOutcome::Cancelled
             } else {
@@ -264,8 +275,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             };
         }
 
-        let selection = current_selection(turn);
-        let response = match request_with_context_recovery(turn, &selection).await {
+        let response = match request_with_context_recovery(turn, &model_step.selection).await {
             Ok(response) => response,
             Err(_) if turn.cancellation.is_cancelled() => return TurnOutcome::Cancelled,
             Err(error) => return TurnOutcome::Failed(format!("{error:#}")),
@@ -281,13 +291,10 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             .iter()
             .map(active_tool_call)
             .collect::<Vec<_>>();
-        turn.context.append_assistant_response(
-            response.content.clone(),
-            response.reasoning.clone(),
-            response.tool_calls.clone(),
-            response.output_items.clone(),
-        );
-        turn.context.record_model_success(selection.model.clone());
+        turn.context
+            .append_response_items(model_step.provider.clone(), response.context_output_items());
+        turn.context
+            .record_model_success(model_step.selection.model.clone());
         turn.emit(TurnEvent::AssistantCompleted {
             turn_id: turn.turn_id.clone(),
             content: response.content,
@@ -350,12 +357,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
 
         let mut execution = ExecutionContext::new(turn.config.borrow().mode);
         execution.confirmation = Some(turn.permission.confirmation_handler());
-        execution.allow_image_input = match turn.model.supports_image_input(&selection.model) {
-            Ok(supported) => supported,
-            Err(error) => {
-                return TurnOutcome::Failed(format!("resolve model image capability: {error:#}"));
-            }
-        };
+        execution.allow_image_input = model_step.allow_image_input;
         let actor = turn.actor.clone();
         let telemetry_turn_id = turn.turn_id.clone();
         execution.events = Some(Arc::new(move |event| {
@@ -430,11 +432,7 @@ async fn request_with_context_recovery(
         Ok(response) => Ok(response),
         Err(error) if error.is_context_length_exceeded() => {
             let recovery = recovery_selection(turn, selection);
-            let allow_image_input = turn.model.supports_image_input(&selection.model)?;
-            let plan = turn
-                .context
-                .recovery_compaction()
-                .project_for_image_input(allow_image_input);
+            let plan = turn.context.recovery_compaction();
             if !compact_context(turn, plan, recovery).await? {
                 return Err(error.into());
             }
@@ -449,8 +447,7 @@ async fn request_model(
     selection: &ModelSelection,
 ) -> Result<ModelReply, dwo_model_client::ModelClientError> {
     let started = Instant::now();
-    let allow_image_input = turn.model.supports_image_input(&selection.model)?;
-    let messages = turn.context.projected_model_messages(allow_image_input);
+    let messages = turn.context.model_messages().to_vec();
     let message_count = messages.len();
     let tool_count = turn.tools.schemas().len();
     tracing::debug!(
@@ -515,6 +512,37 @@ async fn request_model(
     }
 }
 
+fn normalize_context_for_step(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Result<bool> {
+    let previous_provider = if turn.context.context().provider.is_none() {
+        turn.context
+            .context()
+            .usage
+            .last_model
+            .as_deref()
+            .map(|model| turn.model.provider_id(model))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(turn.context.normalize_for_selection(
+        &step.provider,
+        previous_provider.as_deref(),
+        step.allow_image_input,
+    ))
+}
+
+fn normalize_context_for_current_step(turn: &mut RunTurn) -> anyhow::Result<bool> {
+    let step = current_model_step(turn)?;
+    normalize_context_for_step(turn, &step)
+}
+
+async fn prepare_context_for_step(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Result<()> {
+    if normalize_context_for_step(turn, step)? {
+        turn.checkpoint().await?;
+    }
+    Ok(())
+}
+
 fn emit_model_delta(
     actor: &mpsc::UnboundedSender<TurnActorMessage>,
     turn_id: &TurnId,
@@ -575,19 +603,16 @@ async fn compact_context(
     Ok(true)
 }
 
-async fn compact_if_needed(turn: &mut RunTurn) -> anyhow::Result<()> {
-    let desired = current_selection(turn);
+async fn compact_if_needed(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Result<()> {
     let trigger_tokens = turn
         .model
-        .model_limits(&desired.model)?
+        .model_limits(&step.selection.model)?
         .compact_trigger_tokens;
     let schemas = turn.tools.schemas();
     let Some(plan) = turn.context.scheduled_compaction(trigger_tokens, schemas) else {
         return Ok(());
     };
-    let allow_image_input = turn.model.supports_image_input(&desired.model)?;
-    let plan = plan.project_for_image_input(allow_image_input);
-    let recovery = recovery_selection(turn, &desired);
+    let recovery = recovery_selection(turn, &step.selection);
     compact_context(turn, plan, recovery).await?;
     Ok(())
 }
@@ -598,6 +623,15 @@ fn current_selection(turn: &RunTurn) -> ModelSelection {
         model: settings.model,
         reasoning: settings.reasoning,
     }
+}
+
+fn current_model_step(turn: &RunTurn) -> Result<ModelStep, dwo_model_client::ModelClientError> {
+    let selection = current_selection(turn);
+    Ok(ModelStep {
+        provider: turn.model.provider_id(&selection.model)?,
+        allow_image_input: turn.model.supports_image_input(&selection.model)?,
+        selection,
+    })
 }
 
 fn recovery_selection(turn: &RunTurn, desired: &ModelSelection) -> ModelSelection {

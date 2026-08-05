@@ -696,6 +696,7 @@ impl SessionActor {
                     return false;
                 }
                 let model_changed = matches!(&update, SessionConfigUpdate::Model(_));
+                let previous_model = self.record.llm.model.clone();
                 let new_model_reasoning = match &update {
                     SessionConfigUpdate::Model(model) => self
                         .model
@@ -710,35 +711,43 @@ impl SessionActor {
                     .map_err(AgentServiceError::InvalidConfig);
                 let result = match result {
                     Ok(()) => {
-                        let selection = ModelSelection {
+                        let mut selection = ModelSelection {
                             model: updated.llm.model.clone(),
                             reasoning: updated.llm.reasoning.clone(),
                         };
-                        match self.model.validate_selection(&selection) {
+                        let mut remember_reasoning = true;
+                        let validation =
+                            if let Err(error) = self.model.validate_selection(&selection) {
+                                if !model_changed || updated.llm.reasoning.is_none() {
+                                    Err(AgentServiceError::InvalidConfig(error.to_string()))
+                                } else {
+                                    // A remembered mode may not exist on the target model.
+                                    remember_reasoning = !updated
+                                        .llm
+                                        .reasoning_by_model
+                                        .contains_key(&updated.llm.model);
+                                    updated.llm.reasoning = None;
+                                    selection.reasoning = None;
+                                    self.model.validate_selection(&selection).map_err(|_| {
+                                        AgentServiceError::InvalidConfig(error.to_string())
+                                    })
+                                }
+                            } else {
+                                Ok(())
+                            };
+                        match validation {
                             Ok(()) => {
-                                updated.llm.remember_current_reasoning();
-                                updated.touch();
-                                self.repository
-                                    .save(&updated)
-                                    .await
-                                    .map_err(AgentServiceError::from)
-                            }
-                            Err(error) if model_changed && updated.llm.reasoning.is_some() => {
-                                // A remembered mode may not exist on the target
-                                // model. Keep the memory, but use that model's
-                                // default for the active selection.
-                                updated.llm.reasoning = None;
-                                let fallback = ModelSelection {
-                                    model: updated.llm.model.clone(),
-                                    reasoning: None,
+                                let normalized = if model_changed {
+                                    self.normalize_record_context_for_model(
+                                        &mut updated,
+                                        &previous_model,
+                                    )
+                                } else {
+                                    Ok(())
                                 };
-                                match self.model.validate_selection(&fallback) {
+                                match normalized {
                                     Ok(()) => {
-                                        if !updated
-                                            .llm
-                                            .reasoning_by_model
-                                            .contains_key(&updated.llm.model)
-                                        {
+                                        if remember_reasoning {
                                             updated.llm.remember_current_reasoning();
                                         }
                                         updated.touch();
@@ -747,12 +756,10 @@ impl SessionActor {
                                             .await
                                             .map_err(AgentServiceError::from)
                                     }
-                                    Err(_) => {
-                                        Err(AgentServiceError::InvalidConfig(error.to_string()))
-                                    }
+                                    Err(error) => Err(error),
                                 }
                             }
-                            Err(error) => Err(AgentServiceError::InvalidConfig(error.to_string())),
+                            Err(error) => Err(error),
                         }
                     }
                     Err(error) => Err(error),
@@ -1076,6 +1083,33 @@ impl SessionActor {
                 self.record.llm.model
             )));
         }
+        Ok(())
+    }
+
+    fn normalize_record_context_for_model(
+        &self,
+        record: &mut SessionRecord,
+        previous_model: &str,
+    ) -> Result<(), AgentServiceError> {
+        let provider = self
+            .model
+            .provider_id(&record.llm.model)
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+        let previous_provider = match record.context.provider.clone() {
+            Some(provider) => provider,
+            None => self
+                .model
+                .provider_id(previous_model)
+                .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?,
+        };
+        let allow_image_input = self
+            .model
+            .supports_image_input(&record.llm.model)
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+        let mut context = ContextManager::new(record.context.clone());
+        context.normalize_for_selection(&provider, Some(&previous_provider), allow_image_input);
+        context.refresh_usage(self.tools.schemas());
+        record.context = context.into_context();
         Ok(())
     }
 

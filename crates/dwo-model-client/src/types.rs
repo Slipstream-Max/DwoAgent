@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use dwo_context::{CompactionView, ContextMessage};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +58,44 @@ pub struct ModelReply {
     pub usage: ModelUsage,
 }
 
+impl ModelReply {
+    /// Return item-first Responses output. The fallback keeps lightweight test
+    /// clients and custom implementations on the same context contract.
+    pub fn context_output_items(&self) -> Vec<Value> {
+        if !self.output_items.is_empty() {
+            return self.output_items.clone();
+        }
+        let mut items = Vec::new();
+        if let Some(reasoning) = self.reasoning.as_ref().filter(|text| !text.is_empty()) {
+            items.push(json!({
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            }));
+        }
+        if !self.content.is_empty() {
+            items.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": self.content}],
+            }));
+        }
+        items.extend(self.tool_calls.iter().map(|call| {
+            let arguments = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            json!({
+                "type": "function_call",
+                "call_id": call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "name": call.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "arguments": match arguments {
+                    Value::String(value) => value,
+                    value => value.to_string(),
+                },
+            })
+        }));
+        items
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryReply {
     pub summary: String,
@@ -67,6 +105,11 @@ pub struct SummaryReply {
 #[async_trait]
 pub trait ModelClient: Send + Sync {
     fn model_limits(&self, model: &str) -> Result<ModelLimits, ModelClientError>;
+
+    /// Stable configured provider-instance identity for context ownership.
+    fn provider_id(&self, _model: &str) -> Result<String, ModelClientError> {
+        Ok("default".to_string())
+    }
 
     fn supports_image_input(&self, _model: &str) -> Result<bool, ModelClientError> {
         Ok(false)

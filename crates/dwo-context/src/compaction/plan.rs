@@ -102,7 +102,11 @@ impl CompactionPlanner {
 
     pub fn build(&self, context: &SessionContext) -> CompactionPlan {
         let messages = without_initial_system(&context.messages);
-        let cut = find_reserve_cut(messages, self.recent_context_tokens);
+        let mut cut = find_reserve_cut(messages, self.recent_context_tokens);
+        cut.index = align_cut_to_tool_calls(messages, cut.index);
+        if cut.split_turn_user.is_some_and(|index| index >= cut.index) {
+            cut.split_turn_user = None;
+        }
         let history = messages[..cut.index].to_vec();
         let mut raw_reserve = Vec::new();
         if let Some(user_index) = cut.split_turn_user {
@@ -263,6 +267,24 @@ fn is_agent_cut_point(message: &ContextMessage) -> bool {
     message.role == MessageRole::Assistant && message.kind == MessageKind::Conversation
 }
 
+fn align_cut_to_tool_calls(messages: &[ContextMessage], mut cut: usize) -> usize {
+    loop {
+        let required_call = messages[cut..]
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .filter_map(|result_id| {
+                messages[..cut]
+                    .iter()
+                    .rposition(|candidate| candidate.calls_tool(result_id))
+            })
+            .min();
+        let Some(required_call) = required_call else {
+            return cut;
+        };
+        cut = required_call;
+    }
+}
+
 fn reserved_user_tokens(messages: &[ContextMessage]) -> u64 {
     messages
         .iter()
@@ -375,6 +397,49 @@ mod tests {
                 MessageRole::Assistant
             );
         }
+    }
+
+    #[test]
+    fn item_first_reserve_cut_moves_before_all_calls_needed_by_reserved_results() {
+        let mut context = SessionContext::default();
+        context.messages.push(ContextMessage::system("system"));
+        context.messages.push(ContextMessage::user("question"));
+        context.messages.push(ContextMessage::response_item(
+            json!({"type":"function_call", "call_id":"call-1", "name":"terminal", "arguments":"{}"}),
+            None,
+        ));
+        context.messages.push(ContextMessage::response_item(
+            json!({"type":"function_call", "call_id":"call-2", "name":"terminal", "arguments":"{}"}),
+            None,
+        ));
+        for id in ["call-1", "call-2"] {
+            context
+                .messages
+                .push(ContextMessage::tool(&ToolResultRecord {
+                    tool_call_id: id.to_string(),
+                    tool_name: "terminal".to_string(),
+                    output: json!({"status":"completed","output":"ok"}),
+                    model_context: Vec::new(),
+                }));
+        }
+
+        let suffix_budget = std::iter::once(&context.messages[1])
+            .chain(context.messages[3..].iter())
+            .map(estimate_message_tokens)
+            .sum();
+        let plan = CompactionPlanner::new(suffix_budget, 5_000).build(&context);
+        let reserved_ids = plan
+            .reserved_messages
+            .iter()
+            .filter_map(|message| {
+                message
+                    .response_item_value()
+                    .and_then(|item| item.get("call_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .or(message.tool_call_id.as_deref())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reserved_ids, ["call-1", "call-2", "call-1", "call-2"]);
     }
 
     #[test]

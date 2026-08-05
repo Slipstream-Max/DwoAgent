@@ -23,9 +23,8 @@ pub fn estimate_content_tokens(content: &MessageContent) -> u64 {
 }
 
 pub fn estimate_message_tokens(message: &ContextMessage) -> u64 {
-    if !message.response_items.is_empty() {
-        return MESSAGE_OVERHEAD_TOKENS
-            .saturating_add(estimate_serialized_tokens(&message.response_items));
+    if let Some(item) = &message.response_item {
+        return MESSAGE_OVERHEAD_TOKENS.saturating_add(estimate_serialized_tokens(item));
     }
     let mut tokens =
         MESSAGE_OVERHEAD_TOKENS.saturating_add(estimate_content_tokens(&message.content));
@@ -227,17 +226,16 @@ mod tests {
     }
 
     #[test]
-    fn native_response_items_are_counted_without_double_counting_projected_content() {
+    fn native_response_item_is_counted_without_projected_content() {
         let item = json!({
             "type":"message",
             "role":"assistant",
             "content":[{"type":"output_text","text":"answer"}]
         });
-        let message =
-            ContextMessage::assistant_response("answer", None, Vec::new(), vec![item.clone()]);
+        let message = ContextMessage::response_item(item.clone(), None);
         assert_eq!(
             estimate_message_tokens(&message),
-            MESSAGE_OVERHEAD_TOKENS + estimate_serialized_tokens(&vec![item])
+            MESSAGE_OVERHEAD_TOKENS + estimate_serialized_tokens(&item)
         );
     }
 

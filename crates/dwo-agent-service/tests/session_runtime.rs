@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dwo_agent_service::{
-    AgentService, AgentServiceError, ConfirmationDecision, ContentBlock, EndpointId,
-    FsSessionRepository, MemorySessionRepository, MessageContent, MessageKind, ModelLimits,
-    NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload, SessionLlmSettings,
-    SessionMode, SessionRepository,
+    AgentService, AgentServiceError, ConfirmationDecision, ContentBlock, ContextMessage,
+    EndpointId, FsSessionRepository, MemorySessionRepository, MessageContent, MessageKind,
+    ModelLimits, NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload,
+    SessionLlmSettings, SessionMode, SessionRepository,
 };
 use dwo_tools::PolicyConfig;
-use serde_json::json;
+use serde_json::{Value, json};
 use support::{ScriptedCompletionStep, ScriptedModelGateway, ScriptedStep, ScriptedSummaryStep};
 
 fn new_session(cwd: &std::path::Path, mode: SessionMode) -> NewSession {
@@ -48,6 +48,30 @@ async fn wait_for_turn_end(
 fn write(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
+}
+
+fn response_item<'a>(message: &'a ContextMessage, kind: &str) -> Option<&'a Value> {
+    message
+        .response_item_value()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some(kind))
+}
+
+fn response_output_text(message: &ContextMessage) -> Option<&str> {
+    response_item(message, "message")?
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))?
+        .get("text")?
+        .as_str()
+}
+
+fn response_function_arguments(message: &ContextMessage) -> Option<Value> {
+    let arguments = response_item(message, "function_call")?.get("arguments")?;
+    match arguments {
+        Value::String(encoded) => serde_json::from_str(encoded).ok(),
+        value => Some(value.clone()),
+    }
 }
 
 #[tokio::test]
@@ -298,7 +322,7 @@ async fn model_tool_model_cycle_is_persisted_in_context() {
 
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.phase, RuntimePhase::Idle);
-    assert_eq!(snapshot.record.context.messages.len(), 5);
+    assert_eq!(snapshot.record.context.messages.len(), 6);
     assert!(matches!(
         snapshot.transcript.iter().find_map(|event| match &event.payload {
             SessionEventPayload::UserPromptSubmitted { content, .. } => Some(content),
@@ -312,7 +336,7 @@ async fn model_tool_model_cycle_is_persisted_in_context() {
     );
     let requests = model.requests().await;
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].messages.len(), 4);
+    assert_eq!(requests[1].messages.len(), 5);
 }
 
 #[tokio::test]
@@ -469,8 +493,14 @@ async fn prompt_is_accepted_before_the_current_step_finishes() {
     );
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(
-        snapshot.record.context.messages.last().unwrap().content,
-        "replacement"
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("replacement")
     );
 }
 
@@ -758,20 +788,20 @@ async fn rejected_duplicate_file_edits_keep_calls_and_results_unchanged_before_r
 
     let requests = model.requests().await;
     assert_eq!(requests.len(), 2);
-    let assistant = requests[1]
+    let calls = requests[1]
         .messages
         .iter()
-        .find(|message| !message.tool_calls.is_empty())
-        .unwrap();
-    assert_eq!(assistant.tool_calls.len(), 2);
+        .filter_map(response_function_arguments)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
     assert!(
-        assistant.tool_calls[0]["arguments"]["patch"]
+        calls[0]["patch"]
             .as_str()
             .unwrap()
             .contains("*** Add File: a")
     );
     assert!(
-        assistant.tool_calls[1]["arguments"]["patch"]
+        calls[1]["patch"]
             .as_str()
             .unwrap()
             .contains("*** Add File: b")
@@ -1147,13 +1177,13 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
             .iter()
             .any(|message| message.kind == MessageKind::CompactionSummary)
     );
-    let assistant = requests[1]
+    let call = requests[1]
         .messages
         .iter()
-        .find(|message| !message.tool_calls.is_empty())
+        .find_map(response_function_arguments)
         .unwrap();
     assert!(
-        assistant.tool_calls[0]["arguments"]["patch"]
+        call["patch"]
             .as_str()
             .unwrap()
             .contains("file patch omitted")
@@ -1238,14 +1268,18 @@ async fn context_error_summarizes_old_history_and_retries_with_filtered_recent_t
             .iter()
             .any(|message| message.role == dwo_agent_service::MessageRole::Tool)
     );
-    let compacted_assistant = requests[6]
+    let compacted_call = requests[6]
         .messages
         .iter()
-        .find(|message| !message.tool_calls.is_empty())
+        .find_map(|message| response_item(message, "function_call"))
         .unwrap();
-    assert_eq!(compacted_assistant.tool_calls[0]["id"], "edit-recovery");
+    assert_eq!(compacted_call["call_id"], "edit-recovery");
+    let compacted_arguments = compacted_call["arguments"]
+        .as_str()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap();
     assert!(
-        compacted_assistant.tool_calls[0]["arguments"]["patch"]
+        compacted_arguments["patch"]
             .as_str()
             .unwrap()
             .contains("file patch omitted")
@@ -1441,7 +1475,7 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
 }
 
 #[tokio::test]
-async fn switching_models_projects_images_without_rewriting_context() {
+async fn switching_to_text_model_permanently_removes_images_from_model_context() {
     let dir = tempfile::tempdir().unwrap();
     let unlimited = ModelLimits {
         context_window_tokens: u64::MAX,
@@ -1506,7 +1540,7 @@ async fn switching_models_projects_images_without_rewriting_context() {
             .context
             .messages
             .iter()
-            .any(|message| message.content.contains_images())
+            .all(|message| !message.content.contains_images())
     );
     assert_eq!(snapshot.record.context.compaction.count, 0);
     assert_eq!(snapshot.record.context.compaction.summary, None);
@@ -1548,12 +1582,142 @@ async fn switching_models_projects_images_without_rewriting_context() {
         requests[2]
             .messages
             .iter()
-            .any(|message| message.content.contains_images())
+            .all(|message| !message.content.contains_images())
     );
 }
 
 #[tokio::test]
-async fn text_model_compaction_removes_images_from_active_context() {
+async fn switching_providers_trims_private_response_items_but_keeps_visible_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let unlimited = ModelLimits {
+        context_window_tokens: u64::MAX,
+        max_output_tokens: u32::MAX,
+        max_input_tokens: u64::MAX,
+        compact_trigger_tokens: u64::MAX,
+    };
+    let model = ScriptedModelGateway::with_model_limits(
+        [ScriptedStep::reasoning_text(
+            "private summary",
+            "visible answer",
+        )],
+        [],
+        [
+            ("scripted-test-model".to_string(), unlimited),
+            ("next-model".to_string(), unlimited),
+        ],
+    )
+    .with_providers([
+        ("scripted-test-model".to_string(), "provider-a".to_string()),
+        ("next-model".to_string(), "provider-b".to_string()),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "remember").await.unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let before = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(before.record.context.messages.iter().any(|message| {
+        message.provider.as_deref() == Some("provider-a")
+            && message
+                .response_item_value()
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("reasoning")
+    }));
+
+    agent
+        .set_config(SessionConfigUpdate::Model("next-model".to_string()))
+        .await
+        .unwrap();
+    let after = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(after.record.context.provider.as_deref(), Some("provider-b"));
+    assert!(after.record.context.messages.iter().all(|message| {
+        message
+            .response_item_value()
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            != Some("reasoning")
+    }));
+    assert!(after.record.context.messages.iter().any(|message| {
+        message
+            .response_item_value()
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("message")
+    }));
+    assert!(after.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::AssistantCompleted { reasoning: Some(reasoning), .. }
+            if reasoning == "private summary"
+    )));
+}
+
+#[tokio::test]
+async fn in_flight_old_provider_response_cannot_restore_stale_context_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let unlimited = ModelLimits {
+        context_window_tokens: u64::MAX,
+        max_output_tokens: u32::MAX,
+        max_input_tokens: u64::MAX,
+        compact_trigger_tokens: u64::MAX,
+    };
+    let model = ScriptedModelGateway::with_model_limits(
+        [ScriptedStep::delayed_text("old provider answer", 100)],
+        [],
+        [
+            ("scripted-test-model".to_string(), unlimited),
+            ("next-model".to_string(), unlimited),
+        ],
+    )
+    .with_providers([
+        ("scripted-test-model".to_string(), "provider-a".to_string()),
+        ("next-model".to_string(), "provider-b".to_string()),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "start").await.unwrap();
+    agent
+        .set_config(SessionConfigUpdate::Model("next-model".to_string()))
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(snapshot.record.llm.model, "next-model");
+    assert_eq!(
+        snapshot.record.context.provider.as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("old provider answer")
+    );
+}
+
+#[tokio::test]
+async fn text_model_transition_removes_images_without_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let limits = ModelLimits {
         context_window_tokens: 1_000,
@@ -1605,14 +1769,14 @@ async fn text_model_compaction_removes_images_from_active_context() {
             .context
             .messages
             .iter()
-            .any(|message| message.content.contains_images())
+            .all(|message| !message.content.contains_images())
     );
 
     agent.prompt(EndpointId::new(), "continue").await.unwrap();
     wait_for_turn_end(&mut subscription.events).await;
     let after = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(after.record.llm.model, "text-model");
-    assert_eq!(after.record.context.compaction.count, 1);
+    assert_eq!(after.record.context.compaction.count, 0);
     assert_eq!(after.record.context.compaction.summary, None);
     assert!(
         after
@@ -2029,7 +2193,14 @@ async fn mode_change_applies_to_the_next_tool_batch() {
 
     assert!(!dir.path().join("denied.txt").exists());
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
-    let tool_output = &snapshot.record.context.messages[3].content;
+    let tool_output = &snapshot
+        .record
+        .context
+        .messages
+        .iter()
+        .find(|message| message.role == dwo_agent_service::MessageRole::Tool)
+        .unwrap()
+        .content;
     assert!(tool_output.contains("blocked_by_policy"), "{tool_output}");
 }
 
@@ -2203,8 +2374,14 @@ async fn origin_disconnect_keeps_permission_available_to_other_endpoints() {
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert!(snapshot.pending_permission.is_none());
     assert_eq!(
-        snapshot.record.context.messages.last().unwrap().content,
-        "continued"
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("continued")
     );
     assert!(!dir.path().join("disconnected.txt").exists());
 }
@@ -2397,8 +2574,17 @@ async fn filesystem_repository_loads_context_after_service_restart() {
     );
     let loaded = restarted.load(&id).await.unwrap();
     let snapshot = loaded.attach(EndpointId::new()).await.unwrap().snapshot;
-    assert_eq!(snapshot.record.context.messages.len(), 5);
-    assert_eq!(snapshot.record.context.messages[4].content, "persisted");
+    assert_eq!(snapshot.record.context.messages.len(), 7);
+    assert_eq!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("persisted")
+    );
     let transcript_kinds = snapshot
         .transcript
         .iter()

@@ -57,8 +57,8 @@ pub(crate) fn provider_input(
 ) -> Result<Vec<Value>, ModelClientError> {
     let mut output = Vec::new();
     for message in messages {
-        if message.role == MessageRole::Assistant && !message.response_items.is_empty() {
-            output.extend(message.response_items.iter().cloned());
+        if let Some(item) = message.response_item.as_ref() {
+            output.push(item.clone());
             continue;
         }
         match message.role {
@@ -378,11 +378,17 @@ mod tests {
 
     #[test]
     fn responses_input_replays_native_items_and_function_outputs() {
-        let assistant = ContextMessage::assistant_response(
-            "done",
+        let reasoning = ContextMessage::response_item(
+            json!({"type":"reasoning", "summary":[], "encrypted_content":"opaque"}),
+            Some("provider-a".to_string()),
+        );
+        let hosted = ContextMessage::response_item(
+            json!({"type":"web_search_call", "id":"ws-1", "status":"completed"}),
+            Some("provider-a".to_string()),
+        );
+        let message = ContextMessage::response_item(
+            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}),
             None,
-            Vec::new(),
-            vec![json!({"type":"web_search_call", "id":"ws-1", "status":"completed"})],
         );
         let result = dwo_context::ToolResultRecord {
             tool_call_id: "call-1".to_string(),
@@ -390,10 +396,16 @@ mod tests {
             output: json!({"status":"ok"}),
             model_context: Vec::new(),
         };
-        let input = provider_input(&[assistant, ContextMessage::tool(&result)], false).unwrap();
-        assert_eq!(input[0]["type"], "web_search_call");
-        assert_eq!(input[1]["type"], "function_call_output");
-        assert_eq!(input[1]["call_id"], "call-1");
+        let input = provider_input(
+            &[reasoning, hosted, message, ContextMessage::tool(&result)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[1]["type"], "web_search_call");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call-1");
     }
 
     #[test]

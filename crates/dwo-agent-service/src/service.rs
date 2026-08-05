@@ -76,6 +76,10 @@ impl ModelClient for ReloadableModelClient {
         self.current().model_limits(model)
     }
 
+    fn provider_id(&self, model: &str) -> Result<String, ModelClientError> {
+        self.current().provider_id(model)
+    }
+
     fn supports_image_input(&self, model: &str) -> Result<bool, ModelClientError> {
         self.current().supports_image_input(model)
     }

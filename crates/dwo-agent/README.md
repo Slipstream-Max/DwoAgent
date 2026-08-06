@@ -12,7 +12,9 @@ src/
   host/mod.rs          daemon composition root and RPC dispatch
   local/
     ipc.rs             local IPC server, request client, and event subscription
-    acp.rs             ACP stdio adapter backed by local IPC
+    ipc_schema.rs      ACP-facing IPC envelopes and session DTOs
+    acp_stdio.rs       newline-delimited stdio JSON-RPC transport
+    acp.rs             ACP v1/v2 adapter backed only by local IPC
   channels/
     manager.rs         channel login, configuration, state, and secrets
     hub.rs             running channel adapter lifecycle
@@ -62,6 +64,9 @@ dwo channel feishu bind
 dwo channel feishu unbind
 dwo channel feishu send-message <message>
 dwo channel feishu send-file <path>
+dwo channel websocket status
+dwo channel websocket token
+dwo channel websocket reset-token
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
@@ -74,7 +79,7 @@ dwo automation enable|disable --all
 dwo automation delete <job>
 dwo automation delete --all --yes
 dwo automation run <job> [--json]
-dwo acp
+dwo acp [--protocol v1|v2]
 ```
 
 Without `--to`, `session prompt` creates a root session from an external shell
@@ -126,6 +131,7 @@ channels/telegram/runtime.yaml
 channels/telegram/secret.yaml
 channels/feishu/runtime.yaml
 channels/feishu/secret.yaml
+channels/websocket/secret.yaml
 ```
 
 Weixin user settings live in `profile.yaml` and are validated before the host
@@ -259,18 +265,30 @@ inside the daemon, persist sync state, route slash commands through the shared
 prompt submitted by ACP is mirrored to the bound Weixin observer; a prompt that
 originates from Weixin is not echoed back to the same endpoint.
 
-The ACP command is a stdio bridge to the daemon IPC endpoint. It shares the
-same sessions and events as CLI and channel clients. Loading a session keeps a
-live observer attached, so idle ACP clients continue to receive prompts, tool
-events, and permission requests from other clients.
+The ACP command is a small stdio JSON-RPC bridge to the daemon IPC endpoint; it
+depends on the ACP schema rather than embedding another agent runtime. Protocol
+v2 is the default, while `--protocol v1` keeps the prompt request open until
+the turn returns its stop reason. Both versions share the same sessions and
+events as CLI and channel clients. Loading a session keeps a live observer
+attached, so idle ACP clients continue to receive prompts, tool events, and
+permission requests from other clients.
 
-ACP text blocks, text embedded resources, and resource links are flattened in
-their original order before submission. Resource text retains its URI and MIME
-type; links retain their name, URI, and available metadata so referenced files
-and directories remain visible to the model. ACP image and audio input and
-binary embedded resources are rejected. `embeddedContext` remains enabled for
-clients that paste text file contents, while `image` and `audio` remain
-disabled.
+ACP text blocks, images, text embedded resources, and resource links retain
+their original order. Resource text keeps its URI and MIME type; links keep
+their name, URI, and available metadata so referenced files and directories
+remain visible to the model. Images stay as structured blocks and are accepted
+only when the selected model supports them. Audio and binary embedded
+resources are rejected.
+
+Non-empty ACP `mcpServers` and `additionalDirectories` are rejected. MCP
+runtime ownership remains daemon-global through `resource/mcp.json`.
+
+Zed implements Send now as adjacent `session/cancel` and `session/prompt`
+messages. The adapter coalesces that same-connection, same-session pair within
+150ms and submits the prompt to the Host FIFO instead of cancelling the turn.
+A standalone cancel is forwarded after the grace period. Hosted Responses
+tools are surfaced through the same ACP tool updates as local tools, although
+their execution remains provider-side.
 
 External prompts use stable FIFO semantics. During an active turn they wait for
 the current model-response or tool-call boundary, join that turn in arrival

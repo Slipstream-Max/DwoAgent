@@ -213,6 +213,14 @@ model:
 `input`、`max_output_tokens` 和 Responses SSE 事件。Provider catalog 可以通过
 模型级 `hostedTools` 声明服务端工具；本地 function tools 会在请求时与其合并。
 
+### Responses 上下文与 provider 切换
+
+Responses 返回的不是一整块 assistant message。赤铎会按原始顺序保存 reasoning、assistant message、本地 `function_call`/output 和 provider 托管的 tool call。下一次请求仍按这个顺序回放，不会把它们重新揉成一条消息；压缩和 usage 估算也使用同一套结构。
+
+其中 reasoning 和托管工具调用可能包含只对当前 provider instance 有效的状态，因此带有 provider 归属。切换 provider instance 时，daemon 会在下一次模型请求前永久移除这些私有项，同时保留用户与 assistant 可见消息，以及本地工具的 call/result。只在同一个 provider 下切换模型不会触发这项清理。
+
+这里改变的是 `model_context.json`，不是 `client_transcript.jsonl`。客户端回放仍能看到完整的 reasoning、远端工具事件和原始消息。类似地，切换到纯文本模型时，图片只会从模型上下文移除，transcript 仍保留原始输入。
+
 用户自定义 provider 放在 `resource/providers/<type>.yaml`。文件名（不含扩展名）
 就是 `profile.yaml` 中引用的 `type`；文件内容只定义一个 provider，不再包含顶层
 `providers` map。例如：

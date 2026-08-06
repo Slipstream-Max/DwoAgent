@@ -16,7 +16,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [workspace.dependencies]
-agent-client-protocol = { version = "2.0", features = ["unstable_protocol_v2"] }
+agent-client-protocol-schema = { version = "1.5", features = ["unstable_protocol_v2"] }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"

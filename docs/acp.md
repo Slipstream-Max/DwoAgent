@@ -1,8 +1,8 @@
 # ACP 使用指南
 
-ACP（Agent Client Protocol）让 IDE 或其他客户端通过标准协议驱动赤铎。`dwo acp` 是一个 stdio adapter：客户端启动它，它再通过本地 IPC 连接已经运行的 `dwo` daemon。
+ACP（Agent Client Protocol）是编辑器与赤铎之间的连接。你可以把 `dwo acp` 看成一座很薄的桥：客户端通过 stdio JSON-RPC 和它说话，它再通过本地 IPC 找到已经运行的 `dwo` daemon。
 
-因此 ACP、CLI 和消息 channel 看到的是同一批 session、同一份上下文与同一个 tool runtime。关闭 IDE 不会删除 session，也不会关闭 daemon。
+这座桥自己不维护第二套 Agent。session、模型、上下文和工具都由 daemon 统一管理，因此 ACP、CLI 和消息 channel 看到的是同一批会话。关掉 IDE 只会结束这条连接，不会带走 session，也不会停掉 daemon。实现上 adapter 只依赖 ACP schema，并仍随主程序一起安装，不需要额外部署一个可执行文件。
 
 ## 前置条件
 
@@ -11,7 +11,7 @@ dwo daemon start
 dwo daemon status
 ```
 
-`daemon status` 必须返回健康状态。ACP 进程本身不负责加载 profile、连接模型或初始化 MCP server；这些工作都由 daemon 完成。
+确认 `daemon status` 返回 `healthy: true`。ACP 进程不会自己加载 profile、连接模型或启动 MCP server；若 daemon 没有起来，编辑器即使成功启动 `dwo acp` 也无法工作。
 
 ## 客户端配置
 
@@ -20,9 +20,24 @@ dwo daemon status
 ```json
 {
   "command": "dwo",
-  "args": ["acp"]
+  "args": ["acp", "--protocol", "v2"]
 }
 ```
+
+`v2` 是默认值，因此 `dwo acp` 与 `dwo acp --protocol v2` 等价。只有仍使用第一代协议的客户端才需要：
+
+```text
+dwo acp --protocol v1
+```
+
+两个版本共享同一个 Host，只是客户端等待结果的方式不同：
+
+| 协议 | `session/prompt` 的行为 |
+| --- | --- |
+| v1 | 请求保持打开，turn 结束后直接返回 `stopReason`。 |
+| v2 | prompt 被接受后立即响应，运行状态和结束原因随后通过 `state_update` 通知送达。 |
+
+切换协议不会复制或迁移 session，也不会改变模型上下文。
 
 如果 `dwo` 不在客户端进程的 PATH 中，使用安装后的绝对路径：
 
@@ -31,7 +46,7 @@ Windows: C:\Users\<user>\.dwoagent\bin\dwo.exe
 macOS/Linux: /home/<user>/.dwoagent/bin/dwo
 ```
 
-不同客户端的配置文件名和 UI 不同，但最终都应启动同一个命令。客户端关闭 stdin 后，`dwo acp` 会正常退出；daemon 继续运行。
+各家客户端的配置入口不同，但最终启动的都是这条命令。客户端关闭 stdin 后，adapter 会跟着退出；daemon 继续在后台工作。
 
 ## WebSocket 客户端
 
@@ -44,19 +59,24 @@ channels:
     port: 8765
 ```
 
-服务地址固定为 `ws://<host>:8765/acp?token=<token>`。运行 `dwo channel websocket token` 查看 token。每条 ACP JSON-RPC 消息使用一个 WebSocket text frame，方法、通知、能力和 stdio ACP 相同。
+服务地址固定为 `ws://<host>:8765/acp?token=<token>`。运行 `dwo channel websocket token` 查看 token。每条 ACP JSON-RPC 消息使用一个 WebSocket text frame，方法、通知、能力和 stdio ACP 相同。WebSocket adapter 当前固定使用 ACP v2。
 
 服务监听所有网卡。局域网连接需要放行防火墙端口；公网必须通过 TLS 反向代理使用 `wss://`。
 
 ## Session 工作方式
 
 - 新建 ACP session 时，客户端提供的 `cwd` 会成为 session 工作目录。
-- ACP 可以列出、加载和继续 daemon 中已有的 session。
+- ACP 可以新建、列出、加载、继续、关闭和删除 daemon 中的 session。
 - 加载 session 后，ACP 会保持 observer 连接，接收其他入口提交的 prompt、tool event 和权限请求。
-- session 的 model、reasoning 和 policy 作为 ACP config options 暴露，修改后写回同一个持久化 session。
-- 取消操作会直接调用 daemon 的 `session.cancel`，同时停止实际运行的 turn。
+- session 的 model、reasoning 和 policy 会作为 config options 显示；在客户端修改后，设置会写回持久化 session。
 
-ACP client 传入的 `mcpServers` 不会创建客户端专属 MCP runtime。赤铎的 MCP server 统一在 `~/.dwoagent/resource/mcp.json` 配置，由 daemon 托管。
+ACP 暂不接受客户端传入的非空 `mcpServers`，也不会为某个编辑器另起一套 MCP runtime；这类 session 请求会直接返回参数错误。MCP server 统一写在 `~/.dwoagent/resource/mcp.json`，由 daemon 托管和复用。
+
+### Zed 的 Send now
+
+Zed 的 Send now 会先发送 `session/cancel`，紧接着再发送 `session/prompt`。如果照字面执行，刚提交的新消息会先把当前 turn 取消掉，这和赤铎原有的排队语义并不一致。
+
+adapter 会给 cancel 留出 `150ms` 的配对窗口：同一连接、同一 session 在窗口内紧跟 prompt，就把这两条消息识别为 Send now，消费 cancel，并将新 prompt 加入当前 turn 的 FIFO 队列。若没有等到 prompt，则把它当作真正的 Stop 转发给 daemon。换句话说，Send now 继续对话，单独 Stop 仍然停止，只是最多晚 `150ms` 生效。
 
 ## Slash Commands
 
@@ -74,17 +94,21 @@ Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执�
 当前 ACP adapter 支持：
 
 - 普通文本 prompt。
+- 图片输入；最终是否接受取决于当前模型是否支持图片。
 - 文本型 embedded resource。
 - resource link，包括名称、URI、MIME type 和可用元数据。
-- session list/load、usage update、tool call/result、reasoning、权限请求和取消。
+- reasoning、assistant message、usage 和 session state 更新。
+- 本地与 provider 托管的 tool call/result、权限请求和取消。
 
 当前不支持：
 
-- ACP image input。
 - ACP audio input。
 - 二进制 embedded resource。
+- session 级 `mcpServers` 和 `additionalDirectories`。
 
-客户端粘贴的文本文件可以通过 `embeddedContext` 进入 prompt。引用文件或目录时，resource link 会保留明确路径和元数据，方便模型定位工作区内容。
+客户端粘贴的文本文件可以通过 `embeddedContext` 进入 prompt。引用文件或目录时，resource link 会保留明确路径和元数据，方便模型定位工作区内容。图片会保持为结构化 image block，不会被拼成一段文本。
+
+OpenAI、DeepSeek 或兼容网关提供的 Web Search 属于 provider 托管工具：搜索在远端完成，不经过本地 ToolManager，也不会触发本地工具权限确认。adapter 仍会把它映射为普通工具事件，因此客户端可以看到并回放这次调用；provider 返回了结果内容时，工具结果中也会一并显示。
 
 ## 权限
 

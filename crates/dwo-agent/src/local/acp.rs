@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
+use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
-use agent_client_protocol::schema::v2::{
+use agent_client_protocol_schema::v2::{
     AgentCapabilities, AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate,
     CancelSessionNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
     Content as ToolContent, ContentBlock, ContentChunk, DeleteSessionRequest,
@@ -21,64 +21,95 @@ use agent_client_protocol::schema::v2::{
     ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind,
     UpdateSessionNotification, UsageUpdate, UserMessage,
 };
-use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Error as AcpError, Responder,
-    on_receive_notification, on_receive_request,
-};
+use agent_client_protocol_schema::{ProtocolVersion, v1, v2};
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
+use clap::ValueEnum;
 use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
-use serde::Deserialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Mutex;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::acp_stdio::{self, Connection as AcpConnection, Incoming, RpcError};
 use super::ipc;
+use super::ipc_schema::{self, SessionOptions};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum AcpProtocol {
+    V1,
+    V2,
+}
 
 #[derive(Clone)]
 struct AcpRuntime {
     config_path: PathBuf,
+    protocol: AcpProtocol,
     observers: Arc<Mutex<HashMap<String, Arc<SessionObserver>>>>,
+    prompt_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<StopReason>>>>,
+    pending_cancels: PendingCancels,
+}
+
+const SEND_NOW_GRACE_PERIOD: Duration = Duration::from_millis(150);
+
+#[derive(Clone, Default)]
+struct PendingCancels {
+    sessions: Arc<StdMutex<HashMap<String, Arc<CancellationToken>>>>,
+}
+
+impl PendingCancels {
+    fn schedule(&self, session_id: String) -> Option<Arc<CancellationToken>> {
+        let mut sessions = self.sessions.lock().expect("pending cancels lock poisoned");
+        if sessions.contains_key(&session_id) {
+            return None;
+        }
+        let cancellation = Arc::new(CancellationToken::new());
+        sessions.insert(session_id, cancellation.clone());
+        Some(cancellation)
+    }
+
+    fn consume(&self, session_id: &str) -> bool {
+        let Some(cancellation) = self
+            .sessions
+            .lock()
+            .expect("pending cancels lock poisoned")
+            .remove(session_id)
+        else {
+            return false;
+        };
+        cancellation.cancel();
+        true
+    }
+
+    fn finish(&self, session_id: &str, cancellation: &Arc<CancellationToken>) -> bool {
+        let mut sessions = self.sessions.lock().expect("pending cancels lock poisoned");
+        if sessions
+            .get(session_id)
+            .is_some_and(|pending| Arc::ptr_eq(pending, cancellation))
+        {
+            sessions.remove(session_id);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct SessionObserver {
     endpoint_id: String,
 }
 
-pub async fn run(config_path: PathBuf) -> Result<()> {
-    run_with_io(config_path, tokio::io::stdin(), tokio::io::stdout()).await
-}
-
-struct EofReader<R> {
-    inner: R,
-    eof: CancellationToken,
-}
-
-impl<R> EofReader<R> {
-    fn new(inner: R, eof: CancellationToken) -> Self {
-        Self { inner, eof }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for EofReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let filled = buffer.filled().len();
-        let had_capacity = buffer.remaining() > 0;
-        let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
-        if had_capacity && matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() == filled
-        {
-            self.eof.cancel();
-        }
-        result
-    }
+pub async fn run(config_path: PathBuf, protocol: AcpProtocol) -> Result<()> {
+    run_with_protocol_io(
+        config_path,
+        protocol,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )
+    .await
 }
 
 pub(crate) async fn run_with_io<R, W>(config_path: PathBuf, stdin: R, stdout: W) -> Result<()>
@@ -86,319 +117,384 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let eof = CancellationToken::new();
-    let stdin = EofReader::new(stdin, eof.clone()).compat();
-    let stdout = stdout.compat_write();
-    let transport = ByteStreams::new(stdout, stdin);
-    let runtime = AcpRuntime {
-        config_path: config_path.clone(),
-        observers: Arc::new(Mutex::new(HashMap::new())),
-    };
-    let new_config = config_path.clone();
-    let list_config = config_path.clone();
-    let resume_runtime = runtime.clone();
-    let prompt_runtime = runtime.clone();
-    let close_runtime = runtime.clone();
-    let delete_runtime = runtime.clone();
-    let set_runtime = runtime.clone();
-    let cancel_runtime = runtime;
-
-    let agent = Agent
-        .v2()
-        .on_receive_request(
-            async move |request: InitializeRequest,
-                        responder: Responder<InitializeResponse>,
-                        _cx: ConnectionTo<Client>| {
-                responder.respond(
-                    InitializeResponse::new(
-                        request.protocol_version,
-                        Implementation::new("dwo", env!("CARGO_PKG_VERSION")),
-                    )
-                    .capabilities(
-                        AgentCapabilities::new().session(
-                            SessionCapabilities::new()
-                                .prompt(
-                                    PromptCapabilities::new()
-                                        .image(PromptImageCapabilities::new())
-                                        .embedded_context(PromptEmbeddedContextCapabilities::new()),
-                                )
-                                .delete(SessionDeleteCapabilities::new()),
-                        ),
-                    ),
-                )
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: NewSessionRequest,
-                        responder: Responder<NewSessionResponse>,
-                        cx: ConnectionTo<Client>| {
-                if let Err(error) = validate_new_session(&request) {
-                    return responder.respond_with_error(invalid_params(error));
-                }
-                match ipc::request(
-                    &new_config,
-                    "session.new",
-                    json!({"cwd": request.cwd.into_inner(), "title": Value::Null}),
-                )
-                .await
-                {
-                    Ok(value) => {
-                        let id = value["session_id"].as_str().unwrap_or_default();
-                        match session_config_options(&new_config, id).await {
-                            Ok(options) => {
-                                let result = responder.respond(
-                                    NewSessionResponse::new(SessionId::new(id))
-                                        .config_options(options),
-                                );
-                                if let Some((used, size)) = snapshot_usage(&value) {
-                                    send_usage_update(&cx, id, used, size);
-                                }
-                                send_available_commands(&cx, id);
-                                result
-                            }
-                            Err(error) => responder.respond_with_error(internal_error(error)),
-                        }
-                    }
-                    Err(error) => responder.respond_with_error(internal_error(error)),
-                }
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: ListSessionsRequest,
-                        responder: Responder<ListSessionsResponse>,
-                        _cx: ConnectionTo<Client>| {
-                if request.cursor.is_some() {
-                    return responder.respond(ListSessionsResponse::new(Vec::new()));
-                }
-                match ipc::request(&list_config, "session.list", json!({"all": true})).await {
-                    Ok(value) => {
-                        let records: Vec<dwo_agent_service::SessionRecord> =
-                            serde_json::from_value(value).unwrap_or_default();
-                        let cwd = request.cwd;
-                        let sessions = records
-                            .into_iter()
-                            .filter(|record| {
-                                cwd.as_ref()
-                                    .is_none_or(|cwd| record.info.cwd == AsRef::<Path>::as_ref(cwd))
-                            })
-                            .map(|record| {
-                                SessionInfo::new(
-                                    SessionId::new(record.info.id.as_str()),
-                                    record.info.cwd,
-                                )
-                                .title(record.info.title)
-                                .updated_at(timestamp_rfc3339(record.info.updated_at_ms))
-                            })
-                            .collect();
-                        responder.respond(ListSessionsResponse::new(sessions))
-                    }
-                    Err(error) => responder.respond_with_error(internal_error(error)),
-                }
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: ResumeSessionRequest,
-                        responder: Responder<ResumeSessionResponse>,
-                        cx: ConnectionTo<Client>| {
-                let runtime = resume_runtime.clone();
-                cx.clone().spawn(async move {
-                    let session_id = request.session_id.to_string();
-                    match validate_resume(&runtime, &request).await {
-                        Ok(()) => {}
-                        Err(error) => {
-                            responder.respond_with_error(invalid_params(error))?;
-                            return Ok(());
-                        }
-                    }
-                    let replay = request.replay_from.is_some();
-                    match ensure_observer(&runtime, &session_id, &cx, replay).await {
-                        Ok(_) => {
-                            match session_config_options(&runtime.config_path, &session_id).await {
-                                Ok(options) => {
-                                    let result = responder.respond(
-                                        ResumeSessionResponse::new().config_options(options),
-                                    );
-                                    send_available_commands(&cx, &session_id);
-                                    result
-                                }
-                                Err(error) => responder.respond_with_error(internal_error(error)),
-                            }
-                        }
-                        Err(error) => responder.respond_with_error(internal_error(error)),
-                    }?;
-                    Ok(())
-                })?;
-                Ok(())
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: CloseSessionRequest,
-                        responder: Responder<CloseSessionResponse>,
-                        _cx: ConnectionTo<Client>| {
-                let runtime = close_runtime.clone();
-                let session_id = request.session_id.to_string();
-                match ipc::request(
-                    &runtime.config_path,
-                    "session.close",
-                    json!({"session_id": session_id}),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        runtime.observers.lock().await.remove(&session_id);
-                        responder.respond(CloseSessionResponse::new())
-                    }
-                    Err(error) => responder.respond_with_error(internal_error(error)),
-                }
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: DeleteSessionRequest,
-                        responder: Responder<DeleteSessionResponse>,
-                        _cx: ConnectionTo<Client>| {
-                let runtime = delete_runtime.clone();
-                let session_id = request.session_id.to_string();
-                match ipc::request(
-                    &runtime.config_path,
-                    "session.delete",
-                    json!({"session_id": session_id}),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        runtime.observers.lock().await.remove(&session_id);
-                        responder.respond(DeleteSessionResponse::new())
-                    }
-                    Err(error) => responder.respond_with_error(internal_error(error)),
-                }
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: PromptRequest,
-                        responder: Responder<PromptResponse>,
-                        cx: ConnectionTo<Client>| {
-                let runtime = prompt_runtime.clone();
-                cx.clone().spawn(async move {
-                    run_prompt(runtime, request, responder, cx).await;
-                    Ok(())
-                })?;
-                Ok(())
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: SetSessionConfigOptionRequest,
-                        responder: Responder<SetSessionConfigOptionResponse>,
-                        cx: ConnectionTo<Client>| {
-                let session_id = request.session_id.to_string();
-                let config_id = request.config_id.to_string();
-                let Some(value) = request.value.as_id().map(ToString::to_string) else {
-                    return responder
-                        .respond_with_error(invalid_params("session config value must be an id"));
-                };
-                match ipc::request(
-                    &set_runtime.config_path,
-                    "session.set_config_option",
-                    json!({
-                        "session_id": session_id,
-                        "config_id": config_id,
-                        "value": value,
-                    }),
-                )
-                .await
-                {
-                    Ok(value) => {
-                        match session_config_options(&set_runtime.config_path, &session_id).await {
-                            Ok(options) => {
-                                let result =
-                                    responder.respond(SetSessionConfigOptionResponse::new(options));
-                                let observed =
-                                    set_runtime.observers.lock().await.contains_key(&session_id);
-                                if config_id == "model"
-                                    && !observed
-                                    && let Some((used, size)) = snapshot_usage(&value)
-                                {
-                                    send_usage_update(&cx, &session_id, used, size);
-                                }
-                                result
-                            }
-                            Err(error) => responder.respond_with_error(internal_error(error)),
-                        }
-                    }
-                    Err(error) => responder.respond_with_error(internal_error(error)),
-                }
-            },
-            on_receive_request!(),
-        )
-        .on_receive_notification(
-            async move |notification: CancelSessionNotification, _cx: ConnectionTo<Client>| {
-                let _ = ipc::request(
-                    &cancel_runtime.config_path,
-                    "session.cancel",
-                    json!({"session_id": notification.session_id}),
-                )
-                .await;
-                Ok(())
-            },
-            on_receive_notification!(),
-        );
-    connect_until_eof(agent, transport, eof)
-        .await
-        .map_err(|error| anyhow::anyhow!("ACP connection failed: {error}"))
+    run_with_protocol_io(config_path, AcpProtocol::V2, stdin, stdout).await
 }
 
-async fn connect_until_eof<H, Run, Transport>(
-    agent: agent_client_protocol::Builder<Agent, H, Run>,
-    transport: Transport,
-    eof: CancellationToken,
-) -> agent_client_protocol::Result<()>
+pub(crate) async fn run_with_protocol_io<R, W>(
+    config_path: PathBuf,
+    protocol: AcpProtocol,
+    stdin: R,
+    stdout: W,
+) -> Result<()>
 where
-    H: agent_client_protocol::HandleDispatchFrom<Client> + 'static,
-    Run: agent_client_protocol::RunWithConnectionTo<Client> + 'static,
-    Transport: agent_client_protocol::ConnectTo<Agent> + 'static,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
-    agent
-        .connect_with(transport, async move |_cx| {
-            eof.cancelled().await;
-            Ok(())
-        })
+    let runtime = AcpRuntime {
+        config_path,
+        protocol,
+        observers: Arc::new(Mutex::new(HashMap::new())),
+        prompt_waiters: Arc::new(Mutex::new(HashMap::new())),
+        pending_cancels: PendingCancels::default(),
+    };
+    acp_stdio::serve(stdin, stdout, move |connection, incoming| {
+        dispatch_rpc(runtime.clone(), connection, incoming)
+    })
+    .await
+}
+
+fn dispatch_rpc(
+    runtime: AcpRuntime,
+    connection: AcpConnection,
+    incoming: Incoming,
+) -> impl std::future::Future<Output = Result<Option<Value>, RpcError>> + Send + 'static {
+    let deferred_cancel = if incoming.method == "session/cancel" {
+        match parse_request::<v1::CancelNotification, CancelSessionNotification>(
+            runtime.protocol,
+            incoming.params.clone(),
+        ) {
+            Ok(notification) => {
+                defer_cancel(&runtime, &connection, notification.session_id.to_string());
+                Some(Ok(()))
+            }
+            Err(error) => Some(Err(error)),
+        }
+    } else {
+        if incoming.method == "session/prompt"
+            && let Ok(request) = parse_request::<v1::PromptRequest, PromptRequest>(
+                runtime.protocol,
+                incoming.params.clone(),
+            )
+        {
+            runtime
+                .pending_cancels
+                .consume(&request.session_id.to_string());
+        }
+        None
+    };
+
+    async move {
+        match deferred_cancel {
+            Some(result) => result.map(|()| None),
+            None => handle_rpc(runtime, connection, incoming).await,
+        }
+    }
+}
+
+fn defer_cancel(runtime: &AcpRuntime, connection: &AcpConnection, session_id: String) {
+    let Some(cancellation) = runtime.pending_cancels.schedule(session_id.clone()) else {
+        return;
+    };
+    let runtime = runtime.clone();
+    let connection_closed = connection.closed_token();
+    tokio::spawn(async move {
+        if cancellation_due(&cancellation, &connection_closed, SEND_NOW_GRACE_PERIOD).await {
+            if runtime.pending_cancels.finish(&session_id, &cancellation) {
+                let _ = ipc::request(
+                    &runtime.config_path,
+                    "session.cancel",
+                    json!({"session_id": session_id}),
+                )
+                .await;
+            }
+        } else {
+            let _ = runtime.pending_cancels.finish(&session_id, &cancellation);
+        }
+    });
+}
+
+async fn cancellation_due(
+    cancellation: &CancellationToken,
+    connection_closed: &CancellationToken,
+    delay: Duration,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = cancellation.cancelled() => false,
+        _ = connection_closed.cancelled() => false,
+    }
+}
+
+async fn handle_rpc(
+    runtime: AcpRuntime,
+    connection: AcpConnection,
+    incoming: Incoming,
+) -> Result<Option<Value>, RpcError> {
+    let method = incoming.method.as_str();
+    let result = match method {
+        "initialize" => {
+            let protocol_version = match runtime.protocol {
+                AcpProtocol::V1 => {
+                    serde_json::from_value::<v1::InitializeRequest>(incoming.params)
+                        .map_err(invalid_params)?;
+                    ProtocolVersion::V2
+                }
+                AcpProtocol::V2 => {
+                    serde_json::from_value::<InitializeRequest>(incoming.params)
+                        .map_err(invalid_params)?
+                        .protocol_version
+                }
+            };
+            let response = InitializeResponse::new(
+                protocol_version,
+                Implementation::new("dwo", env!("CARGO_PKG_VERSION")),
+            )
+            .capabilities(
+                AgentCapabilities::new().session(
+                    SessionCapabilities::new()
+                        .prompt(
+                            PromptCapabilities::new()
+                                .image(PromptImageCapabilities::new())
+                                .embedded_context(PromptEmbeddedContextCapabilities::new()),
+                        )
+                        .delete(SessionDeleteCapabilities::new()),
+                ),
+            );
+            match runtime.protocol {
+                AcpProtocol::V1 => {
+                    let mut response =
+                        v1::InitializeResponse::try_from(response).map_err(internal_error)?;
+                    response.protocol_version = ProtocolVersion::V1;
+                    serde_json::to_value(response).map_err(internal_error)?
+                }
+                AcpProtocol::V2 => serde_json::to_value(response).map_err(internal_error)?,
+            }
+        }
+        "session/new" => {
+            let request: NewSessionRequest =
+                parse_request::<v1::NewSessionRequest, _>(runtime.protocol, incoming.params)?;
+            validate_new_session(&request).map_err(invalid_params)?;
+            let value = ipc::request(
+                &runtime.config_path,
+                "session.new",
+                json!({"cwd": request.cwd.into_inner(), "title": Value::Null}),
+            )
+            .await
+            .map_err(internal_error)?;
+            let id = value["session_id"].as_str().unwrap_or_default();
+            let options = session_config_options(&runtime.config_path, id)
+                .await
+                .map_err(internal_error)?;
+            if let Some((used, size)) = snapshot_usage(&value) {
+                send_usage_update(&connection, &runtime, id, used, size);
+            }
+            send_available_commands(&connection, &runtime, id);
+            versioned_response::<v1::NewSessionResponse, _>(
+                runtime.protocol,
+                NewSessionResponse::new(SessionId::new(id)).config_options(options),
+            )?
+        }
+        "session/list" => {
+            let request: ListSessionsRequest =
+                parse_request::<v1::ListSessionsRequest, _>(runtime.protocol, incoming.params)?;
+            let sessions = if request.cursor.is_some() {
+                Vec::new()
+            } else {
+                let value =
+                    ipc::request(&runtime.config_path, "session.list", json!({"all": true}))
+                        .await
+                        .map_err(internal_error)?;
+                let records: Vec<ipc_schema::SessionRecord> =
+                    serde_json::from_value(value).unwrap_or_default();
+                records
+                    .into_iter()
+                    .filter(|record| {
+                        request
+                            .cwd
+                            .as_ref()
+                            .is_none_or(|cwd| record.info.cwd == AsRef::<Path>::as_ref(cwd))
+                    })
+                    .map(|record| {
+                        SessionInfo::new(SessionId::new(record.info.id.as_str()), record.info.cwd)
+                            .title(record.info.title)
+                            .updated_at(timestamp_rfc3339(record.info.updated_at_ms))
+                    })
+                    .collect()
+            };
+            versioned_response::<v1::ListSessionsResponse, _>(
+                runtime.protocol,
+                ListSessionsResponse::new(sessions),
+            )?
+        }
+        "session/resume" => {
+            let request: ResumeSessionRequest =
+                parse_request::<v1::ResumeSessionRequest, _>(runtime.protocol, incoming.params)?;
+            resume_session(&runtime, &connection, request).await?
+        }
+        "session/load" if runtime.protocol == AcpProtocol::V1 => {
+            let request: v1::LoadSessionRequest =
+                serde_json::from_value(incoming.params).map_err(invalid_params)?;
+            let request = ResumeSessionRequest::try_from(request).map_err(invalid_params)?;
+            let response = resume_session_v2(&runtime, &connection, request).await?;
+            let response: v1::LoadSessionResponse =
+                serde_json::from_value(serde_json::to_value(response).map_err(internal_error)?)
+                    .map_err(internal_error)?;
+            serde_json::to_value(response).map_err(internal_error)?
+        }
+        "session/close" => {
+            let request: CloseSessionRequest =
+                parse_request::<v1::CloseSessionRequest, _>(runtime.protocol, incoming.params)?;
+            let session_id = request.session_id.to_string();
+            ipc::request(
+                &runtime.config_path,
+                "session.close",
+                json!({"session_id": session_id}),
+            )
+            .await
+            .map_err(internal_error)?;
+            runtime.observers.lock().await.remove(&session_id);
+            versioned_response::<v1::CloseSessionResponse, _>(
+                runtime.protocol,
+                CloseSessionResponse::new(),
+            )?
+        }
+        "session/delete" => {
+            let request: DeleteSessionRequest =
+                parse_request::<v1::DeleteSessionRequest, _>(runtime.protocol, incoming.params)?;
+            let session_id = request.session_id.to_string();
+            ipc::request(
+                &runtime.config_path,
+                "session.delete",
+                json!({"session_id": session_id}),
+            )
+            .await
+            .map_err(internal_error)?;
+            runtime.observers.lock().await.remove(&session_id);
+            versioned_response::<v1::DeleteSessionResponse, _>(
+                runtime.protocol,
+                DeleteSessionResponse::new(),
+            )?
+        }
+        "session/prompt" => {
+            let request: PromptRequest =
+                parse_request::<v1::PromptRequest, _>(runtime.protocol, incoming.params)?;
+            return run_prompt(runtime, request, connection).await.map(Some);
+        }
+        "session/set_config_option" => {
+            let request: SetSessionConfigOptionRequest =
+                parse_request::<v1::SetSessionConfigOptionRequest, _>(
+                    runtime.protocol,
+                    incoming.params,
+                )?;
+            let session_id = request.session_id.to_string();
+            let config_id = request.config_id.to_string();
+            let value = request
+                .value
+                .as_id()
+                .map(ToString::to_string)
+                .ok_or_else(|| invalid_params("session config value must be an id"))?;
+            let changed = ipc::request(
+                &runtime.config_path,
+                "session.set_config_option",
+                json!({
+                    "session_id": session_id,
+                    "config_id": config_id,
+                    "value": value,
+                }),
+            )
+            .await
+            .map_err(internal_error)?;
+            let options = session_config_options(&runtime.config_path, &session_id)
+                .await
+                .map_err(internal_error)?;
+            let observed = runtime.observers.lock().await.contains_key(&session_id);
+            if config_id == "model"
+                && !observed
+                && let Some((used, size)) = snapshot_usage(&changed)
+            {
+                send_usage_update(&connection, &runtime, &session_id, used, size);
+            }
+            versioned_response::<v1::SetSessionConfigOptionResponse, _>(
+                runtime.protocol,
+                SetSessionConfigOptionResponse::new(options),
+            )?
+        }
+        _ => return Err(RpcError::method_not_found(method)),
+    };
+    Ok(Some(result))
+}
+
+async fn resume_session(
+    runtime: &AcpRuntime,
+    connection: &AcpConnection,
+    request: ResumeSessionRequest,
+) -> Result<Value, RpcError> {
+    let response = resume_session_v2(runtime, connection, request).await?;
+    versioned_response::<v1::ResumeSessionResponse, _>(runtime.protocol, response)
+}
+
+async fn resume_session_v2(
+    runtime: &AcpRuntime,
+    connection: &AcpConnection,
+    request: ResumeSessionRequest,
+) -> Result<ResumeSessionResponse, RpcError> {
+    let session_id = request.session_id.to_string();
+    validate_resume(runtime, &request)
         .await
+        .map_err(invalid_params)?;
+    let replay = request.replay_from.is_some();
+    ensure_observer(runtime, &session_id, connection, replay)
+        .await
+        .map_err(internal_error)?;
+    let options = session_config_options(&runtime.config_path, &session_id)
+        .await
+        .map_err(internal_error)?;
+    send_available_commands(connection, runtime, &session_id);
+    Ok(ResumeSessionResponse::new().config_options(options))
+}
+
+fn parse_request<V1, V2>(protocol: AcpProtocol, params: Value) -> Result<V2, RpcError>
+where
+    V1: DeserializeOwned,
+    V2: DeserializeOwned + TryFrom<V1>,
+    <V2 as TryFrom<V1>>::Error: std::fmt::Display,
+{
+    match protocol {
+        AcpProtocol::V1 => {
+            let request = serde_json::from_value::<V1>(params).map_err(invalid_params)?;
+            V2::try_from(request).map_err(invalid_params)
+        }
+        AcpProtocol::V2 => serde_json::from_value(params).map_err(invalid_params),
+    }
+}
+
+fn versioned_response<V1, V2>(protocol: AcpProtocol, response: V2) -> Result<Value, RpcError>
+where
+    V1: Serialize + TryFrom<V2>,
+    V2: Serialize,
+    <V1 as TryFrom<V2>>::Error: std::fmt::Display,
+{
+    match protocol {
+        AcpProtocol::V1 => serde_json::to_value(V1::try_from(response).map_err(internal_error)?)
+            .map_err(internal_error),
+        AcpProtocol::V2 => serde_json::to_value(response).map_err(internal_error),
+    }
 }
 
 async fn run_prompt(
     runtime: AcpRuntime,
     request: PromptRequest,
-    responder: Responder<PromptResponse>,
-    cx: ConnectionTo<Client>,
-) {
+    connection: AcpConnection,
+) -> Result<Value, RpcError> {
     let session_id = request.session_id.to_string();
     let prompt_blocks = request.prompt.clone();
-    let content = match prompt_content(&request.prompt) {
-        Ok(content) => content,
-        Err(error) => {
-            let _ = responder.respond_with_error(invalid_params(error));
-            return;
+    let content = prompt_content(&request.prompt).map_err(invalid_params)?;
+    let command = parse_slash_command(&content).map_err(invalid_params)?;
+    let observer = ensure_observer(&runtime, &session_id, &connection, false)
+        .await
+        .map_err(internal_error)?;
+    let completion = if runtime.protocol == AcpProtocol::V1 {
+        let (sender, receiver) = oneshot::channel();
+        let mut waiters = runtime.prompt_waiters.lock().await;
+        if waiters.contains_key(&session_id) {
+            return Err(invalid_params(
+                "session already has an active ACP v1 prompt",
+            ));
         }
-    };
-    let command = match parse_slash_command(&content) {
-        Ok(command) => command,
-        Err(error) => {
-            let _ = responder.respond_with_error(invalid_params(error));
-            return;
-        }
-    };
-    let observer = match ensure_observer(&runtime, &session_id, &cx, false).await {
-        Ok(observer) => observer,
-        Err(error) => {
-            let _ = responder.respond_with_error(internal_error(error));
-            return;
-        }
+        waiters.insert(session_id.clone(), sender);
+        Some(receiver)
+    } else {
+        None
     };
     let request = match command {
         Some(SlashCommand::Compact) => {
@@ -436,18 +532,40 @@ async fn run_prompt(
             .await
         }
     };
-    match request {
-        Ok(value) => {
-            let _ = responder.respond(PromptResponse::new());
-            if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
-                let prompt = serde_json::to_value(prompt_blocks)
-                    .unwrap_or_else(|_| Value::Array(Vec::new()));
-                send_user_message(&cx, &session_id, message_id, &prompt);
-            }
-        }
+    let value = match request {
+        Ok(value) => value,
         Err(error) => {
-            let _ = responder.respond_with_error(internal_error(error));
+            runtime.prompt_waiters.lock().await.remove(&session_id);
+            return Err(internal_error(error));
         }
+    };
+    if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
+        let prompt =
+            serde_json::to_value(prompt_blocks).unwrap_or_else(|_| Value::Array(Vec::new()));
+        send_user_message(&connection, &runtime, &session_id, message_id, &prompt);
+    }
+    let Some(completion) = completion else {
+        return serde_json::to_value(PromptResponse::new()).map_err(internal_error);
+    };
+    if value.get("accepted").and_then(Value::as_bool) == Some(false) {
+        runtime.prompt_waiters.lock().await.remove(&session_id);
+        return serde_json::to_value(v1::PromptResponse::new(v1::StopReason::EndTurn))
+            .map_err(internal_error);
+    }
+    let reason = tokio::select! {
+        reason = completion => reason.map_err(|_| internal_error("prompt completion was dropped"))?,
+        _ = connection.closed() => {
+            runtime.prompt_waiters.lock().await.remove(&session_id);
+            return Err(internal_error("ACP connection closed"));
+        },
+    };
+    let reason = v1::StopReason::try_from(reason).map_err(internal_error)?;
+    serde_json::to_value(v1::PromptResponse::new(reason)).map_err(internal_error)
+}
+
+async fn complete_prompt(runtime: &AcpRuntime, session_id: &str, reason: StopReason) {
+    if let Some(waiter) = runtime.prompt_waiters.lock().await.remove(session_id) {
+        let _ = waiter.send(reason);
     }
 }
 
@@ -511,7 +629,7 @@ async fn validate_resume(runtime: &AcpRuntime, request: &ResumeSessionRequest) -
         json!({"session_id": request.session_id}),
     )
     .await?;
-    let snapshot: dwo_agent_service::SessionSnapshot = serde_json::from_value(value)?;
+    let snapshot: ipc_schema::SessionSnapshot = serde_json::from_value(value)?;
     let requested = normalize_path(AsRef::<Path>::as_ref(&request.cwd));
     let stored = normalize_path(&snapshot.record.info.cwd);
     anyhow::ensure!(
@@ -528,7 +646,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 async fn ensure_observer(
     runtime: &AcpRuntime,
     session_id: &str,
-    cx: &ConnectionTo<Client>,
+    connection: &AcpConnection,
     replay: bool,
 ) -> Result<Arc<SessionObserver>> {
     let mut observers = runtime.observers.lock().await;
@@ -541,7 +659,12 @@ async fn ensure_observer(
                 json!({"session_id": session_id}),
             )
             .await?;
-            replay_snapshot(cx, session_id, &json!({"snapshot": snapshot}));
+            replay_snapshot(
+                connection,
+                runtime,
+                session_id,
+                &json!({"snapshot": snapshot}),
+            );
         }
         return Ok(observer);
     }
@@ -550,7 +673,7 @@ async fn ensure_observer(
     let (snapshot, mut events) =
         ipc::subscribe(&runtime.config_path, session_id, &endpoint_id).await?;
     if replay {
-        replay_snapshot(cx, session_id, &snapshot);
+        replay_snapshot(connection, runtime, session_id, &snapshot);
     }
     let observer = Arc::new(SessionObserver {
         endpoint_id: endpoint_id.clone(),
@@ -560,16 +683,17 @@ async fn ensure_observer(
     let observer_runtime = runtime.clone();
     let observer_session_id = session_id.to_string();
     let observer_endpoint_id = endpoint_id;
-    let observer_cx = cx.clone();
-    if let Err(error) = cx.spawn(async move {
+    let observer_connection = connection.clone();
+    tokio::spawn(async move {
         while let Some(frame) = events.recv().await {
             handle_session_event(
                 &observer_runtime,
-                &observer_cx,
+                &observer_connection,
                 &observer_session_id,
                 &observer_endpoint_id,
                 frame,
-            );
+            )
+            .await;
         }
         let mut observers = observer_runtime.observers.lock().await;
         if observers
@@ -578,17 +702,13 @@ async fn ensure_observer(
         {
             observers.remove(&observer_session_id);
         }
-        Ok(())
-    }) {
-        observers.remove(session_id);
-        return Err(error.into());
-    }
+    });
     Ok(observer)
 }
 
-fn handle_session_event(
+async fn handle_session_event(
     runtime: &AcpRuntime,
-    cx: &ConnectionTo<Client>,
+    connection: &AcpConnection,
     session_id: &str,
     endpoint_id: &str,
     frame: Value,
@@ -603,7 +723,7 @@ fn handle_session_event(
                 payload.get("message_id").and_then(Value::as_str),
                 payload.get("delta").and_then(Value::as_str),
             ) {
-                send_agent_chunk(cx, session_id, message_id, delta);
+                send_agent_chunk(connection, runtime, session_id, message_id, delta);
             }
         }
         "assistant_reasoning_delta" => {
@@ -611,7 +731,7 @@ fn handle_session_event(
                 payload.get("message_id").and_then(Value::as_str),
                 payload.get("delta").and_then(Value::as_str),
             ) {
-                send_thought_chunk(cx, session_id, message_id, delta);
+                send_thought_chunk(connection, runtime, session_id, message_id, delta);
             }
         }
         "user_prompt_submitted" => {
@@ -622,38 +742,48 @@ fn handle_session_event(
                 payload.get("message_id").and_then(Value::as_str),
                 payload.get("content"),
             ) {
-                send_user_message(cx, session_id, message_id, content);
+                send_user_message(connection, runtime, session_id, message_id, content);
             }
         }
-        "assistant_completed" => send_assistant_completed(cx, session_id, payload),
+        "assistant_completed" => send_assistant_completed(connection, runtime, session_id, payload),
         "turn_started" => send_state(
-            cx,
+            connection,
+            runtime,
             session_id,
             StateUpdate::Running(RunningStateUpdate::new()),
         ),
-        "tool_started" => send_tool_started(cx, session_id, payload),
-        "tool_completed" => send_tool_completed(cx, session_id, payload),
-        "terminal_opened" => send_terminal_opened(cx, session_id, payload),
-        "terminal_output" => send_terminal_output(cx, session_id, payload),
-        "terminal_exited" => send_terminal_exited(cx, session_id, payload),
-        "file_read" => send_file_read(cx, session_id, payload),
-        "file_changed" => send_file_changed(cx, session_id, payload),
+        "tool_started" => send_tool_started(connection, runtime, session_id, payload),
+        "tool_completed" => send_tool_completed(connection, runtime, session_id, payload),
+        "terminal_opened" => send_terminal_opened(connection, runtime, session_id, payload),
+        "terminal_output" => send_terminal_output(connection, runtime, session_id, payload),
+        "terminal_exited" => send_terminal_exited(connection, runtime, session_id, payload),
+        "file_read" => send_file_read(connection, runtime, session_id, payload),
+        "file_changed" => send_file_changed(connection, runtime, session_id, payload),
         "permission_requested" => {
             send_state(
-                cx,
+                connection,
+                runtime,
                 session_id,
                 StateUpdate::RequiresAction(
-                    agent_client_protocol::schema::v2::RequiresActionStateUpdate::new(),
+                    agent_client_protocol_schema::v2::RequiresActionStateUpdate::new(),
                 ),
             );
             let config_path = runtime.config_path.clone();
-            let cx = cx.clone();
+            let protocol = runtime.protocol;
+            let connection = connection.clone();
             let session_id = session_id.to_string();
             let endpoint_id = endpoint_id.to_string();
             let payload = payload.clone();
-            let _ = cx.clone().spawn(async move {
-                if let Err(error) =
-                    resolve_permission(&config_path, &cx, &session_id, &endpoint_id, &payload).await
+            tokio::spawn(async move {
+                if let Err(error) = resolve_permission(
+                    &config_path,
+                    protocol,
+                    &connection,
+                    &session_id,
+                    &endpoint_id,
+                    &payload,
+                )
+                .await
                 {
                     tracing::error!(
                         event = "acp.permission_failed",
@@ -661,26 +791,38 @@ fn handle_session_event(
                         "ACP permission resolution failed"
                     );
                 }
-                Ok(())
             });
         }
         "permission_resolved" => send_state(
-            cx,
+            connection,
+            runtime,
             session_id,
             StateUpdate::Running(RunningStateUpdate::new()),
         ),
-        "turn_completed" => send_idle(cx, session_id, StopReason::EndTurn),
-        "turn_cancelled" => send_idle(cx, session_id, StopReason::Cancelled),
-        "turn_failed" => send_idle(cx, session_id, StopReason::Other("_error".to_string())),
+        "turn_completed" => {
+            send_idle(connection, runtime, session_id, StopReason::EndTurn);
+            complete_prompt(runtime, session_id, StopReason::EndTurn).await;
+        }
+        "turn_cancelled" => {
+            send_idle(connection, runtime, session_id, StopReason::Cancelled);
+            complete_prompt(runtime, session_id, StopReason::Cancelled).await;
+        }
+        "turn_failed" => {
+            let reason = StopReason::Other("_error".to_string());
+            send_idle(connection, runtime, session_id, reason.clone());
+            complete_prompt(runtime, session_id, reason).await;
+        }
         "config_changed" => {
             let config_path = runtime.config_path.clone();
-            let cx = cx.clone();
+            let connection = connection.clone();
+            let runtime = runtime.clone();
             let session_id = session_id.to_string();
-            let _ = cx.clone().spawn(async move {
+            tokio::spawn(async move {
                 match session_config_options(&config_path, &session_id).await {
                     Ok(options) => {
                         send_update(
-                            &cx,
+                            &connection,
+                            &runtime,
                             &session_id,
                             SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
                         );
@@ -691,7 +833,6 @@ fn handle_session_event(
                         "refresh ACP config options failed"
                     ),
                 }
-                Ok(())
             });
         }
         "usage_changed" => {
@@ -699,13 +840,14 @@ fn handle_session_event(
                 payload.get("used").and_then(Value::as_u64),
                 payload.get("size").and_then(Value::as_u64),
             ) {
-                send_usage_update(cx, session_id, used, size);
+                send_usage_update(connection, runtime, session_id, used, size);
             }
         }
         "title_changed" => {
             if let Some(title) = payload.get("title").and_then(Value::as_str) {
                 send_session_info_update(
-                    cx,
+                    connection,
+                    runtime,
                     session_id,
                     title,
                     payload.get("updated_at_ms").and_then(Value::as_u64),
@@ -714,21 +856,6 @@ fn handle_session_event(
         }
         _ => {}
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionOptionSnapshot {
-    config: dwo_agent_service::SessionConfig,
-    models: Vec<SessionModelOption>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionModelOption {
-    id: String,
-    reasoning: Vec<String>,
-    default_reasoning: String,
 }
 
 async fn session_config_options(
@@ -741,13 +868,11 @@ async fn session_config_options(
         json!({"session_id": session_id}),
     )
     .await?;
-    let snapshot: SessionOptionSnapshot = serde_json::from_value(value)?;
+    let snapshot: SessionOptions = serde_json::from_value(value)?;
     build_session_config_options(snapshot)
 }
 
-fn build_session_config_options(
-    snapshot: SessionOptionSnapshot,
-) -> Result<Vec<SessionConfigOption>> {
+fn build_session_config_options(snapshot: SessionOptions) -> Result<Vec<SessionConfigOption>> {
     let model = snapshot
         .models
         .iter()
@@ -759,11 +884,7 @@ fn build_session_config_options(
         .clone()
         .unwrap_or_else(|| model.default_reasoning.clone());
     let reasoning_options = model.reasoning.clone();
-    let policy = match snapshot.config.mode {
-        dwo_tools::SessionMode::FullAccess => "full_access",
-        dwo_tools::SessionMode::Confirm => "confirm",
-        dwo_tools::SessionMode::Watch => "watch",
-    };
+    let policy = snapshot.config.mode.as_str();
 
     Ok(vec![
         SessionConfigOption::select(
@@ -803,7 +924,8 @@ fn build_session_config_options(
 
 async fn resolve_permission(
     config_path: &Path,
-    cx: &ConnectionTo<Client>,
+    protocol: AcpProtocol,
+    connection: &AcpConnection,
     session_id: &str,
     endpoint_id: &str,
     payload: &Value,
@@ -821,29 +943,35 @@ async fn resolve_permission(
     let tool = ToolCallUpdate::new(tool_call_id)
         .title(tool_name.to_string())
         .status(ToolCallStatus::Pending);
-    let response = cx
-        .send_request_to(
-            Client,
-            RequestPermissionRequest::new(
-                SessionId::new(session_id),
-                format!("Allow {tool_name}?"),
-                vec![
-                    PermissionOption::new(
-                        "allow_once",
-                        "Allow Once",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "reject_once",
-                        "Reject Once",
-                        PermissionOptionKind::RejectOnce,
-                    ),
-                ],
-            )
-            .subject(Some(tool.into())),
-        )
-        .block_task()
-        .await?;
+    let request = RequestPermissionRequest::new(
+        SessionId::new(session_id),
+        format!("Allow {tool_name}?"),
+        vec![
+            PermissionOption::new("allow_once", "Allow Once", PermissionOptionKind::AllowOnce),
+            PermissionOption::new(
+                "reject_once",
+                "Reject Once",
+                PermissionOptionKind::RejectOnce,
+            ),
+        ],
+    )
+    .subject(Some(tool.into()));
+    let response = match protocol {
+        AcpProtocol::V1 => {
+            let request = v1::RequestPermissionRequest::try_from(request)?;
+            let value = connection
+                .request("session/request_permission", request)
+                .await?;
+            let response: v1::RequestPermissionResponse = serde_json::from_value(value)?;
+            v2::RequestPermissionResponse::try_from(response)?
+        }
+        AcpProtocol::V2 => {
+            let value = connection
+                .request("session/request_permission", request)
+                .await?;
+            serde_json::from_value(value)?
+        }
+    };
     let allowed = matches!(
         response.outcome,
         RequestPermissionOutcome::Selected(ref selected)
@@ -864,16 +992,37 @@ async fn resolve_permission(
     Ok(())
 }
 
-fn send_update(cx: &ConnectionTo<Client>, session_id: &str, update: SessionUpdate) {
-    let _ = cx.send_notification_to(
-        Client,
-        UpdateSessionNotification::new(SessionId::new(session_id), update),
-    );
+fn send_update(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    update: SessionUpdate,
+) {
+    match runtime.protocol {
+        AcpProtocol::V1 => {
+            let Ok(updates) = Vec::<v1::SessionUpdate>::try_from(update) else {
+                return;
+            };
+            for update in updates {
+                let _ = connection.notify(
+                    "session/update",
+                    v1::SessionNotification::new(v1::SessionId::new(session_id), update),
+                );
+            }
+        }
+        AcpProtocol::V2 => {
+            let _ = connection.notify(
+                "session/update",
+                UpdateSessionNotification::new(SessionId::new(session_id), update),
+            );
+        }
+    }
 }
 
-fn send_available_commands(cx: &ConnectionTo<Client>, session_id: &str) {
+fn send_available_commands(connection: &AcpConnection, runtime: &AcpRuntime, session_id: &str) {
     send_update(
-        cx,
+        connection,
+        runtime,
         session_id,
         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands())),
     );
@@ -887,13 +1036,15 @@ fn available_commands() -> Vec<AvailableCommand> {
 }
 
 fn send_user_message(
-    cx: &ConnectionTo<Client>,
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
     session_id: &str,
     message_id: &str,
     content: &Value,
 ) {
     send_update(
-        cx,
+        connection,
+        runtime,
         session_id,
         SessionUpdate::UserMessage(
             UserMessage::new(message_id.to_string()).content(acp_content_blocks(content)),
@@ -901,9 +1052,16 @@ fn send_user_message(
     );
 }
 
-fn send_agent_chunk(cx: &ConnectionTo<Client>, session_id: &str, message_id: &str, text: &str) {
+fn send_agent_chunk(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    message_id: &str,
+    text: &str,
+) {
     send_update(
-        cx,
+        connection,
+        runtime,
         session_id,
         SessionUpdate::AgentMessageChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(text.to_string())),
@@ -912,9 +1070,16 @@ fn send_agent_chunk(cx: &ConnectionTo<Client>, session_id: &str, message_id: &st
     );
 }
 
-fn send_thought_chunk(cx: &ConnectionTo<Client>, session_id: &str, message_id: &str, text: &str) {
+fn send_thought_chunk(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    message_id: &str,
+    text: &str,
+) {
     send_update(
-        cx,
+        connection,
+        runtime,
         session_id,
         SessionUpdate::AgentThoughtChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(text.to_string())),
@@ -923,14 +1088,20 @@ fn send_thought_chunk(cx: &ConnectionTo<Client>, session_id: &str, message_id: &
     );
 }
 
-fn send_assistant_completed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_assistant_completed(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let (reasoning, content) = assistant_completed_text(payload);
     if let (Some(message_id), Some(reasoning)) = (
         payload.get("thought_message_id").and_then(Value::as_str),
         reasoning,
     ) {
         send_update(
-            cx,
+            connection,
+            runtime,
             session_id,
             SessionUpdate::AgentThought(AgentThought::new(message_id.to_string()).content(vec![
                 ContentBlock::Text(TextContent::new(reasoning.to_string())),
@@ -941,7 +1112,8 @@ fn send_assistant_completed(cx: &ConnectionTo<Client>, session_id: &str, payload
         (payload.get("message_id").and_then(Value::as_str), content)
     {
         send_update(
-            cx,
+            connection,
+            runtime,
             session_id,
             SessionUpdate::AgentMessage(AgentMessage::new(message_id.to_string()).content(vec![
                 ContentBlock::Text(TextContent::new(content.to_string())),
@@ -950,26 +1122,43 @@ fn send_assistant_completed(cx: &ConnectionTo<Client>, session_id: &str, payload
     }
 }
 
-fn send_state(cx: &ConnectionTo<Client>, session_id: &str, state: StateUpdate) {
-    send_update(cx, session_id, SessionUpdate::StateUpdate(state));
+fn send_state(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    state: StateUpdate,
+) {
+    send_update(
+        connection,
+        runtime,
+        session_id,
+        SessionUpdate::StateUpdate(state),
+    );
 }
 
-fn send_idle(cx: &ConnectionTo<Client>, session_id: &str, reason: StopReason) {
+fn send_idle(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    reason: StopReason,
+) {
     send_state(
-        cx,
+        connection,
+        runtime,
         session_id,
         StateUpdate::Idle(IdleStateUpdate::new().stop_reason(reason)),
     );
 }
 
 fn send_session_info_update(
-    cx: &ConnectionTo<Client>,
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
     session_id: &str,
     title: &str,
     updated_at_ms: Option<u64>,
 ) {
     let update = session_info_update(title, updated_at_ms);
-    send_update(cx, session_id, update);
+    send_update(connection, runtime, session_id, update);
 }
 
 fn session_info_update(title: &str, updated_at_ms: Option<u64>) -> SessionUpdate {
@@ -980,20 +1169,41 @@ fn session_info_update(title: &str, updated_at_ms: Option<u64>) -> SessionUpdate
     SessionUpdate::SessionInfoUpdate(update)
 }
 
-fn send_usage_update(cx: &ConnectionTo<Client>, session_id: &str, used: u64, size: u64) {
-    send_update(cx, session_id, usage_update(used, size));
+fn send_usage_update(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    used: u64,
+    size: u64,
+) {
+    send_update(connection, runtime, session_id, usage_update(used, size));
 }
 
 fn usage_update(used: u64, size: u64) -> SessionUpdate {
     SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
 }
 
-fn send_tool_started(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_tool_started(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let tool = tool_started(payload);
-    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(tool));
+    send_update(
+        connection,
+        runtime,
+        session_id,
+        SessionUpdate::ToolCallUpdate(tool),
+    );
 }
 
-fn send_tool_completed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_tool_completed(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let result = &payload["result"];
     if result["tool_name"].as_str() == Some("terminal")
         && let Some(terminal_id) = result["output"]["terminal_id"].as_str()
@@ -1004,23 +1214,44 @@ fn send_tool_completed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Va
                 base64::engine::general_purpose::STANDARD.encode(output.as_bytes()),
             ));
         }
-        send_update(cx, session_id, SessionUpdate::TerminalUpdate(terminal));
+        send_update(
+            connection,
+            runtime,
+            session_id,
+            SessionUpdate::TerminalUpdate(terminal),
+        );
     }
     let update = tool_completed(payload);
-    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+    send_update(
+        connection,
+        runtime,
+        session_id,
+        SessionUpdate::ToolCallUpdate(update),
+    );
 }
 
-fn send_terminal_opened(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_terminal_opened(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let terminal_id = payload["terminal_id"].as_str().unwrap_or("terminal");
     let mut terminal = TerminalUpdate::new(terminal_id.to_string())
         .command(payload["command"].as_str().unwrap_or_default().to_string());
     if let Some(cwd) = payload["cwd"].as_str() {
         terminal = terminal.cwd(PathBuf::from(cwd));
     }
-    send_update(cx, session_id, SessionUpdate::TerminalUpdate(terminal));
+    send_update(
+        connection,
+        runtime,
+        session_id,
+        SessionUpdate::TerminalUpdate(terminal),
+    );
     if let Some(tool_call_id) = payload["tool_call_id"].as_str() {
         send_update(
-            cx,
+            connection,
+            runtime,
             session_id,
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id.to_string()).content(
                 vec![ToolCallContent::Terminal(Terminal::new(
@@ -1031,7 +1262,12 @@ fn send_terminal_opened(cx: &ConnectionTo<Client>, session_id: &str, payload: &V
     }
 }
 
-fn send_terminal_output(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_terminal_output(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let Some(terminal_id) = payload["terminal_id"].as_str() else {
         return;
     };
@@ -1045,7 +1281,8 @@ fn send_terminal_output(cx: &ConnectionTo<Client>, session_id: &str, payload: &V
         .collect::<Vec<_>>();
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     send_update(
-        cx,
+        connection,
+        runtime,
         session_id,
         SessionUpdate::TerminalOutputChunk(TerminalOutputChunk::new(
             terminal_id.to_string(),
@@ -1054,7 +1291,12 @@ fn send_terminal_output(cx: &ConnectionTo<Client>, session_id: &str, payload: &V
     );
 }
 
-fn send_terminal_exited(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_terminal_exited(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let Some(terminal_id) = payload["terminal_id"].as_str() else {
         return;
     };
@@ -1066,7 +1308,8 @@ fn send_terminal_exited(cx: &ConnectionTo<Client>, session_id: &str, payload: &V
         status = status.exit_code(code);
     }
     send_update(
-        cx,
+        connection,
+        runtime,
         session_id,
         SessionUpdate::TerminalUpdate(
             TerminalUpdate::new(terminal_id.to_string()).exit_status(status),
@@ -1074,14 +1317,20 @@ fn send_terminal_exited(cx: &ConnectionTo<Client>, session_id: &str, payload: &V
     );
 }
 
-fn send_file_read(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_file_read(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let (Some(tool_call_id), Some(path)) =
         (payload["tool_call_id"].as_str(), payload["path"].as_str())
     else {
         return;
     };
     send_update(
-        cx,
+        connection,
+        runtime,
         session_id,
         SessionUpdate::ToolCallUpdate(
             ToolCallUpdate::new(tool_call_id.to_string())
@@ -1092,7 +1341,12 @@ fn send_file_read(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) 
     );
 }
 
-fn send_file_changed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Value) {
+fn send_file_changed(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    payload: &Value,
+) {
     let (Some(tool_call_id), Some(changes)) = (
         payload["tool_call_id"].as_str(),
         payload["changes"].as_array(),
@@ -1105,13 +1359,13 @@ fn send_file_changed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Valu
             let path = PathBuf::from(change["path"].as_str()?);
             let kind = change["kind"].as_str().unwrap_or("update");
             Some(match kind {
-                "add" => agent_client_protocol::schema::v2::DiffChange::add(path),
-                "delete" => agent_client_protocol::schema::v2::DiffChange::delete(path),
+                "add" => agent_client_protocol_schema::v2::DiffChange::add(path),
+                "delete" => agent_client_protocol_schema::v2::DiffChange::delete(path),
                 "move" => {
                     let moved_to = PathBuf::from(change["movedTo"].as_str()?);
-                    agent_client_protocol::schema::v2::DiffChange::move_file(path, moved_to)
+                    agent_client_protocol_schema::v2::DiffChange::move_file(path, moved_to)
                 }
-                _ => agent_client_protocol::schema::v2::DiffChange::modify(path),
+                _ => agent_client_protocol_schema::v2::DiffChange::modify(path),
             })
         })
         .collect::<Vec<_>>();
@@ -1124,7 +1378,12 @@ fn send_file_changed(cx: &ConnectionTo<Client>, session_id: &str, payload: &Valu
         .kind(ToolKind::Edit)
         .status(ToolCallStatus::Completed)
         .content(vec![ToolCallContent::Diff(diff)]);
-    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+    send_update(
+        connection,
+        runtime,
+        session_id,
+        SessionUpdate::ToolCallUpdate(update),
+    );
 }
 
 fn tool_started(payload: &Value) -> ToolCallUpdate {
@@ -1225,12 +1484,17 @@ fn text_content(text: String) -> Vec<ToolCallContent> {
     )))]
 }
 
-fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
+fn replay_snapshot(
+    connection: &AcpConnection,
+    runtime: &AcpRuntime,
+    session_id: &str,
+    value: &Value,
+) {
     let Some(snapshot) = value.get("snapshot") else {
         return;
     };
     if let Some((used, size)) = snapshot_usage(snapshot) {
-        send_usage_update(cx, session_id, used, size);
+        send_usage_update(connection, runtime, session_id, used, size);
     }
     let Some(record) = snapshot.get("record") else {
         return;
@@ -1244,7 +1508,7 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
             .get("info")
             .and_then(|info| info.get("updated_at_ms"))
             .and_then(Value::as_u64);
-        send_session_info_update(cx, session_id, title, updated_at_ms);
+        send_session_info_update(connection, runtime, session_id, title, updated_at_ms);
     }
     let Some(transcript) = snapshot.get("transcript").and_then(Value::as_array) else {
         return;
@@ -1256,7 +1520,13 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
         match payload.get("kind").and_then(Value::as_str) {
             Some("user_prompt_submitted") => {
                 if let Some(message_id) = payload.get("message_id").and_then(Value::as_str) {
-                    send_user_message(cx, session_id, message_id, &payload["content"]);
+                    send_user_message(
+                        connection,
+                        runtime,
+                        session_id,
+                        message_id,
+                        &payload["content"],
+                    );
                 }
             }
             Some("assistant_delta") => {
@@ -1264,7 +1534,7 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
                     payload.get("message_id").and_then(Value::as_str),
                     payload.get("delta").and_then(Value::as_str),
                 ) {
-                    send_agent_chunk(cx, session_id, message_id, delta);
+                    send_agent_chunk(connection, runtime, session_id, message_id, delta);
                 }
             }
             Some("assistant_reasoning_delta") => {
@@ -1272,33 +1542,46 @@ fn replay_snapshot(cx: &ConnectionTo<Client>, session_id: &str, value: &Value) {
                     payload.get("message_id").and_then(Value::as_str),
                     payload.get("delta").and_then(Value::as_str),
                 ) {
-                    send_thought_chunk(cx, session_id, message_id, delta);
+                    send_thought_chunk(connection, runtime, session_id, message_id, delta);
                 }
             }
-            Some("assistant_completed") => send_assistant_completed(cx, session_id, payload),
-            Some("tool_started") => send_tool_started(cx, session_id, payload),
-            Some("tool_completed") => send_tool_completed(cx, session_id, payload),
-            Some("terminal_opened") => send_terminal_opened(cx, session_id, payload),
-            Some("terminal_exited") => send_terminal_exited(cx, session_id, payload),
-            Some("file_read") => send_file_read(cx, session_id, payload),
-            Some("file_changed") => send_file_changed(cx, session_id, payload),
+            Some("assistant_completed") => {
+                send_assistant_completed(connection, runtime, session_id, payload)
+            }
+            Some("tool_started") => send_tool_started(connection, runtime, session_id, payload),
+            Some("tool_completed") => send_tool_completed(connection, runtime, session_id, payload),
+            Some("terminal_opened") => {
+                send_terminal_opened(connection, runtime, session_id, payload)
+            }
+            Some("terminal_exited") => {
+                send_terminal_exited(connection, runtime, session_id, payload)
+            }
+            Some("file_read") => send_file_read(connection, runtime, session_id, payload),
+            Some("file_changed") => send_file_changed(connection, runtime, session_id, payload),
             _ => {}
         }
     }
     match snapshot.get("phase").and_then(Value::as_str) {
         Some("running" | "cancelling") => send_state(
-            cx,
+            connection,
+            runtime,
             session_id,
             StateUpdate::Running(RunningStateUpdate::new()),
         ),
         Some("waiting_permission") => send_state(
-            cx,
+            connection,
+            runtime,
             session_id,
             StateUpdate::RequiresAction(
-                agent_client_protocol::schema::v2::RequiresActionStateUpdate::new(),
+                agent_client_protocol_schema::v2::RequiresActionStateUpdate::new(),
             ),
         ),
-        _ => send_state(cx, session_id, StateUpdate::Idle(IdleStateUpdate::new())),
+        _ => send_state(
+            connection,
+            runtime,
+            session_id,
+            StateUpdate::Idle(IdleStateUpdate::new()),
+        ),
     }
 }
 
@@ -1416,43 +1699,138 @@ fn content_text(value: &Value) -> String {
     }
 }
 
-fn internal_error(error: impl std::fmt::Display) -> AcpError {
-    AcpError::internal_error().data(error.to_string())
+fn internal_error(error: impl std::fmt::Display) -> RpcError {
+    RpcError::internal(error)
 }
 
-fn invalid_params(error: impl std::fmt::Display) -> AcpError {
-    AcpError::invalid_params().data(error.to_string())
+fn invalid_params(error: impl std::fmt::Display) -> RpcError {
+    RpcError::invalid_params(error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v2::{
+    use agent_client_protocol_schema::v2::{
         BlobResourceContents, EmbeddedResource, ImageContent, TextResourceContents,
     };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn pending_cancel_is_consumed_only_by_the_same_session() {
+        let pending = PendingCancels::default();
+        let first = pending.schedule("session-a".to_string()).unwrap();
+
+        assert!(!pending.consume("session-b"));
+        assert!(!first.is_cancelled());
+        assert!(pending.consume("session-a"));
+        assert!(first.is_cancelled());
+    }
+
+    #[test]
+    fn duplicate_cancel_does_not_schedule_another_forward() {
+        let pending = PendingCancels::default();
+
+        assert!(pending.schedule("session-a".to_string()).is_some());
+        assert!(pending.schedule("session-a".to_string()).is_none());
+    }
+
+    #[test]
+    fn completed_cancel_cannot_remove_a_newer_cancel() {
+        let pending = PendingCancels::default();
+        let first = pending.schedule("session-a".to_string()).unwrap();
+        assert!(pending.consume("session-a"));
+        let second = pending.schedule("session-a".to_string()).unwrap();
+
+        assert!(!pending.finish("session-a", &first));
+        assert!(pending.finish("session-a", &second));
+    }
 
     #[tokio::test]
-    async fn acp_exits_when_the_client_closes_stdin() {
-        let (client_stdin, agent_stdin) = tokio::io::duplex(1024);
-        let (agent_stdout, _client_stdout) = tokio::io::duplex(1024);
-        let eof = CancellationToken::new();
-        let transport = ByteStreams::new(
-            agent_stdout.compat_write(),
-            EofReader::new(agent_stdin, eof.clone()).compat(),
-        );
-        let agent = Agent.v2().with_spawned(|cx| async move {
-            let _connection_held_by_observer = cx;
-            std::future::pending().await
-        });
-        let task = tokio::spawn(connect_until_eof(agent, transport, eof));
-
-        drop(client_stdin);
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+    async fn cancel_wait_expires_unless_consumed_or_connection_closes() {
+        let connection_closed = CancellationToken::new();
+        assert!(
+            cancellation_due(
+                &CancellationToken::new(),
+                &connection_closed,
+                Duration::from_millis(1),
+            )
             .await
-            .expect("ACP runner should stop after stdin EOF")
-            .expect("ACP runner task should not panic")
-            .expect("stdin EOF should be a clean ACP shutdown");
+        );
+
+        let consumed = CancellationToken::new();
+        consumed.cancel();
+        assert!(!cancellation_due(&consumed, &connection_closed, Duration::from_secs(1)).await);
+
+        connection_closed.cancel();
+        assert!(
+            !cancellation_due(
+                &CancellationToken::new(),
+                &connection_closed,
+                Duration::from_secs(1),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_initializes_with_explicit_v1_and_v2_schemas() {
+        for (protocol, params, expected) in [
+            (
+                AcpProtocol::V1,
+                json!({"protocolVersion":1, "clientCapabilities":{}}),
+                1,
+            ),
+            (
+                AcpProtocol::V2,
+                json!({
+                    "protocolVersion":2,
+                    "info":{"name":"test-client", "version":"1"},
+                    "capabilities":{}
+                }),
+                2,
+            ),
+        ] {
+            let (mut client_input, agent_input) = tokio::io::duplex(16 * 1024);
+            let (agent_output, client_output) = tokio::io::duplex(16 * 1024);
+            let task = tokio::spawn(run_with_protocol_io(
+                PathBuf::from("unused-profile.yaml"),
+                protocol,
+                agent_input,
+                agent_output,
+            ));
+            let request = json!({
+                "jsonrpc":"2.0",
+                "id":7,
+                "method":"initialize",
+                "params":params,
+            });
+            client_input
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            client_input.flush().await.unwrap();
+
+            let mut response = String::new();
+            BufReader::new(client_output)
+                .read_line(&mut response)
+                .await
+                .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], 7);
+            assert_eq!(response["result"]["protocolVersion"], expected);
+            let info = match protocol {
+                AcpProtocol::V1 => &response["result"]["agentInfo"],
+                AcpProtocol::V2 => &response["result"]["info"],
+            };
+            assert_eq!(info["name"], "dwo");
+
+            drop(client_input);
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[test]
@@ -1559,14 +1937,13 @@ mod tests {
 
     #[test]
     fn acp_exposes_model_reasoning_and_policy_options() {
-        let options = build_session_config_options(SessionOptionSnapshot {
-            config: dwo_agent_service::SessionConfig {
-                mode: dwo_tools::SessionMode::FullAccess,
+        let options = build_session_config_options(SessionOptions {
+            config: ipc_schema::SessionConfig {
+                mode: ipc_schema::SessionMode::FullAccess,
                 model: "deepseek-v4-flash".to_string(),
                 reasoning: Some("max".to_string()),
-                max_model_steps: 100,
             },
-            models: vec![SessionModelOption {
+            models: vec![ipc_schema::SessionModelOption {
                 id: "deepseek-v4-flash".to_string(),
                 reasoning: vec!["high".to_string(), "max".to_string()],
                 default_reasoning: "high".to_string(),

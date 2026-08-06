@@ -103,8 +103,10 @@ enum SessionCommand {
         model: Option<String>,
         #[arg(long)]
         reasoning: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from")]
         to: Option<String>,
+        #[arg(long, conflicts_with = "to")]
+        from: Option<String>,
     },
     Cancel {
         id: String,
@@ -547,6 +549,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             model,
             reasoning,
             to,
+            from,
         } => {
             let policy = policy
                 .map(|value| dwo_tools::SessionMode::parse(&value).map_err(anyhow::Error::msg))
@@ -556,6 +559,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                 "session.prompt",
                 json!({
                     "session_id": to,
+                    "from_session_id": from,
                     "caller_session_id": current_session_id(),
                     "endpoint_id": endpoint_id,
                     "message": message,
@@ -1194,6 +1198,39 @@ mod tests {
                 && model.as_deref() == Some("fast")
                 && reasoning.as_deref() == Some("high")
         ));
+
+        let fork = Cli::try_parse_from([
+            "dwo",
+            "session",
+            "prompt",
+            "try another approach",
+            "--from",
+            "session-child",
+        ])
+        .unwrap();
+        assert!(matches!(
+            fork.command,
+            Command::Session {
+                command: SessionCommand::Prompt {
+                    from: Some(ref id),
+                    to: None,
+                    ..
+                }
+            } if id == "session-child"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "dwo",
+                "session",
+                "prompt",
+                "invalid",
+                "--from",
+                "session-a",
+                "--to",
+                "session-b",
+            ])
+            .is_err()
+        );
 
         let watch = Cli::try_parse_from([
             "dwo",

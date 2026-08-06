@@ -41,7 +41,13 @@ dwo session prompt "运行相关测试" --cwd C:\path\to\project --policy watch 
 dwo session prompt "再检查一下错误处理" --to <session-id>
 ```
 
-`--title` 和 `--cwd` 只在创建时使用，不能和 `--to` 一起使用。继续子 session 时可以调整 policy、model 和 reasoning，新的设置会从后续工具调用或模型请求开始生效。
+从已有直接子 session 分出一个新话题并立即提交 prompt：
+
+```text
+dwo session prompt "换一种方案继续" --from <session-id>
+```
+
+`--from` 和 `--to` 不能同时使用。`--title` 可用于新 session 或 fork，`--cwd` 不能和 `--to`、`--from` 一起使用。来源必须 idle；fork 会复制 context、transcript 和配置，并保持相同的父 session。继续或 fork 子 session 时可以调整 policy、model 和 reasoning。
 
 从普通终端执行命令时没有 `DWO_SESSION_ID`，此时创建的是根 session，不会挂到某个现有 session 下。
 
@@ -73,6 +79,7 @@ watch < confirm < full_access
 | `dwo session watch <session-id>` | 读取子 session 最近的内容事件 |
 | `dwo session cancel <session-id>` | 取消子 session 当前正在运行的 turn |
 | `dwo session prompt "..." --to <session-id>` | 向已有子 session 发送后续要求 |
+| `dwo session prompt "..." --from <session-id>` | 从已有子 session 复制新话题并提交要求 |
 
 `watch` 是分页读取命令，默认返回最近 3 个内容事件和一个 `next_cursor`，不会持续订阅实时输出。继续读取时传入 cursor：
 

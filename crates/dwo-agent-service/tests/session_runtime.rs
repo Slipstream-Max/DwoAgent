@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dwo_agent_service::{
-    AgentService, AgentServiceError, ConfirmationDecision, ContentBlock, ContextMessage,
-    EndpointId, FsSessionRepository, MemorySessionRepository, MessageContent, MessageKind,
-    ModelLimits, NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload,
-    SessionLlmSettings, SessionMode, SessionRepository,
+    AgentService, AgentServiceError, CompactionTrigger, ConfirmationDecision, ContentBlock,
+    ContextMessage, EndpointId, FsSessionRepository, MemorySessionRepository, MessageContent,
+    MessageKind, ModelLimits, NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload,
+    SessionId, SessionLlmSettings, SessionMode, SessionRepository,
 };
 use dwo_tools::PolicyConfig;
 use serde_json::{Value, json};
@@ -72,6 +72,76 @@ fn response_function_arguments(message: &ContextMessage) -> Option<Value> {
         Value::String(encoded) => serde_json::from_str(encoded).ok(),
         value => Some(value.clone()),
     }
+}
+
+#[tokio::test]
+async fn fork_copies_an_idle_session_without_changing_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::text("source answer")]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let mut source_config = new_session(dir.path(), SessionMode::Confirm);
+    source_config.parent_session_id = Some(SessionId::parse("session-parent").unwrap());
+    let source = service.create(source_config).await.unwrap();
+    let mut events = source.attach(EndpointId::new()).await.unwrap().events;
+
+    source
+        .prompt(EndpointId::new(), "original question")
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    let before = source.snapshot().await.unwrap();
+
+    let fork = service.fork(source.id(), None).await.unwrap();
+    let forked = fork.snapshot().await.unwrap();
+    let after = source.snapshot().await.unwrap();
+
+    assert_ne!(forked.record.info.id, before.record.info.id);
+    assert_eq!(
+        forked.record.info.parent_session_id,
+        before.record.info.parent_session_id
+    );
+    assert_eq!(forked.record.info.title, before.record.info.title);
+    assert_eq!(forked.record.info.cwd, before.record.info.cwd);
+    assert_eq!(forked.record.config(), before.record.config());
+    assert_eq!(forked.record.context, before.record.context);
+    assert_eq!(
+        serde_json::to_value(&forked.transcript).unwrap(),
+        serde_json::to_value(&before.transcript).unwrap()
+    );
+    assert_eq!(after.record.info.id, before.record.info.id);
+    assert_eq!(after.record.context, before.record.context);
+    assert_eq!(
+        serde_json::to_value(after.transcript).unwrap(),
+        serde_json::to_value(before.transcript).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn fork_rejects_a_running_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        ScriptedModelGateway::new([ScriptedStep::delayed_text("late", 5_000)]),
+        PolicyConfig::default(),
+    );
+    let source = service
+        .create(new_session(dir.path(), SessionMode::Confirm))
+        .await
+        .unwrap();
+    let accepted = source
+        .prompt(EndpointId::new(), "original question")
+        .await
+        .unwrap();
+
+    let error = service.fork(source.id(), None).await.err().unwrap();
+
+    assert!(matches!(error, AgentServiceError::SessionBusy(id) if id == source.id().clone()));
+    source.cancel(Some(accepted.turn_id)).await.unwrap();
+    service.shutdown().await;
 }
 
 #[tokio::test]
@@ -1035,8 +1105,25 @@ async fn manual_compaction_uses_the_command_turn_without_adding_it_to_model_cont
 
     let compact = agent.compact(EndpointId::new()).await.unwrap();
     let mut response = None;
+    let mut started_compaction = None;
+    let mut completed_compaction = None;
     loop {
         match events.recv().await.unwrap().payload {
+            SessionEventPayload::CompactionStarted {
+                turn_id,
+                compaction_id,
+                trigger,
+            } if turn_id == compact.turn_id => {
+                assert_eq!(trigger, CompactionTrigger::Manual);
+                started_compaction = Some(compaction_id);
+            }
+            SessionEventPayload::CompactionCompleted {
+                turn_id,
+                compaction_id,
+                summary,
+            } if turn_id == compact.turn_id => {
+                completed_compaction = Some((compaction_id, summary));
+            }
             SessionEventPayload::AssistantCompleted {
                 turn_id, content, ..
             } if turn_id == compact.turn_id => response = Some(content),
@@ -1051,6 +1138,10 @@ async fn manual_compaction_uses_the_command_turn_without_adding_it_to_model_cont
     let snapshot = agent.snapshot().await.unwrap();
     assert!(snapshot.usage.used < before);
     assert_eq!(snapshot.record.context.compaction.count, 1);
+    let started_compaction = started_compaction.expect("compaction should start");
+    let (completed_id, summary) = completed_compaction.expect("compaction should complete");
+    assert_eq!(completed_id, started_compaction);
+    assert_eq!(summary.as_deref(), Some("older work summary"));
     assert!(
         response
             .as_deref()
@@ -1066,6 +1157,66 @@ async fn manual_compaction_uses_the_command_turn_without_adding_it_to_model_cont
     }));
     assert_eq!(model.requests().await.len(), 2);
     assert_eq!(model.summary_request_count().await, 1);
+}
+
+#[tokio::test]
+async fn handoff_reports_a_completed_compaction_with_the_retained_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let handoff_summary = "Goal: finish the task. Done: inspected files. Next: implement.";
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::tools(
+            vec!["preparing handoff".to_string()],
+            vec![json!({
+                "id": "handoff-1",
+                "name": "handoff",
+                "arguments": {"handoff_text": handoff_summary}
+            })],
+        ),
+        ScriptedStep::text("continued after handoff"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent
+        .prompt(EndpointId::new(), "continue cleanly")
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let snapshot = agent.snapshot().await.unwrap();
+    let started = snapshot
+        .transcript
+        .iter()
+        .find_map(|event| match &event.payload {
+            SessionEventPayload::CompactionStarted {
+                compaction_id,
+                trigger: CompactionTrigger::Handoff,
+                ..
+            } => Some(compaction_id),
+            _ => None,
+        });
+    let completed = snapshot
+        .transcript
+        .iter()
+        .find_map(|event| match &event.payload {
+            SessionEventPayload::CompactionCompleted {
+                compaction_id,
+                summary,
+                ..
+            } => Some((compaction_id, summary.as_deref())),
+            _ => None,
+        });
+    let started = started.expect("handoff compaction should start");
+    let (completed_id, summary) = completed.expect("handoff compaction should complete");
+    assert_eq!(completed_id, started);
+    assert_eq!(summary, Some(handoff_summary));
 }
 
 #[tokio::test]
@@ -1141,6 +1292,13 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
 
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.record.context.compaction.count, 1);
+    assert!(snapshot.transcript.iter().any(|event| matches!(
+        event.payload,
+        SessionEventPayload::CompactionStarted {
+            trigger: CompactionTrigger::Automatic,
+            ..
+        }
+    )));
     assert!(snapshot.transcript.iter().any(|event| {
         matches!(
             event.payload,

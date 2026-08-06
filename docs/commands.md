@@ -28,16 +28,16 @@ dwo profile-list
 dwo session list [--all]
 dwo session status <session-id> [--json]
 dwo session delete <session-id>
-dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <session-id>]
+dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <session-id> | --from <session-id>]
 dwo session cancel <session-id>
 dwo session watch <session-id> [--cursor <cursor>] [--limit <count>]
 dwo session approve <session-id> <permission-id>
 dwo session deny <session-id> <permission-id>
 ```
 
-agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此创建根 session 并使用 profile 默认值。
+agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 或 `--from` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session；带 `--from` 时复制指定直接子 session 的 context 和 transcript，再把 prompt 发给副本。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此默认创建根 session。
 
-`--title` 和 `--cwd` 只用于创建 session，和 `--to` 同时使用会被拒绝。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `profile-list` 中列出的有效组合。继续已有子 session 时，policy/model/reasoning 更新会在提交新 prompt 前写入 session 配置，并分别从下一批 tool call 或下一次 model request 生效。
+`--from` 和 `--to` 严格互斥。`--title` 可用于新建或重命名 fork；`--cwd` 只用于全新 session，和 `--to` 或 `--from` 同时使用会被拒绝。来源必须处于 idle，fork 会保留来源的 cwd、父子关系和配置。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `profile-list` 中列出的有效组合。继续或 fork session 时，policy/model/reasoning 更新会在提交新 prompt 前写入目标配置。
 
 `session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 profile 中的全部 session。输出包含总数、运行状态、模型、更新时间和标题。`session status` 显示单个 session 的配置、usage、active turn 和最后一条最终回答；回答会折叠空白并限制在 100 个字符内。完整内容继续使用 `session watch`。`profile-list` 输出 profile 描述、默认 policy、可用 model/reasoning、默认 model 和 session 总数。
 

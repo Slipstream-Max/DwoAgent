@@ -133,6 +133,14 @@ impl SessionBridge {
                     display_path(&snapshot.record.info.cwd)
                 )]
             }
+            ChannelCommand::Fork => {
+                let source_id = self.selected_session_id().await?;
+                let snapshot = self.host.fork_session(&source_id).await?;
+                vec![format!(
+                    "Forked session {}\nTitle: {}",
+                    snapshot.record.info.id, snapshot.record.info.title
+                )]
+            }
             ChannelCommand::Use { session: id } => {
                 let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
                 self.select_session(&id).await?;

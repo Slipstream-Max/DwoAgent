@@ -142,13 +142,14 @@ const ws = new WebSocket(
 
 ## Slash Commands
 
-三个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP v2 client 会收到 Agent 宣告的 `/compact` 和 `/resume`。
+三个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP client 会收到 Agent 宣告的 `/compact`、`/resume` 和 `/fork`。
 
 | 命令 | 说明 |
 | --- | --- |
 | `/help` | 显示当前支持的命令 |
 | `/list` | 列出全局 session，`*` 表示当前 channel 选择的 session |
 | `/new [NAME] [--cwd <PATH>]` | 创建并选择 session；名称可包含空格 |
+| `/fork` | 把当前 session 复制为一个新 session，并返回新 ID；当前选择不变 |
 | `/use <SESSION>` | 选择已有 session，并回放最近 turn |
 | `/status` | 显示当前 session 的 cwd、模型、reasoning、policy 和运行状态 |
 | `/del <SESSION>` | 删除指定 session |
@@ -171,7 +172,7 @@ Telegram 发来的 `/status@bot_name` 也会正确识别。
 
 ## 对话、文件与权限
 
-- 普通私聊文本会提交到当前 session；没有选择 session 时，adapter 会自动创建并选中一个默认 session。使用 `/new` 可以显式指定名称和 cwd，使用 `/use` 可以切换到已有 session。
+- 普通私聊文本会提交到当前 session；没有选择 session 时，adapter 会自动创建并选中一个默认 session。使用 `/new` 可以显式指定名称和 cwd，使用 `/fork` 可以复制当前话题但不会切换，使用 `/use` 可以切换到已有 session。
 - 微信媒体、Telegram photo/document/video、飞书 image/file 会下载到当前 session 的 `runtime/attachments/<channel>/...`，再以 resource link 交给模型。
 - 仅发送媒体也是有效 prompt。
 - 在 `confirm` 模式中，channel 会显示 permission request。直接发送 `/allow` 或 `/deny` 即可处理当前请求，也可以附带 ID。

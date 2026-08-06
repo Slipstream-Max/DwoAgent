@@ -29,6 +29,8 @@ pub(crate) enum ChannelCommand {
         #[arg(long, value_name = "PATH")]
         cwd: Option<PathBuf>,
     },
+    #[command(about = "Copy the selected session into a new session.")]
+    Fork,
     #[command(about = "Select a session and replay its recent turns.")]
     Use {
         #[arg(value_name = "SESSION")]
@@ -204,6 +206,7 @@ mod tests {
         assert!(help.starts_with("These commands are supported:\n\n"));
         assert!(help.contains("/help - Display this command list."));
         assert!(help.contains("/new - Create and select a session."));
+        assert!(help.contains("/fork - Copy the selected session into a new session."));
         assert!(help.contains("/compact - Compact the selected session context."));
         assert!(help.contains("/resume - Continue the selected session when it is idle."));
         assert!(help.contains("/policy - Show or change the tool permission policy."));
@@ -223,6 +226,15 @@ mod tests {
             parse_command("/status@dwoagent_bot").unwrap(),
             ChannelCommand::Status
         ));
+    }
+
+    #[test]
+    fn fork_command_accepts_no_arguments() {
+        assert!(matches!(
+            parse_command("/fork").unwrap(),
+            ChannelCommand::Fork
+        ));
+        assert!(parse_command("/fork now").is_err());
     }
 
     #[test]

@@ -10,8 +10,9 @@ use dwo_tools::{ExecutionContext, ParsedToolCall, ToolEvent, ToolManager, ToolRe
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-use crate::events::ActiveToolCall;
+use crate::events::{ActiveToolCall, CompactionTrigger};
 use crate::permission::PermissionRequester;
 use crate::record::{SessionConfig, SessionId, SessionLlmSettings};
 
@@ -58,6 +59,25 @@ pub(crate) enum TurnEvent {
     ToolTelemetry {
         turn_id: TurnId,
         event: ToolEvent,
+    },
+    CompactionStarted {
+        turn_id: TurnId,
+        compaction_id: String,
+        trigger: CompactionTrigger,
+    },
+    CompactionCompleted {
+        turn_id: TurnId,
+        compaction_id: String,
+        summary: Option<String>,
+    },
+    CompactionFailed {
+        turn_id: TurnId,
+        compaction_id: String,
+        error: String,
+    },
+    CompactionCancelled {
+        turn_id: TurnId,
+        compaction_id: String,
     },
     Finished {
         turn_id: TurnId,
@@ -214,7 +234,7 @@ async fn manual_compaction_inner(turn: &mut RunTurn) -> TurnOutcome {
     }
     let plan = turn.context.plan_compaction(&CompactionPlanner::default());
     let recovery = recovery_selection(turn, &step.selection);
-    match compact_context(turn, plan, recovery).await {
+    match compact_context(turn, plan, recovery, CompactionTrigger::Manual).await {
         Ok(compacted) => {
             let content = if compacted {
                 format!(
@@ -433,6 +453,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                 plan,
                 handoff_text.to_string(),
                 &model_step.selection,
+                CompactionTrigger::Handoff,
             )
             .await
             {
@@ -469,7 +490,7 @@ async fn request_with_context_recovery(
         Err(error) if error.is_context_length_exceeded() => {
             let recovery = recovery_selection(turn, selection);
             let plan = turn.context.recovery_compaction();
-            if !compact_context(turn, plan, recovery).await? {
+            if !compact_context(turn, plan, recovery, CompactionTrigger::Recovery).await? {
                 return Err(error.into());
             }
             request_model(turn, selection).await.map_err(Into::into)
@@ -603,31 +624,12 @@ async fn compact_context(
     turn: &mut RunTurn,
     plan: CompactionPlan,
     selection: ModelSelection,
+    trigger: CompactionTrigger,
 ) -> anyhow::Result<bool> {
     if !plan.needs_replacement() {
         return Ok(false);
     }
-    tracing::info!(
-        event = "context.compaction_started",
-        session_id = %turn.session_id,
-        turn_id = %turn.turn_id,
-        model = %selection.model,
-        "context compaction started"
-    );
-    let summary = if plan.has_compactable_history() {
-        let summary = turn
-            .model
-            .summarize(
-                selection.clone(),
-                plan.view.clone(),
-                turn.cancellation.clone(),
-            )
-            .await?;
-        summary.summary
-    } else {
-        String::new()
-    };
-    compact_context_with_summary(turn, plan, summary, &selection).await?;
+    perform_compaction(turn, plan, selection, None, trigger).await?;
     Ok(true)
 }
 
@@ -636,11 +638,77 @@ async fn compact_context_with_summary(
     plan: CompactionPlan,
     summary: String,
     selection: &ModelSelection,
+    trigger: CompactionTrigger,
 ) -> anyhow::Result<()> {
+    perform_compaction(turn, plan, selection.clone(), Some(summary), trigger).await
+}
+
+async fn perform_compaction(
+    turn: &mut RunTurn,
+    plan: CompactionPlan,
+    selection: ModelSelection,
+    supplied_summary: Option<String>,
+    trigger: CompactionTrigger,
+) -> anyhow::Result<()> {
+    let compaction_id = format!("cmp_{}", Uuid::new_v4().simple());
+    turn.emit(TurnEvent::CompactionStarted {
+        turn_id: turn.turn_id.clone(),
+        compaction_id: compaction_id.clone(),
+        trigger,
+    });
     let started = Instant::now();
-    turn.context
-        .apply_compaction(plan, summary, &turn.prompt_builder, turn.tools.schemas())?;
-    turn.checkpoint().await?;
+    tracing::info!(
+        event = "context.compaction_started",
+        session_id = %turn.session_id,
+        turn_id = %turn.turn_id,
+        model = %selection.model,
+        "context compaction started"
+    );
+    let result = async {
+        let summary = match supplied_summary {
+            Some(summary) => summary,
+            None if plan.has_compactable_history() => {
+                turn.model
+                    .summarize(
+                        selection.clone(),
+                        plan.view.clone(),
+                        turn.cancellation.clone(),
+                    )
+                    .await?
+                    .summary
+            }
+            None => String::new(),
+        };
+        let display_summary = (!summary.is_empty()).then(|| summary.clone());
+        turn.context
+            .apply_compaction(plan, summary, &turn.prompt_builder, turn.tools.schemas())?;
+        turn.checkpoint().await?;
+        anyhow::Ok(display_summary)
+    }
+    .await;
+    let display_summary = match result {
+        Ok(summary) => summary,
+        Err(error) => {
+            if turn.cancellation.is_cancelled() {
+                turn.emit(TurnEvent::CompactionCancelled {
+                    turn_id: turn.turn_id.clone(),
+                    compaction_id,
+                });
+            } else {
+                turn.emit(TurnEvent::CompactionFailed {
+                    turn_id: turn.turn_id.clone(),
+                    compaction_id,
+                    error: format!("{error:#}"),
+                });
+            }
+            return Err(error);
+        }
+    };
+    turn.emit(TurnEvent::CompactionCompleted {
+        turn_id: turn.turn_id.clone(),
+        compaction_id,
+        summary: display_summary,
+    });
     tracing::info!(
         event = "context.compaction_completed",
         session_id = %turn.session_id,
@@ -669,7 +737,7 @@ async fn compact_if_needed(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Resu
         return Ok(());
     };
     let recovery = recovery_selection(turn, &step.selection);
-    compact_context(turn, plan, recovery).await?;
+    compact_context(turn, plan, recovery, CompactionTrigger::Automatic).await?;
     Ok(())
 }
 

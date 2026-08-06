@@ -84,10 +84,23 @@ adapter 会给 cancel 留出 `150ms` 的配对窗口：同一连接、同一 ses
 
 | 命令 | 行为 |
 | --- | --- |
-| `/compact` | 手动压缩当前 session context，并返回压缩前后的估算 token；命令文本不进入模型上下文 |
+| `/compact` | 手动压缩当前 session context；命令文本不进入模型上下文，并通过下述 compaction update 回显进度与摘要 |
 | `/resume` | session idle 时加入内部继续指令并启动新 turn；运行中静默忽略，不排队也不报错 |
+| `/fork` | 复制当前 session 并显示副本 ID；当前 ACP session 不变 |
 
-Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执行。ACP 协议自身的 `session/resume` 是重新接入已有 session、恢复 observer 和可选回放历史，不会启动模型；它与自定义 `/resume` 命令不是同一功能。
+Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执行。ACP 同时声明并实现实验性原生 `session/fork`；它和 `/fork` 都返回副本 ID，但都不会切换当前 ACP session。ACP 协议自身的 `session/resume` 是重新接入已有 session、恢复 observer 和可选回放历史，不会启动模型；它与自定义 `/resume` 命令不是同一功能。
+
+## 上下文压缩回显
+
+手动 `/compact`、达到 token 阈值后的自动压缩、上下文超限恢复，以及 Agent 调用 `handoff` 触发的上下文重建，都会在 ACP 时间线中产生同一个 ID 寻址的压缩实体：
+
+1. 开始时发送 `compaction_update`，状态为 `in_progress`。
+2. 成功时复用同一个 `compactionId` 发送 `completed`，并在存在安全、用户可见的保留摘要时附带 `summary`。
+3. 失败或取消时复用同一个 ID 发送 `failed` 或 `cancelled`；失败状态包含可读的 `error`。
+
+这些事件会写入 session transcript，因此 `session/load` 或带 replay 的 `session/resume` 可以在原来的时间线位置重建压缩边界。`usage_update` 仍独立报告压缩后的 context window 使用量。
+
+ACP v2 始终发送这些标准 update。ACP v1 仅在客户端初始化时声明 `clientCapabilities.session.compaction: {}` 后发送；未声明该能力的 v1 客户端继续接收原有的普通文本结果。
 
 ## 输入与输出能力
 
@@ -97,7 +110,7 @@ Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执�
 - 图片输入；最终是否接受取决于当前模型是否支持图片。
 - 文本型 embedded resource。
 - resource link，包括名称、URI、MIME type 和可用元数据。
-- reasoning、assistant message、usage 和 session state 更新。
+- reasoning、assistant message、usage、compaction lifecycle 和 session state 更新。
 - 本地与 provider 托管的 tool call/result、权限请求和取消。
 
 当前不支持：

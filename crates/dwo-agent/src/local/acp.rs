@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -11,18 +12,19 @@ use agent_client_protocol::schema::v2::{
     AgentCapabilities, AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate,
     CancelSessionNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
     Content as ToolContent, ContentBlock, ContentChunk, DeleteSessionRequest,
-    DeleteSessionResponse, Diff, EmbeddedResourceResource, IdleStateUpdate, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-    PromptCapabilities, PromptEmbeddedContextCapabilities, PromptImageCapabilities, PromptRequest,
-    PromptResponse, ReplayFrom, RequestPermissionOutcome, RequestPermissionRequest, ResourceLink,
-    ResumeSessionRequest, ResumeSessionResponse, RunningStateUpdate, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionDeleteCapabilities, SessionId, SessionInfo, SessionInfoUpdate, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StateUpdate, StopReason,
-    Terminal, TerminalExitStatus, TerminalOutput, TerminalOutputChunk, TerminalUpdate, TextContent,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind,
-    UpdateSessionNotification, UsageUpdate, UserMessage,
+    DeleteSessionResponse, Diff, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
+    IdleStateUpdate, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, NewSessionRequest, NewSessionResponse, OtherSessionUpdate,
+    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptEmbeddedContextCapabilities,
+    PromptImageCapabilities, PromptRequest, PromptResponse, ReplayFrom, RequestPermissionOutcome,
+    RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
+    RunningStateUpdate, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionInfoUpdate, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StateUpdate, StopReason, Terminal, TerminalExitStatus,
+    TerminalOutput, TerminalOutputChunk, TerminalUpdate, TextContent, ToolCallContent, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind, UpdateSessionNotification,
+    UsageUpdate, UserMessage,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Error as AcpError, Responder,
@@ -33,6 +35,7 @@ use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::ValueEnum;
 use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, oneshot};
@@ -58,6 +61,7 @@ struct AcpRuntime {
     observers: Arc<Mutex<HashMap<String, Arc<SessionObserver>>>>,
     prompt_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<PromptCompletion>>>>,
     pending_cancels: PendingCancels,
+    compaction_supported: Arc<AtomicBool>,
 }
 
 type PromptCompletion = Result<StopReason, String>;
@@ -148,21 +152,56 @@ struct AcpConnection {
     protocol: AcpProtocol,
     inner: ConnectionTo<Client>,
     delivered: Arc<StdMutex<DeliveredMessages>>,
+    compaction_supported: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
+#[notification(method = "session/update")]
+#[serde(rename_all = "camelCase")]
+struct RawSessionNotification {
+    session_id: String,
+    update: Value,
 }
 
 #[derive(Default)]
 struct DeliveredMessages {
     agent: HashSet<String>,
     thought: HashSet<String>,
+    manual_compaction_turns: HashSet<String>,
 }
 
 impl AcpConnection {
-    fn new(protocol: AcpProtocol, inner: ConnectionTo<Client>) -> Self {
+    fn new(
+        protocol: AcpProtocol,
+        inner: ConnectionTo<Client>,
+        compaction_supported: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             protocol,
             inner,
             delivered: Arc::new(StdMutex::new(DeliveredMessages::default())),
+            compaction_supported,
         }
+    }
+
+    fn supports_compaction(&self) -> bool {
+        self.protocol == AcpProtocol::V2 || self.compaction_supported.load(Ordering::Relaxed)
+    }
+
+    fn mark_manual_compaction(&self, turn_id: &str) {
+        self.delivered
+            .lock()
+            .expect("delivered messages lock poisoned")
+            .manual_compaction_turns
+            .insert(turn_id.to_string());
+    }
+
+    fn is_manual_compaction_turn(&self, turn_id: &str) -> bool {
+        self.delivered
+            .lock()
+            .expect("delivered messages lock poisoned")
+            .manual_compaction_turns
+            .contains(turn_id)
     }
 
     fn mark_streamed(&self, message_id: &str, thought: bool) {
@@ -240,9 +279,11 @@ where
         observers: Arc::new(Mutex::new(HashMap::new())),
         prompt_waiters: Arc::new(Mutex::new(HashMap::new())),
         pending_cancels: PendingCancels::default(),
+        compaction_supported: Arc::new(AtomicBool::new(true)),
     };
     let new_config = config_path.clone();
     let list_config = config_path.clone();
+    let fork_runtime = runtime.clone();
     let resume_runtime = runtime.clone();
     let prompt_runtime = runtime.clone();
     let close_runtime = runtime.clone();
@@ -269,6 +310,7 @@ where
                                         .image(PromptImageCapabilities::new())
                                         .embedded_context(PromptEmbeddedContextCapabilities::new()),
                                 )
+                                .fork(SessionForkCapabilities::new())
                                 .delete(SessionDeleteCapabilities::new()),
                         ),
                     ),
@@ -294,7 +336,11 @@ where
                         let id = value["session_id"].as_str().unwrap_or_default();
                         match session_config_options(&new_config, id).await {
                             Ok(options) => {
-                                let connection = AcpConnection::new(AcpProtocol::V2, cx.clone());
+                                let connection = AcpConnection::new(
+                                    AcpProtocol::V2,
+                                    cx.clone(),
+                                    Arc::new(AtomicBool::new(true)),
+                                );
                                 let result = responder.respond(
                                     NewSessionResponse::new(SessionId::new(id))
                                         .config_options(options),
@@ -308,6 +354,20 @@ where
                             Err(error) => responder.respond_with_error(internal_error(error)),
                         }
                     }
+                    Err(error) => responder.respond_with_error(internal_error(error)),
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ForkSessionRequest,
+                        responder: Responder<ForkSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                if let Err(error) = validate_fork(&fork_runtime, &request).await {
+                    return responder.respond_with_error(invalid_params(error));
+                }
+                match fork_acp_session(&fork_runtime, &request.session_id.to_string()).await {
+                    Ok(response) => responder.respond(response),
                     Err(error) => responder.respond_with_error(internal_error(error)),
                 }
             },
@@ -352,7 +412,11 @@ where
                         responder: Responder<ResumeSessionResponse>,
                         cx: ConnectionTo<Client>| {
                 let runtime = resume_runtime.clone();
-                let connection = AcpConnection::new(AcpProtocol::V2, cx.clone());
+                let connection = AcpConnection::new(
+                    AcpProtocol::V2,
+                    cx.clone(),
+                    Arc::new(AtomicBool::new(true)),
+                );
                 cx.clone().spawn(async move {
                     let session_id = request.session_id.to_string();
                     match validate_resume(&runtime, &request).await {
@@ -445,7 +509,11 @@ where
                 runtime
                     .pending_cancels
                     .consume(&request.session_id.to_string());
-                let connection = AcpConnection::new(AcpProtocol::V2, cx.clone());
+                let connection = AcpConnection::new(
+                    AcpProtocol::V2,
+                    cx.clone(),
+                    Arc::new(AtomicBool::new(true)),
+                );
                 cx.clone().spawn(async move {
                     run_prompt(runtime, request, responder, connection).await;
                     Ok(())
@@ -458,7 +526,8 @@ where
             async move |request: SetSessionConfigOptionRequest,
                         responder: Responder<SetSessionConfigOptionResponse>,
                         cx: ConnectionTo<Client>| {
-                let connection = AcpConnection::new(AcpProtocol::V2, cx);
+                let connection =
+                    AcpConnection::new(AcpProtocol::V2, cx, Arc::new(AtomicBool::new(true)));
                 let session_id = request.session_id.to_string();
                 let config_id = request.config_id.to_string();
                 let Some(value) = request.value.as_id().map(ToString::to_string) else {
@@ -587,6 +656,14 @@ async fn run_prompt(
             )
             .await
         }
+        Some(SlashCommand::Fork) => {
+            ipc::request(
+                &runtime.config_path,
+                "session.fork",
+                json!({"session_id": session_id}),
+            )
+            .await
+        }
         None => {
             ipc::request(
                 &runtime.config_path,
@@ -603,6 +680,7 @@ async fn run_prompt(
     match request {
         Ok(value) => {
             let _ = responder.respond(PromptResponse::new());
+            send_fork_result(&cx, &session_id, &value);
             if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
                 let prompt = serde_json::to_value(prompt_blocks)
                     .unwrap_or_else(|_| Value::Array(Vec::new()));
@@ -619,6 +697,7 @@ async fn run_prompt(
 enum SlashCommand {
     Compact,
     Resume,
+    Fork,
 }
 
 fn parse_slash_command(content: &MessageContent) -> Result<Option<SlashCommand>> {
@@ -637,6 +716,10 @@ fn parse_slash_command(content: &MessageContent) -> Result<Option<SlashCommand>>
         "/resume" => {
             anyhow::ensure!(parts.next().is_none(), "/resume does not accept input");
             Ok(Some(SlashCommand::Resume))
+        }
+        "/fork" => {
+            anyhow::ensure!(parts.next().is_none(), "/fork does not accept input");
+            Ok(Some(SlashCommand::Fork))
         }
         _ => Ok(None),
     }
@@ -683,6 +766,45 @@ async fn validate_resume(runtime: &AcpRuntime, request: &ResumeSessionRequest) -
         "resume cwd does not match the session cwd"
     );
     Ok(())
+}
+
+async fn validate_fork(runtime: &AcpRuntime, request: &ForkSessionRequest) -> Result<()> {
+    anyhow::ensure!(
+        request.additional_directories.is_empty(),
+        "additionalDirectories are not supported"
+    );
+    anyhow::ensure!(
+        request.mcp_servers.is_empty(),
+        "MCP session setup is not supported"
+    );
+    let value = ipc::request(
+        &runtime.config_path,
+        "session.snapshot",
+        json!({"session_id": request.session_id}),
+    )
+    .await?;
+    let snapshot: ipc_schema::SessionSnapshot = serde_json::from_value(value)?;
+    anyhow::ensure!(
+        normalize_path(AsRef::<Path>::as_ref(&request.cwd))
+            == normalize_path(&snapshot.record.info.cwd),
+        "fork cwd does not match the session cwd"
+    );
+    Ok(())
+}
+
+async fn fork_acp_session(runtime: &AcpRuntime, source_id: &str) -> Result<ForkSessionResponse> {
+    let value = ipc::request(
+        &runtime.config_path,
+        "session.fork",
+        json!({"session_id": source_id}),
+    )
+    .await?;
+    let id = value
+        .get("forked_session_id")
+        .and_then(Value::as_str)
+        .context("session.fork response omitted forked_session_id")?;
+    let options = session_config_options(&runtime.config_path, id).await?;
+    Ok(ForkSessionResponse::new(SessionId::new(id)).config_options(options))
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -866,6 +988,10 @@ async fn handle_session_event(
         "terminal_exited" => send_terminal_exited(cx, session_id, payload),
         "file_read" => send_file_read(cx, session_id, payload),
         "file_changed" => send_file_changed(cx, session_id, payload),
+        "compaction_started"
+        | "compaction_completed"
+        | "compaction_failed"
+        | "compaction_cancelled" => send_compaction_event(cx, session_id, payload),
         "permission_requested" => {
             send_state(
                 cx,
@@ -1132,7 +1258,24 @@ fn available_commands() -> Vec<AvailableCommand> {
     vec![
         AvailableCommand::new("compact", "Compact the current session context"),
         AvailableCommand::new("resume", "Continue the current session when it is idle"),
+        AvailableCommand::new("fork", "Copy the current session into a new session"),
     ]
+}
+
+fn send_fork_result(cx: &AcpConnection, source_id: &str, value: &Value) {
+    let Some(forked_id) = value.get("forked_session_id").and_then(Value::as_str) else {
+        return;
+    };
+    send_update(
+        cx,
+        source_id,
+        SessionUpdate::AgentMessage(
+            AgentMessage::new(format!("message-{}", Uuid::new_v4())).content(vec![
+                ContentBlock::Text(TextContent::new(format!("Forked session {forked_id}"))),
+            ]),
+        ),
+    );
+    send_idle(cx, source_id, StopReason::EndTurn);
 }
 
 fn send_user_message(cx: &AcpConnection, session_id: &str, message_id: &str, content: &Value) {
@@ -1170,6 +1313,14 @@ fn send_thought_chunk(cx: &AcpConnection, session_id: &str, message_id: &str, te
 }
 
 fn send_assistant_completed(cx: &AcpConnection, session_id: &str, payload: &Value) {
+    if cx.supports_compaction()
+        && payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .is_some_and(|turn_id| cx.is_manual_compaction_turn(turn_id))
+    {
+        return;
+    }
     let (reasoning, content) = assistant_completed_text(payload);
     if let (Some(message_id), Some(reasoning)) = (
         payload.get("thought_message_id").and_then(Value::as_str),
@@ -1234,6 +1385,74 @@ fn send_usage_update(cx: &AcpConnection, session_id: &str, used: u64, size: u64)
 
 fn usage_update(used: u64, size: u64) -> SessionUpdate {
     SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
+}
+
+fn send_compaction_event(cx: &AcpConnection, session_id: &str, payload: &Value) {
+    if !cx.supports_compaction() {
+        return;
+    }
+    let Some(update) = compaction_session_update(payload) else {
+        return;
+    };
+    if payload.get("kind").and_then(Value::as_str) == Some("compaction_started")
+        && payload.get("trigger").and_then(Value::as_str) == Some("manual")
+        && let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str)
+    {
+        cx.mark_manual_compaction(turn_id);
+    }
+    match cx.protocol {
+        AcpProtocol::V1 => {
+            let Ok(update) = serde_json::to_value(update) else {
+                return;
+            };
+            let _ = cx.inner.send_notification_to(
+                Client,
+                RawSessionNotification {
+                    session_id: session_id.to_string(),
+                    update,
+                },
+            );
+        }
+        AcpProtocol::V2 => send_update(cx, session_id, update),
+    }
+}
+
+fn compaction_session_update(payload: &Value) -> Option<SessionUpdate> {
+    let compaction_id = payload.get("compaction_id").and_then(Value::as_str)?;
+    let (status, summary, error) = match payload.get("kind").and_then(Value::as_str) {
+        Some("compaction_started") => ("in_progress", None, None),
+        Some("compaction_completed") => (
+            "completed",
+            payload
+                .get("summary")
+                .and_then(Value::as_str)
+                .filter(|summary| !summary.is_empty()),
+            None,
+        ),
+        Some("compaction_failed") => ("failed", None, payload.get("error").and_then(Value::as_str)),
+        Some("compaction_cancelled") => ("cancelled", None, None),
+        _ => return None,
+    };
+    let mut fields = BTreeMap::from([
+        (
+            "compactionId".to_string(),
+            Value::String(compaction_id.to_string()),
+        ),
+        ("status".to_string(), Value::String(status.to_string())),
+    ]);
+    if let Some(summary) = summary {
+        fields.insert(
+            "summary".to_string(),
+            json!([{"type": "text", "text": summary}]),
+        );
+    }
+    if let Some(error) = error {
+        fields.insert("error".to_string(), Value::String(error.to_string()));
+    }
+    Some(SessionUpdate::Other(OtherSessionUpdate::new(
+        "compaction_update",
+        fields,
+    )))
 }
 
 fn send_tool_started(cx: &AcpConnection, session_id: &str, payload: &Value) {
@@ -1544,6 +1763,12 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
             Some("terminal_exited") => send_terminal_exited(cx, session_id, payload),
             Some("file_read") => send_file_read(cx, session_id, payload),
             Some("file_changed") => send_file_changed(cx, session_id, payload),
+            Some(
+                "compaction_started"
+                | "compaction_completed"
+                | "compaction_failed"
+                | "compaction_cancelled",
+            ) => send_compaction_event(cx, session_id, payload),
             _ => {}
         }
     }
@@ -1775,6 +2000,13 @@ mod tests {
                 AcpProtocol::V2 => &response["result"]["info"],
             };
             assert_eq!(info["name"], "dwo");
+            let fork = match protocol {
+                AcpProtocol::V1 => {
+                    &response["result"]["agentCapabilities"]["sessionCapabilities"]["fork"]
+                }
+                AcpProtocol::V2 => &response["result"]["capabilities"]["session"]["fork"],
+            };
+            assert!(fork.is_object());
 
             drop(client_input);
             tokio::time::timeout(Duration::from_secs(1), task)
@@ -1877,6 +2109,10 @@ mod tests {
             parse_slash_command(&MessageContent::text("/resume")).unwrap(),
             Some(SlashCommand::Resume)
         ));
+        assert!(matches!(
+            parse_slash_command(&MessageContent::text("/fork")).unwrap(),
+            Some(SlashCommand::Fork)
+        ));
         assert!(
             parse_slash_command(&MessageContent::text("/custom value"))
                 .unwrap()
@@ -1894,6 +2130,12 @@ mod tests {
                 .to_string(),
             "/resume does not accept input"
         );
+        assert_eq!(
+            parse_slash_command(&MessageContent::text("/fork now"))
+                .unwrap_err()
+                .to_string(),
+            "/fork does not accept input"
+        );
     }
 
     #[test]
@@ -1909,6 +2151,7 @@ mod tests {
             "Compact the current session context"
         );
         assert_eq!(json["availableCommands"][1]["name"], "resume");
+        assert_eq!(json["availableCommands"][2]["name"], "fork");
     }
 
     #[test]
@@ -1953,6 +2196,63 @@ mod tests {
         assert_eq!(update["sessionUpdate"], "usage_update");
         assert_eq!(update["used"], 15);
         assert_eq!(update["size"], 200_000);
+    }
+
+    #[test]
+    fn compaction_events_map_to_id_addressed_acp_updates() {
+        let started = serde_json::to_value(
+            compaction_session_update(&json!({
+                "kind": "compaction_started",
+                "compaction_id": "cmp_001"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(started["sessionUpdate"], "compaction_update");
+        assert_eq!(started["compactionId"], "cmp_001");
+        assert_eq!(started["status"], "in_progress");
+        assert!(started.get("summary").is_none());
+
+        let completed = serde_json::to_value(
+            compaction_session_update(&json!({
+                "kind": "compaction_completed",
+                "compaction_id": "cmp_001",
+                "summary": "retained context"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(completed["compactionId"], started["compactionId"]);
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["summary"][0]["type"], "text");
+        assert_eq!(completed["summary"][0]["text"], "retained context");
+    }
+
+    #[test]
+    fn failed_and_cancelled_compactions_have_terminal_statuses() {
+        let failed = serde_json::to_value(
+            compaction_session_update(&json!({
+                "kind": "compaction_failed",
+                "compaction_id": "cmp_failed",
+                "error": "summary request failed"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"], "summary request failed");
+
+        let cancelled = serde_json::to_value(
+            compaction_session_update(&json!({
+                "kind": "compaction_cancelled",
+                "compaction_id": "cmp_cancelled"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(cancelled.get("summary").is_none());
+        assert!(cancelled.get("error").is_none());
     }
 
     #[test]

@@ -62,6 +62,7 @@ struct ListSessionParam {
 #[derive(Deserialize)]
 struct PromptParam {
     session_id: Option<String>,
+    from_session_id: Option<String>,
     caller_session_id: Option<String>,
     endpoint_id: String,
     message: PromptMessage,
@@ -358,6 +359,10 @@ impl Host {
         Ok(self.create_session(title, cwd).await?.snapshot().await?)
     }
 
+    pub async fn fork_session(&self, source_id: &SessionId) -> Result<SessionSnapshot> {
+        Ok(self.service.fork(source_id, None).await?.snapshot().await?)
+    }
+
     pub async fn subscribe_session(
         &self,
         id: &SessionId,
@@ -518,6 +523,17 @@ impl Host {
                 let snapshot = self.setup_session(params.title, params.cwd).await?;
                 Ok(json!({
                     "session_id": snapshot.record.info.id,
+                    "usage": snapshot.usage,
+                }))
+            }
+            "session.fork" => {
+                let source_id = parse_session(params)?;
+                let snapshot = self.fork_session(&source_id).await?;
+                let id = snapshot.record.info.id;
+                Ok(json!({
+                    "accepted": false,
+                    "session_id": id.clone(),
+                    "forked_session_id": id,
                     "usage": snapshot.usage,
                 }))
             }
@@ -1052,6 +1068,10 @@ impl Host {
         params: &PromptParam,
         caller: Option<SessionId>,
     ) -> Result<(Arc<dwo_agent_service::SessionAgent>, Option<SessionId>)> {
+        anyhow::ensure!(
+            params.session_id.is_none() || params.from_session_id.is_none(),
+            "--from cannot be used with --to"
+        );
         let (default_model, default_mode, default_max_model_steps) = self.defaults();
         let records = self.service.list().await?;
         let caller_record = caller
@@ -1085,20 +1105,39 @@ impl Host {
                 ensure_policy_ceiling(mode, parent.info.mode)?;
             }
             let agent = self.service.load(&id).await?;
-            if let Some(mode) = params.policy {
-                agent.set_config(SessionConfigUpdate::Mode(mode)).await?;
-            }
-            if let Some(model) = &params.model {
-                agent
-                    .set_config(SessionConfigUpdate::Model(model.clone()))
-                    .await?;
-            }
-            if let Some(reasoning) = &params.reasoning {
-                agent
-                    .set_config(SessionConfigUpdate::Reasoning(Some(reasoning.clone())))
-                    .await?;
-            }
+            apply_prompt_config(&agent, params).await?;
             return Ok((agent, record.info.parent_session_id.clone()));
+        }
+
+        if let Some(source) = &params.from_session_id {
+            anyhow::ensure!(
+                params.cwd.is_none(),
+                "--cwd cannot be used when forking a session"
+            );
+            let source_id = SessionId::parse(source.clone()).map_err(anyhow::Error::msg)?;
+            let source_record = records
+                .iter()
+                .find(|record| record.info.id == source_id)
+                .cloned()
+                .with_context(|| format!("session not found: {source_id}"))?;
+            if let Some(caller) = &caller {
+                anyhow::ensure!(
+                    source_record.info.parent_session_id.as_ref() == Some(caller),
+                    "session {source_id} is not a direct subsession of {caller}"
+                );
+            }
+            let mode = params.policy.unwrap_or(source_record.info.mode);
+            if let Some(parent) = &caller_record {
+                ensure_policy_ceiling(mode, parent.info.mode)?;
+            }
+            let parent_id = source_record.info.parent_session_id.clone();
+            let agent = self.service.fork(&source_id, params.title.clone()).await?;
+            if let Err(error) = apply_prompt_config(&agent, params).await {
+                let id = agent.id().clone();
+                let _ = self.service.delete(&id).await;
+                return Err(error.into());
+            }
+            return Ok((agent, parent_id));
         }
 
         let inherited_mode = caller_record
@@ -1517,6 +1556,26 @@ fn parse_optional_session(value: Option<String>) -> Result<Option<SessionId>> {
         .map_err(anyhow::Error::msg)
 }
 
+async fn apply_prompt_config(
+    agent: &dwo_agent_service::SessionAgent,
+    params: &PromptParam,
+) -> std::result::Result<(), dwo_agent_service::AgentServiceError> {
+    if let Some(mode) = params.policy {
+        agent.set_config(SessionConfigUpdate::Mode(mode)).await?;
+    }
+    if let Some(model) = &params.model {
+        agent
+            .set_config(SessionConfigUpdate::Model(model.clone()))
+            .await?;
+    }
+    if let Some(reasoning) = &params.reasoning {
+        agent
+            .set_config(SessionConfigUpdate::Reasoning(Some(reasoning.clone())))
+            .await?;
+    }
+    Ok(())
+}
+
 fn ensure_policy_ceiling(requested: SessionMode, parent: SessionMode) -> Result<()> {
     let rank = |mode| match mode {
         SessionMode::Watch => 0,
@@ -1757,6 +1816,79 @@ model:
         )
         .unwrap();
         config
+    }
+
+    #[tokio::test]
+    async fn prompt_from_forks_a_direct_child_and_rejects_to() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::load(&write_test_profile(root.path())).await.unwrap();
+        let parent = host
+            .create_session(Some("parent".to_string()), None)
+            .await
+            .unwrap();
+        let create = PromptParam {
+            session_id: None,
+            from_session_id: None,
+            caller_session_id: None,
+            endpoint_id: "test".to_string(),
+            message: PromptMessage::Text("unused".to_string()),
+            title: Some("child".to_string()),
+            cwd: None,
+            policy: None,
+            model: None,
+            reasoning: None,
+        };
+        let (source, _) = host
+            .resolve_prompt_session(&create, Some(parent.id().clone()))
+            .await
+            .unwrap();
+        let source_snapshot = source.snapshot().await.unwrap();
+        let fork = PromptParam {
+            from_session_id: Some(source.id().to_string()),
+            title: Some("forked child".to_string()),
+            ..create
+        };
+
+        let (forked, parent_id) = host
+            .resolve_prompt_session(&fork, Some(parent.id().clone()))
+            .await
+            .unwrap();
+        let forked_snapshot = forked.snapshot().await.unwrap();
+
+        assert_ne!(forked.id(), source.id());
+        assert_eq!(parent_id.as_ref(), Some(parent.id()));
+        assert_eq!(
+            forked_snapshot.record.info.parent_session_id.as_ref(),
+            Some(parent.id())
+        );
+        assert_eq!(forked_snapshot.record.info.title, "forked child");
+        assert_eq!(
+            forked_snapshot.record.context,
+            source_snapshot.record.context
+        );
+
+        let slash_fork = host
+            .dispatch(
+                "session.fork",
+                json!({"session_id": source.id().to_string()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slash_fork["accepted"], false);
+        assert_ne!(slash_fork["session_id"], source.id().as_str());
+
+        let invalid = PromptParam {
+            session_id: Some(source.id().to_string()),
+            from_session_id: Some(source.id().to_string()),
+            ..fork
+        };
+        let error = host
+            .resolve_prompt_session(&invalid, Some(parent.id().clone()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "--from cannot be used with --to");
+        host.shutdown().await;
     }
 
     #[tokio::test]

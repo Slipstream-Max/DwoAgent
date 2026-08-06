@@ -1320,6 +1320,52 @@ impl SessionActor {
                     .await;
                 }
             },
+            TurnEvent::CompactionStarted {
+                turn_id,
+                compaction_id,
+                trigger,
+            } => {
+                self.emit_client_event(SessionEventPayload::CompactionStarted {
+                    turn_id,
+                    compaction_id,
+                    trigger,
+                })
+                .await;
+            }
+            TurnEvent::CompactionCompleted {
+                turn_id,
+                compaction_id,
+                summary,
+            } => {
+                self.emit_client_event(SessionEventPayload::CompactionCompleted {
+                    turn_id,
+                    compaction_id,
+                    summary,
+                })
+                .await;
+            }
+            TurnEvent::CompactionFailed {
+                turn_id,
+                compaction_id,
+                error,
+            } => {
+                self.emit_client_event(SessionEventPayload::CompactionFailed {
+                    turn_id,
+                    compaction_id,
+                    error,
+                })
+                .await;
+            }
+            TurnEvent::CompactionCancelled {
+                turn_id,
+                compaction_id,
+            } => {
+                self.emit_client_event(SessionEventPayload::CompactionCancelled {
+                    turn_id,
+                    compaction_id,
+                })
+                .await;
+            }
             TurnEvent::Finished { turn_id, outcome } => {
                 if self
                     .active

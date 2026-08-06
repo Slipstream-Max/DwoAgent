@@ -4,6 +4,7 @@ Use a child session when a bounded task can run independently or needs a separat
 
 - Start a child: `dwo session prompt "instruction" [--title TITLE] [--cwd PATH] [--policy watch|confirm|full_access] [--model MODEL] [--reasoning MODE]`.
 - Continue a child: `dwo session prompt "follow-up" --to SESSION_ID [--policy POLICY] [--model MODEL] [--reasoning MODE]`.
+- Fork an idle child and prompt the copy: `dwo session prompt "new direction" --from SESSION_ID [--title TITLE] [--policy POLICY] [--model MODEL] [--reasoning MODE]`. `--from` and `--to` are mutually exclusive, and a fork keeps the source cwd and parent.
 - List your direct children: `dwo session list`. Use `--all` only when the wider profile inventory is necessary.
 - Check whether a child is running: `dwo session status SESSION_ID`. Use its phase and active turn; `idle` means no turn is currently running. The last answer is only a 100-character preview.
 - Inspect recent child content: `dwo session watch SESSION_ID`. It returns the latest three content events and a `next_cursor`; pass `--cursor NEXT_CURSOR` to read later events. Use `--limit N` to change the page size. `watch` reads content and is not the source of current running state.

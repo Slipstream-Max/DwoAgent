@@ -43,7 +43,7 @@ dwo profile-list
 dwo session list [--all]
 dwo session status <id> [--json]
 dwo session delete <id>
-dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <id>]
+dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <id> | --from <id>]
 dwo session cancel <id>
 dwo session watch <id> [--cursor <cursor>] [--limit <count>]
 dwo session approve|deny <id> <permission-id>
@@ -82,12 +82,13 @@ dwo automation run <job> [--json]
 dwo acp [--protocol v1|v2]
 ```
 
-Without `--to`, `session prompt` creates a root session from an external shell
-or a direct child when `DWO_SESSION_ID` identifies the calling agent. `--title`
-and `--cwd` are creation-only options. With `--to`, the target must be a direct
-child for agent callers; optional policy, model, and reasoning changes are
-validated and persisted before the prompt is queued. Child policy cannot be
-more permissive than its parent.
+Without `--to` or `--from`, `session prompt` creates a root session from an
+external shell or a direct child when `DWO_SESSION_ID` identifies the calling
+agent. `--to` continues an existing session; `--from` copies an idle session
+and prompts the copy. They are mutually exclusive. Agent callers can target
+only direct children, and child policy cannot be more permissive than its
+parent. A fork keeps the source cwd and parent; `--title` may override its
+title, while `--cwd` is rejected with either `--to` or `--from`.
 
 `dwo install` deploys the running executable to `~/.dwoagent/bin`, adds that
 directory to the Windows user PATH, and registers the daemon using the stable
@@ -207,8 +208,9 @@ rewriting. Sessions created without an explicit cwd use
 Channel slash commands are declared as one clap-derived command enum shared by
 platform adapters. Parsing, argument validation, and `/help` descriptions
 therefore come from one command definition instead of separate handwritten
-lists. The commands include `/new [name] [--cwd <path>]` and `/policy
-[full_access|confirm|watch]`. In confirm mode, `/allow` and `/deny` act on the
+lists. The commands include `/new [name] [--cwd <path>]`, `/fork`, and `/policy
+[full_access|confirm|watch]`. `/fork` copies the selected session without
+selecting the copy. In confirm mode, `/allow` and `/deny` act on the
 current pending permission; an optional request ID can still be supplied.
 Assistant responses are buffered for the whole turn, joined in commit order,
 and split only when the combined text exceeds 4,000 characters. Tool calls are

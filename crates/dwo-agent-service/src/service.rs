@@ -243,6 +243,57 @@ impl AgentService {
         self.load_record(record).await
     }
 
+    pub async fn fork(
+        &self,
+        source_id: &SessionId,
+        title: Option<String>,
+    ) -> Result<Arc<SessionAgent>, AgentServiceError> {
+        let snapshot = self.load(source_id).await?.snapshot().await?;
+        if snapshot.phase != RuntimePhase::Idle {
+            return Err(AgentServiceError::SessionBusy(source_id.clone()));
+        }
+
+        let source = snapshot.record;
+        let title = title
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| source.info.title.clone());
+        let mut record = SessionRecord::new(
+            SessionId::new(),
+            title,
+            source.info.cwd.clone(),
+            source.info.mode,
+            source.llm.clone(),
+            source.config().max_model_steps,
+        );
+        record.set_parent_session_id(source.info.parent_session_id.clone());
+        record.context = source.context;
+
+        let id = record.info.id.clone();
+        let operation = self.session_operation(&id).await;
+        let _operation = operation.lock().await;
+        let persisted = async {
+            self.repository.save(&record).await?;
+            for event in &snapshot.transcript {
+                self.repository.append_transcript_event(&id, event).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = persisted {
+            let _ = self.repository.delete(&id).await;
+            return Err(error.into());
+        }
+
+        match self.load_record(record).await {
+            Ok(agent) => Ok(agent),
+            Err(error) => {
+                let _ = self.repository.delete(&id).await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn load(&self, id: &SessionId) -> Result<Arc<SessionAgent>, AgentServiceError> {
         {
             let loaded = self.loaded.lock().await;

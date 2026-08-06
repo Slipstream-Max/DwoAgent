@@ -41,6 +41,15 @@ pub struct FileChange {
     pub moved_to: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    Automatic,
+    Recovery,
+    Handoff,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveStepSnapshot {
@@ -165,6 +174,25 @@ pub enum SessionEventPayload {
         responder: EndpointId,
         allowed: bool,
         reason: Option<String>,
+    },
+    CompactionStarted {
+        turn_id: TurnId,
+        compaction_id: String,
+        trigger: CompactionTrigger,
+    },
+    CompactionCompleted {
+        turn_id: TurnId,
+        compaction_id: String,
+        summary: Option<String>,
+    },
+    CompactionFailed {
+        turn_id: TurnId,
+        compaction_id: String,
+        error: String,
+    },
+    CompactionCancelled {
+        turn_id: TurnId,
+        compaction_id: String,
     },
     TurnCompleted {
         turn_id: TurnId,

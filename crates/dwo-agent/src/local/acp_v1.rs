@@ -8,6 +8,7 @@ use agent_client_protocol::{
     on_receive_request,
 };
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, oneshot};
@@ -15,6 +16,22 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "initialize", response = v1::InitializeResponse)]
+#[serde(rename_all = "camelCase")]
+struct InitializeRequest {
+    protocol_version: ProtocolVersion,
+    #[serde(default)]
+    client_capabilities: Value,
+}
+
+fn advertises_compaction(request: &InitializeRequest) -> bool {
+    request
+        .client_capabilities
+        .pointer("/session/compaction")
+        .is_some_and(Value::is_object)
+}
 
 pub(super) async fn run_with_io<R, W>(config_path: PathBuf, stdin: R, stdout: W) -> Result<()>
 where
@@ -31,9 +48,12 @@ where
         observers: Arc::new(Mutex::new(HashMap::new())),
         prompt_waiters: Arc::new(Mutex::new(HashMap::new())),
         pending_cancels: PendingCancels::default(),
+        compaction_supported: Arc::new(AtomicBool::new(false)),
     };
+    let initialize_compaction_supported = runtime.compaction_supported.clone();
     let new_runtime = runtime.clone();
     let list_runtime = runtime.clone();
+    let fork_runtime = runtime.clone();
     let load_runtime = runtime.clone();
     let resume_runtime = runtime.clone();
     let prompt_runtime = runtime.clone();
@@ -45,9 +65,11 @@ where
     let agent = Agent
         .builder()
         .on_receive_request(
-            async move |_request: v1::InitializeRequest,
+            async move |request: InitializeRequest,
                         responder: Responder<v1::InitializeResponse>,
                         _cx: ConnectionTo<Client>| {
+                initialize_compaction_supported
+                    .store(advertises_compaction(&request), Ordering::Relaxed);
                 let response = v2::InitializeResponse::new(
                     ProtocolVersion::V2,
                     v2::Implementation::new("dwo", env!("CARGO_PKG_VERSION")),
@@ -95,7 +117,11 @@ where
                     Ok(response) => response,
                     Err(error) => return responder.respond_with_error(internal_error(error)),
                 };
-                let connection = AcpConnection::new(AcpProtocol::V1, cx);
+                let connection = AcpConnection::new(
+                    AcpProtocol::V1,
+                    cx,
+                    new_runtime.compaction_supported.clone(),
+                );
                 let result = responder.respond(response);
                 if result.is_ok() {
                     if let Some((used, size)) = snapshot_usage(&value) {
@@ -104,6 +130,27 @@ where
                     send_available_commands(&connection, id);
                 }
                 result
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: v1::ForkSessionRequest,
+                        responder: Responder<v1::ForkSessionResponse>,
+                        _cx: ConnectionTo<Client>| {
+                let request = match v2::ForkSessionRequest::try_from(request) {
+                    Ok(request) => request,
+                    Err(error) => return responder.respond_with_error(invalid_params(error)),
+                };
+                if let Err(error) = validate_fork(&fork_runtime, &request).await {
+                    return responder.respond_with_error(invalid_params(error));
+                }
+                match fork_acp_session(&fork_runtime, &request.session_id.to_string()).await {
+                    Ok(response) => match v1::ForkSessionResponse::try_from(response) {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(internal_error(error)),
+                    },
+                    Err(error) => responder.respond_with_error(internal_error(error)),
+                }
             },
             on_receive_request!(),
         )
@@ -237,6 +284,7 @@ fn agent_capabilities() -> v2::AgentCapabilities {
                     .image(v2::PromptImageCapabilities::new())
                     .embedded_context(v2::PromptEmbeddedContextCapabilities::new()),
             )
+            .fork(v2::SessionForkCapabilities::new())
             .delete(v2::SessionDeleteCapabilities::new()),
     )
 }
@@ -302,7 +350,7 @@ async fn run_load(
             return;
         }
     };
-    let connection = AcpConnection::new(AcpProtocol::V1, cx);
+    let connection = AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
     if responder
         .respond(v1::LoadSessionResponse::new().config_options(options))
         .is_ok()
@@ -349,7 +397,7 @@ async fn run_resume(
             return;
         }
     };
-    let connection = AcpConnection::new(AcpProtocol::V1, cx);
+    let connection = AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
     if responder.respond(response).is_ok() {
         if activate_observer(&runtime, &session_id, &connection, prepared)
             .await
@@ -395,7 +443,7 @@ async fn run_prompt(
             return;
         }
     };
-    let connection = AcpConnection::new(AcpProtocol::V1, cx);
+    let connection = AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
     let observer = match activate_observer(&runtime, &session_id, &connection, prepared).await {
         Ok(observer) => observer,
         Err(error) => {
@@ -423,6 +471,7 @@ async fn run_prompt(
             return;
         }
     };
+    send_fork_result(&connection, &session_id, &value);
     if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
         let prompt = serde_json::to_value(request.prompt).unwrap_or_else(|_| Value::Array(vec![]));
         send_user_message(&connection, &session_id, message_id, &prompt);
@@ -468,6 +517,7 @@ async fn submit_prompt(
             "session.resume-turn",
             json!({"session_id": session_id, "endpoint_id": observer.endpoint_id}),
         ),
+        Some(SlashCommand::Fork) => ("session.fork", json!({"session_id": session_id})),
         None => (
             "session.prompt",
             json!({
@@ -518,13 +568,35 @@ async fn set_config_option(
         && let Some((used, size)) = snapshot_usage(&changed)
     {
         send_usage_update(
-            &AcpConnection::new(AcpProtocol::V1, cx),
+            &AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone()),
             &session_id,
             used,
             size,
         );
     }
     result
+}
+
+#[cfg(test)]
+mod compaction_capability_tests {
+    use super::*;
+
+    #[test]
+    fn v1_requires_the_session_compaction_capability() {
+        let unsupported: InitializeRequest = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"session": {}}
+        }))
+        .unwrap();
+        assert!(!advertises_compaction(&unsupported));
+
+        let supported: InitializeRequest = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"session": {"compaction": {}}}
+        }))
+        .unwrap();
+        assert!(advertises_compaction(&supported));
+    }
 }
 
 async fn close_session(runtime: &AcpRuntime, session_id: String) -> Result<()> {

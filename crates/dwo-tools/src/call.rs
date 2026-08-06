@@ -22,6 +22,12 @@ pub enum ToolCall {
     Terminal(TerminalArgs),
     FileEdit(FileEditArgs),
     ReadFile(ReadFileArgs),
+    Handoff(HandoffArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffArgs {
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +76,7 @@ pub enum ToolIntent {
     },
     FileEdit,
     ReadFile,
+    Handoff,
 }
 
 impl ToolCall {
@@ -89,6 +96,7 @@ impl ToolCall {
             },
             Self::FileEdit(_) => ToolIntent::FileEdit,
             Self::ReadFile(_) => ToolIntent::ReadFile,
+            Self::Handoff(_) => ToolIntent::Handoff,
         }
     }
 
@@ -97,6 +105,7 @@ impl ToolCall {
             Self::Terminal(_) => "terminal",
             Self::FileEdit(_) => "file_edit",
             Self::ReadFile(_) => "read_file",
+            Self::Handoff(_) => "handoff",
         }
     }
 }
@@ -140,6 +149,9 @@ impl ParsedToolCall {
             "read_file" => ToolCall::ReadFile(
                 parse_read_file(&arguments).map_err(|message| parse_error(&id, &name, message))?,
             ),
+            "handoff" => ToolCall::Handoff(
+                parse_handoff(&arguments).map_err(|message| parse_error(&id, &name, message))?,
+            ),
             _ => return Err(parse_error(&id, &name, format!("Unknown tool: {name}"))),
         };
         Ok(Self {
@@ -148,6 +160,17 @@ impl ParsedToolCall {
             raw_arguments: arguments,
         })
     }
+}
+
+fn parse_handoff(args: &Map<String, Value>) -> Result<HandoffArgs, String> {
+    let text = required_string(args, "handoff_text")?;
+    if text.trim().is_empty() {
+        return Err("handoff_text must not be empty.".to_string());
+    }
+    if text.len() > 32_000 {
+        return Err("handoff_text must not exceed 32000 UTF-8 bytes.".to_string());
+    }
+    Ok(HandoffArgs { text })
 }
 
 fn parse_arguments(value: Option<&Value>) -> Result<Map<String, Value>, String> {
@@ -349,6 +372,27 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.message.contains("between 1 and 500"));
+    }
+
+    #[test]
+    fn handoff_requires_bounded_nonempty_text() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id": "handoff-1",
+            "name": "handoff",
+            "arguments": {"handoff_text": "done; next: test"}
+        }))
+        .unwrap();
+        assert!(
+            matches!(parsed.call, ToolCall::Handoff(HandoffArgs { ref text }) if text == "done; next: test")
+        );
+
+        let error = ParsedToolCall::parse(json!({
+            "id": "handoff-2",
+            "name": "handoff",
+            "arguments": {"handoff_text": "  "}
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("must not be empty"));
     }
 
     #[test]

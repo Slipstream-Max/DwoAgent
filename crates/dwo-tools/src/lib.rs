@@ -12,7 +12,7 @@ pub mod schema;
 mod telemetry;
 pub mod terminal;
 
-pub use call::{ParsedToolCall, ToolCall, ToolCallParseError, ToolIntent};
+pub use call::{HandoffArgs, ParsedToolCall, ToolCall, ToolCallParseError, ToolIntent};
 pub use file_edit::FileEditManager;
 pub use manager::{
     ConfirmationDecision, ConfirmationHandler, ConfirmationRequest, ExecutionContext, ToolManager,

@@ -98,7 +98,7 @@ pub(crate) async fn execute(
                 );
                 json!({
                     "tool": "file_edit",
-                    "kind": "file_edit",
+                    "kind": "other",
                     "status": "completed",
                     "changes": result.changes,
                 })
@@ -123,6 +123,12 @@ pub(crate) async fn execute(
                     result.output
                 })
         }
+        ToolCall::Handoff(args) => Ok(json!({
+            "tool": "handoff",
+            "kind": "other",
+            "status": "completed",
+            "handoff_text": args.text,
+        })),
     };
 
     ToolResult {
@@ -151,6 +157,24 @@ pub(crate) async fn execute_batch(
         .into_iter()
         .map(ParsedToolCall::parse)
         .collect::<Vec<_>>();
+    let handoff_count = parsed_calls
+        .iter()
+        .filter(|parsed| matches!(parsed, Ok(call) if matches!(call.call, ToolCall::Handoff(_))))
+        .count();
+    if handoff_count > 0 && parsed_calls.len() > 1 {
+        return parsed_calls
+            .into_iter()
+            .map(|parsed| match parsed {
+                Ok(call) => result_error_with_code(
+                    &call.id,
+                    call.call.name(),
+                    "handoff_must_be_only_tool",
+                    "handoff must be the only tool call in a batch.",
+                ),
+                Err(error) => result_error(&error.id, &error.name, error.message),
+            })
+            .collect();
+    }
     let file_edit_count = parsed_calls
         .iter()
         .filter(|parsed| match parsed {
@@ -222,7 +246,7 @@ pub(crate) async fn execute_batch(
 fn terminal_output(snapshot: crate::terminal::TerminalSnapshot) -> Value {
     json!({
         "tool": "terminal",
-        "kind": "terminal",
+        "kind": "other",
         "terminal_id": snapshot.terminal_id,
         "status": snapshot.status,
         "exit_code": snapshot.exit_code,
@@ -287,10 +311,6 @@ fn error_output(name: &str, message: impl Into<String>) -> Value {
 }
 
 fn tool_kind(name: &str) -> &'static str {
-    match name {
-        "terminal" => "terminal",
-        "file_edit" => "file_edit",
-        "read_file" => "read_file",
-        _ => "unknown",
-    }
+    let _ = name;
+    "other"
 }

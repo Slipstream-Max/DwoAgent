@@ -184,6 +184,16 @@ impl ContextManager {
         self.extend_messages(messages);
     }
 
+    /// Removes a control-tool exchange from the model context while leaving
+    /// the client transcript untouched.
+    pub fn remove_tool_call(&mut self, tool_call_id: &str) {
+        self.context.messages.retain(|message| {
+            message.tool_call_id.as_deref() != Some(tool_call_id)
+                && !message.calls_tool(tool_call_id)
+        });
+        self.recalculate_message_tokens();
+    }
+
     pub fn append_pending(&mut self, batch: PendingMessageBatch) -> bool {
         for message in batch.messages {
             match message {

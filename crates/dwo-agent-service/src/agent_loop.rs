@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dwo_context::{
-    CompactionPlan, CompactionPlanner, ContextManager, PendingMessageBatch, SessionContext,
-    SystemPromptBuilder, TurnId,
+    CompactionPlan, CompactionPlanner, ContextManager, MessageKind, PendingMessageBatch,
+    SessionContext, SystemPromptBuilder, TurnId,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection, ModelStreamEvent};
 use dwo_tools::{ExecutionContext, ParsedToolCall, ToolEvent, ToolManager, ToolResult};
@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 use crate::events::ActiveToolCall;
 use crate::permission::PermissionRequester;
 use crate::record::{SessionConfig, SessionId, SessionLlmSettings};
+
+const HANDOFF_CONTINUATION: &str = "<handoff_continuation>The handoff has already been completed and the model context has been rebuilt from the handoff summary. Continue the user's original task from this context. Do not call handoff again unless a genuinely new context rebuild is necessary.</handoff_continuation>";
 
 pub(crate) enum TurnActorMessage {
     Event(TurnEvent),
@@ -380,8 +382,14 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             results = turn.tools.execute_batch(calls.clone(), &execution) => results,
         };
 
+        let handoff_ids = tool_results
+            .iter()
+            .filter(|result| handoff_text(result).is_some())
+            .map(|result| result.tool_call_id.clone())
+            .collect::<Vec<_>>();
         let context_results = tool_results
             .iter()
+            .filter(|result| handoff_text(result).is_none())
             .map(ToolResult::context_record)
             .collect::<Vec<_>>();
         for result in &tool_results {
@@ -415,6 +423,34 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             }
         };
         turn.context.append_pending(pending);
+        if let Some(handoff_text) = tool_results.iter().find_map(handoff_text) {
+            for tool_call_id in handoff_ids {
+                turn.context.remove_tool_call(&tool_call_id);
+            }
+            let plan = turn.context.plan_compaction(&CompactionPlanner::default());
+            if let Err(error) = compact_context_with_summary(
+                turn,
+                plan,
+                handoff_text.to_string(),
+                &model_step.selection,
+            )
+            .await
+            {
+                return TurnOutcome::Failed(format!("apply handoff context: {error:#}"));
+            }
+            turn.context
+                .append_internal(MessageKind::Runtime, HANDOFF_CONTINUATION);
+            if let Err(error) = turn.checkpoint().await {
+                return TurnOutcome::Failed(format!("persist handoff continuation: {error:#}"));
+            }
+            tracing::info!(
+                event = "context.handoff_continuing",
+                session_id = %turn.session_id,
+                turn_id = %turn.turn_id,
+                "handoff context rebuilt; continuing turn"
+            );
+            continue;
+        }
         if let Err(error) = turn.checkpoint().await {
             return TurnOutcome::Failed(format!("persist tool checkpoint: {error:#}"));
         }
@@ -571,7 +607,6 @@ async fn compact_context(
     if !plan.needs_replacement() {
         return Ok(false);
     }
-    let started = Instant::now();
     tracing::info!(
         event = "context.compaction_started",
         session_id = %turn.session_id,
@@ -579,16 +614,30 @@ async fn compact_context(
         model = %selection.model,
         "context compaction started"
     );
-    let model = selection.model.clone();
     let summary = if plan.has_compactable_history() {
         let summary = turn
             .model
-            .summarize(selection, plan.view.clone(), turn.cancellation.clone())
+            .summarize(
+                selection.clone(),
+                plan.view.clone(),
+                turn.cancellation.clone(),
+            )
             .await?;
         summary.summary
     } else {
         String::new()
     };
+    compact_context_with_summary(turn, plan, summary, &selection).await?;
+    Ok(true)
+}
+
+async fn compact_context_with_summary(
+    turn: &mut RunTurn,
+    plan: CompactionPlan,
+    summary: String,
+    selection: &ModelSelection,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
     turn.context
         .apply_compaction(plan, summary, &turn.prompt_builder, turn.tools.schemas())?;
     turn.checkpoint().await?;
@@ -596,11 +645,18 @@ async fn compact_context(
         event = "context.compaction_completed",
         session_id = %turn.session_id,
         turn_id = %turn.turn_id,
-        model = %model,
+        model = %selection.model,
         duration_ms = started.elapsed().as_millis() as u64,
         "context compaction completed"
     );
-    Ok(true)
+    Ok(())
+}
+
+fn handoff_text(result: &ToolResult) -> Option<&str> {
+    (result.tool_name == "handoff"
+        && result.output.get("status").and_then(Value::as_str) == Some("completed"))
+    .then(|| result.output.get("handoff_text").and_then(Value::as_str))
+    .flatten()
 }
 
 async fn compact_if_needed(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Result<()> {
@@ -659,7 +715,7 @@ fn cancelled_results(calls: &[Value]) -> Vec<ToolResult> {
                 tool_name: tool_name.clone(),
                 output: json!({
                     "tool": tool_name,
-                    "kind": "cancelled",
+                    "kind": "other",
                     "status": "cancelled",
                     "error": "turn cancelled",
                 }),

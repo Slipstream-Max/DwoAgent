@@ -222,8 +222,8 @@ impl SystemPromptBuilder {
             .expect("external skill dirs lock poisoned")
             .clone();
         for dir in external {
-            for skill in skills::scan(&dir)
-                .map_err(|error| PromptBuildError::Skills(error.to_string()))?
+            for skill in
+                skills::scan(&dir).map_err(|error| PromptBuildError::Skills(error.to_string()))?
             {
                 skills.retain(|existing| existing.name != skill.name);
                 skills.push(skill);

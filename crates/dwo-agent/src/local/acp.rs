@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -147,11 +147,54 @@ where
 struct AcpConnection {
     protocol: AcpProtocol,
     inner: ConnectionTo<Client>,
+    delivered: Arc<StdMutex<DeliveredMessages>>,
+}
+
+#[derive(Default)]
+struct DeliveredMessages {
+    agent: HashSet<String>,
+    thought: HashSet<String>,
 }
 
 impl AcpConnection {
     fn new(protocol: AcpProtocol, inner: ConnectionTo<Client>) -> Self {
-        Self { protocol, inner }
+        Self {
+            protocol,
+            inner,
+            delivered: Arc::new(StdMutex::new(DeliveredMessages::default())),
+        }
+    }
+
+    fn mark_streamed(&self, message_id: &str, thought: bool) {
+        if self.protocol != AcpProtocol::V1 {
+            return;
+        }
+        let mut delivered = self
+            .delivered
+            .lock()
+            .expect("delivered messages lock poisoned");
+        delivered.select_mut(thought).insert(message_id.to_string());
+    }
+
+    fn should_send_completed(&self, message_id: &str, thought: bool) -> bool {
+        if self.protocol != AcpProtocol::V1 {
+            return true;
+        }
+        let mut delivered = self
+            .delivered
+            .lock()
+            .expect("delivered messages lock poisoned");
+        delivered.select_mut(thought).insert(message_id.to_string())
+    }
+}
+
+impl DeliveredMessages {
+    fn select_mut(&mut self, thought: bool) -> &mut HashSet<String> {
+        if thought {
+            &mut self.thought
+        } else {
+            &mut self.agent
+        }
     }
 }
 
@@ -1103,6 +1146,7 @@ fn send_user_message(cx: &AcpConnection, session_id: &str, message_id: &str, con
 }
 
 fn send_agent_chunk(cx: &AcpConnection, session_id: &str, message_id: &str, text: &str) {
+    cx.mark_streamed(message_id, false);
     send_update(
         cx,
         session_id,
@@ -1114,6 +1158,7 @@ fn send_agent_chunk(cx: &AcpConnection, session_id: &str, message_id: &str, text
 }
 
 fn send_thought_chunk(cx: &AcpConnection, session_id: &str, message_id: &str, text: &str) {
+    cx.mark_streamed(message_id, true);
     send_update(
         cx,
         session_id,
@@ -1129,7 +1174,8 @@ fn send_assistant_completed(cx: &AcpConnection, session_id: &str, payload: &Valu
     if let (Some(message_id), Some(reasoning)) = (
         payload.get("thought_message_id").and_then(Value::as_str),
         reasoning,
-    ) {
+    ) && cx.should_send_completed(message_id, true)
+    {
         send_update(
             cx,
             session_id,
@@ -1140,6 +1186,7 @@ fn send_assistant_completed(cx: &AcpConnection, session_id: &str, payload: &Valu
     }
     if let (Some(message_id), Some(content)) =
         (payload.get("message_id").and_then(Value::as_str), content)
+        && cx.should_send_completed(message_id, false)
     {
         send_update(
             cx,

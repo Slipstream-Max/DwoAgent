@@ -77,3 +77,10 @@ from the complete context and tool schemas after each message checkpoint; model
 provider input/output usage is not accumulated or used as the session context
 counter. The model trigger is based on `contextWindowTokens - maxOutputTokens`
 and `compactThreshold`, with no additional fixed 10K headroom.
+
+Handoff compaction uses the same plan and replacement path, except the summary
+comes from the model-provided `handoff_text` instead of a summary request.
+`ContextManager::remove_tool_call` first drops the handoff tool-call exchange
+from model history; `apply_compaction` then rebuilds the context with the
+handoff summary and the caller appends a `<handoff_continuation>` runtime
+message so the same turn continues. The client transcript is untouched.

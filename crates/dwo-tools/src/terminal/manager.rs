@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use super::process::{ProcessSnapshot, ProcessStatus, TerminalProcess, resolve_cwd};
+use crate::ToolEventHandler;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TerminalId(String);
@@ -58,6 +59,20 @@ struct TerminalEntry {
     operation: Mutex<()>,
 }
 
+pub(crate) struct TerminalTelemetry {
+    tool_call_id: String,
+    events: Option<ToolEventHandler>,
+}
+
+impl TerminalTelemetry {
+    pub(crate) fn new(tool_call_id: String, events: Option<ToolEventHandler>) -> Self {
+        Self {
+            tool_call_id,
+            events,
+        }
+    }
+}
+
 pub struct TerminalManager {
     base_cwd: PathBuf,
     environment: HashMap<String, String>,
@@ -101,11 +116,34 @@ impl TerminalManager {
         yield_ms: u64,
         timeout_ms: Option<u64>,
     ) -> Result<TerminalSnapshot> {
+        self.run_with_events(command, cwd, tty, yield_ms, timeout_ms, None)
+            .await
+    }
+
+    pub(crate) async fn run_with_events(
+        &self,
+        command: String,
+        cwd: Option<&Path>,
+        tty: bool,
+        yield_ms: u64,
+        timeout_ms: Option<u64>,
+        telemetry: Option<TerminalTelemetry>,
+    ) -> Result<TerminalSnapshot> {
+        let (tool_call_id, events) = telemetry
+            .map(|telemetry| (telemetry.tool_call_id, telemetry.events))
+            .unwrap_or_default();
         let cwd = resolve_cwd(&self.base_cwd, cwd)?;
         let terminal_id = TerminalId::new();
-        let process =
-            TerminalProcess::spawn(terminal_id.clone(), command, cwd, tty, &self.environment)
-                .await?;
+        let process = TerminalProcess::spawn(
+            terminal_id.clone(),
+            tool_call_id,
+            command,
+            cwd,
+            tty,
+            &self.environment,
+            events,
+        )
+        .await?;
         let entry = Arc::new(TerminalEntry {
             process: process.clone(),
             operation: Mutex::new(()),
@@ -200,7 +238,10 @@ fn render_snapshot(process: &TerminalProcess, snapshot: ProcessSnapshot) -> Term
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+
     use super::*;
+    use crate::ToolEvent;
 
     fn output_command() -> &'static str {
         if cfg!(windows) {
@@ -219,6 +260,67 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.status, "completed");
         assert!(snapshot.output.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_streams_open_output_and_exit_in_order() {
+        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let events: ToolEventHandler = Arc::new({
+            let recorded = recorded.clone();
+            move |event| recorded.lock().unwrap().push(event)
+        });
+
+        manager
+            .run_with_events(
+                output_command().to_string(),
+                None,
+                false,
+                5_000,
+                None,
+                Some(TerminalTelemetry::new("call-1".to_string(), Some(events))),
+            )
+            .await
+            .unwrap();
+
+        let events = recorded.lock().unwrap();
+        assert!(events.len() >= 3, "incomplete telemetry: {events:?}");
+        let (terminal_id, cwd) = match &events[0] {
+            ToolEvent::TerminalOpened {
+                tool_call_id,
+                terminal_id,
+                cwd,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call-1");
+                (terminal_id, cwd)
+            }
+            event => panic!("first event was not terminal_opened: {event:?}"),
+        };
+        assert!(cwd.is_absolute());
+        let output = events[1..events.len() - 1]
+            .iter()
+            .flat_map(|event| match event {
+                ToolEvent::TerminalOutput {
+                    terminal_id: output_id,
+                    data,
+                } => {
+                    assert_eq!(output_id, terminal_id);
+                    data.iter()
+                }
+                event => panic!("unexpected event between open and exit: {event:?}"),
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(String::from_utf8_lossy(&output).contains("done"));
+        assert!(matches!(
+            events.last(),
+            Some(ToolEvent::TerminalExited {
+                terminal_id: exit_id,
+                status,
+                ..
+            }) if exit_id == terminal_id && status == "completed"
+        ));
     }
 
     #[tokio::test]

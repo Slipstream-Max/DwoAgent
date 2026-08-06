@@ -23,6 +23,9 @@ pub fn estimate_content_tokens(content: &MessageContent) -> u64 {
 }
 
 pub fn estimate_message_tokens(message: &ContextMessage) -> u64 {
+    if let Some(item) = &message.response_item {
+        return MESSAGE_OVERHEAD_TOKENS.saturating_add(estimate_serialized_tokens(item));
+    }
     let mut tokens =
         MESSAGE_OVERHEAD_TOKENS.saturating_add(estimate_content_tokens(&message.content));
     if let Some(reasoning) = &message.reasoning {
@@ -220,6 +223,20 @@ mod tests {
 
         assert!(without_tools > estimate_content_tokens(&MessageContent::text("answer")));
         assert!(with_tools > without_tools);
+    }
+
+    #[test]
+    fn native_response_item_is_counted_without_projected_content() {
+        let item = json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"answer"}]
+        });
+        let message = ContextMessage::response_item(item.clone(), None);
+        assert_eq!(
+            estimate_message_tokens(&message),
+            MESSAGE_OVERHEAD_TOKENS + estimate_serialized_tokens(&item)
+        );
     }
 
     #[test]

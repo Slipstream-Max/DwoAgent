@@ -5,149 +5,140 @@ use dwo_context::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::{ModelClientError, ModelUsage};
+use crate::{FinishReason, ModelClientError, ModelReply, ModelUsage};
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamAccumulator {
     pub content: String,
     pub reasoning: String,
-    pub tool_calls: BTreeMap<u64, PartialToolCall>,
-    pub finish_reason: Option<String>,
-    pub usage: Option<ModelUsage>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct PartialToolCall {
-    id: String,
-    name: String,
-    arguments: String,
+    pub output_items: BTreeMap<u64, Value>,
+    pub response: Option<Value>,
 }
 
 impl StreamAccumulator {
-    pub fn merge_tool_calls(&mut self, deltas: &[Value]) {
-        for (fallback_index, delta) in deltas.iter().enumerate() {
-            let Some(object) = delta.as_object() else {
-                continue;
-            };
-            let index = object
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or(fallback_index as u64);
-            let call = self.tool_calls.entry(index).or_default();
-            if let Some(id) = object.get("id").and_then(Value::as_str) {
-                call.id.push_str(id);
-            }
-            let function = object.get("function").and_then(Value::as_object);
-            if let Some(name) = function
-                .and_then(|value| value.get("name"))
-                .and_then(Value::as_str)
-            {
-                call.name.push_str(name);
-            }
-            if let Some(arguments) = function
-                .and_then(|value| value.get("arguments"))
-                .and_then(Value::as_str)
-            {
-                call.arguments.push_str(arguments);
-            }
+    pub fn add_output_item(&mut self, index: u64, item: Value) {
+        self.output_items.insert(index, item);
+    }
+
+    pub fn append_function_arguments(&mut self, index: u64, delta: &str) {
+        let item = self
+            .output_items
+            .entry(index)
+            .or_insert_with(|| json!({"type":"function_call", "arguments":""}));
+        let Some(object) = item.as_object_mut() else {
+            return;
+        };
+        let arguments = object
+            .entry("arguments")
+            .or_insert_with(|| Value::String(String::new()));
+        if let Some(current) = arguments.as_str().map(str::to_string) {
+            *arguments = Value::String(format!("{current}{delta}"));
         }
     }
 
-    pub fn normalized_tool_calls(self) -> Vec<Value> {
-        self.tool_calls
-            .into_values()
-            .map(|call| {
-                json!({
-                    "id": call.id,
-                    "name": call.name,
-                    "arguments": normalize_arguments(&call.arguments),
-                })
-            })
-            .collect()
+    pub fn finish(self) -> Result<ModelReply, ModelClientError> {
+        if let Some(response) = self.response {
+            return parse_response(&response);
+        }
+        let output = self.output_items.into_values().collect::<Vec<_>>();
+        reply_from_output(
+            self.content,
+            (!self.reasoning.is_empty()).then_some(self.reasoning),
+            output,
+            FinishReason::Stop,
+            ModelUsage::default(),
+        )
     }
 }
 
-pub(crate) fn provider_messages(
+pub(crate) fn provider_input(
     messages: &[ContextMessage],
     allow_image_input: bool,
 ) -> Result<Vec<Value>, ModelClientError> {
-    let mut output = Vec::with_capacity(messages.len());
+    let mut output = Vec::new();
     for message in messages {
-        output.push(provider_message(message, allow_image_input)?);
+        if let Some(item) = message.response_item.as_ref() {
+            output.push(item.clone());
+            continue;
+        }
+        match message.role {
+            MessageRole::System | MessageRole::User | MessageRole::Assistant => {
+                if !message.content.is_empty() {
+                    output.push(json!({
+                        "type":"message",
+                        "role":role_name(message.role),
+                        "content":provider_content(&message.content, message.role, allow_image_input)?,
+                    }));
+                }
+                if message.role == MessageRole::Assistant {
+                    output.extend(
+                        message
+                            .tool_calls
+                            .iter()
+                            .map(provider_function_call)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                }
+            }
+            MessageRole::Tool => output.push(json!({
+                "type":"function_call_output",
+                "call_id":message.tool_call_id.as_deref().unwrap_or_default(),
+                "output":content_as_output(&message.content)?,
+            })),
+        }
     }
     Ok(output)
 }
 
-fn provider_message(
-    message: &ContextMessage,
-    allow_image_input: bool,
-) -> Result<Value, ModelClientError> {
-    match message.role {
-        MessageRole::System => Ok(json!({
-            "role":"system",
-            "content": provider_content(&message.content, false, allow_image_input)?
-        })),
-        MessageRole::User => Ok(json!({
-            "role":"user",
-            "content": provider_content(&message.content, true, allow_image_input)?
-        })),
-        MessageRole::Assistant => {
-            let tool_calls = message
-                .tool_calls
-                .iter()
-                .map(provider_tool_call)
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut object = Map::new();
-            object.insert("role".to_string(), Value::String("assistant".to_string()));
-            object.insert(
-                "content".to_string(),
-                if message.content.is_empty() && !tool_calls.is_empty() {
-                    Value::Null
-                } else {
-                    provider_content(&message.content, false, allow_image_input)?
-                },
-            );
-            if !tool_calls.is_empty() {
-                object.insert("tool_calls".to_string(), Value::Array(tool_calls));
-            }
-            if let Some(reasoning) = &message.reasoning {
-                object.insert(
-                    "reasoning_content".to_string(),
-                    Value::String(reasoning.clone()),
-                );
-            }
-            Ok(Value::Object(object))
+pub(crate) fn provider_tools(
+    local_tools: &[Value],
+    hosted_tools: &[Value],
+) -> Result<Vec<Value>, ModelClientError> {
+    let mut tools = hosted_tools.to_vec();
+    for tool in local_tools {
+        let object = tool
+            .as_object()
+            .ok_or_else(|| ModelClientError::protocol("tool definition must be an object"))?;
+        if object.get("type").and_then(Value::as_str) != Some("function") {
+            tools.push(tool.clone());
+            continue;
         }
-        MessageRole::Tool => Ok(json!({
-            "role":"tool",
-            "content":provider_content(&message.content, false, allow_image_input)?,
-            "tool_call_id":message.tool_call_id,
-        })),
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .unwrap_or(object);
+        let mut flattened = function.clone();
+        flattened.insert("type".to_string(), Value::String("function".to_string()));
+        tools.push(Value::Object(flattened));
     }
+    Ok(tools)
 }
 
 fn provider_content(
     content: &MessageContent,
-    is_user_message: bool,
+    role: MessageRole,
     allow_image_input: bool,
-) -> Result<Value, ModelClientError> {
+) -> Result<Vec<Value>, ModelClientError> {
     if let Some(text) = content.as_text() {
-        return Ok(Value::String(text.to_string()));
+        return Ok(vec![json!({"type":"input_text", "text":text})]);
     }
     let mut blocks = Vec::with_capacity(content.as_blocks().len());
     for block in content.as_blocks() {
         match block {
-            ContentBlock::Text { text, .. } => {
-                blocks.push(json!({"type":"text", "text":text}));
-            }
+            ContentBlock::Text { text, .. } => blocks.push(json!({
+                "type":"input_text",
+                "text":text,
+            })),
             ContentBlock::Image {
                 mime_type, data, ..
-            } if is_user_message && allow_image_input => {
-                let url = format!("data:{mime_type};base64,{data}");
-                blocks.push(json!({"type":"image_url", "image_url":{"url":url}}));
+            } if role == MessageRole::User && allow_image_input => {
+                blocks.push(json!({
+                    "type":"input_image",
+                    "image_url":format!("data:{mime_type};base64,{data}"),
+                }));
             }
             ContentBlock::Image { .. } => {
-                let reason = if !is_user_message {
+                let reason = if role != MessageRole::User {
                     "images are only valid in user messages"
                 } else {
                     "selected model does not support image input"
@@ -166,7 +157,7 @@ fn provider_content(
             } => {
                 let mime = mime_type.as_deref().unwrap_or("text/plain");
                 blocks.push(json!({
-                    "type":"text",
+                    "type":"input_text",
                     "text":format!("<embedded_resource uri=\"{uri}\" mime_type=\"{mime}\">\n{text}\n</embedded_resource>")
                 }));
             }
@@ -175,7 +166,7 @@ fn provider_content(
                 ..
             } => {
                 return Err(ModelClientError::protocol(
-                    "OpenAI-compatible chat completions do not support blob resources",
+                    "Responses API blob resource input is not implemented",
                 ));
             }
             ContentBlock::ResourceLink {
@@ -197,61 +188,152 @@ fn provider_content(
                 if let Some(description) = description {
                     text.push_str(&format!("\n{description}"));
                 }
-                blocks.push(json!({"type":"text", "text":text}));
+                blocks.push(json!({"type":"input_text", "text":text}));
             }
             ContentBlock::Audio { .. } => {
                 return Err(ModelClientError::protocol(
-                    "OpenAI-compatible chat completions audio input is not implemented",
+                    "Responses API audio input is not implemented",
                 ));
             }
         }
     }
-    Ok(Value::Array(blocks))
+    Ok(blocks)
 }
 
-fn provider_tool_call(call: &Value) -> Result<Value, ModelClientError> {
+fn role_name(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "user",
+    }
+}
+
+fn content_as_output(content: &MessageContent) -> Result<String, ModelClientError> {
+    if let Some(text) = content.as_text() {
+        return Ok(text.to_string());
+    }
+    serde_json::to_string(content).map_err(|error| ModelClientError::protocol(error.to_string()))
+}
+
+fn provider_function_call(call: &Value) -> Result<Value, ModelClientError> {
     let object = call
         .as_object()
         .ok_or_else(|| ModelClientError::protocol("stored tool call must be an object"))?;
-    let id = object.get("id").and_then(Value::as_str).unwrap_or_default();
-    let name = object
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let arguments = match object.get("arguments") {
-        Some(Value::String(arguments)) => arguments.clone(),
-        Some(arguments) => serde_json::to_string(arguments)
-            .map_err(|error| ModelClientError::protocol(error.to_string()))?,
-        None => "{}".to_string(),
-    };
     Ok(json!({
-        "id":id,
-        "type":"function",
-        "function":{"name":name, "arguments":arguments},
+        "type":"function_call",
+        "call_id":object.get("id").and_then(Value::as_str).unwrap_or_default(),
+        "name":object.get("name").and_then(Value::as_str).unwrap_or_default(),
+        "arguments":arguments_string(object.get("arguments"))?,
     }))
 }
 
-pub(crate) fn normalize_response_tool_calls(value: Option<&Value>) -> Vec<Value> {
-    value
+fn arguments_string(value: Option<&Value>) -> Result<String, ModelClientError> {
+    match value {
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(value) => serde_json::to_string(value)
+            .map_err(|error| ModelClientError::protocol(error.to_string())),
+        None => Ok("{}".to_string()),
+    }
+}
+
+pub(crate) fn parse_response(payload: &Value) -> Result<ModelReply, ModelClientError> {
+    let output = payload
+        .get("output")
         .and_then(Value::as_array)
-        .into_iter()
+        .cloned()
+        .ok_or_else(|| ModelClientError::protocol("missing response.output"))?;
+    let status = payload.get("status").and_then(Value::as_str);
+    let finish_reason = match status {
+        Some("incomplete") => FinishReason::Length,
+        Some("completed") | None => FinishReason::Stop,
+        Some(other) => FinishReason::Other(other.to_string()),
+    };
+    reply_from_output(
+        response_text(&output),
+        response_reasoning(&output),
+        output,
+        finish_reason,
+        usage(payload.get("usage")),
+    )
+}
+
+fn reply_from_output(
+    content: String,
+    reasoning: Option<String>,
+    output_items: Vec<Value>,
+    mut finish_reason: FinishReason,
+    usage: ModelUsage,
+) -> Result<ModelReply, ModelClientError> {
+    let tool_calls = normalize_function_calls(&output_items);
+    if !tool_calls.is_empty() {
+        finish_reason = FinishReason::ToolCalls;
+    }
+    let remote_tool_calls = normalize_remote_tool_calls(&output_items);
+    Ok(ModelReply {
+        content,
+        reasoning,
+        tool_calls,
+        remote_tool_calls,
+        output_items,
+        finish_reason,
+        usage,
+    })
+}
+
+fn response_text(output: &[Value]) -> String {
+    output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
         .flatten()
-        .filter_map(|call| {
-            let object = call.as_object()?;
-            let function = object.get("function").and_then(Value::as_object);
-            Some(json!({
-                "id": object.get("id").and_then(Value::as_str).unwrap_or_default(),
-                "name": function
-                    .and_then(|value| value.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                "arguments": normalize_arguments(
-                    function
-                        .and_then(|value| value.get("arguments"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                ),
-            }))
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>()
+}
+
+fn response_reasoning(output: &[Value]) -> Option<String> {
+    let text = output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .filter_map(|item| item.get("summary").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
+}
+
+fn normalize_function_calls(output: &[Value]) -> Vec<Value> {
+    output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(|item| {
+            json!({
+                "id":item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default(),
+                "name":item.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "arguments":normalize_arguments(item.get("arguments").and_then(Value::as_str).unwrap_or_default()),
+            })
+        })
+        .collect()
+}
+
+fn normalize_remote_tool_calls(output: &[Value]) -> Vec<Value> {
+    output
+        .iter()
+        .filter(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.ends_with("_call") && kind != "function_call")
+        })
+        .map(|item| {
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("remote_tool_call");
+            json!({
+                "id":item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or_default(),
+                "name":kind.strip_suffix("_call").unwrap_or(kind),
+                "arguments":item,
+                "status":item.get("status").cloned().unwrap_or(Value::Null),
+                "remote":true,
+            })
         })
         .collect()
 }
@@ -262,8 +344,7 @@ fn normalize_arguments(arguments: &str) -> Value {
         return Value::Object(Map::new());
     }
     match serde_json::from_str::<Value>(arguments) {
-        Ok(Value::Object(object)) => Value::Object(object),
-        Ok(other) => other,
+        Ok(value) => value,
         Err(_) => Value::String(arguments.to_string()),
     }
 }
@@ -273,13 +354,11 @@ pub(crate) fn usage(value: Option<&Value>) -> ModelUsage {
         return ModelUsage::default();
     };
     let input_tokens = value
-        .get("prompt_tokens")
-        .or_else(|| value.get("input_tokens"))
+        .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or_default();
     let output_tokens = value
-        .get("completion_tokens")
-        .or_else(|| value.get("output_tokens"))
+        .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or_default();
     let total_tokens = value
@@ -298,61 +377,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn malformed_arguments_remain_recoverable_by_the_tool_executor() {
-        let calls = normalize_response_tool_calls(Some(&json!([{
-            "id":"broken",
-            "function":{"name":"terminal", "arguments":"{not-json"}
-        }])));
-
-        assert_eq!(calls[0]["id"], "broken");
-        assert_eq!(calls[0]["name"], "terminal");
-        assert_eq!(calls[0]["arguments"], "{not-json");
+    fn responses_input_replays_native_items_and_function_outputs() {
+        let reasoning = ContextMessage::response_item(
+            json!({"type":"reasoning", "summary":[], "encrypted_content":"opaque"}),
+            Some("provider-a".to_string()),
+        );
+        let hosted = ContextMessage::response_item(
+            json!({"type":"web_search_call", "id":"ws-1", "status":"completed"}),
+            Some("provider-a".to_string()),
+        );
+        let message = ContextMessage::response_item(
+            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}),
+            None,
+        );
+        let result = dwo_context::ToolResultRecord {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "terminal".to_string(),
+            output: json!({"status":"ok"}),
+            model_context: Vec::new(),
+        };
+        let input = provider_input(
+            &[reasoning, hosted, message, ContextMessage::tool(&result)],
+            false,
+        )
+        .unwrap();
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[1]["type"], "web_search_call");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call-1");
     }
 
     #[test]
-    fn provider_messages_restore_assistant_reasoning_and_tool_shape() {
-        let message = ContextMessage::assistant_with_reasoning(
-            "",
-            Some("private reasoning".to_string()),
-            vec![json!({
-                "id":"call-1",
-                "name":"terminal",
-                "arguments":{"action":"run", "command":"pwd"}
+    fn response_parser_separates_local_and_hosted_tools() {
+        let reply = parse_response(&json!({
+            "status":"completed",
+            "output":[
+                {"type":"web_search_call", "id":"ws-1", "status":"completed"},
+                {"type":"function_call", "call_id":"call-1", "name":"terminal", "arguments":"{\"command\":\"pwd\"}"},
+                {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"ok"}]}
+            ],
+            "usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}
+        })).unwrap();
+        assert_eq!(reply.content, "ok");
+        assert_eq!(reply.tool_calls[0]["name"], "terminal");
+        assert_eq!(reply.remote_tool_calls[0]["name"], "web_search");
+        assert_eq!(reply.usage.total_tokens, 5);
+    }
+
+    #[test]
+    fn function_tools_are_flattened_for_responses() {
+        let tools = provider_tools(
+            &[json!({
+                "type":"function",
+                "function":{"name":"terminal","description":"run","parameters":{"type":"object"}}
             })],
-        );
-        let messages = provider_messages(&[message], false).unwrap();
-
-        assert_eq!(messages[0]["reasoning_content"], "private reasoning");
-        assert_eq!(messages[0]["content"], Value::Null);
-        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "terminal");
-        assert_eq!(
-            messages[0]["tool_calls"][0]["function"]["arguments"],
-            r#"{"action":"run","command":"pwd"}"#
-        );
-    }
-
-    #[test]
-    fn image_input_requires_an_explicit_model_capability() {
-        let message = ContextMessage::user(MessageContent::blocks(vec![ContentBlock::image(
-            "image/png",
-            "aGVsbG8=",
-        )]));
-
-        let error = provider_messages(&[message], false).unwrap_err();
-        assert!(error.to_string().contains("does not support image input"));
-    }
-
-    #[test]
-    fn response_usage_is_optional_because_context_is_estimated_locally() {
-        assert_eq!(usage(None), ModelUsage::default());
-        assert_eq!(usage(Some(&json!({"prompt_tokens": 1}))).total_tokens, 1);
-        assert_eq!(
-            usage(Some(&json!({
-                "prompt_tokens": 2,
-                "completion_tokens": 3
-            })))
-            .total_tokens,
-            5
-        );
+            &[json!({"type":"web_search"})],
+        )
+        .unwrap();
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(tools[1]["name"], "terminal");
+        assert!(tools[1].get("function").is_none());
     }
 }

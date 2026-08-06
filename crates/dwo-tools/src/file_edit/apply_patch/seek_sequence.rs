@@ -5,24 +5,23 @@ pub(super) fn seek_sequence(
     eof: bool,
 ) -> Option<usize> {
     if pattern.is_empty() {
-        return Some(if eof {
-            lines.len()
-        } else {
-            start.min(lines.len())
-        });
+        return Some(start);
     }
     if pattern.len() > lines.len() {
         return None;
     }
-    let last = lines.len() - pattern.len();
-    let search_start = if eof { last } else { start.min(last) };
+    let search_start = if eof {
+        lines.len() - pattern.len()
+    } else {
+        start
+    };
     for strategy in [
         MatchStrategy::Exact,
         MatchStrategy::Rstrip,
         MatchStrategy::Trim,
         MatchStrategy::Unicode,
     ] {
-        for index in search_start..=last {
+        for index in search_start..=lines.len().saturating_sub(pattern.len()) {
             if pattern
                 .iter()
                 .enumerate()
@@ -33,48 +32,6 @@ pub(super) fn seek_sequence(
         }
     }
     None
-}
-
-pub(super) struct PartialMatch {
-    pub index: usize,
-    pub matched: usize,
-}
-
-pub(super) fn best_partial_match(
-    lines: &[String],
-    pattern: &[String],
-    start: usize,
-    eof: bool,
-) -> PartialMatch {
-    let first = start.min(lines.len());
-    let candidates = if eof {
-        let index = lines.len().saturating_sub(pattern.len());
-        index..=index
-    } else {
-        first..=lines.len()
-    };
-    let mut best = PartialMatch {
-        index: first,
-        matched: 0,
-    };
-    for strategy in [
-        MatchStrategy::Exact,
-        MatchStrategy::Rstrip,
-        MatchStrategy::Trim,
-        MatchStrategy::Unicode,
-    ] {
-        for index in candidates.clone() {
-            let matched = pattern
-                .iter()
-                .zip(lines.iter().skip(index))
-                .take_while(|(expected, actual)| line_matches(actual, expected, strategy))
-                .count();
-            if matched > best.matched || (matched == best.matched && index < best.index) {
-                best = PartialMatch { index, matched };
-            }
-        }
-    }
-    best
 }
 
 #[derive(Clone, Copy)]
@@ -109,4 +66,16 @@ fn normalize_unicode(value: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn does_not_search_backwards_when_cursor_is_past_last_match() {
+        let lines = ["a", "b", "c"].map(str::to_string);
+        let pattern = ["b", "c"].map(str::to_string);
+        assert_eq!(seek_sequence(&lines, &pattern, 3, false), None);
+    }
 }

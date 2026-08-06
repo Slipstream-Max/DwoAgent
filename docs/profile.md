@@ -193,7 +193,7 @@ model:
 
 内置 catalog 按 provider 分文件维护在
 `dwo-model-client/resources/providers/`。OpenAI-compatible 网关可以继承
-`openai`，只覆盖完整的 Chat Completions URL：
+`openai`，只覆盖完整的 Responses URL：
 
 ```yaml
 model:
@@ -201,7 +201,7 @@ model:
   providers:
     newapi:
       type: openai
-      baseUrl: https://gateway.example.com/v1/chat/completions
+      baseUrl: https://gateway.example.com/v1/responses
       apiKeyEnv: NEW_API_KEY
   models:
     - modelName: gpt-5.6-terra
@@ -209,9 +209,17 @@ model:
       modelId: gpt-5.6-terra
 ```
 
-`openai` 当前使用 Chat Completions transport，并按 provider 配置发送
-`max_completion_tokens`；DeepSeek provider 继续发送 `max_tokens`。Responses
-API 需要独立的 protocol adapter，不能只靠修改 `baseUrl` 切换。
+`openai` 与 `deepseek` 都使用 Responses transport，并统一发送
+`input`、`max_output_tokens` 和 Responses SSE 事件。Provider catalog 可以通过
+模型级 `hostedTools` 声明服务端工具；本地 function tools 会在请求时与其合并。
+
+### Responses 上下文与 provider 切换
+
+Responses 返回的不是一整块 assistant message。赤铎会按原始顺序保存 reasoning、assistant message、本地 `function_call`/output 和 provider 托管的 tool call。下一次请求仍按这个顺序回放，不会把它们重新揉成一条消息；压缩和 usage 估算也使用同一套结构。
+
+其中 reasoning 和托管工具调用可能包含只对当前 provider instance 有效的状态，因此带有 provider 归属。切换 provider instance 时，daemon 会在下一次模型请求前永久移除这些私有项，同时保留用户与 assistant 可见消息，以及本地工具的 call/result。只在同一个 provider 下切换模型不会触发这项清理。
+
+这里改变的是 `model_context.json`，不是 `client_transcript.jsonl`。客户端回放仍能看到完整的 reasoning、远端工具事件和原始消息。类似地，切换到纯文本模型时，图片只会从模型上下文移除，transcript 仍保留原始输入。
 
 用户自定义 provider 放在 `resource/providers/<type>.yaml`。文件名（不含扩展名）
 就是 `profile.yaml` 中引用的 `type`；文件内容只定义一个 provider，不再包含顶层
@@ -219,9 +227,8 @@ API 需要独立的 protocol adapter，不能只靠修改 `baseUrl` 切换。
 
 ```yaml
 # resource/providers/newapi.yaml
-protocol: open_ai_chat_completions
-endpoint: https://gateway.example.com/v1/chat/completions
-maxOutputTokensField: max_completion_tokens
+protocol: open_ai_responses
+endpoint: https://gateway.example.com/v1/responses
 models:
   custom-model:
     contextWindowTokens: 200000
@@ -229,11 +236,13 @@ models:
     capabilities:
       imageInput: true
       toolCalls: true
+    hostedTools:
+      - type: web_search_preview
     defaultReasoningMode: medium
     reasoning:
-      low: {reasoning_effort: low}
-      medium: {reasoning_effort: medium}
-      high: {reasoning_effort: high}
+      low: {reasoning: {effort: low}}
+      medium: {reasoning: {effort: medium}}
+      high: {reasoning: {effort: high}}
 ```
 
 自定义文件不能覆盖 `openai`、`deepseek` 等内置 type；需要修改时应使用新的文件名，

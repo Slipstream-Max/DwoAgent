@@ -123,7 +123,7 @@ model:
       # Provider type from dwo-model-client/resources/providers/*.yaml.
       type: deepseek
 
-      # Optional complete Chat Completions URL override.
+      # Optional complete Responses URL override.
       # The catalog endpoint is used when omitted.
       baseUrl: null
 

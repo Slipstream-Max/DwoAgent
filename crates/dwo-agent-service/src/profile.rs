@@ -425,8 +425,7 @@ model:
         std::fs::write(
             root.path().join("resource/providers/newapi.yaml"),
             r#"
-endpoint: https://gateway.example.com/v1/chat/completions
-maxOutputTokensField: max_completion_tokens
+endpoint: https://gateway.example.com/v1/responses
 models:
   custom-model:
     contextWindowTokens: 100000
@@ -437,7 +436,8 @@ models:
     defaultReasoningMode: medium
     reasoning:
       medium:
-        reasoning_effort: medium
+        reasoning:
+          effort: medium
 "#,
         )
         .unwrap();
@@ -466,7 +466,7 @@ model:
         assert!(loaded.models.models["custom"].capabilities.image_input);
         assert_eq!(
             loaded.models.providers["relay"].endpoint,
-            "https://gateway.example.com/v1/chat/completions"
+            "https://gateway.example.com/v1/responses"
         );
     }
 }

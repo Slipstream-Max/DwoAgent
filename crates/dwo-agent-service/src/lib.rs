@@ -26,9 +26,9 @@ pub use dwo_model_client::{
 pub use dwo_tools::{ConfirmationDecision, ConfirmationRequest, SessionMode};
 pub use error::AgentServiceError;
 pub use events::{
-    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, PendingPermission, RuntimePhase,
-    SessionEvent, SessionEventPayload, SessionSnapshot, SessionStatusSnapshot, SessionSubscription,
-    SessionUsageSnapshot,
+    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, FileChange, PendingPermission,
+    RuntimePhase, SessionEvent, SessionEventPayload, SessionSnapshot, SessionStatusSnapshot,
+    SessionSubscription, SessionUsageSnapshot,
 };
 pub use profile::{AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, load_profile};
 pub use record::{
@@ -37,4 +37,4 @@ pub use record::{
 };
 pub use repository::{FsSessionRepository, MemorySessionRepository, SessionRepository};
 pub use service::{AgentService, NewSession};
-pub use session::{EndpointId, SessionAgent};
+pub use session::{EndpointId, MessageId, PromptAccepted, SessionAgent};

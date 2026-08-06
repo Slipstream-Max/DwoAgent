@@ -30,6 +30,9 @@ pub struct SessionContext {
     pub system_prompt: SystemPromptBlock,
     #[serde(default)]
     pub messages: Vec<ContextMessage>,
+    /// Provider instance for which the mutable model context is normalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub usage: SessionUsage,
     #[serde(default)]
@@ -118,14 +121,6 @@ impl ContextManager {
         &self.context.messages
     }
 
-    pub fn projected_model_messages(&self, allow_image_input: bool) -> Vec<ContextMessage> {
-        self.context
-            .messages
-            .iter()
-            .filter_map(|message| message.project_for_image_input(allow_image_input))
-            .collect()
-    }
-
     pub fn contains_images(&self) -> bool {
         self.context
             .messages
@@ -155,6 +150,19 @@ impl ContextManager {
         self.extend_messages([ContextMessage::assistant_with_reasoning(
             content, reasoning, tool_calls,
         )]);
+    }
+
+    pub fn append_response_items(
+        &mut self,
+        provider: impl Into<String>,
+        response_items: Vec<Value>,
+    ) {
+        let provider = provider.into();
+        self.extend_messages(response_items.into_iter().map(|item| {
+            let owner =
+                ContextMessage::response_item_requires_provider(&item).then(|| provider.clone());
+            ContextMessage::response_item(item, owner)
+        }));
     }
 
     pub fn append_tool(&mut self, result: ToolResultRecord) {
@@ -192,6 +200,50 @@ impl ContextManager {
 
     pub fn record_model_success(&mut self, model: impl Into<String>) {
         self.context.usage.last_model = Some(model.into());
+    }
+
+    /// Permanently normalize stored model context for the selected provider and
+    /// input capabilities. Returns whether any persisted item changed.
+    pub fn normalize_for_selection(
+        &mut self,
+        provider: &str,
+        assumed_source_provider: Option<&str>,
+        allow_image_input: bool,
+    ) -> bool {
+        let previous_provider = self.context.provider.clone();
+        let source_provider = self
+            .context
+            .provider
+            .as_deref()
+            .or(assumed_source_provider)
+            .unwrap_or(provider)
+            .to_string();
+        let provider_changed = source_provider != provider;
+        let mut changed = previous_provider.as_deref() != Some(provider);
+        let mut messages = Vec::with_capacity(self.context.messages.len());
+        for mut message in self.context.messages.drain(..) {
+            if message.provider.is_none()
+                && message
+                    .response_item_value()
+                    .is_some_and(ContextMessage::response_item_requires_provider)
+            {
+                message.provider = Some(source_provider.clone());
+                changed = true;
+            }
+            if provider_changed && message.is_provider_owned() {
+                changed = true;
+                continue;
+            }
+            let projected = message.project_for_image_input(allow_image_input);
+            changed |= projected.as_ref() != Some(&message);
+            messages.extend(projected);
+        }
+        self.context.messages = messages;
+        self.context.provider = Some(provider.to_string());
+        if changed {
+            self.recalculate_message_tokens();
+        }
+        changed
     }
 
     pub fn refresh_usage(&mut self, tools: &[Value]) -> u64 {
@@ -272,12 +324,7 @@ impl ContextManager {
         let replacement = plan.into_replacement(&rebuilt_prompt, summary.clone());
         self.context.system_prompt = rebuilt_prompt;
         self.context.messages = replacement;
-        self.message_tokens = self
-            .context
-            .messages
-            .iter()
-            .map(estimate_message_tokens)
-            .fold(0, u64::saturating_add);
+        self.recalculate_message_tokens();
         self.context.env_watcher = EnvWatcherState { baseline };
         self.context.compaction.count = self.context.compaction.count.saturating_add(1);
         self.context.compaction.summary = (!summary.is_empty()).then_some(summary);
@@ -292,5 +339,14 @@ impl ContextManager {
                 .saturating_add(estimate_message_tokens(&message));
             self.context.messages.push(message);
         }
+    }
+
+    fn recalculate_message_tokens(&mut self) {
+        self.message_tokens = self
+            .context
+            .messages
+            .iter()
+            .map(estimate_message_tokens)
+            .fold(0, u64::saturating_add);
     }
 }

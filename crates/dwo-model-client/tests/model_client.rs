@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use dwo_context::{CompactionView, ContentBlock, ContextMessage, MessageContent};
 use dwo_model_client::{
-    AgentModelConfig, ConfiguredModelClient, FinishReason, MaxOutputTokensField, ModelCatalog,
-    ModelClient, ModelClientConfig, ModelClientError, ModelSelection, ModelStreamEvent,
+    AgentModelConfig, ConfiguredModelClient, FinishReason, ModelCatalog, ModelClient,
+    ModelClientConfig, ModelClientError, ModelSelection, ModelStreamEvent,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -81,9 +81,12 @@ providers:
         capabilities:
           imageInput: true
           toolCalls: true
+        hostedTools:
+          - type: web_search
         reasoning:
           high:
-            reasoning_effort: high
+            reasoning:
+              effort: high
             extra_body:
               thinking:
                 type: enabled
@@ -107,11 +110,13 @@ models:
 #[tokio::test]
 async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     let chunks = [
-        json!({"choices":[{"delta":{"reasoning_content":"think "}}]}).to_string(),
-        json!({"choices":[{"delta":{"content":"working"}}]}).to_string(),
-        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"terminal","arguments":"{\"action\":\"run\",\"comm"}}]}}]}).to_string(),
-        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"echo hi\"}"}}]},"finish_reason":"tool_calls"}]}).to_string(),
-        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}).to_string(),
+        json!({"type":"response.reasoning_summary_text.delta","delta":"think "}).to_string(),
+        json!({"type":"response.output_text.delta","delta":"working"}).to_string(),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call-1","name":"terminal","arguments":""}}).to_string(),
+        json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"action\":\"run\",\"comm"}).to_string(),
+        json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"and\":\"echo hi\"}"}).to_string(),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}}).to_string(),
+        json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"think "}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]},{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}).to_string(),
     ];
     let sse = chunks
         .iter()
@@ -173,15 +178,17 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     let request = request_rx.await.unwrap();
     assert_eq!(request["stream"], true);
     assert_eq!(request["model"], "test-model");
-    assert_eq!(request["max_tokens"], 4096);
-    assert_eq!(request["messages"][0]["role"], "system");
-    assert_eq!(request["messages"][1]["content"][0]["type"], "text");
+    assert_eq!(request["max_output_tokens"], 4096);
+    assert_eq!(request["input"][0]["role"], "system");
+    assert_eq!(request["input"][1]["content"][0]["type"], "input_text");
     assert_eq!(
-        request["messages"][1]["content"][1]["image_url"]["url"],
+        request["input"][1]["content"][1]["image_url"],
         "data:image/png;base64,aGVsbG8="
     );
-    assert_eq!(request["tools"].as_array().unwrap().len(), 1);
-    assert_eq!(request["reasoning_effort"], "high");
+    assert_eq!(request["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(request["tools"][0]["type"], "web_search");
+    assert_eq!(request["tools"][1]["name"], "terminal");
+    assert_eq!(request["reasoning"]["effort"], "high");
     assert_eq!(request["extra_body"]["provider_flag"], true);
     assert_eq!(request["extra_body"]["thinking"]["type"], "enabled");
 }
@@ -189,8 +196,9 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
 #[tokio::test]
 async fn summary_uses_non_streaming_request_without_tools() {
     let payload = json!({
-        "choices":[{"message":{"role":"assistant","content":"summary text"},"finish_reason":"stop"}],
-        "usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}
+        "status":"completed",
+        "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary text"}]}],
+        "usage":{"input_tokens":20,"output_tokens":3,"total_tokens":23}
     });
     let body = payload.to_string();
     let response = format!(
@@ -219,15 +227,19 @@ async fn summary_uses_non_streaming_request_without_tools() {
     let request = request_rx.await.unwrap();
     assert_eq!(request["stream"], false);
     assert!(request.get("tools").is_none());
-    assert_eq!(request["messages"][0]["content"], "compact instruction");
-    assert_eq!(request["messages"][1]["content"], "history");
+    assert_eq!(
+        request["input"][0]["content"][0]["text"],
+        "compact instruction"
+    );
+    assert_eq!(request["input"][1]["content"][0]["text"], "history");
 }
 
 #[tokio::test]
 async fn completion_uses_non_streaming_request_without_tools() {
     let payload = json!({
-        "choices":[{"message":{"role":"assistant","content":"Short title"},"finish_reason":"stop"}],
-        "usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}
+        "status":"completed",
+        "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Short title"}]}],
+        "usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10}
     });
     let body = payload.to_string();
     let response = format!(
@@ -256,14 +268,21 @@ async fn completion_uses_non_streaming_request_without_tools() {
     let request = request_rx.await.unwrap();
     assert_eq!(request["stream"], false);
     assert!(request.get("tools").is_none());
-    assert_eq!(request["messages"][0]["content"], "Generate a title");
-    assert_eq!(request["messages"][1]["content"], "Investigate flaky tests");
+    assert_eq!(
+        request["input"][0]["content"][0]["text"],
+        "Generate a title"
+    );
+    assert_eq!(
+        request["input"][1]["content"][0]["text"],
+        "Investigate flaky tests"
+    );
 }
 
 #[tokio::test]
-async fn provider_selects_the_max_output_tokens_request_field() {
+async fn responses_always_uses_max_output_tokens() {
     let payload = json!({
-        "choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]
+        "status":"completed",
+        "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]
     });
     let body = payload.to_string();
     let response = format!(
@@ -271,12 +290,7 @@ async fn provider_selects_the_max_output_tokens_request_field() {
         body.len()
     );
     let (endpoint, request_rx) = one_response_server(response).await;
-    let catalog = catalog(&endpoint).replacen(
-        "endpoint:",
-        "maxOutputTokensField: max_completion_tokens\n    endpoint:",
-        1,
-    );
-    let client = ConfiguredModelClient::from_yaml(&catalog, agent()).unwrap();
+    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
     client
         .complete(
             ModelSelection {
@@ -293,8 +307,9 @@ async fn provider_selects_the_max_output_tokens_request_field() {
         .unwrap();
 
     let request = request_rx.await.unwrap();
-    assert_eq!(request["max_completion_tokens"], 4096);
+    assert_eq!(request["max_output_tokens"], 4096);
     assert!(request.get("max_tokens").is_none());
+    assert!(request.get("max_completion_tokens").is_none());
 }
 
 #[tokio::test]
@@ -340,16 +355,16 @@ fn config_rejects_reserved_body_overrides() {
     let invalid = r#"
 providers:
   local:
-    endpoint: http://localhost:1/chat/completions
+    endpoint: http://localhost:1/responses
     models:
       test:
         contextWindowTokens: 100000
         maxOutputTokens: 4096
         body:
-          messages: []
+          input: []
 "#;
     let error = ModelCatalog::from_yaml(invalid).unwrap_err();
-    assert!(error.to_string().contains("reserved field messages"));
+    assert!(error.to_string().contains("reserved field input"));
 }
 
 #[test]
@@ -396,10 +411,7 @@ models:
 fn builtin_openai_provider_exposes_verified_model_capabilities() {
     let catalog = ModelCatalog::builtin().unwrap();
     let openai = &catalog.providers["openai"];
-    assert_eq!(
-        openai.max_output_tokens_field,
-        MaxOutputTokensField::MaxCompletionTokens
-    );
+    assert_eq!(openai.endpoint, "https://api.openai.com/v1/responses");
 
     for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4"] {
         let model = &openai.models[id];
@@ -409,13 +421,16 @@ fn builtin_openai_provider_exposes_verified_model_capabilities() {
         assert!(model.capabilities.tool_calls, "{id}");
         assert_eq!(model.default_reasoning_mode, "medium", "{id}");
         for effort in ["low", "medium", "high", "xhigh"] {
-            assert_eq!(model.reasoning[effort]["reasoning_effort"], effort, "{id}");
+            assert_eq!(
+                model.reasoning[effort]["reasoning"]["effort"], effort,
+                "{id}"
+            );
         }
     }
 
     for id in ["gpt-5.6-sol", "gpt-5.6-terra"] {
         assert_eq!(
-            openai.models[id].reasoning["max"]["reasoning_effort"],
+            openai.models[id].reasoning["max"]["reasoning"]["effort"],
             "max"
         );
     }
@@ -433,7 +448,7 @@ defaultModelId: gpt-5.6-terra
 providers:
   relay:
     type: openai
-    baseUrl: https://relay.example.com/v1/chat/completions
+    baseUrl: https://relay.example.com/v1/responses
     apiKeyEnv: RELAY_API_KEY
 models:
   - modelName: gpt-5.6-terra
@@ -445,15 +460,8 @@ models:
     let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
 
     let provider = &resolved.providers["relay"];
-    assert_eq!(
-        provider.endpoint,
-        "https://relay.example.com/v1/chat/completions"
-    );
+    assert_eq!(provider.endpoint, "https://relay.example.com/v1/responses");
     assert_eq!(provider.api_key_env.as_deref(), Some("RELAY_API_KEY"));
-    assert_eq!(
-        provider.max_output_tokens_field,
-        MaxOutputTokensField::MaxCompletionTokens
-    );
     let model = &resolved.models["gpt-5.6-terra"];
     assert!(model.capabilities.image_input);
     assert_eq!(model.default_reasoning_mode, "medium");
@@ -465,9 +473,8 @@ fn custom_provider_directory_adds_one_provider_per_yaml_file() {
     std::fs::write(
         directory.path().join("newapi.yaml"),
         r#"
-protocol: open_ai_chat_completions
-endpoint: https://gateway.example.com/v1/chat/completions
-maxOutputTokensField: max_completion_tokens
+protocol: open_ai_responses
+endpoint: https://gateway.example.com/v1/responses
 models:
   chat:
     contextWindowTokens: 100000
@@ -478,7 +485,8 @@ models:
     defaultReasoningMode: medium
     reasoning:
       medium:
-        reasoning_effort: medium
+        reasoning:
+          effort: medium
 "#,
     )
     .unwrap();
@@ -502,8 +510,8 @@ models:
     .unwrap();
     let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
     assert_eq!(
-        resolved.providers["relay"].max_output_tokens_field,
-        MaxOutputTokensField::MaxCompletionTokens
+        resolved.providers["relay"].endpoint,
+        "https://gateway.example.com/v1/responses"
     );
 }
 
@@ -512,7 +520,7 @@ fn custom_provider_directory_rejects_builtin_name_collisions() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
         directory.path().join("openai.yaml"),
-        "endpoint: https://example.com/v1/chat/completions\nmodels: {}\n",
+        "endpoint: https://example.com/v1/responses\nmodels: {}\n",
     )
     .unwrap();
     let error = ModelCatalog::builtin()
@@ -535,7 +543,7 @@ defaultModelId: custom-pro
 providers:
   deepseek:
     type: deepseek
-    baseUrl: https://gateway.example.com/chat/completions
+    baseUrl: https://gateway.example.com/responses
     apiKeyEnv: CUSTOM_DEEPSEEK_KEY
 models:
   - modelName: custom-pro
@@ -551,10 +559,7 @@ models:
     let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
 
     let provider = &resolved.providers["deepseek"];
-    assert_eq!(
-        provider.endpoint,
-        "https://gateway.example.com/chat/completions"
-    );
+    assert_eq!(provider.endpoint, "https://gateway.example.com/responses");
     assert_eq!(provider.api_key_env.as_deref(), Some("CUSTOM_DEEPSEEK_KEY"));
     assert_eq!(provider.request.max_retries, 4);
 
@@ -571,7 +576,7 @@ fn reasoning_cannot_override_the_model_output_limit() {
     let invalid = r#"
 providers:
   local:
-    endpoint: http://localhost:1/chat/completions
+    endpoint: http://localhost:1/responses
     models:
       test:
         contextWindowTokens: 100000

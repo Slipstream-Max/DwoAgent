@@ -20,8 +20,11 @@ impl FileEditManager {
 
     pub async fn execute(&self, patch: String, cwd: PathBuf) -> Result<FileEditResult> {
         let _operation = self.operation.lock().await;
-        let changes = tokio::task::spawn_blocking(move || apply_patch(&patch, &cwd)).await??;
-        Ok(FileEditResult { changes })
+        let applied = tokio::task::spawn_blocking(move || apply_patch(&patch, &cwd)).await??;
+        Ok(FileEditResult {
+            changes: applied.changes,
+            patch: applied.git_patch,
+        })
     }
 }
 
@@ -34,4 +37,5 @@ impl Default for FileEditManager {
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEditResult {
     pub changes: Vec<PatchChange>,
+    pub patch: String,
 }

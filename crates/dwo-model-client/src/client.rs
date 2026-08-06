@@ -80,6 +80,10 @@ impl ModelClient for ConfiguredModelClient {
         Ok(self.resolve(model)?.1.capabilities.image_input)
     }
 
+    fn provider_id(&self, model: &str) -> Result<String, ModelClientError> {
+        Ok(self.resolve(model)?.1.provider.clone())
+    }
+
     fn reasoning_modes(&self, model: &str) -> Result<Vec<String>, ModelClientError> {
         Ok(self.resolve(model)?.1.reasoning.keys().cloned().collect())
     }

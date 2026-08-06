@@ -76,6 +76,10 @@ impl ModelClient for ReloadableModelClient {
         self.current().model_limits(model)
     }
 
+    fn provider_id(&self, model: &str) -> Result<String, ModelClientError> {
+        self.current().provider_id(model)
+    }
+
     fn supports_image_input(&self, model: &str) -> Result<bool, ModelClientError> {
         self.current().supports_image_input(model)
     }
@@ -525,6 +529,8 @@ mod status_tests {
     fn last_answer_preview_is_bounded_to_one_hundred_characters() {
         let transcript = vec![ClientTranscriptEvent::new(
             SessionEventPayload::AssistantCompleted {
+                message_id: crate::MessageId::new(),
+                thought_message_id: crate::MessageId::new(),
                 turn_id: TurnId::new(),
                 content: format!("answer\n{}", "x".repeat(120)),
                 reasoning: None,

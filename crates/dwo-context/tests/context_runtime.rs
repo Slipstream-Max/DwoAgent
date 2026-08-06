@@ -1,12 +1,104 @@
 use dwo_context::{
-    CompactionPlanner, ContentBlock, ContextManager, MessageContent, MessageKind, MessageRole,
-    SystemPromptBuilder, ToolResultRecord, estimate_content_tokens, estimate_context_tokens,
+    CompactionPlanner, ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind,
+    MessageRole, SessionContext, SystemPromptBuilder, ToolResultRecord, estimate_content_tokens,
+    estimate_context_tokens,
 };
 use serde_json::json;
 
 fn write(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
+}
+
+#[test]
+fn responses_are_stored_item_first_and_provider_private_items_are_trimmed_on_switch() {
+    let mut manager = ContextManager::new(SessionContext {
+        messages: vec![
+            ContextMessage::system("system"),
+            ContextMessage::user("question"),
+        ],
+        ..SessionContext::default()
+    });
+    manager.append_response_items(
+        "provider-a",
+        vec![
+            json!({"type":"reasoning", "summary":[{"type":"summary_text", "text":"think"}], "encrypted_content":"opaque"}),
+            json!({"type":"web_search_call", "id":"search-1", "status":"completed"}),
+            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}),
+            json!({"type":"function_call", "call_id":"call-1", "name":"terminal", "arguments":"{\"command\":\"pwd\"}"}),
+        ],
+    );
+    manager.append_tool(ToolResultRecord {
+        tool_call_id: "call-1".to_string(),
+        tool_name: "terminal".to_string(),
+        output: json!({"status":"completed", "output":"cwd"}),
+        model_context: Vec::new(),
+    });
+
+    let response_items = manager
+        .model_messages()
+        .iter()
+        .filter_map(ContextMessage::response_item_value)
+        .collect::<Vec<_>>();
+    assert_eq!(response_items.len(), 4);
+    assert_eq!(
+        manager
+            .model_messages()
+            .iter()
+            .filter(|message| message.is_provider_owned())
+            .count(),
+        2
+    );
+    assert!(manager.normalize_for_selection("provider-a", None, true));
+    assert!(!manager.normalize_for_selection("provider-a", None, true));
+    assert!(manager.normalize_for_selection("provider-b", None, true));
+
+    let kinds = manager
+        .model_messages()
+        .iter()
+        .filter_map(ContextMessage::response_item_value)
+        .filter_map(|item| item.get("type").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["message", "function_call"]);
+    assert!(manager.model_messages().iter().any(|message| {
+        message.role == MessageRole::Tool && message.tool_call_id.as_deref() == Some("call-1")
+    }));
+    assert_eq!(manager.context().provider.as_deref(), Some("provider-b"));
+}
+
+#[test]
+fn legacy_aggregated_response_schema_is_rejected() {
+    let error = serde_json::from_value::<ContextMessage>(json!({
+        "role": "assistant",
+        "content": [],
+        "response_items": [{"type": "message", "role": "assistant", "content": []}]
+    }))
+    .unwrap_err();
+
+    assert!(error.to_string().contains("unknown field `response_items`"));
+}
+
+#[test]
+fn selection_normalization_permanently_removes_unsupported_images() {
+    let mut manager = ContextManager::new(SessionContext {
+        messages: vec![
+            ContextMessage::system("system"),
+            ContextMessage::user(MessageContent::blocks(vec![
+                ContentBlock::text("inspect"),
+                ContentBlock::image("image/png", "aGVsbG8="),
+            ])),
+        ],
+        ..SessionContext::default()
+    });
+
+    assert!(manager.normalize_for_selection("provider-a", None, false));
+    assert!(!manager.contains_images());
+    assert_eq!(
+        manager.model_messages()[1].content.as_text(),
+        Some("inspect")
+    );
+    assert!(!manager.normalize_for_selection("provider-a", None, true));
+    assert!(!manager.contains_images());
 }
 
 #[test]

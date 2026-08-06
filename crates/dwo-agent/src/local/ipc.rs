@@ -3,32 +3,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::host::Host;
+use crate::local::ipc_schema::{RpcRequest, RpcResponse};
 
 // TODO(gui): version these DTOs and add structured errors/capabilities before Flutter consumes IPC.
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RpcRequest {
-    id: u64,
-    method: String,
-    #[serde(default)]
-    params: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RpcResponse {
-    id: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
 
 pub fn endpoint(_config_path: &Path) -> String {
     #[cfg(windows)]

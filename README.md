@@ -35,6 +35,7 @@ OpenClaw 功能很全，但常驻内存、组件数量和整体复杂度也跟�
 | --- | --- |
 | **Rust 原生实现** | daemon 和 agent loop 运行在同一个原生二进制中，基础 daemon 实际常驻内存约 `6 MB`，也能处理多个并行 session。内存占用会随活跃 session、channel 和 MCP 连接变化。 |
 | **完整 Agent 功能** | 内置终端、文件编辑、MCP、skills、subsessions、上下文压缩、权限控制和 cron automation。 |
+| **Responses 原生支持** | OpenAI、DeepSeek 和兼容网关统一使用 Responses API；本地工具与 provider 托管的 Web Search 可以出现在同一轮里，并作为正常工具事件回放。 |
 | **本地与远程入口** | 本地支持 ACP 和 CLI，远程支持微信、Telegram、飞书/Lark，图片和文件也可以进入 session。 |
 | **Session 原生广播** | ACP 和各个 channel 可以同时订阅同一个 session，已连接端点都能查看进度、取消任务、处理权限请求和继续发送消息。 |
 | **运行中继续操作** | 新消息按顺序进入队列，在模型响应或工具调用的边界加入当前 turn。一个入口等待回复时，其他入口仍可正常操作。 |
@@ -128,7 +129,7 @@ CLI 的 `prompt` 用来提交任务，`watch` 用来读取最新事件。需要�
 | --- | --- |
 | **终端 `terminal`** | 启动命令、向交互式终端写入输入、轮询增量输出或终止进程。多个独立终端可以并行运行，所有操作都会经过当前 session 的权限策略。 |
 | **读取 `read_file`** | 读取 UTF-8 文本或 PNG、JPEG、GIF、WebP 图片。文本每次最多返回 500 行，并通过 `cursor` 继续读取；图片只会加入支持图片输入的模型上下文。 |
-| **写入 `file_edit`** | 使用结构化 patch 新建、修改、移动或删除文件。一次调用可以原子表达多个相关文件变更；`confirm` 模式需要确认，`watch` 模式禁止写入。 |
+| **写入 `file_edit`** | 使用结构化 patch 新建、修改、移动或删除文件。一次调用可以按顺序表达多个相关文件变更；`confirm` 模式需要确认，`watch` 模式禁止写入。 |
 
 `read_file` 和 `file_edit` 使用 session 的工作目录解析相对路径。没有显式指定 `cwd` 的 session 使用自己的隔离工作区。
 
@@ -140,10 +141,10 @@ CLI 的 `prompt` 用来提交任务，`watch` 用来读取最新事件。需要�
 
 ```text
 command: dwo
-args: [acp]
+args: [acp, --protocol, v2]
 ```
 
-`dwo acp` 通过 stdio 接入现有 daemon，共享 session、模型配置、工具事件和权限请求。具体能力、客户端配置要点与限制见 [ACP 使用指南](docs/acp.md)。
+`dwo acp` 默认使用 ACP v2；旧客户端可以显式传入 `--protocol v1`。它只负责在 ACP 和本地 IPC 之间转接，真正的 session、模型和工具仍由 daemon 掌管，所以从 IDE 切到手机或 CLI 时，对话还在原处。具体能力、客户端配置要点与限制见 [ACP 使用指南](docs/acp.md)。
 
 ### Channels：从聊天应用连接
 

@@ -3,8 +3,9 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
-    AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession, SessionConfig,
-    SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings,
+    AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession, PromptAccepted,
+    SessionConfig, SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings,
+    SessionRecord, SessionSnapshot, SessionStatusSnapshot, SessionSubscription, TurnId,
 };
 use dwo_context::MessageContent;
 use dwo_mcp::McpRuntime;
@@ -22,7 +23,7 @@ use crate::channels::{
 };
 
 pub struct Host {
-    pub service: Arc<AgentService>,
+    service: Arc<AgentService>,
     pub channel_hub: Arc<ChannelHub>,
     pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
@@ -69,6 +70,12 @@ struct PromptParam {
     policy: Option<SessionMode>,
     model: Option<String>,
     reasoning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionCommandParam {
+    session_id: String,
+    endpoint_id: String,
 }
 
 #[derive(Deserialize)]
@@ -311,6 +318,133 @@ impl Host {
         );
     }
 
+    pub async fn list_sessions(
+        &self,
+        all: bool,
+        caller: Option<&SessionId>,
+    ) -> Result<Vec<SessionRecord>> {
+        let mut records = self.service.list().await?;
+        if !all {
+            records.retain(|record| record.info.parent_session_id.as_ref() == caller);
+        }
+        Ok(records)
+    }
+
+    pub async fn list_session_statuses(
+        &self,
+        all: bool,
+        caller: Option<&SessionId>,
+    ) -> Result<Vec<SessionStatusSnapshot>> {
+        let mut statuses = self.service.list_statuses().await?;
+        if !all {
+            statuses.retain(|status| status.record.info.parent_session_id.as_ref() == caller);
+        }
+        Ok(statuses)
+    }
+
+    pub async fn session_status(&self, id: &SessionId) -> Result<SessionStatusSnapshot> {
+        Ok(self.service.status(id).await?)
+    }
+
+    pub async fn session_snapshot(&self, id: &SessionId) -> Result<SessionSnapshot> {
+        Ok(self.service.load(id).await?.snapshot().await?)
+    }
+
+    pub async fn setup_session(
+        &self,
+        title: Option<String>,
+        cwd: Option<PathBuf>,
+    ) -> Result<SessionSnapshot> {
+        Ok(self.create_session(title, cwd).await?.snapshot().await?)
+    }
+
+    pub async fn subscribe_session(
+        &self,
+        id: &SessionId,
+        endpoint: EndpointId,
+        checkpoint_cursor: Option<usize>,
+    ) -> Result<SessionSubscription> {
+        Ok(self
+            .service
+            .load(id)
+            .await?
+            .attach_from(endpoint, checkpoint_cursor)
+            .await?)
+    }
+
+    pub async fn prompt_session(
+        &self,
+        id: &SessionId,
+        endpoint: EndpointId,
+        content: MessageContent,
+    ) -> Result<PromptAccepted> {
+        Ok(self
+            .service
+            .load(id)
+            .await?
+            .prompt_content(endpoint, content)
+            .await?)
+    }
+
+    pub async fn compact_session(
+        &self,
+        id: &SessionId,
+        endpoint: EndpointId,
+    ) -> Result<PromptAccepted> {
+        Ok(self.service.load(id).await?.compact(endpoint).await?)
+    }
+
+    pub async fn resume_session_turn(
+        &self,
+        id: &SessionId,
+        endpoint: EndpointId,
+    ) -> Result<Option<PromptAccepted>> {
+        Ok(self.service.load(id).await?.resume(endpoint).await?)
+    }
+
+    pub async fn cancel_session(
+        &self,
+        id: &SessionId,
+        expected_turn_id: Option<TurnId>,
+    ) -> Result<()> {
+        self.service
+            .load(id)
+            .await?
+            .cancel(expected_turn_id)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn close_session(&self, id: &SessionId) -> Result<()> {
+        self.service.close(id).await?;
+        Ok(())
+    }
+
+    pub async fn set_session_config(
+        &self,
+        id: &SessionId,
+        update: SessionConfigUpdate,
+    ) -> Result<SessionSnapshot> {
+        let agent = self.service.load(id).await?;
+        agent.set_config(update).await?;
+        Ok(agent.snapshot().await?)
+    }
+
+    pub async fn resolve_session_permission(
+        &self,
+        id: &SessionId,
+        endpoint: EndpointId,
+        request_id: String,
+        decision: ConfirmationDecision,
+    ) -> Result<()> {
+        self.service
+            .load(id)
+            .await?
+            .respond_permission(endpoint, request_id, decision)
+            .await?;
+        Ok(())
+    }
+
     pub async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
         if let Some((channel, action)) = managed_channel_action(method) {
             return self.dispatch_channel(channel, action, params).await;
@@ -359,37 +493,31 @@ impl Host {
             "session.list" => {
                 let params: ListSessionParam = serde_json::from_value(params)?;
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
-                let mut records = self.service.list().await?;
-                if !params.all {
-                    records.retain(|record| record.info.parent_session_id == caller);
-                }
-                Ok(serde_json::to_value(records)?)
+                Ok(serde_json::to_value(
+                    self.list_sessions(params.all, caller.as_ref()).await?,
+                )?)
             }
             "session.status-list" => {
                 let params: ListSessionParam = serde_json::from_value(params)?;
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
-                let mut statuses = self.service.list_statuses().await?;
-                if !params.all {
-                    statuses.retain(|status| status.record.info.parent_session_id == caller);
-                }
-                Ok(serde_json::to_value(statuses)?)
+                Ok(serde_json::to_value(
+                    self.list_session_statuses(params.all, caller.as_ref())
+                        .await?,
+                )?)
             }
             "session.status" => {
                 let id = parse_session(params)?;
-                Ok(serde_json::to_value(self.service.status(&id).await?)?)
+                Ok(serde_json::to_value(self.session_status(&id).await?)?)
             }
             "session.snapshot" => {
                 let id = parse_session(params)?;
-                Ok(serde_json::to_value(
-                    self.service.load(&id).await?.snapshot().await?,
-                )?)
+                Ok(serde_json::to_value(self.session_snapshot(&id).await?)?)
             }
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
-                let agent = self.create_session(params.title, params.cwd).await?;
-                let snapshot = agent.snapshot().await?;
+                let snapshot = self.setup_session(params.title, params.cwd).await?;
                 Ok(json!({
-                    "session_id": agent.id(),
+                    "session_id": snapshot.record.info.id,
                     "usage": snapshot.usage,
                 }))
             }
@@ -398,13 +526,18 @@ impl Host {
                 self.delete_session(&id).await?;
                 Ok(json!({"deleted": true}))
             }
+            "session.close" => {
+                let id = parse_session(params)?;
+                self.close_session(&id).await?;
+                Ok(json!({"closed": true}))
+            }
             "session.prompt" => {
                 let params: PromptParam = serde_json::from_value(params)?;
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
                 let (agent, parent_id) = self.resolve_prompt_session(&params, caller).await?;
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
                 let subscription = agent.attach(EndpointId::new()).await?;
-                let turn_id = agent
+                let accepted = agent
                     .prompt_content(endpoint, params.message.into_content())
                     .await?;
                 if let Some(parent_id) = parent_id {
@@ -412,10 +545,43 @@ impl Host {
                         subscription,
                         agent.id().clone(),
                         parent_id,
-                        turn_id.clone(),
+                        accepted.turn_id.clone(),
                     );
                 }
-                Ok(json!({"session_id": agent.id(), "turn_id": turn_id}))
+                Ok(json!({
+                    "session_id": agent.id(),
+                    "message_id": accepted.message_id,
+                    "turn_id": accepted.turn_id,
+                }))
+            }
+            "session.compact" => {
+                let params: SessionCommandParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
+                let accepted = self.compact_session(&id, endpoint).await?;
+                Ok(json!({
+                    "session_id": id,
+                    "message_id": accepted.message_id,
+                    "turn_id": accepted.turn_id,
+                }))
+            }
+            "session.resume-turn" => {
+                let params: SessionCommandParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
+                let accepted = self.resume_session_turn(&id, endpoint).await?;
+                Ok(match accepted {
+                    Some(accepted) => json!({
+                        "accepted": true,
+                        "session_id": id,
+                        "message_id": accepted.message_id,
+                        "turn_id": accepted.turn_id,
+                    }),
+                    None => json!({
+                        "accepted": false,
+                        "session_id": id,
+                    }),
+                })
             }
             "session.read" => {
                 let params: ReadSessionParam = serde_json::from_value(params)?;
@@ -424,7 +590,7 @@ impl Host {
                     "limit must be between 1 and 100"
                 );
                 let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
-                let snapshot = self.service.load(&id).await?.snapshot().await?;
+                let snapshot = self.session_snapshot(&id).await?;
                 let total = snapshot.transcript.len();
                 let content = snapshot
                     .transcript
@@ -467,7 +633,7 @@ impl Host {
                     .map(dwo_context::TurnId::parse)
                     .transpose()
                     .map_err(anyhow::Error::msg)?;
-                self.service.load(&id).await?.cancel(turn).await?;
+                self.cancel_session(&id, turn).await?;
                 Ok(json!({"cancelled": true}))
             }
             "session.set_model" => {
@@ -477,21 +643,19 @@ impl Host {
                     .value
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("model must be a string"))?;
-                let agent = self.service.load(&id).await?;
-                agent
-                    .set_config(SessionConfigUpdate::Model(model.to_string()))
+                let snapshot = self
+                    .set_session_config(&id, SessionConfigUpdate::Model(model.to_string()))
                     .await?;
                 Ok(json!({
                     "updated": true,
-                    "usage": agent.snapshot().await?.usage,
+                    "usage": snapshot.usage,
                 }))
             }
             "session.set_reasoning" => {
                 let params: ConfigParam = serde_json::from_value(params)?;
                 let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
                 let reasoning = params.value.as_str().map(str::to_string);
-                self.service
-                    .set_config(&id, SessionConfigUpdate::Reasoning(reasoning))
+                self.set_session_config(&id, SessionConfigUpdate::Reasoning(reasoning))
                     .await?;
                 Ok(json!({"updated": true}))
             }
@@ -518,11 +682,10 @@ impl Host {
                     }
                     other => anyhow::bail!("unknown session config option: {other}"),
                 };
-                let agent = self.service.load(&id).await?;
-                agent.set_config(update).await?;
+                let snapshot = self.set_session_config(&id, update).await?;
                 Ok(json!({
                     "updated": true,
-                    "usage": agent.snapshot().await?.usage,
+                    "usage": snapshot.usage,
                 }))
             }
             "session.options" => {
@@ -548,18 +711,16 @@ impl Host {
                 let params: PermissionParam = serde_json::from_value(params)?;
                 let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
-                self.service
-                    .load(&id)
-                    .await?
-                    .respond_permission(
-                        endpoint,
-                        params.request_id,
-                        ConfirmationDecision {
-                            allowed: params.allowed,
-                            reason: params.reason,
-                        },
-                    )
-                    .await?;
+                self.resolve_session_permission(
+                    &id,
+                    endpoint,
+                    params.request_id,
+                    ConfirmationDecision {
+                        allowed: params.allowed,
+                        reason: params.reason,
+                    },
+                )
+                .await?;
                 Ok(json!({"resolved": true}))
             }
             other => anyhow::bail!("unknown RPC method: {other}"),
@@ -1207,12 +1368,8 @@ impl Host {
     ) -> Result<dwo_agent_service::SessionSubscription> {
         let id = SessionId::parse(session_id.to_string()).map_err(anyhow::Error::msg)?;
         let endpoint = EndpointId::parse(endpoint_id.to_string()).map_err(anyhow::Error::msg)?;
-        Ok(self
-            .service
-            .load(&id)
-            .await?
-            .attach_from(endpoint, checkpoint_cursor)
-            .await?)
+        self.subscribe_session(&id, endpoint, checkpoint_cursor)
+            .await
     }
 }
 
@@ -1378,6 +1535,10 @@ fn is_content_event(payload: &SessionEventPayload) -> bool {
             | SessionEventPayload::AssistantCompleted { .. }
             | SessionEventPayload::ToolStarted { .. }
             | SessionEventPayload::ToolCompleted { .. }
+            | SessionEventPayload::TerminalOpened { .. }
+            | SessionEventPayload::TerminalExited { .. }
+            | SessionEventPayload::FileRead { .. }
+            | SessionEventPayload::FileChanged { .. }
             | SessionEventPayload::PermissionRequested { .. }
             | SessionEventPayload::PermissionResolved { .. }
             | SessionEventPayload::TurnCancelled { .. }

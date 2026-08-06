@@ -51,6 +51,8 @@ active turn 运行期间收到的新 prompt 会进入 session FIFO，在当前 m
 
 `session prompt --to ... --model ...` 的模型切换应用于后续 model request。若目标模型支持图片则直接切换；若目标模型是纯文本模型且当前 context 含图片，idle session 会先使用当前或最后成功的视觉模型生成文字摘要，再重建无图 model context。摘要失败时模型和 context 都不改变；图片 turn 运行期间不允许降级切换。client transcript 始终保留原始图片用于 replay，文本模型也会在持久化前拒绝新的图片 prompt。迁移成功会将当前 context token 重置为 0，并按目标模型窗口发送新的 usage update。
 
+若新模型属于另一个 provider instance，daemon 还会在下一次请求前移除只对旧 provider 有效的 reasoning 和托管工具调用。用户与 assistant 消息、本地工具 call/result 以及完整 client transcript 都会保留；同一 provider 内切换模型不会触发这项裁剪。
+
 Session 文件布局和持久化说明见 [Profile 配置指南](profile.md#session-数据)。
 
 ## MCP
@@ -137,9 +139,9 @@ dwo automation run <job> [--json]
 客户端配置、session 协作、权限和内容类型限制见 [ACP 使用指南](acp.md)。
 
 ```text
-dwo acp
+dwo acp [--protocol v1|v2]
 ```
 
-ACP 使用 stdio 连接同一个 daemon，共享 session、事件流、模型配置和 tool runtime，不会创建独立的 session 或 MCP 连接。
+ACP 使用 stdio 连接同一个 daemon，共享 session、事件流、模型配置和 tool runtime，不会创建独立的 Host 或 MCP 连接。非空的 session `mcpServers` 和 `additionalDirectories` 会被拒绝。`--protocol` 默认是 `v2`；v1 保持 `session/prompt` 到 turn 结束，v2 接受 prompt 后立即响应并通过 `state_update` 报告完成。
 
-ACP prompt 会按原顺序把普通文本、文本型 embedded resource 和 resource link 展开为文本。embedded resource 保留 URI、MIME 和正文，resource link 保留名称、URI 与可用元数据，因此 Zed 引用的本地文件或目录会作为明确路径进入模型上下文。当前不声明图片或音频输入能力，并拒绝 image、audio 与二进制 embedded resource；`embeddedContext` 仅用于客户端粘贴文本文件内容。
+ACP prompt 会按原顺序处理文本、图片、文本型 embedded resource 和 resource link。embedded resource 保留 URI、MIME 和正文，resource link 保留名称、URI 与可用元数据，因此 Zed 引用的本地文件或目录会作为明确路径进入模型上下文。图片只会交给支持 image input 的模型；audio 和二进制 embedded resource 会被拒绝。Zed 的 Send now 所产生的同 session `cancel + prompt` 会在 150ms 窗口内合并为排队 prompt，单独 cancel 仍会正常中断 turn。

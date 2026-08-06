@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ModelConfig, ProviderConfig, ProviderProtocol};
-use crate::message::{StreamAccumulator, normalize_response_tool_calls, provider_messages, usage};
-use crate::{FinishReason, ModelClientError, ModelReply, ModelStreamEvent, RequestPolicy};
+use crate::message::{StreamAccumulator, parse_response, provider_input, provider_tools};
+use crate::{ModelClientError, ModelReply, ModelStreamEvent, RequestPolicy};
 
 pub struct BaseClient {
     provider: ProviderConfig,
@@ -21,7 +21,7 @@ pub struct BaseClient {
 
 impl BaseClient {
     pub fn new(provider: ProviderConfig) -> Result<Self, ModelClientError> {
-        if provider.protocol != ProviderProtocol::OpenAiChatCompletions {
+        if provider.protocol != ProviderProtocol::OpenAiResponses {
             return Err(ModelClientError::config("unsupported provider protocol"));
         }
         let endpoint = provider.endpoint()?;
@@ -67,8 +67,9 @@ impl BaseClient {
                 model.model_id
             )));
         }
-        let messages = provider_messages(messages, model.capabilities.image_input)?;
-        let body = self.request_body(model, messages, tools, reasoning, true)?;
+        let input = provider_input(messages, model.capabilities.image_input)?;
+        let tools = provider_tools(tools, &model.hosted_tools)?;
+        let body = self.request_body(model, input, &tools, reasoning, true)?;
         let response = self.send_with_retries(&body, cancellation).await?;
         self.read_stream(response, events, cancellation).await
     }
@@ -80,20 +81,20 @@ impl BaseClient {
         reasoning: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<ModelReply, ModelClientError> {
-        let messages = provider_messages(messages, model.capabilities.image_input)?;
-        let body = self.request_body(model, messages, &[], reasoning, false)?;
+        let input = provider_input(messages, model.capabilities.image_input)?;
+        let body = self.request_body(model, input, &[], reasoning, false)?;
         let response = self.send_with_retries(&body, cancellation).await?;
         let payload: Value = tokio::select! {
             _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
             payload = response.json() => payload?,
         };
-        parse_completion(&payload)
+        parse_response(&payload)
     }
 
     fn request_body(
         &self,
         model: &ModelConfig,
-        messages: Vec<Value>,
+        input: Vec<Value>,
         tools: &[Value],
         reasoning: Option<&str>,
         stream: bool,
@@ -107,7 +108,7 @@ impl BaseClient {
             body.insert("top_p".to_string(), json!(top_p));
         }
         body.insert(
-            self.provider.max_output_tokens_field.as_str().to_string(),
+            "max_output_tokens".to_string(),
             json!(model.max_output_tokens),
         );
         let mode = reasoning.unwrap_or(&model.default_reasoning_mode);
@@ -120,7 +121,7 @@ impl BaseClient {
             )));
         }
         body.insert("model".to_string(), Value::String(model.model_id.clone()));
-        body.insert("messages".to_string(), Value::Array(messages));
+        body.insert("input".to_string(), Value::Array(input));
         if !tools.is_empty() {
             body.insert("tools".to_string(), Value::Array(tools.to_vec()));
         }
@@ -184,7 +185,12 @@ impl BaseClient {
                 }
             };
             let Some(event) = next else {
-                return Err(ModelClientError::protocol("stream closed before [DONE]"));
+                if accumulated.response.is_some() {
+                    break;
+                }
+                return Err(ModelClientError::protocol(
+                    "stream closed before response.completed",
+                ));
             };
             let event = event.map_err(|error| ModelClientError::protocol(error.to_string()))?;
             if event.data == "[DONE]" {
@@ -193,106 +199,50 @@ impl BaseClient {
             let payload: Value = serde_json::from_str(&event.data).map_err(|error| {
                 ModelClientError::protocol(format!("invalid SSE JSON: {error}"))
             })?;
-            if let Some(value) = payload.get("usage").filter(|value| !value.is_null()) {
-                accumulated.usage = Some(usage(Some(value)));
-            }
-            let Some(choice) = payload
-                .get("choices")
-                .and_then(Value::as_array)
-                .and_then(|choices| choices.first())
-            else {
-                continue;
-            };
-            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                accumulated.finish_reason = Some(reason.to_string());
-            }
-            let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
-                continue;
-            };
-            if let Some(text) = delta
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                accumulated.content.push_str(text);
-                let _ = events.send(ModelStreamEvent::TextDelta(text.to_string()));
-            }
-            if let Some(reasoning) = delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoning"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                accumulated.reasoning.push_str(reasoning);
-                let _ = events.send(ModelStreamEvent::ReasoningDelta(reasoning.to_string()));
-            }
-            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                accumulated.merge_tool_calls(tool_calls);
+            match payload.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta") => {
+                    if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                        accumulated.content.push_str(delta);
+                        let _ = events.send(ModelStreamEvent::TextDelta(delta.to_string()));
+                    }
+                }
+                Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+                    if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                        accumulated.reasoning.push_str(delta);
+                        let _ = events.send(ModelStreamEvent::ReasoningDelta(delta.to_string()));
+                    }
+                }
+                Some("response.output_item.added" | "response.output_item.done") => {
+                    if let (Some(index), Some(item)) = (
+                        payload.get("output_index").and_then(Value::as_u64),
+                        payload.get("item"),
+                    ) {
+                        accumulated.add_output_item(index, item.clone());
+                    }
+                }
+                Some("response.function_call_arguments.delta") => {
+                    if let (Some(index), Some(delta)) = (
+                        payload.get("output_index").and_then(Value::as_u64),
+                        payload.get("delta").and_then(Value::as_str),
+                    ) {
+                        accumulated.append_function_arguments(index, delta);
+                    }
+                }
+                Some("response.completed" | "response.incomplete") => {
+                    accumulated.response = payload.get("response").cloned();
+                    break;
+                }
+                Some("response.failed") => {
+                    return Err(ModelClientError::protocol(format!(
+                        "response failed: {}",
+                        payload.get("response").unwrap_or(&payload)
+                    )));
+                }
+                _ => {}
             }
         }
-        let StreamAccumulator {
-            content,
-            reasoning,
-            tool_calls,
-            finish_reason,
-            usage,
-            ..
-        } = accumulated;
-        let tool_calls = StreamAccumulator {
-            tool_calls,
-            ..StreamAccumulator::default()
-        }
-        .normalized_tool_calls();
-        let usage = usage.unwrap_or_default();
-        Ok(ModelReply {
-            content,
-            reasoning: (!reasoning.is_empty()).then_some(reasoning),
-            finish_reason: FinishReason::from_provider(
-                finish_reason.as_deref(),
-                !tool_calls.is_empty(),
-            ),
-            tool_calls,
-            usage,
-        })
+        accumulated.finish()
     }
-}
-
-fn parse_completion(payload: &Value) -> Result<ModelReply, ModelClientError> {
-    let choice = payload
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
-        .ok_or_else(|| ModelClientError::protocol("missing choices[0]"))?;
-    let message = choice
-        .get("message")
-        .and_then(Value::as_object)
-        .ok_or_else(|| ModelClientError::protocol("missing choices[0].message"))?;
-    let content = match message.get("content") {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(content)) => content.clone(),
-        Some(_) => {
-            return Err(ModelClientError::protocol(
-                "assistant content must be a string",
-            ));
-        }
-    };
-    let reasoning = message
-        .get("reasoning_content")
-        .or_else(|| message.get("reasoning"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let tool_calls = normalize_response_tool_calls(message.get("tool_calls"));
-    Ok(ModelReply {
-        content,
-        reasoning,
-        finish_reason: FinishReason::from_provider(
-            choice.get("finish_reason").and_then(Value::as_str),
-            !tool_calls.is_empty(),
-        ),
-        tool_calls,
-        usage: usage(payload.get("usage")),
-    })
 }
 
 fn merge_map(target: &mut Map<String, Value>, source: &Map<String, Value>) {

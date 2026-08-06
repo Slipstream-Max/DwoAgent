@@ -1,6 +1,5 @@
-protocol: open_ai_chat_completions
-endpoint: https://api.deepseek.com/chat/completions
-maxOutputTokensField: max_tokens
+protocol: open_ai_responses
+endpoint: https://api.deepseek.com/responses
 models:
   deepseek-v4-pro:
     contextWindowTokens: 1000000
@@ -9,20 +8,20 @@ models:
     capabilities:
       imageInput: false
       toolCalls: true
+    hostedTools:
+      - type: web_search
     defaultReasoningMode: high
     reasoning:
       auto: {}
       nonthink:
-        thinking:
-          type: disabled
+        reasoning:
+          effort: none
       high:
-        thinking:
-          type: enabled
-        reasoning_effort: high
+        reasoning:
+          effort: high
       max:
-        thinking:
-          type: enabled
-        reasoning_effort: max
+        reasoning:
+          effort: max
   deepseek-v4-flash:
     contextWindowTokens: 1000000
     maxOutputTokens: 384000
@@ -30,17 +29,17 @@ models:
     capabilities:
       imageInput: false
       toolCalls: true
+    hostedTools:
+      - type: web_search
     defaultReasoningMode: high
     reasoning:
       auto: {}
       nonthink:
-        thinking:
-          type: disabled
+        reasoning:
+          effort: none
       high:
-        thinking:
-          type: enabled
-        reasoning_effort: high
+        reasoning:
+          effort: high
       max:
-        thinking:
-          type: enabled
-        reasoning_effort: max
+        reasoning:
+          effort: max

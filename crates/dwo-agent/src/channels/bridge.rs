@@ -98,7 +98,7 @@ impl SessionBridge {
         let messages = match command {
             ChannelCommand::Help => vec![render_command_help()],
             ChannelCommand::List => {
-                let records = self.host.service.list().await?;
+                let records = self.host.list_sessions(true, None).await?;
                 let selected = self.selected_session_id.lock().await.clone();
                 let text = records
                     .into_iter()
@@ -124,20 +124,22 @@ impl SessionBridge {
             }
             ChannelCommand::New { name, cwd } => {
                 let title = (!name.is_empty()).then(|| name.join(" "));
-                let session = self.host.create_session(title, cwd).await?;
-                self.select_session(session.id().as_str()).await?;
-                let snapshot = session.attach(self.endpoint.clone()).await?.snapshot;
+                let snapshot = self.host.setup_session(title, cwd).await?;
+                let session_id = snapshot.record.info.id.clone();
+                self.select_session(session_id.as_str()).await?;
                 vec![format!(
                     "Selected new session {}\nCwd: {}",
-                    session.id(),
+                    session_id,
                     display_path(&snapshot.record.info.cwd)
                 )]
             }
             ChannelCommand::Use { session: id } => {
                 let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
-                let agent = self.host.service.load(&session_id).await?;
                 self.select_session(&id).await?;
-                let subscription = agent.attach(self.endpoint.clone()).await?;
+                let subscription = self
+                    .host
+                    .subscribe_session(&session_id, self.endpoint.clone(), None)
+                    .await?;
                 let replay = render_session_replay(&subscription.snapshot, self.replay_turns);
                 if replay.is_empty() {
                     vec![render_status(&subscription.snapshot)]
@@ -147,11 +149,9 @@ impl SessionBridge {
             }
             ChannelCommand::Status => {
                 let snapshot = self
-                    .selected_agent()
-                    .await?
-                    .attach(self.endpoint.clone())
-                    .await?
-                    .snapshot;
+                    .host
+                    .session_snapshot(&self.selected_session_id().await?)
+                    .await?;
                 vec![render_status(&snapshot)]
             }
             ChannelCommand::Del { session: id } => {
@@ -163,14 +163,32 @@ impl SessionBridge {
                 vec!["Session deleted".to_string()]
             }
             ChannelCommand::Cancel => {
-                self.selected_agent().await?.cancel(None).await?;
+                self.host
+                    .cancel_session(&self.selected_session_id().await?, None)
+                    .await?;
                 vec!["Cancellation requested".to_string()]
+            }
+            ChannelCommand::Compact => {
+                let id = self.selected_session_id().await?;
+                self.ensure_observer(&id).await?;
+                self.host
+                    .compact_session(&id, self.endpoint.clone())
+                    .await?;
+                Vec::new()
+            }
+            ChannelCommand::Resume => {
+                let id = self.selected_session_id().await?;
+                self.ensure_observer(&id).await?;
+                let _ = self
+                    .host
+                    .resume_session_turn(&id, self.endpoint.clone())
+                    .await?;
+                Vec::new()
             }
             ChannelCommand::Model { name: model } => {
                 let id = self.selected_session_id().await?;
                 self.host
-                    .service
-                    .set_config(&id, SessionConfigUpdate::Model(model))
+                    .set_session_config(&id, SessionConfigUpdate::Model(model))
                     .await?;
                 vec!["Model updated".to_string()]
             }
@@ -178,8 +196,7 @@ impl SessionBridge {
                 let reasoning = (level != "off").then_some(level);
                 let id = self.selected_session_id().await?;
                 self.host
-                    .service
-                    .set_config(&id, SessionConfigUpdate::Reasoning(reasoning))
+                    .set_session_config(&id, SessionConfigUpdate::Reasoning(reasoning))
                     .await?;
                 vec!["Reasoning updated".to_string()]
             }
@@ -188,19 +205,11 @@ impl SessionBridge {
                 if let Some(value) = mode {
                     let mode = SessionMode::parse(&value).map_err(anyhow::Error::msg)?;
                     self.host
-                        .service
-                        .set_config(&id, SessionConfigUpdate::Mode(mode))
+                        .set_session_config(&id, SessionConfigUpdate::Mode(mode))
                         .await?;
                     vec![format!("Policy updated: {}", policy_name(mode))]
                 } else {
-                    let snapshot = self
-                        .host
-                        .service
-                        .load(&id)
-                        .await?
-                        .attach(self.endpoint.clone())
-                        .await?
-                        .snapshot;
+                    let snapshot = self.host.session_snapshot(&id).await?;
                     vec![format!(
                         "Policy: {}\nOptions: full_access | confirm | watch",
                         policy_name(snapshot.record.info.mode)
@@ -208,11 +217,13 @@ impl SessionBridge {
                 }
             }
             ChannelCommand::Allow { id } => {
-                let (agent, id) = self.permission_request(id).await?;
-                agent
-                    .respond_permission(
+                let session_id = self.selected_session_id().await?;
+                let request_id = self.permission_request(id).await?;
+                self.host
+                    .resolve_session_permission(
+                        &session_id,
                         self.endpoint.clone(),
-                        id,
+                        request_id,
                         ConfirmationDecision {
                             allowed: true,
                             reason: None,
@@ -222,11 +233,13 @@ impl SessionBridge {
                 Vec::new()
             }
             ChannelCommand::Deny { id } => {
-                let (agent, id) = self.permission_request(id).await?;
-                agent
-                    .respond_permission(
+                let session_id = self.selected_session_id().await?;
+                let request_id = self.permission_request(id).await?;
+                self.host
+                    .resolve_session_permission(
+                        &session_id,
                         self.endpoint.clone(),
-                        id,
+                        request_id,
                         ConfirmationDecision {
                             allowed: false,
                             reason: Some(format!(
@@ -244,9 +257,10 @@ impl SessionBridge {
 
     pub(crate) async fn submit_prompt(&self, content: MessageContent) -> Result<()> {
         let session_id = self.ensure_prompt_session().await?;
-        let agent = self.host.service.load(&session_id).await?;
-        self.ensure_observer(agent.clone()).await?;
-        agent.prompt_content(self.endpoint.clone(), content).await?;
+        self.ensure_observer(&session_id).await?;
+        self.host
+            .prompt_session(&session_id, self.endpoint.clone(), content)
+            .await?;
         Ok(())
     }
 
@@ -255,9 +269,10 @@ impl SessionBridge {
             return SessionId::parse(id).map_err(anyhow::Error::msg);
         }
         let session_id = {
-            let agent = self.host.create_session(None, None).await?;
-            self.select_session(agent.id().as_str()).await?;
-            agent.id().clone()
+            let snapshot = self.host.setup_session(None, None).await?;
+            let session_id = snapshot.record.info.id;
+            self.select_session(session_id.as_str()).await?;
+            session_id
         };
         Ok(session_id)
     }
@@ -267,8 +282,7 @@ impl SessionBridge {
             return Ok(());
         };
         let session_id = SessionId::parse(id).map_err(anyhow::Error::msg)?;
-        let agent = self.host.service.load(&session_id).await?;
-        self.ensure_observer(agent).await
+        self.ensure_observer(&session_id).await
     }
 
     pub(crate) async fn stop(&self) {
@@ -287,33 +301,23 @@ impl SessionBridge {
         SessionId::parse(id).map_err(anyhow::Error::msg)
     }
 
-    async fn selected_agent(&self) -> Result<Arc<dwo_agent_service::SessionAgent>> {
-        Ok(self
-            .host
-            .service
-            .load(&self.selected_session_id().await?)
-            .await?)
-    }
-
-    async fn permission_request(
-        &self,
-        requested: Option<String>,
-    ) -> Result<(Arc<dwo_agent_service::SessionAgent>, String)> {
-        let agent = self.selected_agent().await?;
+    async fn permission_request(&self, requested: Option<String>) -> Result<String> {
         let id = if requested.is_some() {
             resolve_permission_request_id(requested, None)?
         } else {
-            let subscription = agent.attach(self.endpoint.clone()).await?;
-            resolve_permission_request_id(None, subscription.snapshot.pending_permission.as_ref())?
+            let snapshot = self
+                .host
+                .session_snapshot(&self.selected_session_id().await?)
+                .await?;
+            resolve_permission_request_id(None, snapshot.pending_permission.as_ref())?
         };
-        Ok((agent, id))
+        Ok(id)
     }
 
     async fn select_session(&self, id: &str) -> Result<()> {
         self.set_selected_session(Some(id)).await?;
         let session_id = SessionId::parse(id.to_string()).map_err(anyhow::Error::msg)?;
-        let agent = self.host.service.load(&session_id).await?;
-        self.ensure_observer(agent).await
+        self.ensure_observer(&session_id).await
     }
 
     async fn set_selected_session(&self, id: Option<&str>) -> Result<()> {
@@ -321,8 +325,8 @@ impl SessionBridge {
         self.transport.save_selected_session(id).await
     }
 
-    async fn ensure_observer(&self, agent: Arc<dwo_agent_service::SessionAgent>) -> Result<()> {
-        let session_id = agent.id().to_string();
+    async fn ensure_observer(&self, id: &SessionId) -> Result<()> {
+        let session_id = id.to_string();
         let mut observer = self.observer.lock().await;
         if observer
             .as_ref()
@@ -333,9 +337,16 @@ impl SessionBridge {
         if let Some(current) = observer.take() {
             current.task.abort();
         }
-        let subscription = agent.attach(self.endpoint.clone()).await?;
+        let subscription = self
+            .host
+            .subscribe_session(id, self.endpoint.clone(), None)
+            .await?;
         let transport = self.transport.clone();
-        let task = tokio::spawn(stream_session(transport, subscription));
+        let task = tokio::spawn(stream_session(
+            transport,
+            self.endpoint.clone(),
+            subscription,
+        ));
         *observer = Some(SessionObserver { session_id, task });
         Ok(())
     }
@@ -352,6 +363,7 @@ fn resolve_permission_request_id(
 
 async fn stream_session(
     transport: Arc<dyn ConversationTransport>,
+    endpoint: EndpointId,
     mut subscription: dwo_agent_service::SessionSubscription,
 ) {
     let mut stream = SessionStreamState::default();
@@ -360,7 +372,12 @@ async fn stream_session(
             break;
         };
         match event.payload {
-            SessionEventPayload::UserPromptSubmitted { content, .. } => {
+            SessionEventPayload::UserPromptSubmitted {
+                origin, content, ..
+            } => {
+                if origin == endpoint {
+                    continue;
+                }
                 if let Some(prompt) = render_live_user_prompt(&content) {
                     send(&transport, &prompt).await;
                 }
@@ -436,8 +453,8 @@ async fn send(transport: &Arc<dyn ConversationTransport>, text: &str) {
 mod tests {
     use super::*;
     use dwo_agent_service::{
-        ClientTranscriptEvent, RuntimePhase, SessionLlmSettings, SessionRecord, SessionSnapshot,
-        SessionSubscription, SessionUsageSnapshot, TurnId,
+        ClientTranscriptEvent, MessageId, RuntimePhase, SessionLlmSettings, SessionRecord,
+        SessionSnapshot, SessionSubscription, SessionUsageSnapshot, TurnId,
     };
     use std::path::PathBuf;
 
@@ -521,14 +538,21 @@ mod tests {
             },
             events,
         };
-        let task = tokio::spawn(stream_session(transport.clone(), subscription));
+        let task = tokio::spawn(stream_session(
+            transport.clone(),
+            EndpointId::new(),
+            subscription,
+        ));
         for (seq, payload) in [
             SessionEventPayload::UserPromptSubmitted {
+                message_id: MessageId::new(),
                 turn_id: turn_id.clone(),
                 origin: EndpointId::new(),
                 content: MessageContent::text("question"),
             },
             SessionEventPayload::AssistantCompleted {
+                message_id: MessageId::new(),
+                thought_message_id: MessageId::new(),
                 turn_id: turn_id.clone(),
                 content: "answer".to_string(),
                 reasoning: None,

@@ -9,6 +9,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::{OutputBuffer, TerminalId, environment};
+use crate::{ToolEvent, ToolEventHandler};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProcessStatus {
@@ -30,6 +31,7 @@ pub(super) struct TerminalProcess {
     pub cwd: std::path::PathBuf,
     pub tty: bool,
     pub pid: Option<u32>,
+    events: Option<ToolEventHandler>,
     state: Arc<Mutex<ProcessState>>,
     output_notify: Arc<Notify>,
     state_notify: Arc<Notify>,
@@ -39,10 +41,12 @@ pub(super) struct TerminalProcess {
 impl TerminalProcess {
     pub async fn spawn(
         id: TerminalId,
+        tool_call_id: String,
         command: String,
         cwd: std::path::PathBuf,
         tty: bool,
         environment_overrides: &HashMap<String, String>,
+        events: Option<ToolEventHandler>,
     ) -> Result<Arc<Self>> {
         let (program, args) = shell_command(&command);
         let mut env = environment::current();
@@ -63,15 +67,25 @@ impl TerminalProcess {
         } else {
             dwo_pty::spawn_pipe_process_no_stdin(&program, &args, &cwd, &env, &None).await?
         };
-        Ok(Self::from_spawned(id, command, cwd, tty, spawned))
+        Ok(Self::from_spawned(
+            id,
+            tool_call_id,
+            command,
+            cwd,
+            tty,
+            spawned,
+            events,
+        ))
     }
 
     fn from_spawned(
         id: TerminalId,
+        tool_call_id: String,
         command: String,
         cwd: std::path::PathBuf,
         tty: bool,
         spawned: SpawnedProcess,
+        events: Option<ToolEventHandler>,
     ) -> Arc<Self> {
         let SpawnedProcess {
             session,
@@ -86,6 +100,7 @@ impl TerminalProcess {
             tty,
             // dwo-pty intentionally keeps the OS pid internal.
             pid: None,
+            events: events.clone(),
             state: Arc::new(Mutex::new(ProcessState {
                 output: OutputBuffer::default(),
                 status: ProcessStatus::Running,
@@ -96,6 +111,14 @@ impl TerminalProcess {
             state_notify: Arc::new(Notify::new()),
             session: Arc::new(session),
         });
+        if let Some(events) = events {
+            events(ToolEvent::TerminalOpened {
+                tool_call_id,
+                terminal_id: process.id.to_string(),
+                command: process.command.clone(),
+                cwd: process.cwd.clone(),
+            });
+        }
         let readers = vec![
             spawn_reader(stdout_rx, process.clone()),
             spawn_reader(stderr_rx, process.clone()),
@@ -188,6 +211,12 @@ impl TerminalProcess {
 
     fn push_output(&self, bytes: &[u8]) {
         lock(&self.state).output.push(bytes);
+        if let Some(events) = &self.events {
+            events(ToolEvent::TerminalOutput {
+                terminal_id: self.id.to_string(),
+                data: bytes.to_vec(),
+            });
+        }
         self.output_notify.notify_one();
     }
 
@@ -198,7 +227,20 @@ impl TerminalProcess {
         }
         state.finished = true;
         state.exit_code = exit_code;
+        let status = match state.status {
+            ProcessStatus::Killed => "cancelled",
+            ProcessStatus::Exited if exit_code == Some(0) => "completed",
+            ProcessStatus::Exited => "error",
+            ProcessStatus::Running => "error",
+        };
         drop(state);
+        if let Some(events) = &self.events {
+            events(ToolEvent::TerminalExited {
+                terminal_id: self.id.to_string(),
+                exit_code,
+                status: status.to_string(),
+            });
+        }
         self.state_notify.notify_one();
     }
 }

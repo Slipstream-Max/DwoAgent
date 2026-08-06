@@ -4,8 +4,7 @@
 
 ## 从这里开始
 
-1. 按 [README 的 Build & Install](../README.md#build--install) 编译、安装并启动 daemon。
-1. 按 [README 的 Build & Install](../README.md#五分钟跑起来) 编译、安装并启动 daemon。
+1. 按 README 的[“五分钟跑起来”](../README.md#五分钟跑起来)编译、安装并启动 daemon。
 1. 在 [Profile 配置指南](profile.md) 中设置模型、权限和需要启用的 channel。
 1. 选择一种对话入口：IDE/编辑器使用 [ACP](acp.md)，聊天应用使用 [Channels](channels.md)，脚本或终端使用 [CLI](commands.md)。
 
@@ -22,6 +21,6 @@
 
 ## 推荐阅读顺序
 
-- 首次部署：README -> Agent Profile -> ACP 或 Channels。
+- 首次部署：README -> Profile 配置 -> ACP 或 Channels。
 - 日常操作：CLI 命令参考 + 对应入口指南；需要拆分任务时阅读 Subsessions 使用指南。
 - 排查状态：先运行 `dwo daemon status`、`dwo profile-list` 和 `dwo channel <name> status`，再检查 `~/.dwoagent/runtime/logs/`。

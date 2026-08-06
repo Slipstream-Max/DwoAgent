@@ -17,8 +17,8 @@ use crate::TurnId;
 use crate::agent_loop::{self, RunTurn, TurnActorMessage, TurnEvent, TurnOutcome};
 use crate::error::AgentServiceError;
 use crate::events::{
-    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, RuntimePhase, SessionEvent,
-    SessionEventPayload, SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
+    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, FileChange, RuntimePhase,
+    SessionEvent, SessionEventPayload, SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord, title_from_user_content};
@@ -52,6 +52,42 @@ impl fmt::Display for EndpointId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageId(String);
+
+impl MessageId {
+    pub fn new() -> Self {
+        Self(format!("message-{}", Uuid::new_v4()))
+    }
+
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err("message id must not be empty".to_string());
+        }
+        Ok(Self(value))
+    }
+}
+
+impl Default for MessageId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptAccepted {
+    pub message_id: MessageId,
+    pub turn_id: TurnId,
 }
 
 pub struct SessionAgent {
@@ -123,7 +159,7 @@ impl SessionAgent {
 
     pub async fn attach_from(
         &self,
-        endpoint: EndpointId,
+        _endpoint: EndpointId,
         checkpoint_cursor: Option<usize>,
     ) -> Result<SessionSubscription, AgentServiceError> {
         let (response, wait) = oneshot::channel();
@@ -145,13 +181,6 @@ impl SessionAgent {
             loop {
                 match source.recv().await {
                     Ok(event) if event.seq > watermark => {
-                        if matches!(
-                            &event.payload,
-                            SessionEventPayload::UserPromptSubmitted { origin, .. }
-                                if origin == &endpoint
-                        ) {
-                            continue;
-                        }
                         if apply_step_delta(&mut active_step, &event.payload) {
                             step_seq = event.seq;
                             if needs_step_snapshot {
@@ -222,7 +251,7 @@ impl SessionAgent {
         &self,
         origin: EndpointId,
         content: impl Into<String>,
-    ) -> Result<TurnId, AgentServiceError> {
+    ) -> Result<PromptAccepted, AgentServiceError> {
         self.prompt_content(origin, MessageContent::text(content))
             .await
     }
@@ -231,7 +260,7 @@ impl SessionAgent {
         &self,
         origin: EndpointId,
         content: MessageContent,
-    ) -> Result<TurnId, AgentServiceError> {
+    ) -> Result<PromptAccepted, AgentServiceError> {
         let (response, wait) = oneshot::channel();
         self.send(Control::Prompt {
             origin,
@@ -244,11 +273,11 @@ impl SessionAgent {
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
     }
 
-    pub async fn try_prompt(
+    pub async fn prompt_idle(
         &self,
         origin: EndpointId,
         content: impl Into<String>,
-    ) -> Result<TurnId, AgentServiceError> {
+    ) -> Result<PromptAccepted, AgentServiceError> {
         let (response, wait) = oneshot::channel();
         self.send(Control::Prompt {
             origin,
@@ -257,6 +286,23 @@ impl SessionAgent {
             response,
         })
         .await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
+    pub async fn compact(&self, origin: EndpointId) -> Result<PromptAccepted, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::Compact { origin, response }).await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
+    pub async fn resume(
+        &self,
+        origin: EndpointId,
+    ) -> Result<Option<PromptAccepted>, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::Resume { origin, response }).await?;
         wait.await
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
     }
@@ -355,7 +401,15 @@ enum Control {
         origin: EndpointId,
         content: MessageContent,
         only_if_idle: bool,
-        response: oneshot::Sender<Result<TurnId, AgentServiceError>>,
+        response: oneshot::Sender<Result<PromptAccepted, AgentServiceError>>,
+    },
+    Compact {
+        origin: EndpointId,
+        response: oneshot::Sender<Result<PromptAccepted, AgentServiceError>>,
+    },
+    Resume {
+        origin: EndpointId,
+        response: oneshot::Sender<Result<Option<PromptAccepted>, AgentServiceError>>,
     },
     AppendInternal {
         turn_id: TurnId,
@@ -388,12 +442,21 @@ enum Control {
 
 struct ActiveTurn {
     id: TurnId,
+    kind: ActiveTurnKind,
     cancellation: CancellationToken,
     partial_message: String,
     partial_reasoning: String,
     step_id: u64,
     step_revision: u64,
+    message_id: MessageId,
+    thought_message_id: MessageId,
     tools: Vec<ActiveToolCall>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveTurnKind {
+    Agent,
+    ManualCompaction,
 }
 
 struct SessionActor {
@@ -421,9 +484,7 @@ struct SessionActor {
 
 enum PendingMessage {
     User {
-        origin: EndpointId,
         content: MessageContent,
-        response: oneshot::Sender<Result<TurnId, AgentServiceError>>,
     },
     Internal {
         content: MessageContent,
@@ -511,6 +572,16 @@ impl SessionActor {
                     let _ = response.send(result);
                     return false;
                 }
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.kind == ActiveTurnKind::ManualCompaction)
+                {
+                    let _ = response.send(Err(AgentServiceError::SessionBusy(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
                 if only_if_idle {
                     let _ = response.send(Err(AgentServiceError::SessionBusy(
                         self.record.info.id.clone(),
@@ -521,11 +592,62 @@ impl SessionActor {
                     let _ = response.send(Err(error));
                     return false;
                 }
-                self.pending_messages.push_back(PendingMessage::User {
+                let turn_id = self
+                    .active
+                    .as_ref()
+                    .expect("active prompt has a turn")
+                    .id
+                    .clone();
+                let message_id = MessageId::new();
+                self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
+                    message_id: message_id.clone(),
+                    turn_id: turn_id.clone(),
                     origin,
-                    content,
-                    response,
-                });
+                    content: content.clone(),
+                })
+                .await;
+                self.pending_messages
+                    .push_back(PendingMessage::User { content });
+                let _ = response.send(Ok(PromptAccepted {
+                    message_id,
+                    turn_id,
+                }));
+            }
+            Control::Compact { origin, response } => {
+                if self.phase == RuntimePhase::Closing {
+                    let _ = response.send(Err(AgentServiceError::SessionClosed(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                if self.phase == RuntimePhase::Cancelling {
+                    let _ = response.send(Err(AgentServiceError::PromptCancelled(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                if self.active.is_some() {
+                    let _ = response.send(Err(AgentServiceError::SessionBusy(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                let result = self.start_manual_compaction(origin).await;
+                let _ = response.send(result);
+            }
+            Control::Resume { origin, response } => {
+                if self.phase == RuntimePhase::Closing {
+                    let _ = response.send(Err(AgentServiceError::SessionClosed(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                if self.active.is_some() || self.phase != RuntimePhase::Idle {
+                    let _ = response.send(Ok(None));
+                    return false;
+                }
+                let result = self.start_resume(origin).await.map(Some);
+                let _ = response.send(result);
             }
             Control::AppendInternal {
                 turn_id,
@@ -560,7 +682,6 @@ impl SessionActor {
                     return false;
                 }
                 active.cancellation.cancel();
-                self.clear_pending_users();
                 self.phase = RuntimePhase::Cancelling;
                 self.permission.reject("turn cancelled");
                 let tools = self.tools.clone();
@@ -575,6 +696,7 @@ impl SessionActor {
                     return false;
                 }
                 let model_changed = matches!(&update, SessionConfigUpdate::Model(_));
+                let previous_model = self.record.llm.model.clone();
                 let new_model_reasoning = match &update {
                     SessionConfigUpdate::Model(model) => self
                         .model
@@ -589,35 +711,43 @@ impl SessionActor {
                     .map_err(AgentServiceError::InvalidConfig);
                 let result = match result {
                     Ok(()) => {
-                        let selection = ModelSelection {
+                        let mut selection = ModelSelection {
                             model: updated.llm.model.clone(),
                             reasoning: updated.llm.reasoning.clone(),
                         };
-                        match self.model.validate_selection(&selection) {
+                        let mut remember_reasoning = true;
+                        let validation =
+                            if let Err(error) = self.model.validate_selection(&selection) {
+                                if !model_changed || updated.llm.reasoning.is_none() {
+                                    Err(AgentServiceError::InvalidConfig(error.to_string()))
+                                } else {
+                                    // A remembered mode may not exist on the target model.
+                                    remember_reasoning = !updated
+                                        .llm
+                                        .reasoning_by_model
+                                        .contains_key(&updated.llm.model);
+                                    updated.llm.reasoning = None;
+                                    selection.reasoning = None;
+                                    self.model.validate_selection(&selection).map_err(|_| {
+                                        AgentServiceError::InvalidConfig(error.to_string())
+                                    })
+                                }
+                            } else {
+                                Ok(())
+                            };
+                        match validation {
                             Ok(()) => {
-                                updated.llm.remember_current_reasoning();
-                                updated.touch();
-                                self.repository
-                                    .save(&updated)
-                                    .await
-                                    .map_err(AgentServiceError::from)
-                            }
-                            Err(error) if model_changed && updated.llm.reasoning.is_some() => {
-                                // A remembered mode may not exist on the target
-                                // model. Keep the memory, but use that model's
-                                // default for the active selection.
-                                updated.llm.reasoning = None;
-                                let fallback = ModelSelection {
-                                    model: updated.llm.model.clone(),
-                                    reasoning: None,
+                                let normalized = if model_changed {
+                                    self.normalize_record_context_for_model(
+                                        &mut updated,
+                                        &previous_model,
+                                    )
+                                } else {
+                                    Ok(())
                                 };
-                                match self.model.validate_selection(&fallback) {
+                                match normalized {
                                     Ok(()) => {
-                                        if !updated
-                                            .llm
-                                            .reasoning_by_model
-                                            .contains_key(&updated.llm.model)
-                                        {
+                                        if remember_reasoning {
                                             updated.llm.remember_current_reasoning();
                                         }
                                         updated.touch();
@@ -626,12 +756,10 @@ impl SessionActor {
                                             .await
                                             .map_err(AgentServiceError::from)
                                     }
-                                    Err(_) => {
-                                        Err(AgentServiceError::InvalidConfig(error.to_string()))
-                                    }
+                                    Err(error) => Err(error),
                                 }
                             }
-                            Err(error) => Err(AgentServiceError::InvalidConfig(error.to_string())),
+                            Err(error) => Err(error),
                         }
                     }
                     Err(error) => Err(error),
@@ -728,7 +856,7 @@ impl SessionActor {
         &mut self,
         origin: EndpointId,
         content: MessageContent,
-    ) -> Result<TurnId, AgentServiceError> {
+    ) -> Result<PromptAccepted, AgentServiceError> {
         if self.phase == RuntimePhase::Closing {
             return Err(AgentServiceError::SessionClosed(
                 self.record.info.id.clone(),
@@ -737,6 +865,7 @@ impl SessionActor {
         self.validate_message_content(&content)?;
         let previous_usage = self.usage_snapshot();
         let turn_id = TurnId::new();
+        let message_id = MessageId::new();
         let event_content = content.clone();
         let repaired_title = self
             .record
@@ -767,6 +896,7 @@ impl SessionActor {
             self.start_title_generation(source, original_title);
         }
         self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
+            message_id: message_id.clone(),
             turn_id: turn_id.clone(),
             origin,
             content: event_content,
@@ -782,7 +912,66 @@ impl SessionActor {
             self.emit_usage_changed();
         }
         self.activate_turn(turn_id.clone());
-        Ok(turn_id)
+        Ok(PromptAccepted {
+            message_id,
+            turn_id,
+        })
+    }
+
+    async fn start_manual_compaction(
+        &mut self,
+        origin: EndpointId,
+    ) -> Result<PromptAccepted, AgentServiceError> {
+        let turn_id = TurnId::new();
+        let message_id = MessageId::new();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
+            message_id: message_id.clone(),
+            turn_id: turn_id.clone(),
+            origin,
+            content: MessageContent::text("/compact"),
+        })
+        .await;
+        let turn = self.prepare_turn(turn_id.clone(), ActiveTurnKind::ManualCompaction);
+        tokio::spawn(agent_loop::run_manual_compaction(turn));
+        Ok(PromptAccepted {
+            message_id,
+            turn_id,
+        })
+    }
+
+    async fn start_resume(
+        &mut self,
+        origin: EndpointId,
+    ) -> Result<PromptAccepted, AgentServiceError> {
+        let previous_usage = self.usage_snapshot();
+        let turn_id = TurnId::new();
+        let message_id = MessageId::new();
+        let mut context = ContextManager::new(self.record.context.clone());
+        context.append_internal(
+            MessageKind::Runtime,
+            "<resume>Continue the previous task from the current session state.</resume>",
+        );
+        context.refresh_usage(self.tools.schemas());
+        self.record.context = context.into_context();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
+            message_id: message_id.clone(),
+            turn_id: turn_id.clone(),
+            origin,
+            content: MessageContent::text("/resume"),
+        })
+        .await;
+        if self.usage_snapshot() != previous_usage {
+            self.emit_usage_changed();
+        }
+        self.activate_turn(turn_id.clone());
+        Ok(PromptAccepted {
+            message_id,
+            turn_id,
+        })
     }
 
     async fn start_internal(
@@ -826,15 +1015,37 @@ impl SessionActor {
         Ok(())
     }
 
+    async fn append_user_idle(&mut self, content: MessageContent) -> Result<(), AgentServiceError> {
+        let previous_usage = self.usage_snapshot();
+        let mut context = ContextManager::new(self.record.context.clone());
+        context.append_user(content);
+        context.refresh_usage(self.tools.schemas());
+        self.record.context = context.into_context();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        if self.usage_snapshot() != previous_usage {
+            self.emit_usage_changed();
+        }
+        Ok(())
+    }
+
     fn activate_turn(&mut self, turn_id: TurnId) {
+        let turn = self.prepare_turn(turn_id, ActiveTurnKind::Agent);
+        tokio::spawn(agent_loop::run(turn));
+    }
+
+    fn prepare_turn(&mut self, turn_id: TurnId, kind: ActiveTurnKind) -> RunTurn {
         let cancellation = CancellationToken::new();
         self.active = Some(ActiveTurn {
             id: turn_id.clone(),
+            kind,
             cancellation: cancellation.clone(),
             partial_message: String::new(),
             partial_reasoning: String::new(),
             step_id: 1,
             step_revision: 0,
+            message_id: MessageId::new(),
+            thought_message_id: MessageId::new(),
             tools: Vec::new(),
         });
         self.phase = RuntimePhase::Running;
@@ -846,9 +1057,9 @@ impl SessionActor {
             cancellation.clone(),
             self.permission_tx.clone(),
         );
-        tokio::spawn(agent_loop::run(RunTurn {
+        RunTurn {
             session_id: self.record.info.id.clone(),
-            turn_id: turn_id.clone(),
+            turn_id,
             context: ContextManager::new(self.record.context.clone()),
             prompt_builder: self.prompt_builder.clone(),
             model: self.model.clone(),
@@ -857,7 +1068,7 @@ impl SessionActor {
             permission,
             cancellation,
             actor: self.turn_tx.clone(),
-        }));
+        }
     }
 
     fn validate_message_content(&self, content: &MessageContent) -> Result<(), AgentServiceError> {
@@ -872,6 +1083,33 @@ impl SessionActor {
                 self.record.llm.model
             )));
         }
+        Ok(())
+    }
+
+    fn normalize_record_context_for_model(
+        &self,
+        record: &mut SessionRecord,
+        previous_model: &str,
+    ) -> Result<(), AgentServiceError> {
+        let provider = self
+            .model
+            .provider_id(&record.llm.model)
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+        let previous_provider = match record.context.provider.clone() {
+            Some(provider) => provider,
+            None => self
+                .model
+                .provider_id(previous_model)
+                .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?,
+        };
+        let allow_image_input = self
+            .model
+            .supports_image_input(&record.llm.model)
+            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+        let mut context = ContextManager::new(record.context.clone());
+        context.normalize_for_selection(&provider, Some(&previous_provider), allow_image_input);
+        context.refresh_usage(self.tools.schemas());
+        record.context = context.into_context();
         Ok(())
     }
 
@@ -912,12 +1150,17 @@ impl SessionActor {
                 {
                     active.partial_message.push_str(&delta);
                     active.step_revision = active.step_revision.saturating_add(1);
-                    Some((active.step_id, active.step_revision))
+                    Some((
+                        active.step_id,
+                        active.step_revision,
+                        active.message_id.clone(),
+                    ))
                 } else {
                     None
                 };
-                if let Some((step_id, revision)) = step {
+                if let Some((step_id, revision, message_id)) = step {
                     self.emit(SessionEventPayload::AssistantDelta {
+                        message_id,
                         turn_id,
                         step_id,
                         revision,
@@ -931,12 +1174,17 @@ impl SessionActor {
                 {
                     active.partial_reasoning.push_str(&delta);
                     active.step_revision = active.step_revision.saturating_add(1);
-                    Some((active.step_id, active.step_revision))
+                    Some((
+                        active.step_id,
+                        active.step_revision,
+                        active.thought_message_id.clone(),
+                    ))
                 } else {
                     None
                 };
-                if let Some((step_id, revision)) = step {
+                if let Some((step_id, revision, message_id)) = step {
                     self.emit(SessionEventPayload::AssistantReasoningDelta {
+                        message_id,
                         turn_id,
                         step_id,
                         revision,
@@ -953,16 +1201,22 @@ impl SessionActor {
                 let accepted = if let Some(active) =
                     self.active.as_mut().filter(|active| active.id == turn_id)
                 {
+                    let message_id = active.message_id.clone();
+                    let thought_message_id = active.thought_message_id.clone();
                     active.partial_message.clear();
                     active.partial_reasoning.clear();
                     active.step_id = active.step_id.saturating_add(1);
                     active.step_revision = 0;
-                    true
+                    active.message_id = MessageId::new();
+                    active.thought_message_id = MessageId::new();
+                    Some((message_id, thought_message_id))
                 } else {
-                    false
+                    None
                 };
-                if accepted {
+                if let Some((message_id, thought_message_id)) = accepted {
                     self.emit_client_event(SessionEventPayload::AssistantCompleted {
+                        message_id,
+                        thought_message_id,
                         turn_id,
                         content,
                         reasoning,
@@ -1001,6 +1255,71 @@ impl SessionActor {
                         .await;
                 }
             }
+            TurnEvent::ToolTelemetry { turn_id, event } => match event {
+                dwo_tools::ToolEvent::TerminalOpened {
+                    tool_call_id,
+                    terminal_id,
+                    command,
+                    cwd,
+                } => {
+                    self.emit_client_event(SessionEventPayload::TerminalOpened {
+                        turn_id,
+                        tool_call_id,
+                        terminal_id,
+                        command,
+                        cwd,
+                    })
+                    .await;
+                }
+                dwo_tools::ToolEvent::TerminalOutput { terminal_id, data } => {
+                    self.emit(SessionEventPayload::TerminalOutput {
+                        turn_id,
+                        terminal_id,
+                        data,
+                    });
+                }
+                dwo_tools::ToolEvent::TerminalExited {
+                    terminal_id,
+                    exit_code,
+                    status,
+                } => {
+                    self.emit_client_event(SessionEventPayload::TerminalExited {
+                        turn_id,
+                        terminal_id,
+                        exit_code,
+                        status,
+                    })
+                    .await;
+                }
+                dwo_tools::ToolEvent::FileRead { tool_call_id, path } => {
+                    self.emit_client_event(SessionEventPayload::FileRead {
+                        turn_id,
+                        tool_call_id,
+                        path,
+                    })
+                    .await;
+                }
+                dwo_tools::ToolEvent::FileChanged {
+                    tool_call_id,
+                    changes,
+                    patch,
+                } => {
+                    self.emit_client_event(SessionEventPayload::FileChanged {
+                        turn_id,
+                        tool_call_id,
+                        changes: changes
+                            .into_iter()
+                            .map(|change| FileChange {
+                                path: change.path,
+                                kind: change.kind.to_string(),
+                                moved_to: change.moved_to,
+                            })
+                            .collect(),
+                        patch,
+                    })
+                    .await;
+                }
+            },
             TurnEvent::Finished { turn_id, outcome } => {
                 if self
                     .active
@@ -1039,30 +1358,14 @@ impl SessionActor {
     }
 
     async fn take_pending_messages(&mut self) -> PendingMessageBatch {
-        let turn_id = self
-            .active
-            .as_ref()
-            .expect("pending messages are taken only by an active turn")
-            .id
-            .clone();
+        debug_assert!(self.active.is_some());
         let mut messages = Vec::with_capacity(self.pending_messages.len());
         let mut should_continue = false;
         while let Some(pending) = self.pending_messages.pop_front() {
             match pending {
-                PendingMessage::User {
-                    origin,
-                    content,
-                    response,
-                } => {
-                    self.emit_client_event(SessionEventPayload::UserPromptSubmitted {
-                        turn_id: turn_id.clone(),
-                        origin,
-                        content: content.clone(),
-                    })
-                    .await;
+                PendingMessage::User { content } => {
                     messages.push(PendingContextMessage::User(content));
                     should_continue = true;
-                    let _ = response.send(Ok(turn_id.clone()));
                 }
                 PendingMessage::Internal {
                     content,
@@ -1088,16 +1391,14 @@ impl SessionActor {
     async fn process_pending_idle(&mut self, allow_wake: bool) {
         while let Some(pending) = self.pending_messages.pop_front() {
             match pending {
-                PendingMessage::User {
-                    origin,
-                    content,
-                    response,
-                } => {
-                    let started = self.start_prompt(origin, content).await;
-                    let running = started.is_ok();
-                    let _ = response.send(started);
-                    if running {
-                        return;
+                PendingMessage::User { content } => {
+                    if let Err(error) = self.append_user_idle(content).await {
+                        tracing::error!(
+                            event = "session.pending_user_persist_failed",
+                            session_id = %self.record.info.id,
+                            error = %format!("{error:#}"),
+                            "persist accepted user message after turn finished"
+                        );
                     }
                 }
                 PendingMessage::Internal {
@@ -1122,28 +1423,11 @@ impl SessionActor {
         }
     }
 
-    fn clear_pending_users(&mut self) {
-        let mut retained = VecDeque::with_capacity(self.pending_messages.len());
-        while let Some(pending) = self.pending_messages.pop_front() {
-            match pending {
-                PendingMessage::User { response, .. } => {
-                    let _ = response.send(Err(AgentServiceError::PromptCancelled(
-                        self.record.info.id.clone(),
-                    )));
-                }
-                internal => retained.push_back(internal),
-            }
-        }
-        self.pending_messages = retained;
-    }
-
     fn reject_pending_messages(&mut self) {
         while let Some(pending) = self.pending_messages.pop_front() {
             let error = || AgentServiceError::SessionClosed(self.record.info.id.clone());
             match pending {
-                PendingMessage::User { response, .. } => {
-                    let _ = response.send(Err(error()));
-                }
+                PendingMessage::User { .. } => {}
                 PendingMessage::Internal { response, .. } => {
                     let _ = response.send(Err(error()));
                 }
@@ -1238,6 +1522,8 @@ impl SessionActor {
                 turn_id: active.id.clone(),
                 step_id: active.step_id,
                 revision: active.step_revision,
+                message_id: active.message_id.clone(),
+                thought_message_id: active.thought_message_id.clone(),
                 reasoning: active.partial_reasoning.clone(),
                 response: active.partial_message.clone(),
             }),
@@ -1303,19 +1589,21 @@ impl SessionActor {
 }
 
 fn apply_step_delta(step: &mut Option<ActiveStepSnapshot>, payload: &SessionEventPayload) -> bool {
-    let (turn_id, step_id, revision, delta, reasoning) = match payload {
+    let (message_id, turn_id, step_id, revision, delta, reasoning) = match payload {
         SessionEventPayload::AssistantDelta {
+            message_id,
             turn_id,
             step_id,
             revision,
             delta,
-        } => (turn_id, *step_id, *revision, delta, false),
+        } => (message_id, turn_id, *step_id, *revision, delta, false),
         SessionEventPayload::AssistantReasoningDelta {
+            message_id,
             turn_id,
             step_id,
             revision,
             delta,
-        } => (turn_id, *step_id, *revision, delta, true),
+        } => (message_id, turn_id, *step_id, *revision, delta, true),
         _ => return false,
     };
     if step
@@ -1326,6 +1614,8 @@ fn apply_step_delta(step: &mut Option<ActiveStepSnapshot>, payload: &SessionEven
             turn_id: turn_id.clone(),
             step_id,
             revision: 0,
+            message_id: MessageId::new(),
+            thought_message_id: MessageId::new(),
             reasoning: String::new(),
             response: String::new(),
         });
@@ -1333,8 +1623,10 @@ fn apply_step_delta(step: &mut Option<ActiveStepSnapshot>, payload: &SessionEven
     let current = step.as_mut().expect("active step was initialized");
     current.revision = revision;
     if reasoning {
+        current.thought_message_id = message_id.clone();
         current.reasoning.push_str(delta);
     } else {
+        current.message_id = message_id.clone();
         current.response.push_str(delta);
     }
     true
@@ -1418,6 +1710,8 @@ fn update_step_checkpoint(step: &mut Option<ActiveStepSnapshot>, payload: &Sessi
                 turn_id: turn_id.clone(),
                 step_id: 1,
                 revision: 0,
+                message_id: MessageId::new(),
+                thought_message_id: MessageId::new(),
                 reasoning: String::new(),
                 response: String::new(),
             });
@@ -1430,6 +1724,8 @@ fn update_step_checkpoint(step: &mut Option<ActiveStepSnapshot>, payload: &Sessi
             let current = step.as_mut().expect("matching active step exists");
             current.step_id = current.step_id.saturating_add(1);
             current.revision = 0;
+            current.message_id = MessageId::new();
+            current.thought_message_id = MessageId::new();
             current.reasoning.clear();
             current.response.clear();
         }

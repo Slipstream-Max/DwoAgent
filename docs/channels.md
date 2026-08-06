@@ -142,7 +142,7 @@ const ws = new WebSocket(
 
 ## Slash Commands
 
-三个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP，不支持这些 slash commands。
+三个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP v2 client 会收到 Agent 宣告的 `/compact` 和 `/resume`。
 
 | 命令 | 说明 |
 | --- | --- |
@@ -153,6 +153,8 @@ const ws = new WebSocket(
 | `/status` | 显示当前 session 的 cwd、模型、reasoning、policy 和运行状态 |
 | `/del <SESSION>` | 删除指定 session |
 | `/cancel` | 请求取消当前 turn |
+| `/compact` | 手动压缩当前 session context；命令本身不进入模型上下文 |
+| `/resume` | 仅在 session idle 时继续上一项工作；运行中静默忽略 |
 | `/model <NAME>` | 切换当前 session 的模型 alias |
 | `/reasoning <LEVEL\|off>` | 修改 reasoning mode，或使用 `off` 关闭 |
 | `/policy [full_access\|confirm\|watch]` | 不带参数查看 policy，带参数修改 |

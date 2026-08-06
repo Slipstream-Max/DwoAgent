@@ -7,8 +7,8 @@ ConfiguredModelClient
 |- model alias registry
 `- provider id -> BaseClient
    |- HTTP/auth/retry/cancellation
-   |- OpenAI-compatible Chat Completions encoding
-   |- SSE text/reasoning/tool-call assembly
+   |- OpenAI-compatible Responses input/output items
+   |- SSE text/reasoning/function/hosted-tool assembly
    `- non-streaming response normalization
 ```
 
@@ -17,6 +17,7 @@ operations:
 
 ```text
 model_limits(model_alias) -> context/output/input limits + compact trigger
+provider_id(model_alias) -> configured provider-instance id
 supports_image_input(model_alias) -> bool
 stream_turn(selection, messages, tools, event_sender, cancellation) -> ModelReply
 summarize(selection, compaction_view, cancellation)                  -> SummaryReply
@@ -28,11 +29,15 @@ tools. Both paths resolve the session's model alias through the same model and
 provider configuration.
 
 The session runtime consults `supports_image_input` before accepting an image
-prompt or committing a model switch. Provider message shaping still validates
-the capability as a final boundary check.
+prompt. A model switch normalizes stored context immediately, permanently
+removing unsupported images. Provider message shaping still validates the
+capability as a final boundary check.
 
-The model context is one message sequence. Message index 0 is the system
-message; there is no parallel `system_prompt` request field.
+The model context is one canonical item-first sequence. Each native Responses
+output item is persisted as its own ordered context entry and replayed verbatim.
+Reasoning and hosted-tool calls are owned by the configured provider instance;
+switching provider instances removes those private items while retaining
+visible messages and local function call/output pairs.
 
 ## Configuration
 
@@ -65,21 +70,20 @@ models:
 One provider entry produces one shared `BaseClient`, so every model using that
 provider shares its API key, endpoint, headers, HTTP pool, and retry policy.
 Only `baseUrl`, `apiKeyEnv`, and `apiKey` are profile-level provider settings;
-headers, retry policy, output-token field, and provider request fields remain
-catalog-owned. DeepSeek uses `max_tokens`; the OpenAI-compatible preset uses
-`max_completion_tokens`.
+headers, retry policy, hosted tools, and provider request fields remain
+catalog-owned. Responses requests always use `max_output_tokens`.
 Catalog provider body, catalog model body, and the selected reasoning map are
 deep-merged in that order. Reasoning never changes the model output limit.
 
-The built-in `openai` preset currently uses the Chat Completions transport. A
-NewAPI-compatible gateway can inherit it by overriding the complete endpoint:
+The built-in `openai` preset uses the Responses transport. A NewAPI-compatible
+gateway can inherit it by overriding the complete endpoint:
 
 ```yaml
 defaultModelId: gpt-5.6-terra
 providers:
   newapi:
     type: openai
-    baseUrl: https://gateway.example.com/v1/chat/completions
+    baseUrl: https://gateway.example.com/v1/responses
     apiKeyEnv: NEW_API_KEY
 models:
   - modelName: gpt-5.6-terra
@@ -87,8 +91,15 @@ models:
     modelId: gpt-5.6-terra
 ```
 
-Native Responses API transport is a separate protocol adapter; changing only
-`baseUrl` does not switch the wire format.
+Each catalog model may declare `hostedTools`. DeepSeek uses `web_search`; the
+OpenAI/NewAPI preset uses `web_search_preview`. Local function schemas are
+flattened to the Responses function-tool shape and appended to those hosted
+tools at request time.
+
+Only `function_call` items enter the local tool executor. Hosted calls such as
+`web_search_call` are retained in native output items and emitted as completed
+remote tool events. When a provider includes results on the item, the same
+event exposes them as the remote tool output.
 
 Profiles may add provider types as individual files under
 `resource/providers/`. The filename stem becomes the provider type, so
@@ -106,8 +117,8 @@ compact trigger = max input * compact threshold
 Context usage is estimated from the complete model request, including messages,
 tool calls, tool results, and tool schemas. Provider response usage is optional
 transport metadata and is not used for session context accounting.
-Transport-owned fields (`model`, `messages`, `tools`, `stream`, and
-`stream_options`) cannot be overridden by configuration.
+Transport-owned fields (`model`, `input`, `instructions`, `tools`, `stream`,
+and `max_output_tokens`) cannot be overridden by configuration.
 
 Provider response structure errors fail the model step. Malformed individual
 tool arguments remain a raw string in the normalized tool call, allowing the

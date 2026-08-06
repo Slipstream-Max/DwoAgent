@@ -113,6 +113,7 @@ pub struct ScriptedModelGateway {
     default_limits: ModelLimits,
     limits_by_model: BTreeMap<String, ModelLimits>,
     image_input_by_model: BTreeMap<String, bool>,
+    provider_by_model: BTreeMap<String, String>,
 }
 
 impl ScriptedModelGateway {
@@ -132,6 +133,7 @@ impl ScriptedModelGateway {
             },
             limits_by_model: BTreeMap::new(),
             image_input_by_model: BTreeMap::new(),
+            provider_by_model: BTreeMap::new(),
         })
     }
 
@@ -154,6 +156,7 @@ impl ScriptedModelGateway {
             },
             limits_by_model: BTreeMap::new(),
             image_input_by_model: BTreeMap::new(),
+            provider_by_model: BTreeMap::new(),
         })
     }
 
@@ -172,6 +175,7 @@ impl ScriptedModelGateway {
             default_limits: limits,
             limits_by_model: BTreeMap::new(),
             image_input_by_model: BTreeMap::new(),
+            provider_by_model: BTreeMap::new(),
         })
     }
 
@@ -195,6 +199,7 @@ impl ScriptedModelGateway {
             },
             limits_by_model: limits.into_iter().collect(),
             image_input_by_model: BTreeMap::new(),
+            provider_by_model: BTreeMap::new(),
         })
     }
 
@@ -209,6 +214,16 @@ impl ScriptedModelGateway {
             .expect("scripted model must be uniquely owned during setup")
             .image_input_by_model = image_input.into_iter().collect();
         model
+    }
+
+    pub fn with_providers(
+        mut self: Arc<Self>,
+        providers: impl IntoIterator<Item = (String, String)>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("scripted model must be uniquely owned during setup")
+            .provider_by_model = providers.into_iter().collect();
+        self
     }
 
     pub async fn requests(&self) -> Vec<RecordedTurnRequest> {
@@ -244,6 +259,14 @@ impl ModelClient for ScriptedModelGateway {
             .get(model)
             .copied()
             .unwrap_or(true))
+    }
+
+    fn provider_id(&self, model: &str) -> Result<String, ModelClientError> {
+        Ok(self
+            .provider_by_model
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| "scripted".to_string()))
     }
 
     fn reasoning_modes(&self, _model: &str) -> Result<Vec<String>, ModelClientError> {
@@ -294,6 +317,8 @@ impl ModelClient for ScriptedModelGateway {
                     content,
                     reasoning: None,
                     tool_calls,
+                    remote_tool_calls: Vec::new(),
+                    output_items: Vec::new(),
                     finish_reason,
                     usage: ModelUsage {
                         input_tokens,
@@ -309,6 +334,8 @@ impl ModelClient for ScriptedModelGateway {
                     content,
                     reasoning: Some(reasoning),
                     tool_calls: Vec::new(),
+                    remote_tool_calls: Vec::new(),
+                    output_items: Vec::new(),
                     finish_reason: FinishReason::Stop,
                     usage: ModelUsage::default(),
                 })
@@ -350,6 +377,8 @@ impl ModelClient for ScriptedModelGateway {
             content: step.content,
             reasoning: None,
             tool_calls: Vec::new(),
+            remote_tool_calls: Vec::new(),
+            output_items: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: ModelUsage {
                 input_tokens: step.input_tokens,

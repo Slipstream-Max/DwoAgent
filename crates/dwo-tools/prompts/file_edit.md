@@ -21,7 +21,7 @@ Use `file_edit` for deliberate source-code, configuration, documentation, and ot
 
 ## Add File
 
-Create a file that does not already exist. Every content line starts with `+`.
+Write a file, replacing an existing file at the same path. Every content line starts with `+`. An Add File operation with no content lines creates an empty file.
 
 ```text
 *** Add File: path/to/new.txt
@@ -71,12 +71,12 @@ Within an update hunk:
 - `+` adds a line.
 - `@@` starts a hunk.
 - `@@ context` finds an anchor, then matches the hunk after that anchor. Do not repeat the anchor in the hunk body.
-- Blank context lines should normally contain a single leading space. Completely empty lines are accepted for compatibility: between `+` lines they are inferred as additions, between `-` lines as removals, and otherwise as unchanged context.
+- Blank context lines may be completely empty or contain a single leading space. Use `+` or `-` explicitly when adding or removing a blank line.
 - `*** End of File` requires the hunk to match at the end of the file.
 
 ## Move File
 
-Move an updated file by placing `*** Move to:` immediately after its update header. The destination must not already exist.
+Move an updated file by placing `*** Move to:` immediately after its update header. An existing destination is replaced.
 
 ```text
 *** Update File: old/path.txt
@@ -101,10 +101,11 @@ A successful result lists each changed path and whether it was added, updated, m
 # Notes
 
 - Prefer paths relative to the session working directory.
-- Add targets must not already exist. Update and delete targets must exist.
-- Existing files must contain valid UTF-8 text.
-- Updates preserve an existing UTF-8 BOM, CRLF line endings, and the presence or absence of a final newline.
+- Add targets replace existing files. Update and delete targets must exist.
+- Files being updated must contain valid UTF-8 text.
+- Updates follow Codex apply-patch text behavior and normally finish with a final newline.
 - Hunk matching tries exact text first, then tolerates trailing whitespace, surrounding whitespace, and common Unicode punctuation differences.
+- File operations are applied in patch order. If a later operation fails, earlier successful operations remain applied.
 - Keep related multi-file changes in one patch when they form one coherent edit.
 - Only one `file_edit` call is allowed per assistant response. Combine coherent multi-file changes into one patch; issue unrelated or follow-up patches in later responses.
 - File edits from different sessions are serialized by the shared file-edit service.

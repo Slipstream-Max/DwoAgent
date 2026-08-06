@@ -4,7 +4,8 @@ Owns the model-visible context for the rewrite. It does not call a model.
 
 ```text
 ContextManager
-|- model history (index 0 is the current system message)
+|- item-first model history (index 0 is the current system message)
+|- provider instance for which history is normalized
 |- SystemPromptBlock source metadata + watcher baseline
 |- current token estimate for the complete model request
 `- compaction state
@@ -24,6 +25,14 @@ Rules also include the `AGENTS.md` at the session's initial `cwd`. Only the
 profile and initial-cwd rule paths are watched. Changes to system prompt,
 rules, skills, MCP config, or environment append `EnvWatcher` messages at
 model-step boundaries. They do not mutate the existing system prompt.
+
+Responses output is stored item-first. Reasoning, assistant messages, local
+function calls, and hosted calls occupy separate ordered history entries rather
+than one aggregated assistant message. Reasoning and hosted calls carry their
+provider-instance owner; visible messages and local function call/output pairs
+are provider-neutral. Switching providers permanently removes provider-owned
+items from model history. Switching to a model without image input permanently
+removes image blocks. The client transcript is independent and remains intact.
 
 Compaction is split into preparation and replacement phases. The model client
 owns the non-streaming summary request:
@@ -47,8 +56,9 @@ ContextManager::apply_compaction(summary)
   -> reset watcher baseline
 ```
 
-Tool exchanges retain their standard assistant `tool_calls` plus paired tool
-result messages. File-edit patches are replaced with bounded omission markers.
+Tool exchanges retain item-first `function_call` entries plus paired output
+messages. Legacy aggregated assistant calls are normalized on load. File-edit
+patches are replaced with bounded omission markers.
 Terminal commands remain unchanged, while terminal result `output` values are
 replaced with the shared content-omission marker; status and other small result
 fields remain. This filtering is applied only to the retained reserve; the

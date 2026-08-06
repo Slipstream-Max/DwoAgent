@@ -43,6 +43,10 @@ pub(crate) enum ChannelCommand {
     },
     #[command(about = "Cancel the active turn.")]
     Cancel,
+    #[command(about = "Compact the selected session context.")]
+    Compact,
+    #[command(about = "Continue the selected session when it is idle.")]
+    Resume,
     #[command(about = "Change the selected session model.")]
     Model {
         #[arg(value_name = "NAME")]
@@ -200,6 +204,8 @@ mod tests {
         assert!(help.starts_with("These commands are supported:\n\n"));
         assert!(help.contains("/help - Display this command list."));
         assert!(help.contains("/new - Create and select a session."));
+        assert!(help.contains("/compact - Compact the selected session context."));
+        assert!(help.contains("/resume - Continue the selected session when it is idle."));
         assert!(help.contains("/policy - Show or change the tool permission policy."));
         assert!(help.contains("/deny - Deny the current or specified permission request."));
     }

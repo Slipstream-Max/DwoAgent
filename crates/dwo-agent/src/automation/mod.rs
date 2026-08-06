@@ -494,8 +494,8 @@ impl AutomationRuntime {
         let endpoint = EndpointId::new();
         let mut subscription = agent.attach(endpoint.clone()).await?;
         let turn_id = loop {
-            match agent.try_prompt(endpoint.clone(), prompt.clone()).await {
-                Ok(turn_id) => break turn_id,
+            match agent.prompt_idle(endpoint.clone(), prompt.clone()).await {
+                Ok(accepted) => break accepted.turn_id,
                 Err(AgentServiceError::SessionBusy(_)) => {}
                 Err(error) => return Err(error.into()),
             }

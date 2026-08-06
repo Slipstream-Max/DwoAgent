@@ -423,6 +423,7 @@ mod tests {
 
         repository.save(&record).await.unwrap();
         let event = ClientTranscriptEvent::new(SessionEventPayload::AssistantDelta {
+            message_id: crate::MessageId::new(),
             turn_id: TurnId::parse("turn-test").unwrap(),
             step_id: 1,
             revision: 1,
@@ -454,6 +455,7 @@ mod tests {
             .append_transcript_event(
                 &record.info.id,
                 &ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
+                    message_id: crate::MessageId::new(),
                     turn_id: TurnId::parse("turn-test").unwrap(),
                     step_id: 1,
                     revision: 2,

@@ -9,6 +9,7 @@ pub mod prompt;
 mod read_file;
 pub mod result;
 pub mod schema;
+mod telemetry;
 pub mod terminal;
 
 pub use call::{ParsedToolCall, ToolCall, ToolCallParseError, ToolIntent};
@@ -18,4 +19,5 @@ pub use manager::{
 };
 pub use policy::{Authorization, CommandRule, PolicyConfig, SessionMode, ToolPolicyEngine};
 pub use result::ToolResult;
+pub use telemetry::{ToolEvent, ToolEventHandler};
 pub use terminal::{TerminalId, TerminalManager};

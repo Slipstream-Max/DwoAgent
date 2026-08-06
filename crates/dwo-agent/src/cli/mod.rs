@@ -64,7 +64,10 @@ enum Command {
         #[command(subcommand)]
         command: AutomationCommand,
     },
-    Acp,
+    Acp {
+        #[arg(long, value_enum, default_value_t = acp::AcpProtocol::V2)]
+        protocol: acp::AcpProtocol,
+    },
 }
 
 #[derive(Subcommand)]
@@ -296,7 +299,7 @@ pub(crate) async fn run() -> Result<()> {
         Command::Channel { command } => run_channel(command, &config_path).await?,
         Command::Mcp { command } => run_mcp(command, &config_path).await?,
         Command::Automation { command } => run_automation(command, &config_path).await?,
-        Command::Acp => acp::run(config_path).await?,
+        Command::Acp { protocol } => acp::run(config_path, protocol).await?,
     }
     Ok(())
 }
@@ -958,6 +961,25 @@ model:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_acp_protocol_version() {
+        let default = Cli::try_parse_from(["dwo", "acp"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Command::Acp {
+                protocol: acp::AcpProtocol::V2
+            }
+        ));
+
+        let v1 = Cli::try_parse_from(["dwo", "acp", "--protocol", "v1"]).unwrap();
+        assert!(matches!(
+            v1.command,
+            Command::Acp {
+                protocol: acp::AcpProtocol::V1
+            }
+        ));
+    }
 
     #[test]
     fn parses_nested_weixin_commands() {

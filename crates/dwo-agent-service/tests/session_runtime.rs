@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dwo_agent_service::{
-    AgentService, AgentServiceError, ConfirmationDecision, ContentBlock, EndpointId,
-    FsSessionRepository, MemorySessionRepository, MessageContent, MessageKind, ModelLimits,
-    NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload, SessionLlmSettings,
-    SessionMode, SessionRepository,
+    AgentService, AgentServiceError, ConfirmationDecision, ContentBlock, ContextMessage,
+    EndpointId, FsSessionRepository, MemorySessionRepository, MessageContent, MessageKind,
+    ModelLimits, NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload,
+    SessionLlmSettings, SessionMode, SessionRepository,
 };
 use dwo_tools::PolicyConfig;
-use serde_json::json;
+use serde_json::{Value, json};
 use support::{ScriptedCompletionStep, ScriptedModelGateway, ScriptedStep, ScriptedSummaryStep};
 
 fn new_session(cwd: &std::path::Path, mode: SessionMode) -> NewSession {
@@ -48,6 +48,30 @@ async fn wait_for_turn_end(
 fn write(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
+}
+
+fn response_item<'a>(message: &'a ContextMessage, kind: &str) -> Option<&'a Value> {
+    message
+        .response_item_value()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some(kind))
+}
+
+fn response_output_text(message: &ContextMessage) -> Option<&str> {
+    response_item(message, "message")?
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))?
+        .get("text")?
+        .as_str()
+}
+
+fn response_function_arguments(message: &ContextMessage) -> Option<Value> {
+    let arguments = response_item(message, "function_call")?.get("arguments")?;
+    match arguments {
+        Value::String(encoded) => serde_json::from_str(encoded).ok(),
+        value => Some(value.clone()),
+    }
 }
 
 #[tokio::test]
@@ -298,7 +322,7 @@ async fn model_tool_model_cycle_is_persisted_in_context() {
 
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(snapshot.phase, RuntimePhase::Idle);
-    assert_eq!(snapshot.record.context.messages.len(), 5);
+    assert_eq!(snapshot.record.context.messages.len(), 6);
     assert!(matches!(
         snapshot.transcript.iter().find_map(|event| match &event.payload {
             SessionEventPayload::UserPromptSubmitted { content, .. } => Some(content),
@@ -312,7 +336,7 @@ async fn model_tool_model_cycle_is_persisted_in_context() {
     );
     let requests = model.requests().await;
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].messages.len(), 4);
+    assert_eq!(requests[1].messages.len(), 5);
 }
 
 #[tokio::test]
@@ -360,7 +384,7 @@ async fn reasoning_and_answer_deltas_are_broadcast_separately() {
 }
 
 #[tokio::test]
-async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
+async fn accepted_prompt_is_broadcast_to_origin_and_other_observers() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([ScriptedStep::text("done")]);
     let service = AgentService::new(
@@ -377,7 +401,7 @@ async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
     let mut origin_events = agent.attach(origin.clone()).await.unwrap().events;
     let mut observer_events = agent.attach(observer).await.unwrap().events;
 
-    let turn_id = agent
+    let accepted = agent
         .prompt(origin.clone(), "hello observers")
         .await
         .unwrap();
@@ -387,6 +411,7 @@ async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
                 turn_id,
                 origin,
                 content,
+                ..
             } = observer_events.recv().await.unwrap().payload
             {
                 break (turn_id, origin, content);
@@ -395,31 +420,33 @@ async fn prompt_is_broadcast_to_observers_but_not_echoed_to_its_origin() {
     })
     .await
     .unwrap();
-    assert_eq!(observed.0, turn_id);
+    assert_eq!(observed.0, accepted.turn_id);
     assert_eq!(observed.1, origin);
     assert_eq!(observed.2, "hello observers");
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let observed_origin = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let event = origin_events.recv().await.unwrap();
-            assert!(!matches!(
-                &event.payload,
-                SessionEventPayload::UserPromptSubmitted { .. }
-            ));
-            if matches!(&event.payload, SessionEventPayload::TurnCompleted { .. }) {
-                break;
+            if let SessionEventPayload::UserPromptSubmitted {
+                message_id,
+                content,
+                ..
+            } = origin_events.recv().await.unwrap().payload
+            {
+                break (message_id, content);
             }
         }
     })
     .await
     .unwrap();
+    assert_eq!(observed_origin.0, accepted.message_id);
+    assert_eq!(observed_origin.1, "hello observers");
 }
 
 #[tokio::test]
-async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
+async fn prompt_is_accepted_before_the_current_step_finishes() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([
-        ScriptedStep::delayed_text("first answer", 200),
+        ScriptedStep::delayed_text("first answer", 500),
         ScriptedStep::text("replacement"),
     ]);
     let service = AgentService::new(
@@ -433,7 +460,11 @@ async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
         .unwrap();
     let endpoint = EndpointId::new();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let first = agent.prompt(endpoint.clone(), "first").await.unwrap();
+    let first = agent
+        .prompt(endpoint.clone(), "first")
+        .await
+        .unwrap()
+        .turn_id;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         while model.requests().await.is_empty() {
@@ -442,11 +473,11 @@ async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
     })
     .await
     .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(2), agent.prompt(endpoint, "second"))
+    let second = tokio::time::timeout(Duration::from_millis(100), agent.prompt(endpoint, "second"))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first, second);
+    assert_eq!(first, second.turn_id);
     assert!(matches!(
         wait_for_turn_end(&mut events).await,
         SessionEventPayload::TurnCompleted { turn_id } if turn_id == first
@@ -462,13 +493,19 @@ async fn prompt_waits_for_the_response_boundary_without_cancelling_the_turn() {
     );
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(
-        snapshot.record.context.messages.last().unwrap().content,
-        "replacement"
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("replacement")
     );
 }
 
 #[tokio::test]
-async fn try_prompt_never_joins_an_active_turn() {
+async fn prompt_idle_rejects_an_active_turn() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([
         ScriptedStep::delayed_text("first answer", 150),
@@ -484,13 +521,17 @@ async fn try_prompt_never_joins_an_active_turn() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let first = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    let first = agent
+        .prompt(EndpointId::new(), "first")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let error = agent
-        .try_prompt(EndpointId::new(), "second")
+        .prompt_idle(EndpointId::new(), "second")
         .await
         .unwrap_err();
     assert!(matches!(error, AgentServiceError::SessionBusy(_)));
@@ -499,7 +540,11 @@ async fn try_prompt_never_joins_an_active_turn() {
         SessionEventPayload::TurnCompleted { turn_id } if turn_id == first
     ));
 
-    let second = agent.try_prompt(EndpointId::new(), "second").await.unwrap();
+    let second = agent
+        .prompt_idle(EndpointId::new(), "second")
+        .await
+        .unwrap()
+        .turn_id;
     assert_ne!(first, second);
     assert!(matches!(
         wait_for_turn_end(&mut events).await,
@@ -525,7 +570,11 @@ async fn targeted_internal_message_continues_only_the_expected_turn() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let turn = agent.prompt(EndpointId::new(), "work").await.unwrap();
+    let turn = agent
+        .prompt(EndpointId::new(), "work")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -560,7 +609,7 @@ async fn targeted_internal_message_continues_only_the_expected_turn() {
 }
 
 #[tokio::test]
-async fn cancel_clears_queued_user_prompts() {
+async fn cancel_keeps_an_already_accepted_queued_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([ScriptedStep::delayed_text("late", 5_000)]);
     let service = AgentService::new(
@@ -573,32 +622,36 @@ async fn cancel_clears_queued_user_prompts() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let first = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    let first = agent
+        .prompt(EndpointId::new(), "first")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let queued_agent = agent.clone();
-    let queued =
-        tokio::spawn(async move { queued_agent.prompt(EndpointId::new(), "queued").await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let queued = agent.prompt(EndpointId::new(), "queued").await.unwrap();
     agent.cancel(Some(first.clone())).await.unwrap();
-    let error = queued.await.unwrap().unwrap_err();
-    assert!(matches!(
-        error,
-        dwo_agent_service::AgentServiceError::PromptCancelled(_)
-    ));
     assert!(matches!(
         wait_for_turn_end(&mut events).await,
         SessionEventPayload::TurnCancelled { turn_id } if turn_id == first
     ));
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
-    assert!(snapshot.transcript.iter().all(|event| {
-        !matches!(
+    assert!(snapshot.transcript.iter().any(|event| {
+        matches!(
             &event.payload,
-            SessionEventPayload::UserPromptSubmitted { content, .. }
-                if content.as_text() == Some("queued")
+            SessionEventPayload::UserPromptSubmitted { message_id, content, .. }
+                if message_id == &queued.message_id && content.as_text() == Some("queued")
         )
     }));
+    assert!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .any(|message| message.content == "queued")
+    );
 }
 
 #[tokio::test]
@@ -618,7 +671,11 @@ async fn queued_prompts_are_delivered_fifo_in_the_same_turn() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let turn = agent.prompt(EndpointId::new(), "first").await.unwrap();
+    let turn = agent
+        .prompt(EndpointId::new(), "first")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -628,8 +685,8 @@ async fn queued_prompts_are_delivered_fifo_in_the_same_turn() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let third_agent = agent.clone();
     let third = tokio::spawn(async move { third_agent.prompt(EndpointId::new(), "third").await });
-    assert_eq!(second.await.unwrap().unwrap(), turn);
-    assert_eq!(third.await.unwrap().unwrap(), turn);
+    assert_eq!(second.await.unwrap().unwrap().turn_id, turn);
+    assert_eq!(third.await.unwrap().unwrap().turn_id, turn);
     wait_for_turn_end(&mut events).await;
 
     let requests = model.requests().await;
@@ -659,7 +716,11 @@ async fn cancel_keeps_internal_messages_without_waking_another_step() {
         .await
         .unwrap();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    let turn = agent.prompt(EndpointId::new(), "work").await.unwrap();
+    let turn = agent
+        .prompt(EndpointId::new(), "work")
+        .await
+        .unwrap()
+        .turn_id;
     while model.requests().await.is_empty() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -727,20 +788,20 @@ async fn rejected_duplicate_file_edits_keep_calls_and_results_unchanged_before_r
 
     let requests = model.requests().await;
     assert_eq!(requests.len(), 2);
-    let assistant = requests[1]
+    let calls = requests[1]
         .messages
         .iter()
-        .find(|message| !message.tool_calls.is_empty())
-        .unwrap();
-    assert_eq!(assistant.tool_calls.len(), 2);
+        .filter_map(response_function_arguments)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
     assert!(
-        assistant.tool_calls[0]["arguments"]["patch"]
+        calls[0]["patch"]
             .as_str()
             .unwrap()
             .contains("*** Add File: a")
     );
     assert!(
-        assistant.tool_calls[1]["arguments"]["patch"]
+        calls[1]["patch"]
             .as_str()
             .unwrap()
             .contains("*** Add File: b")
@@ -882,6 +943,132 @@ async fn waking_internal_message_starts_an_idle_session_immediately() {
 }
 
 #[tokio::test]
+async fn resume_continues_idle_context_and_is_silent_while_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::text("initial answer"),
+        ScriptedStep::delayed_text("resumed answer", 5_000),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "start work").await.unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let resumed = agent.resume(EndpointId::new()).await.unwrap().unwrap();
+    while model.requests().await.len() < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(agent.resume(EndpointId::new()).await.unwrap().is_none());
+    agent.cancel(Some(resumed.turn_id.clone())).await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCancelled { turn_id } if turn_id == resumed.turn_id
+    ));
+
+    let requests = model.requests().await;
+    assert!(requests[1].messages.iter().any(|message| {
+        message.kind == MessageKind::Runtime && message.content.contains("<resume>")
+    }));
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(snapshot.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::UserPromptSubmitted { content, .. }
+            if content.as_text() == Some("/resume")
+    )));
+    assert!(!snapshot.record.context.messages.iter().any(|message| {
+        message.role == dwo_agent_service::MessageRole::User && message.content == "/resume"
+    }));
+}
+
+#[tokio::test]
+async fn manual_compaction_uses_the_command_turn_without_adding_it_to_model_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::with_compaction(
+        [
+            ScriptedStep::text("old answer"),
+            ScriptedStep::text("recent answer"),
+        ],
+        [ScriptedSummaryStep {
+            summary: "older work summary".to_string(),
+            input_tokens: 100,
+            output_tokens: 10,
+        }],
+        ModelLimits {
+            context_window_tokens: 200_000,
+            max_output_tokens: 20_000,
+            max_input_tokens: 180_000,
+            compact_trigger_tokens: u64::MAX,
+        },
+    );
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent
+        .prompt(
+            EndpointId::new(),
+            format!("old work {}", "x".repeat(100_000)),
+        )
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    agent
+        .prompt(EndpointId::new(), "recent work")
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    let before = agent.snapshot().await.unwrap().usage.used;
+
+    let compact = agent.compact(EndpointId::new()).await.unwrap();
+    let mut response = None;
+    loop {
+        match events.recv().await.unwrap().payload {
+            SessionEventPayload::AssistantCompleted {
+                turn_id, content, ..
+            } if turn_id == compact.turn_id => response = Some(content),
+            SessionEventPayload::TurnCompleted { turn_id } if turn_id == compact.turn_id => break,
+            SessionEventPayload::TurnFailed { turn_id, error } if turn_id == compact.turn_id => {
+                panic!("manual compaction failed: {error}")
+            }
+            _ => {}
+        }
+    }
+
+    let snapshot = agent.snapshot().await.unwrap();
+    assert!(snapshot.usage.used < before);
+    assert_eq!(snapshot.record.context.compaction.count, 1);
+    assert!(
+        response
+            .as_deref()
+            .is_some_and(|content| content.starts_with("Context compacted from "))
+    );
+    assert!(snapshot.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::UserPromptSubmitted { content, .. }
+            if content.as_text() == Some("/compact")
+    )));
+    assert!(!snapshot.record.context.messages.iter().any(|message| {
+        message.role == dwo_agent_service::MessageRole::User && message.content == "/compact"
+    }));
+    assert_eq!(model.requests().await.len(), 2);
+    assert_eq!(model.summary_request_count().await, 1);
+}
+
+#[tokio::test]
 async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_model() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::with_compaction(
@@ -990,13 +1177,13 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
             .iter()
             .any(|message| message.kind == MessageKind::CompactionSummary)
     );
-    let assistant = requests[1]
+    let call = requests[1]
         .messages
         .iter()
-        .find(|message| !message.tool_calls.is_empty())
+        .find_map(response_function_arguments)
         .unwrap();
     assert!(
-        assistant.tool_calls[0]["arguments"]["patch"]
+        call["patch"]
             .as_str()
             .unwrap()
             .contains("file patch omitted")
@@ -1081,14 +1268,18 @@ async fn context_error_summarizes_old_history_and_retries_with_filtered_recent_t
             .iter()
             .any(|message| message.role == dwo_agent_service::MessageRole::Tool)
     );
-    let compacted_assistant = requests[6]
+    let compacted_call = requests[6]
         .messages
         .iter()
-        .find(|message| !message.tool_calls.is_empty())
+        .find_map(|message| response_item(message, "function_call"))
         .unwrap();
-    assert_eq!(compacted_assistant.tool_calls[0]["id"], "edit-recovery");
+    assert_eq!(compacted_call["call_id"], "edit-recovery");
+    let compacted_arguments = compacted_call["arguments"]
+        .as_str()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap();
     assert!(
-        compacted_assistant.tool_calls[0]["arguments"]["patch"]
+        compacted_arguments["patch"]
             .as_str()
             .unwrap()
             .contains("file patch omitted")
@@ -1284,7 +1475,7 @@ async fn switching_models_compacts_with_the_last_successful_model_and_keeps_reas
 }
 
 #[tokio::test]
-async fn switching_models_projects_images_without_rewriting_context() {
+async fn switching_to_text_model_permanently_removes_images_from_model_context() {
     let dir = tempfile::tempdir().unwrap();
     let unlimited = ModelLimits {
         context_window_tokens: u64::MAX,
@@ -1349,7 +1540,7 @@ async fn switching_models_projects_images_without_rewriting_context() {
             .context
             .messages
             .iter()
-            .any(|message| message.content.contains_images())
+            .all(|message| !message.content.contains_images())
     );
     assert_eq!(snapshot.record.context.compaction.count, 0);
     assert_eq!(snapshot.record.context.compaction.summary, None);
@@ -1391,12 +1582,142 @@ async fn switching_models_projects_images_without_rewriting_context() {
         requests[2]
             .messages
             .iter()
-            .any(|message| message.content.contains_images())
+            .all(|message| !message.content.contains_images())
     );
 }
 
 #[tokio::test]
-async fn text_model_compaction_removes_images_from_active_context() {
+async fn switching_providers_trims_private_response_items_but_keeps_visible_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let unlimited = ModelLimits {
+        context_window_tokens: u64::MAX,
+        max_output_tokens: u32::MAX,
+        max_input_tokens: u64::MAX,
+        compact_trigger_tokens: u64::MAX,
+    };
+    let model = ScriptedModelGateway::with_model_limits(
+        [ScriptedStep::reasoning_text(
+            "private summary",
+            "visible answer",
+        )],
+        [],
+        [
+            ("scripted-test-model".to_string(), unlimited),
+            ("next-model".to_string(), unlimited),
+        ],
+    )
+    .with_providers([
+        ("scripted-test-model".to_string(), "provider-a".to_string()),
+        ("next-model".to_string(), "provider-b".to_string()),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "remember").await.unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let before = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert!(before.record.context.messages.iter().any(|message| {
+        message.provider.as_deref() == Some("provider-a")
+            && message
+                .response_item_value()
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("reasoning")
+    }));
+
+    agent
+        .set_config(SessionConfigUpdate::Model("next-model".to_string()))
+        .await
+        .unwrap();
+    let after = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(after.record.context.provider.as_deref(), Some("provider-b"));
+    assert!(after.record.context.messages.iter().all(|message| {
+        message
+            .response_item_value()
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            != Some("reasoning")
+    }));
+    assert!(after.record.context.messages.iter().any(|message| {
+        message
+            .response_item_value()
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("message")
+    }));
+    assert!(after.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::AssistantCompleted { reasoning: Some(reasoning), .. }
+            if reasoning == "private summary"
+    )));
+}
+
+#[tokio::test]
+async fn in_flight_old_provider_response_cannot_restore_stale_context_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let unlimited = ModelLimits {
+        context_window_tokens: u64::MAX,
+        max_output_tokens: u32::MAX,
+        max_input_tokens: u64::MAX,
+        compact_trigger_tokens: u64::MAX,
+    };
+    let model = ScriptedModelGateway::with_model_limits(
+        [ScriptedStep::delayed_text("old provider answer", 100)],
+        [],
+        [
+            ("scripted-test-model".to_string(), unlimited),
+            ("next-model".to_string(), unlimited),
+        ],
+    )
+    .with_providers([
+        ("scripted-test-model".to_string(), "provider-a".to_string()),
+        ("next-model".to_string(), "provider-b".to_string()),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "start").await.unwrap();
+    agent
+        .set_config(SessionConfigUpdate::Model("next-model".to_string()))
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+
+    let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
+    assert_eq!(snapshot.record.llm.model, "next-model");
+    assert_eq!(
+        snapshot.record.context.provider.as_deref(),
+        Some("provider-b")
+    );
+    assert_eq!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("old provider answer")
+    );
+}
+
+#[tokio::test]
+async fn text_model_transition_removes_images_without_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let limits = ModelLimits {
         context_window_tokens: 1_000,
@@ -1448,14 +1769,14 @@ async fn text_model_compaction_removes_images_from_active_context() {
             .context
             .messages
             .iter()
-            .any(|message| message.content.contains_images())
+            .all(|message| !message.content.contains_images())
     );
 
     agent.prompt(EndpointId::new(), "continue").await.unwrap();
     wait_for_turn_end(&mut subscription.events).await;
     let after = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert_eq!(after.record.llm.model, "text-model");
-    assert_eq!(after.record.context.compaction.count, 1);
+    assert_eq!(after.record.context.compaction.count, 0);
     assert_eq!(after.record.context.compaction.summary, None);
     assert!(
         after
@@ -1505,7 +1826,8 @@ async fn model_switch_is_allowed_while_an_image_turn_is_active() {
             MessageContent::blocks(vec![ContentBlock::image("image/png", "aGVsbG8=")]),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .turn_id;
 
     agent
         .set_config(SessionConfigUpdate::Model("text-model".to_string()))
@@ -1773,7 +2095,11 @@ async fn another_endpoint_can_cancel_the_current_turn() {
         .await
         .unwrap();
     let mut subscription = agent.attach(EndpointId::new()).await.unwrap();
-    let turn_id = agent.prompt(EndpointId::new(), "wait").await.unwrap();
+    let turn_id = agent
+        .prompt(EndpointId::new(), "wait")
+        .await
+        .unwrap()
+        .turn_id;
     agent.cancel(Some(turn_id)).await.unwrap();
 
     assert!(matches!(
@@ -1867,7 +2193,14 @@ async fn mode_change_applies_to_the_next_tool_batch() {
 
     assert!(!dir.path().join("denied.txt").exists());
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
-    let tool_output = &snapshot.record.context.messages[3].content;
+    let tool_output = &snapshot
+        .record
+        .context
+        .messages
+        .iter()
+        .find(|message| message.role == dwo_agent_service::MessageRole::Tool)
+        .unwrap()
+        .content;
     assert!(tool_output.contains("blocked_by_policy"), "{tool_output}");
 }
 
@@ -2041,8 +2374,14 @@ async fn origin_disconnect_keeps_permission_available_to_other_endpoints() {
     let snapshot = agent.attach(EndpointId::new()).await.unwrap().snapshot;
     assert!(snapshot.pending_permission.is_none());
     assert_eq!(
-        snapshot.record.context.messages.last().unwrap().content,
-        "continued"
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("continued")
     );
     assert!(!dir.path().join("disconnected.txt").exists());
 }
@@ -2235,8 +2574,17 @@ async fn filesystem_repository_loads_context_after_service_restart() {
     );
     let loaded = restarted.load(&id).await.unwrap();
     let snapshot = loaded.attach(EndpointId::new()).await.unwrap().snapshot;
-    assert_eq!(snapshot.record.context.messages.len(), 5);
-    assert_eq!(snapshot.record.context.messages[4].content, "persisted");
+    assert_eq!(snapshot.record.context.messages.len(), 7);
+    assert_eq!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .rev()
+            .find_map(response_output_text),
+        Some("persisted")
+    );
     let transcript_kinds = snapshot
         .transcript
         .iter()
@@ -2246,6 +2594,7 @@ async fn filesystem_repository_loads_context_after_service_restart() {
             SessionEventPayload::AssistantReasoningDelta { .. } => "reasoning_delta",
             SessionEventPayload::AssistantCompleted { .. } => "assistant_completed",
             SessionEventPayload::ToolStarted { .. } => "tool_started",
+            SessionEventPayload::FileChanged { .. } => "file_changed",
             SessionEventPayload::ToolCompleted { .. } => "tool_completed",
             _ => "other",
         })
@@ -2256,6 +2605,7 @@ async fn filesystem_repository_loads_context_after_service_restart() {
             "user",
             "assistant_completed",
             "tool_started",
+            "file_changed",
             "tool_completed",
             "assistant_completed",
         ]

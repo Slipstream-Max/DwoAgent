@@ -184,6 +184,127 @@ fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
 }
 
 #[test]
+fn prompt_discovers_project_agents_rules_and_skills() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("profile");
+    let cwd = root.path().join("workspace").join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    write(
+        &profile.join("resource/prompts/System.md"),
+        "Profile system prompt",
+    );
+    write(&profile.join("resource/prompts/AGENTS.md"), "resource rule");
+    write(
+        &profile.join("resource/skills/global-tool/SKILL.md"),
+        "---\nname: global-tool\ndescription: Global tool\n---\nGlobal instructions",
+    );
+    write(
+        &profile.join("resource/skills/shared/SKILL.md"),
+        "---\nname: shared\ndescription: Profile shared skill\n---\nProfile version",
+    );
+    write(&cwd.join("AGENTS.md"), "cwd rule");
+    write(&cwd.join(".agents/AGENTS.md"), "project rule v1");
+    write(
+        &cwd.join(".agents/skills/local-tool/SKILL.md"),
+        "---\nname: local-tool\ndescription: Local tool\n---\nLocal instructions",
+    );
+    write(
+        &cwd.join(".agents/skills/shared/SKILL.md"),
+        "---\nname: shared\ndescription: Project shared skill\n---\nProject version",
+    );
+
+    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone());
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+    let prompt = manager.system_prompt();
+    assert!(prompt.contains("resource rule"));
+    assert!(prompt.contains("cwd rule"));
+    assert!(prompt.contains("project rule v1"));
+    assert!(prompt.contains("Global tool"));
+    assert!(prompt.contains("Local tool"));
+    assert!(prompt.contains("Project shared skill"));
+    assert!(!prompt.contains("Profile shared skill"));
+    let expected_fragment = std::path::Path::new(".agents")
+        .join("skills")
+        .join("local-tool")
+        .join("SKILL.md");
+    assert!(prompt.contains(&expected_fragment.to_string_lossy().to_string()));
+
+    std::fs::remove_file(cwd.join(".agents/AGENTS.md")).unwrap();
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
+    let watcher = manager.model_messages().last().unwrap();
+    assert_eq!(watcher.kind, MessageKind::EnvWatcher);
+    assert!(!watcher.content.contains("project rule v1"));
+
+    write(
+        &cwd.join(".agents/skills/extra/SKILL.md"),
+        "---\nname: extra\ndescription: Extra skill\n---\nExtra instructions",
+    );
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
+    let watcher = manager.model_messages().last().unwrap();
+    assert_eq!(watcher.kind, MessageKind::EnvWatcher);
+    assert!(watcher.content.contains("Extra skill"));
+}
+
+#[test]
+fn prompt_discovers_external_skill_dirs_and_applies_project_priority() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("profile");
+    let cwd = root.path().join("workspace").join("project");
+    let external = root.path().join("shared-skills");
+    std::fs::create_dir_all(&cwd).unwrap();
+    write(
+        &profile.join("resource/prompts/System.md"),
+        "Profile system prompt",
+    );
+    write(
+        &profile.join("resource/skills/builtin/SKILL.md"),
+        "---\nname: builtin\ndescription: Builtin skill\n---\nBuiltin instructions",
+    );
+    write(
+        &profile.join("resource/skills/shared/SKILL.md"),
+        "---\nname: shared\ndescription: Profile shared skill\n---\nProfile version",
+    );
+    write(
+        &external.join("external-tool/SKILL.md"),
+        "---\nname: external-tool\ndescription: External tool\n---\nExternal instructions",
+    );
+    write(
+        &external.join("shared/SKILL.md"),
+        "---\nname: shared\ndescription: External shared skill\n---\nExternal version",
+    );
+
+    let dirs = std::sync::Arc::new(std::sync::RwLock::new(vec![external.clone()]));
+    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone())
+        .with_external_skill_dirs(dirs.clone());
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+    let prompt = manager.system_prompt();
+    assert!(prompt.contains("Builtin skill"));
+    assert!(prompt.contains("External tool"));
+    assert!(prompt.contains("External shared skill"));
+    assert!(!prompt.contains("Profile shared skill"));
+
+    // 项目级同名 skill 覆盖 external 目录
+    write(
+        &cwd.join(".agents/skills/shared/SKILL.md"),
+        "---\nname: shared\ndescription: Project shared skill\n---\nProject version",
+    );
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
+    let watcher = manager.model_messages().last().unwrap();
+    assert_eq!(watcher.kind, MessageKind::EnvWatcher);
+    assert!(watcher.content.contains("Project shared skill"));
+    assert!(!watcher.content.contains("External shared skill"));
+
+    // 热更新：Arc 内容变化（模拟 service.replace_external_skill_dirs）
+    *dirs.write().unwrap() = vec![];
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
+    let watcher = manager.model_messages().last().unwrap();
+    assert_eq!(watcher.kind, MessageKind::EnvWatcher);
+    assert!(watcher.content.contains("Builtin skill"));
+    assert!(watcher.content.contains("Project shared skill"));
+    assert!(!watcher.content.contains("External tool"));
+}
+
+#[test]
 fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");

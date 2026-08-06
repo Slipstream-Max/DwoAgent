@@ -40,6 +40,7 @@ pub struct AgentService {
     policy: Arc<ToolPolicyEngine>,
     file_edit: Arc<FileEditManager>,
     profile_root: Option<PathBuf>,
+    external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
     loaded: Mutex<LoadedSessionRegistry>,
     operations: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
@@ -161,7 +162,9 @@ impl AgentService {
     ) -> Result<Self, AgentServiceError> {
         let model = ConfiguredModelClient::from_resolved(profile.models)
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
-        Ok(Self::build(repository, model, policy, Some(profile.root)))
+        let service = Self::build(repository, model, policy, Some(profile.root));
+        service.replace_external_skill_dirs(profile.external_skill_dirs);
+        Ok(service)
     }
 
     fn build(
@@ -176,6 +179,7 @@ impl AgentService {
             policy: Arc::new(ToolPolicyEngine::new(policy)),
             file_edit: Arc::new(FileEditManager::new()),
             profile_root,
+            external_skill_dirs: Arc::new(RwLock::new(Vec::new())),
             loaded: Mutex::new(LoadedSessionRegistry::default()),
             operations: Mutex::new(HashMap::new()),
         }
@@ -183,6 +187,13 @@ impl AgentService {
 
     fn replace_model(&self, model: Arc<dyn ModelClient>) {
         self.model.replace(model);
+    }
+
+    pub fn replace_external_skill_dirs(&self, dirs: Vec<PathBuf>) {
+        *self
+            .external_skill_dirs
+            .write()
+            .expect("external skill dirs lock poisoned") = dirs;
     }
 
     pub fn replace_models(&self, config: ModelClientConfig) -> Result<(), AgentServiceError> {
@@ -460,6 +471,7 @@ impl AgentService {
 
     fn prompt_builder(&self, cwd: PathBuf) -> SystemPromptBuilder {
         SystemPromptBuilder::new(self.profile_root.clone(), cwd)
+            .with_external_skill_dirs(self.external_skill_dirs.clone())
             .with_tool_prompt(dwo_tools::prompt::tools())
             .with_subsession_prompt(dwo_tools::prompt::SUBSESSIONS)
             .with_automation_prompt(dwo_tools::prompt::AUTOMATION)

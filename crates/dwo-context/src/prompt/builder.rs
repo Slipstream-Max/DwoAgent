@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +83,7 @@ impl SystemPromptBlock {
 pub struct SystemPromptBuilder {
     profile: Option<AgentProfilePaths>,
     cwd: PathBuf,
+    external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
     tool_prompt: Option<String>,
     subsession_prompt: Option<String>,
     automation_prompt: Option<String>,
@@ -93,6 +95,7 @@ impl SystemPromptBuilder {
         Self {
             profile: profile_root.map(AgentProfilePaths::new),
             cwd: cwd.into(),
+            external_skill_dirs: Arc::new(RwLock::new(Vec::new())),
             tool_prompt: None,
             subsession_prompt: None,
             automation_prompt: None,
@@ -102,6 +105,11 @@ impl SystemPromptBuilder {
 
     pub fn with_tool_prompt(mut self, tool_prompt: impl Into<String>) -> Self {
         self.tool_prompt = Some(tool_prompt.into());
+        self
+    }
+
+    pub fn with_external_skill_dirs(mut self, dirs: Arc<RwLock<Vec<PathBuf>>>) -> Self {
+        self.external_skill_dirs = dirs;
         self
     }
 
@@ -190,14 +198,46 @@ impl SystemPromptBuilder {
                 content,
             });
         }
+        let project_rules = self.cwd.join(".agents").join("AGENTS.md");
+        if let Some(content) = read_optional_nonempty(&project_rules)? {
+            rules.push(RuleSnapshot {
+                path: resolve_or_original(&project_rules),
+                content,
+            });
+        }
         Ok(rules)
     }
 
     fn read_skills(&self) -> Result<Vec<SkillSnapshot>, PromptBuildError> {
-        let Some(profile) = &self.profile else {
-            return Ok(Vec::new());
-        };
-        skills::scan(&profile.skills).map_err(|error| PromptBuildError::Skills(error.to_string()))
+        let mut skills = Vec::new();
+        if let Some(profile) = &self.profile {
+            skills.extend(
+                skills::scan(&profile.skills)
+                    .map_err(|error| PromptBuildError::Skills(error.to_string()))?,
+            );
+        }
+        let external = self
+            .external_skill_dirs
+            .read()
+            .expect("external skill dirs lock poisoned")
+            .clone();
+        for dir in external {
+            for skill in skills::scan(&dir)
+                .map_err(|error| PromptBuildError::Skills(error.to_string()))?
+            {
+                skills.retain(|existing| existing.name != skill.name);
+                skills.push(skill);
+            }
+        }
+        let project_skills = self.cwd.join(".agents").join("skills");
+        for project in skills::scan(&project_skills)
+            .map_err(|error| PromptBuildError::Skills(error.to_string()))?
+        {
+            skills.retain(|existing| existing.name != project.name);
+            skills.push(project);
+        }
+        skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+        Ok(skills)
     }
 
     fn read_channels(&self) -> Vec<ChannelCapabilitySnapshot> {

@@ -1310,6 +1310,8 @@ impl Host {
         let default_max_model_steps = loaded.config.max_model_steps;
 
         self.service.replace_models(loaded.models)?;
+        self.service
+            .replace_external_skill_dirs(loaded.external_skill_dirs);
         self.automation
             .apply_profile(
                 automation_config,

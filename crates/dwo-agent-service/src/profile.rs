@@ -19,6 +19,8 @@ pub struct AgentProfileConfig {
     pub max_model_steps: usize,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub external_skills_dirs: Vec<PathBuf>,
     pub model: AgentModelConfig,
     #[serde(default)]
     pub channels: BTreeMap<String, serde_yaml::Value>,
@@ -80,6 +82,7 @@ pub struct LoadedAgentProfile {
     pub root: PathBuf,
     pub config: AgentProfileConfig,
     pub models: ModelClientConfig,
+    pub external_skill_dirs: Vec<PathBuf>,
 }
 
 impl LoadedAgentProfile {
@@ -95,10 +98,22 @@ impl LoadedAgentProfile {
         SystemPromptBuilder::new(Some(root.clone()), root.clone())
             .build_initial()
             .map_err(anyhow::Error::from)?;
+        let external_skill_dirs = config
+            .external_skills_dirs
+            .iter()
+            .map(|dir| {
+                if dir.is_absolute() {
+                    dir.clone()
+                } else {
+                    root.join(dir)
+                }
+            })
+            .collect();
         Ok(Self {
             root,
             config,
             models,
+            external_skill_dirs,
         })
     }
 }
@@ -468,5 +483,48 @@ model:
             loaded.models.providers["relay"].endpoint,
             "https://gateway.example.com/v1/responses"
         );
+    }
+
+    #[test]
+    fn profile_parses_external_skills_dirs_and_resolves_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("resource/prompts")).unwrap();
+        std::fs::write(
+            root.path().join("resource/prompts/System.md"),
+            "You are a coding agent.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("profile.yaml"),
+            r#"
+name: coder
+description: coding agent
+policyMode: confirm
+externalSkillsDirs:
+  - C:/Users/example/shared-skills
+  - team-skills
+model:
+  defaultModelId: deepseek-v4-pro
+  providers:
+    deepseek:
+      type: deepseek
+  models:
+    - modelName: deepseek-v4-pro
+      provider: deepseek
+      modelId: deepseek-v4-pro
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_profile(root.path()).unwrap();
+        assert_eq!(loaded.external_skill_dirs.len(), 2);
+        assert_eq!(
+            loaded.external_skill_dirs[0],
+            PathBuf::from("C:/Users/example/shared-skills")
+        );
+        assert!(loaded.external_skill_dirs[1].is_absolute());
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        assert!(loaded.external_skill_dirs[1].starts_with(&canonical_root));
+        assert!(loaded.external_skill_dirs[1].ends_with("team-skills"));
     }
 }

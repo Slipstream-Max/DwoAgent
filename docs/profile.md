@@ -2,13 +2,16 @@
 
 Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默认目录是 `~/.dwoagent/`，入口文件是 `profile.yaml`。
 
-安装和启动见根目录 [README](../README.md)，channel 部署见 [Channel 部署与使用](channels.md)，定时任务见 [Automation 使用指南](automation.md)，CLI 参数见 [命令参考](commands.md)。
+运行 `dwo install` 后，安装器会把这份指南复制到 `<profile-root>/profile.md`，所以可以直接在 `~/.dwoagent/profile.md` 查看配置说明。
+
+安装和启动见 [README](https://github.com/Slipstream-Max/DwoAgent/blob/main/README.md)，channel 部署见 [Channel 部署与使用](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/channels.md)，定时任务见 [Automation 使用指南](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/automation.md)，CLI 参数见 [命令参考](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/commands.md)。
 
 ## 目录结构
 
 ```text
 <profile-root>/
 |- profile.yaml
+|- profile.md              # 本地配置参考，由 dwo install 创建
 |- bin/
 |  `- dwo
 |- resource/
@@ -39,8 +42,13 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
    |- telegram/
    |  |- runtime.yaml
    |  `- secret.yaml
-   `- feishu/
-      |- runtime.yaml
+   |- feishu/
+   |  |- runtime.yaml
+   |  `- secret.yaml
+   |- qq/
+   |  |- runtime.yaml
+   |  `- secret.yaml
+   `- websocket/
       `- secret.yaml
 ```
 
@@ -62,6 +70,7 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 name: coder
 description: coding agent
 policyMode: confirm
+maxModelSteps: 100
 externalSkillsDirs: []
 
 logging:
@@ -72,12 +81,14 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
+    replayMode: response
     markdownFilter: true
     mediaInput: true
 
   telegram:
     enabled: false
     replayTurns: 5
+    replayMode: response
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
     mediaInput: true
@@ -85,6 +96,7 @@ channels:
   feishu:
     enabled: false
     replayTurns: 5
+    replayMode: response
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
@@ -92,10 +104,15 @@ channels:
   qq:
     enabled: false
     replayTurns: 5
+    replayMode: response
     mediaInput: true
+  websocket:
+    enabled: false
+    port: 8765
 
 automation:
   enabled: false
+  timeoutSeconds: 900
   jobs: []
 
 model:
@@ -288,25 +305,43 @@ Channels 配置 adapter 是否启动，以及回放、凭据环境变量、代�
 
 | Channel | 关键字段 |
 | --- | --- |
-| 微信 | `enabled`、`replayTurns`、`markdownFilter`、`mediaInput` |
-| Telegram | `enabled`、`replayTurns`、`botTokenEnv`、`tgProxy`、`mediaInput` |
-| 飞书/Lark | `enabled`、`replayTurns`、`appIdEnv`、`appSecretEnv`、`platform`、`mediaInput` |
-| QQ Bot | `enabled`、`replayTurns`、`mediaInput` |
+| 微信 | `enabled`、`replayTurns`、`replayMode`、`markdownFilter`、`mediaInput` |
+| Telegram | `enabled`、`replayTurns`、`replayMode`、`botTokenEnv`、`tgProxy`、`mediaInput` |
+| 飞书/Lark | `enabled`、`replayTurns`、`replayMode`、`appIdEnv`、`appSecretEnv`、`platform`、`mediaInput` |
+| QQ Bot | `enabled`、`replayTurns`、`replayMode`、`mediaInput` |
 | WebSocket | `enabled`、`port` |
 
-`replayTurns` 最大为 10。`platform` 使用 `feishu` 或 `lark`。Token、App ID 和 App Secret 从环境变量读取。QQ Bot 通过 `dwo channel qq bind` 扫码绑定，不在 profile.yaml 中填写凭据。
+### Channel 字段
+
+| Channel | 字段 | 默认值/限制 | 作用 |
+| --- | --- | --- | --- |
+| 全部消息 channel | `enabled` | 必填，`false` 或 `true` | 是否启动该 channel。修改后会热重启对应 adapter。 |
+| 全部消息 channel | `replayTurns` | 必填，范围 `0..=10`；安装模板为 `5` | `/use` 切换 session 后回放的最近完成 turn 数。 |
+| 微信、Telegram、飞书、QQ | `replayMode` | 默认 `response`；`response` 或 `full` | `response` 只发送最终回答；`full` 还发送 reasoning 和 tool-call 阶段。微信只允许 `response`。 |
+| 微信、Telegram、飞书、QQ | `mediaInput` | 默认 `true` | 是否接收图片和文件；关闭后只处理文本。 |
+| 微信 | `markdownFilter` | 必填 | 是否将 assistant Markdown 转成微信兼容文本。 |
+| Telegram | `botTokenEnv` | 非空环境变量名 | BotFather token 所在的环境变量。token 不写入 profile 或 secret。 |
+| Telegram | `tgProxy` | 默认 `null`；必须是 `http://` 或 `https://` | 仅代理 Telegram Bot API 和媒体下载。 |
+| 飞书/Lark | `appIdEnv`、`appSecretEnv` | 非空环境变量名 | 企业自建应用凭据所在的环境变量。 |
+| 飞书/Lark | `platform` | `feishu` 或 `lark` | 选择国内飞书或海外 Lark 的 API 地址。 |
+| QQ Bot | 无凭据字段 | 通过二维码绑定 | 运行 `dwo channel qq bind` 后写入 `channels/qq/secret.yaml`，仅支持单用户 C2C 私聊。 |
+| WebSocket | `port` | 默认 `8765`，必须大于 `0` | ACP WebSocket 监听端口，固定路径为 `/acp`。 |
+
+`replayTurns` 最大为 10。Token、App ID 和 App Secret 从环境变量读取。QQ Bot 通过 `dwo channel qq bind` 扫码绑定，不在 `profile.yaml` 中填写凭据。
 
 WebSocket 固定监听 `0.0.0.0:<port>`，ACP 路径固定为 `/acp`。访问 token 自动生成并保存到 `channels/websocket/secret.yaml`，不需要写入 profile。
 
-绑定命令、开放平台设置和 slash commands 见 [Channel 部署与使用](channels.md)。
+绑定命令、开放平台设置和 slash commands 见 [Channel 部署与使用](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/channels.md)。
 
 ## Automation
 
 ```yaml
 automation:
   enabled: true
+  timeoutSeconds: 900
   jobs:
     - name: daily-report
+      enabled: true
       schedule:
         cron: "0 9 * * *"
         timezone: Asia/Shanghai
@@ -317,7 +352,18 @@ automation:
       prompt: 检查项目状态。
 ```
 
-Automation 支持每次新建 session 和投递固定 session。完整字段和运行行为见 [Automation 使用指南](automation.md)。
+| 字段 | 默认值/限制 | 说明 |
+| --- | --- | --- |
+| `automation.enabled` | 默认 `false` | 是否按照 cron 自动调度；手动 `dwo automation run` 不受此开关影响。 |
+| `automation.timeoutSeconds` | 默认 `900`，范围 `1..=86400` | 单次 automation turn 的最长运行时间。到时会要求 agent 停止使用工具并回答。 |
+| `automation.jobs` | 默认 `[]` | 定时任务列表；每个任务的 `name` 必须唯一。 |
+| `jobs[].enabled` | 默认 `true` | 是否参与调度。 |
+| `jobs[].schedule.cron` | 必填 | 标准五字段 cron：分 时 日 月 周。 |
+| `jobs[].schedule.timezone` | 默认 `local` | `local`、`UTC` 或有效 IANA 时区，例如 `Asia/Shanghai`。 |
+| `jobs[].session` | 必填 | `mode: new` 创建新 session，`mode: fixed` 投递到指定 `sessionId`。 |
+| `jobs[].prompt` | 必填 | 每次触发提交给 agent 的文本。 |
+
+`mode: new` 还需要 `behavior: every_time` 或 `once`；`cwd` 和 `title` 可选。`mode: fixed` 需要已有的 `sessionId`。完整字段和运行行为见 [Automation 使用指南](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/automation.md)。
 
 ## Prompts 与 Skills
 

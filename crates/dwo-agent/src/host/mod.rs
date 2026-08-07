@@ -1651,7 +1651,9 @@ mod tests {
                 "automation",
                 "channels",
                 "description",
+                "externalSkillsDirs",
                 "logging",
+                "maxModelSteps",
                 "model",
                 "name",
                 "policyMode",
@@ -1660,7 +1662,13 @@ mod tests {
         assert_eq!(yaml_keys(&document["logging"]), ["level", "retentionDays"]);
         assert_eq!(
             yaml_keys(&document["channels"]["weixin"]),
-            ["enabled", "markdownFilter", "mediaInput", "replayTurns"]
+            [
+                "enabled",
+                "markdownFilter",
+                "mediaInput",
+                "replayMode",
+                "replayTurns"
+            ]
         );
         assert_eq!(
             yaml_keys(&document["channels"]["telegram"]),
@@ -1668,6 +1676,7 @@ mod tests {
                 "botTokenEnv",
                 "enabled",
                 "mediaInput",
+                "replayMode",
                 "replayTurns",
                 "tgProxy"
             ]
@@ -1680,8 +1689,17 @@ mod tests {
                 "enabled",
                 "mediaInput",
                 "platform",
+                "replayMode",
                 "replayTurns"
             ]
+        );
+        assert_eq!(
+            yaml_keys(&document["channels"]["qq"]),
+            ["enabled", "mediaInput", "replayMode", "replayTurns"]
+        );
+        assert_eq!(
+            yaml_keys(&document["channels"]["websocket"]),
+            ["enabled", "port"]
         );
         assert_eq!(
             yaml_keys(&document["automation"]),
@@ -1735,15 +1753,17 @@ mod tests {
             .await
             .unwrap();
         let channel = channels.list().await.unwrap();
-        assert_eq!(channel.len(), 4);
+        assert_eq!(channel.len(), 5);
         assert_eq!(channel[0].name, "weixin");
         assert!(!channel[0].enabled);
         assert_eq!(channel[1].name, "telegram");
         assert!(!channel[1].enabled);
         assert_eq!(channel[2].name, "feishu");
         assert!(!channel[2].enabled);
-        assert_eq!(channel[3].name, "websocket");
+        assert_eq!(channel[3].name, "qq");
         assert!(!channel[3].enabled);
+        assert_eq!(channel[4].name, "websocket");
+        assert!(!channel[4].enabled);
 
         let automation = parse_automation_config(profile.automation).unwrap();
         assert!(!automation.enabled);

@@ -11,6 +11,12 @@ description: coding agent
 # full_access | confirm | watch
 policyMode: confirm
 
+# Maximum model steps in one agent turn. 0 means unlimited; valid finite range is 5..=200.
+maxModelSteps: 100
+
+# Additional skills directories. Relative paths are resolved from this profile root.
+externalSkillsDirs: []
+
 # Daemon diagnostics are structured JSONL files under runtime/logs. DWO_LOG
 # can temporarily override the configured level with tracing filter directives.
 logging:
@@ -33,6 +39,7 @@ channels:
     replayTurns: 5
 
     # Apply the Weixin markdown compatibility filter to assistant responses.
+    replayMode: response
     markdownFilter: true
 
     # Download inbound images/files and submit structured content blocks.
@@ -48,6 +55,7 @@ channels:
     replayTurns: 5
 
     # Environment variable containing the BotFather token.
+    replayMode: response
     botTokenEnv: TELEGRAM_BOT_TOKEN
 
     # Optional HTTP proxy used only for Telegram Bot API and media downloads.
@@ -67,6 +75,7 @@ channels:
     replayTurns: 5
 
     # Environment variables containing enterprise application credentials.
+    replayMode: response
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
 
@@ -74,6 +83,19 @@ channels:
     platform: feishu
 
     # Download inbound images and files as structured resources.
+    mediaInput: true
+
+  qq:
+    # QQ Bot is private C2C only. Credentials are persisted by QR binding in
+    # channels/qq/secret.yaml; there are no App ID/Secret fields here.
+    enabled: false
+
+    # Number of completed turns replayed after selecting an existing session.
+    # Valid range: 0..=10.
+    replayTurns: 5
+    replayMode: response
+
+    # Download inbound attachments and submit structured resources.
     mediaInput: true
 
   websocket:

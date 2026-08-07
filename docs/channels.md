@@ -19,16 +19,19 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
+    replayMode: response
     markdownFilter: true
   telegram:
     enabled: false
     replayTurns: 5
+    replayMode: response
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
     mediaInput: true
   feishu:
     enabled: false
     replayTurns: 5
+    replayMode: response
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
@@ -36,13 +39,14 @@ channels:
   qq:
     enabled: false
     replayTurns: 5
+    replayMode: response
     mediaInput: true
   websocket:
     enabled: false
     port: 8765
 ```
 
-`replayTurns` 最大为 10，控制 `/use` session 时回放多少个最近 turn。`mediaInput` 控制是否接收平台图片和文件。
+`replayTurns` 最大为 10，控制 `/use` session 时回放多少个最近 turn。`replayMode` 支持 `response` 和 `full`：前者只发送最终回答，后者还发送 reasoning 和 tool-call 阶段；微信固定使用 `response`。`mediaInput` 控制是否接收平台图片和文件。
 
 ## QQ Bot
 
@@ -58,7 +62,7 @@ channels:
 
 运行 `dwo channel qq bind`，终端会显示 QQ 官方二维码。扫码成功后，QQ 返回的 AppID、AppSecret 和扫码用户 OpenID 会写入私有的 `channels/qq/secret.yaml`；如果官方结果没有返回 `userOpenid`，绑定会失败，不会自动绑定第一个发消息的人。
 
-QQ 支持私聊文本和附件入站、文本回复以及主动发送本地文件。出站文件首版限制为 20 MiB。`confirm` 模式下，工具批准会显示 QQ Markdown 消息和“允许/拒绝”按钮，点击只对绑定用户生效。
+QQ 支持私聊文本和附件入站、文本回复以及主动发送本地文件。出站文件首版限制为 20 MiB。`response` 模式会优先使用当前入站消息的被动回复额度，额度耗尽后自动改用主动消息；`full` 模式的 reasoning、tool-call 和最终回答全部使用主动消息。主动消息仍受 QQ 的用户授权、频率和每日额度限制。`confirm` 模式下，工具批准会显示 QQ Markdown 消息和“允许/拒绝”按钮，点击只对绑定用户生效。
 
 ## 微信
 

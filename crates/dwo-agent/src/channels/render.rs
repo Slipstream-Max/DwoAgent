@@ -189,12 +189,28 @@ fn render_replay_turns(
 
 #[derive(Default)]
 pub(crate) struct SessionStreamState {
+    reasoning: Vec<String>,
     responses: Vec<String>,
     tools: HashMap<String, ActiveToolCall>,
     permission_messages: HashSet<String>,
 }
 
 impl SessionStreamState {
+    pub(crate) fn remember_reasoning(&mut self, reasoning: Option<String>) {
+        let Some(reasoning) = reasoning else {
+            return;
+        };
+        let reasoning = reasoning.trim();
+        if !reasoning.is_empty() {
+            self.reasoning.push(reasoning.to_string());
+        }
+    }
+
+    pub(crate) fn take_reasoning(&mut self) -> Option<String> {
+        let reasoning = std::mem::take(&mut self.reasoning).join("\n\n");
+        (!reasoning.is_empty()).then(|| render_reasoning(&reasoning))
+    }
+
     pub(crate) fn remember_response(&mut self, content: String) {
         let content = content.trim();
         if !content.is_empty() {
@@ -225,6 +241,7 @@ impl SessionStreamState {
     }
 
     pub(crate) fn finish_turn(&mut self) {
+        self.reasoning.clear();
         self.responses.clear();
         self.tools.clear();
         self.permission_messages.clear();
@@ -249,6 +266,10 @@ pub(crate) fn render_tool_call(call: &ActiveToolCall, id_label: &str, id: &str) 
         serde_json::to_string_pretty(&call.raw_input).unwrap_or_else(|_| call.tool_name.clone())
     });
     format!("🔧Tool Call:\n{}\n{id_label}：{id}", fenced(&content))
+}
+
+pub(crate) fn render_reasoning(reasoning: &str) -> String {
+    format!("🧠 Thinking:\n{}", reasoning.trim())
 }
 
 fn fenced(content: &str) -> String {
@@ -287,6 +308,24 @@ mod tests {
             Some("先检查项目\n\n检查完成")
         );
         assert_eq!(stream.take_response(), None);
+    }
+
+    #[test]
+    fn reasoning_is_buffered_and_cleared_with_a_turn() {
+        let mut stream = SessionStreamState::default();
+        stream.remember_reasoning(Some("first thought".to_string()));
+        stream.remember_reasoning(Some("  ".to_string()));
+        stream.remember_reasoning(Some("second thought".to_string()));
+
+        assert_eq!(
+            stream.take_reasoning().as_deref(),
+            Some("🧠 Thinking:\nfirst thought\n\nsecond thought")
+        );
+        assert_eq!(stream.take_reasoning(), None);
+
+        stream.remember_reasoning(Some("next turn".to_string()));
+        stream.finish_turn();
+        assert_eq!(stream.take_reasoning(), None);
     }
 
     #[test]

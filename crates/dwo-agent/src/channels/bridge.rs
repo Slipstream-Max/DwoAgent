@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use crate::host::Host;
 
 use super::command::{ChannelCommand, render_command_help};
+use super::manager::ChannelReplayMode;
 use super::render::{
     SessionStreamState, display_path, policy_name, render_live_user_prompt, render_session_replay,
     render_status, render_tool_call,
@@ -95,6 +96,7 @@ pub(crate) struct SessionBridge {
     conversation: ConversationId,
     endpoint: EndpointId,
     replay_turns: usize,
+    replay_mode: ChannelReplayMode,
     selected_session_id: Mutex<Option<String>>,
     transport: Arc<dyn ConversationTransport>,
     observer: Mutex<Option<SessionObserver>>,
@@ -105,6 +107,7 @@ impl SessionBridge {
         host: Arc<Host>,
         conversation: ConversationId,
         replay_turns: usize,
+        replay_mode: ChannelReplayMode,
         selected_session_id: Option<String>,
         transport: Arc<dyn ConversationTransport>,
     ) -> Self {
@@ -114,6 +117,7 @@ impl SessionBridge {
             conversation,
             endpoint,
             replay_turns,
+            replay_mode,
             selected_session_id: Mutex::new(selected_session_id),
             transport,
             observer: Mutex::new(None),
@@ -396,10 +400,12 @@ impl SessionBridge {
             .subscribe_session(id, self.endpoint.clone(), None)
             .await?;
         let transport = self.transport.clone();
-        let task = tokio::spawn(stream_session(
+        let replay_mode = self.replay_mode;
+        let task = tokio::spawn(stream_session_with_mode(
             transport,
             self.endpoint.clone(),
             id.clone(),
+            replay_mode,
             subscription,
         ));
         *observer = Some(SessionObserver { session_id, task });
@@ -440,10 +446,28 @@ fn resolve_permission_request_id(
         .context("No pending permission request")
 }
 
+#[cfg(test)]
 async fn stream_session(
     transport: Arc<dyn ConversationTransport>,
     endpoint: EndpointId,
     session_id: SessionId,
+    subscription: dwo_agent_service::SessionSubscription,
+) {
+    stream_session_with_mode(
+        transport,
+        endpoint,
+        session_id,
+        ChannelReplayMode::Response,
+        subscription,
+    )
+    .await;
+}
+
+async fn stream_session_with_mode(
+    transport: Arc<dyn ConversationTransport>,
+    endpoint: EndpointId,
+    session_id: SessionId,
+    replay_mode: ChannelReplayMode,
     mut subscription: dwo_agent_service::SessionSubscription,
 ) {
     let mut stream = SessionStreamState::default();
@@ -463,16 +487,34 @@ async fn stream_session(
                 }
             }
             SessionEventPayload::AssistantCompleted {
+                reasoning,
                 content,
                 tool_calls,
                 ..
             } => {
+                if replay_mode == ChannelReplayMode::Full {
+                    stream.remember_reasoning(reasoning);
+                }
                 stream.remember_response(content);
                 for call in tool_calls {
                     stream.remember_tool(call);
                 }
+                if replay_mode == ChannelReplayMode::Full
+                    && let Some(reasoning) = stream.take_reasoning()
+                {
+                    send(&transport, &reasoning).await;
+                }
             }
-            SessionEventPayload::ToolStarted { call, .. } => stream.remember_tool(call),
+            SessionEventPayload::ToolStarted { call, .. } => {
+                if replay_mode == ChannelReplayMode::Full {
+                    send(
+                        &transport,
+                        &render_tool_call(&call, "tool call id", &call.tool_call_id),
+                    )
+                    .await;
+                }
+                stream.remember_tool(call);
+            }
             SessionEventPayload::PermissionRequested { permission, .. } => {
                 if !stream.mark_permission_sent(&permission.tool_call_id) {
                     continue;

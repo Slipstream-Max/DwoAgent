@@ -109,6 +109,7 @@ impl ChannelAdapter for TelegramAdapter {
         Ok(PreparedChannel {
             conversation: ConversationId::new("telegram", runtime.secret.bound_user_id.to_string()),
             replay_turns: runtime.config.replay_turns,
+            replay_mode: runtime.config.replay_mode,
             selected_session_id,
             transport: conversation,
             starter: Box::new(TelegramStarter { bot, host, access }),

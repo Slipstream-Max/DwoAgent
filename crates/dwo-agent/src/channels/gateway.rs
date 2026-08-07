@@ -124,6 +124,7 @@ pub(crate) struct ChannelPollParams {
 pub(crate) struct PreparedChannel {
     pub(crate) conversation: ConversationId,
     pub(crate) replay_turns: usize,
+    pub(crate) replay_mode: super::manager::ChannelReplayMode,
     pub(crate) selected_session_id: Option<String>,
     pub(crate) transport: Arc<dyn ConversationTransport>,
     pub(crate) starter: Box<dyn ChannelStarter>,
@@ -250,6 +251,7 @@ impl ChannelGateway {
                 host,
                 prepared.conversation,
                 prepared.replay_turns,
+                prepared.replay_mode,
                 prepared.selected_session_id,
                 prepared.transport,
             ));

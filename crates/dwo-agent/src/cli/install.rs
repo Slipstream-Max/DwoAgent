@@ -9,6 +9,8 @@ use super::DEFAULT_PROFILE;
 #[cfg(target_os = "macos")]
 use super::home_dir;
 
+const PROFILE_GUIDE: &str = include_str!("../../../../docs/profile.md");
+
 pub(super) fn install(config_path: &Path) -> Result<()> {
     let root = config_path.parent().context("config path has no parent")?;
     let executable = install_executable(root)?;
@@ -29,6 +31,7 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
         &root.join("resource/mcp.json"),
         "{\n  \"mcpServers\": {}\n}\n",
     )?;
+    write_if_missing(&root.join("profile.md"), PROFILE_GUIDE)?;
     register_service(config_path, &executable)
 }
 
@@ -107,6 +110,45 @@ fn write_if_missing(path: &Path, content: &str) -> Result<()> {
         std::fs::write(path, content)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_files_preserve_existing_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.yaml");
+        std::fs::write(&path, "user configuration\n").unwrap();
+
+        write_if_missing(&path, "replacement\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "user configuration\n"
+        );
+    }
+
+    #[test]
+    fn bundled_profile_guide_covers_config_sections() {
+        for field in [
+            "maxModelSteps",
+            "externalSkillsDirs",
+            "logging:",
+            "model:",
+            "weixin:",
+            "replayMode: response",
+            "telegram:",
+            "feishu:",
+            "qq:",
+            "websocket:",
+            "automation:",
+        ] {
+            assert!(PROFILE_GUIDE.contains(field), "missing {field}");
+        }
+    }
 }
 
 #[cfg(windows)]

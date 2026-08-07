@@ -962,6 +962,8 @@ async fn bind_qq(config_path: &Path) -> Result<()> {
 const DEFAULT_PROFILE: &str = r#"name: coder
 description: coding agent
 policyMode: confirm
+maxModelSteps: 100
+externalSkillsDirs: []
 logging:
   level: info
   retentionDays: 14
@@ -969,16 +971,20 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
+    replayMode: response
     markdownFilter: true
+    mediaInput: true
   telegram:
     enabled: false
     replayTurns: 5
+    replayMode: response
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
     mediaInput: true
   feishu:
     enabled: false
     replayTurns: 5
+    replayMode: response
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
@@ -986,6 +992,7 @@ channels:
   qq:
     enabled: false
     replayTurns: 5
+    replayMode: response
     mediaInput: true
   websocket:
     enabled: false

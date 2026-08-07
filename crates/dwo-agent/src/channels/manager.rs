@@ -41,6 +41,8 @@ impl WebsocketChannelConfig {
 pub struct WeixinChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
+    #[serde(default)]
+    pub replay_mode: ChannelReplayMode,
     pub markdown_filter: bool,
     #[serde(default = "default_true")]
     pub media_input: bool,
@@ -50,10 +52,21 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ChannelReplayMode {
+    #[default]
+    Response,
+    Full,
+}
+
 impl WeixinChannelConfig {
     fn validate(&self) -> Result<()> {
         if self.replay_turns > 10 {
             bail!("channels.weixin.replayTurns must be at most 10");
+        }
+        if self.replay_mode != ChannelReplayMode::Response {
+            bail!("channels.weixin.replayMode only supports response");
         }
         Ok(())
     }
@@ -87,6 +100,8 @@ pub type QqChannelState = ChannelState;
 pub struct TelegramChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
+    #[serde(default)]
+    pub replay_mode: ChannelReplayMode,
     pub bot_token_env: String,
     #[serde(default)]
     pub tg_proxy: Option<String>,
@@ -140,6 +155,8 @@ impl FeishuPlatform {
 pub struct FeishuChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
+    #[serde(default)]
+    pub replay_mode: ChannelReplayMode,
     pub app_id_env: String,
     pub app_secret_env: String,
     pub(crate) platform: FeishuPlatform,
@@ -167,6 +184,8 @@ impl FeishuChannelConfig {
 pub struct QqChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
+    #[serde(default)]
+    pub replay_mode: ChannelReplayMode,
     #[serde(default = "default_true")]
     pub media_input: bool,
 }

@@ -38,7 +38,7 @@ use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
     ChannelStarter, PreparedChannel,
 };
-use super::manager::QqChannelState;
+use super::manager::{ChannelReplayMode, QqChannelState};
 use super::render::render_tool_call;
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A QQ channel is bound to one private C2C user. Normal reasoning and responses are already delivered through QQ.
@@ -49,6 +49,8 @@ const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_BIND_BASE: &str = "https://q.qq.com";
 const QQ_MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
 const QQ_TEXT_CHUNK_CHARS: usize = 1800;
+const QQ_PASSIVE_REPLY_MAX_MESSAGES: u32 = 4;
+const QQ_PASSIVE_REPLY_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone)]
 pub(crate) struct QqBindTask {
@@ -288,11 +290,13 @@ impl ChannelAdapter for QqAdapter {
             state,
             reply: Mutex::new(None),
             approvals: approvals.clone(),
+            replay_mode: runtime.config.replay_mode,
         });
         let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
         Ok(PreparedChannel {
             conversation: ConversationId::new("qq", runtime.secret.bound_user_openid.clone()),
             replay_turns: runtime.config.replay_turns,
+            replay_mode: runtime.config.replay_mode,
             selected_session_id,
             transport: conversation.clone(),
             starter: Box::new(QqStarter {
@@ -498,6 +502,7 @@ impl QqHandler {
 struct ReplyContext {
     msg_id: String,
     next_seq: u32,
+    remaining: u32,
     expires_at: Instant,
 }
 
@@ -516,6 +521,7 @@ struct QqConversation {
     state: Arc<Mutex<QqChannelState>>,
     reply: Mutex<Option<ReplyContext>>,
     approvals: Arc<Mutex<HashMap<String, PendingAction>>>,
+    replay_mode: ChannelReplayMode,
 }
 
 impl QqConversation {
@@ -523,29 +529,51 @@ impl QqConversation {
         *self.reply.lock().await = Some(ReplyContext {
             msg_id: msg_id.to_string(),
             next_seq: 1,
-            expires_at: Instant::now() + Duration::from_secs(4 * 60),
+            remaining: QQ_PASSIVE_REPLY_MAX_MESSAGES,
+            expires_at: Instant::now() + QQ_PASSIVE_REPLY_WINDOW,
         });
     }
 
-    async fn reserve_reply(&self, count: u32) -> Option<(String, u32)> {
+    async fn reserve_reply(&self) -> Option<(String, u32)> {
+        self.reserve_replies(1).await.into_iter().next().flatten()
+    }
+
+    async fn reserve_replies(&self, count: usize) -> Vec<Option<(String, u32)>> {
+        let mut replies = vec![None; count];
+        if count == 0 {
+            return replies;
+        }
         let mut reply = self.reply.lock().await;
-        let context = reply.as_mut()?;
+        let Some(context) = reply.as_mut() else {
+            return replies;
+        };
         if Instant::now() >= context.expires_at {
             *reply = None;
-            return None;
+            return replies;
         }
-        let seq = context.next_seq;
-        context.next_seq = context.next_seq.saturating_add(count.max(1));
-        Some((context.msg_id.clone(), seq))
+        let passive_count = count.min(context.remaining as usize);
+        let msg_id = context.msg_id.clone();
+        let first_seq = context.next_seq;
+        context.next_seq = context.next_seq.saturating_add(passive_count as u32);
+        context.remaining -= passive_count as u32;
+        for (index, slot) in replies.iter_mut().take(passive_count).enumerate() {
+            *slot = Some((msg_id.clone(), first_seq.saturating_add(index as u32)));
+        }
+        replies
     }
 }
 
 #[async_trait]
 impl ConversationTransport for QqConversation {
     async fn send_text(&self, text: &str) -> Result<()> {
-        let count = u32::try_from(split_text(text).len()).unwrap_or(u32::MAX);
-        let reply = self.reserve_reply(count).await;
-        send_c2c_text(&self.api, &self.openid, text, reply).await
+        ensure!(!text.is_empty(), "QQ message must not be empty");
+        let chunks = split_text(text);
+        let replies = if self.replay_mode == ChannelReplayMode::Full {
+            vec![None; chunks.len()]
+        } else {
+            self.reserve_replies(chunks.len()).await
+        };
+        send_c2c_chunks(&self.api, &self.openid, chunks, replies).await
     }
 
     async fn send_permission_request(
@@ -605,7 +633,9 @@ impl ConversationTransport for QqConversation {
             }),
             ..Default::default()
         };
-        if let Some((msg_id, msg_seq)) = self.reserve_reply(1).await {
+        if self.replay_mode == ChannelReplayMode::Response
+            && let Some((msg_id, msg_seq)) = self.reserve_reply().await
+        {
             params.msg_id = Some(msg_id);
             params.msg_seq = Some(msg_seq);
         }
@@ -684,17 +714,29 @@ async fn send_c2c_text(
 ) -> Result<()> {
     ensure!(!text.is_empty(), "QQ message must not be empty");
     let chunks = split_text(text);
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let (msg_id, msg_seq) = if index == 0 {
-            reply
-                .clone()
-                .map_or((None, None), |(id, seq)| (Some(id), Some(seq)))
-        } else {
-            (
-                reply.as_ref().map(|(id, _)| id.clone()),
-                reply.as_ref().map(|(_, seq)| seq + index as u32),
-            )
-        };
+    let replies = match reply {
+        Some((msg_id, msg_seq)) => chunks
+            .iter()
+            .enumerate()
+            .map(|(index, _)| Some((msg_id.clone(), msg_seq.saturating_add(index as u32))))
+            .collect(),
+        None => vec![None; chunks.len()],
+    };
+    send_c2c_chunks(api, openid, chunks, replies).await
+}
+
+async fn send_c2c_chunks(
+    api: &BotApi,
+    openid: &str,
+    chunks: Vec<String>,
+    replies: Vec<Option<(String, u32)>>,
+) -> Result<()> {
+    ensure!(
+        chunks.len() == replies.len(),
+        "QQ chunks and reply plans differ"
+    );
+    for (chunk, reply) in chunks.into_iter().zip(replies) {
+        let (msg_id, msg_seq) = reply.map_or((None, None), |(id, seq)| (Some(id), Some(seq)));
         let params = C2CMessageParams {
             content: Some(chunk),
             msg_id,

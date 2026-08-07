@@ -110,6 +110,7 @@ impl ChannelAdapter for FeishuAdapter {
         Ok(PreparedChannel {
             conversation: ConversationId::new("feishu", access.open_id.clone()),
             replay_turns: runtime.config.replay_turns,
+            replay_mode: runtime.config.replay_mode,
             selected_session_id,
             transport: conversation,
             starter: Box::new(FeishuStarter { host, api, access }),

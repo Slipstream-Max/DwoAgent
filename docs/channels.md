@@ -1,8 +1,8 @@
 # Channel 部署与使用
 
-赤铎可以把同一个 daemon 接到微信、Telegram、飞书/Lark 私聊和 ACP WebSocket。所有入口共享全局 session、模型、工具、MCP 和持久化数据。
+赤铎可以把同一个 daemon 接到微信、Telegram、飞书/Lark、QQ Bot 私聊和 ACP WebSocket。所有入口共享全局 session、模型、工具、MCP 和持久化数据。
 
-三个消息 channel 只接受已绑定用户的私聊；WebSocket 使用独立 token 鉴权。修改 `profile.yaml` 后重启 daemon，使 adapter 按新配置启动：
+四个消息 channel 只接受已绑定用户的私聊；WebSocket 使用独立 token 鉴权。修改 `profile.yaml` 后重启 daemon，使 adapter 按新配置启动：
 
 ```text
 dwo daemon stop
@@ -33,12 +33,32 @@ channels:
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
     mediaInput: true
+  qq:
+    enabled: false
+    replayTurns: 5
+    mediaInput: true
   websocket:
     enabled: false
     port: 8765
 ```
 
 `replayTurns` 最大为 10，控制 `/use` session 时回放多少个最近 turn。`mediaInput` 控制是否接收平台图片和文件。
+
+## QQ Bot
+
+QQ channel 只支持单用户 C2C 私聊，不支持群聊。配置最小化为：
+
+```yaml
+channels:
+  qq:
+    enabled: true
+    replayTurns: 5
+    mediaInput: true
+```
+
+运行 `dwo channel qq bind`，终端会显示 QQ 官方二维码。扫码成功后，QQ 返回的 AppID、AppSecret 和扫码用户 OpenID 会写入私有的 `channels/qq/secret.yaml`；如果官方结果没有返回 `userOpenid`，绑定会失败，不会自动绑定第一个发消息的人。
+
+QQ 支持私聊文本和附件入站、文本回复以及主动发送本地文件。出站文件首版限制为 20 MiB。`confirm` 模式下，工具批准会显示 QQ Markdown 消息和“允许/拒绝”按钮，点击只对绑定用户生效。
 
 ## 微信
 
@@ -142,7 +162,7 @@ const ws = new WebSocket(
 
 ## Slash Commands
 
-三个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP client 会收到 Agent 宣告的 `/compact`、`/resume` 和 `/fork`。
+四个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP client 会收到 Agent 宣告的 `/compact`、`/resume` 和 `/fork`。
 
 | 命令 | 说明 |
 | --- | --- |
@@ -186,6 +206,7 @@ Telegram 发来的 `/status@bot_name` 也会正确识别。
 dwo channel weixin send-message "任务完成"
 dwo channel telegram send-file ./report.pdf
 dwo channel feishu send-message "请查看最新结果"
+dwo channel qq send-file ./report.zip
 ```
 
 Agent 只应在用户明确要求主动发送消息或文件时调用这些命令。普通回答已经由 channel adapter 自动返回，不需要重复发送。
@@ -194,10 +215,10 @@ Agent 只应在用户明确要求主动发送消息或文件时调用这些命�
 
 ```text
 dwo channel list
-dwo channel <weixin|telegram|feishu|websocket> status
+dwo channel <weixin|telegram|feishu|qq|websocket> status
 ```
 
-`connected` 表示持久化绑定有效；Telegram 还要求 token 环境变量可读取，飞书/Lark 还要求 App ID/Secret 环境变量可读取。它不代表实时网络健康。排查顺序：
+`connected` 表示持久化绑定有效；Telegram 还要求 token 环境变量可读取，飞书/Lark 还要求 App ID/Secret 环境变量可读取。QQ 的 AppID/AppSecret 由二维码绑定写入私有 secret 文件。它不代表实时网络健康。排查顺序：
 
 1. 确认 `enabled: true` 且 daemon 已在配置修改后重启。
 2. 确认 daemon 进程能读取相应环境变量。

@@ -14,7 +14,7 @@
 | --- | --- |
 | [CLI 命令参考](commands.md) | 查询命令、参数和 session/MCP/automation 行为 |
 | [ACP 使用指南](acp.md) | 将支持 ACP 的 IDE 或客户端连接到已有 daemon |
-| [Channel 部署与使用](channels.md) | 部署微信、Telegram、飞书/Lark，查询 slash commands |
+| [Channel 部署与使用](channels.md) | 部署微信、Telegram、飞书/Lark、QQ Bot，查询 slash commands |
 | [Subsessions 使用指南](subsessions.md) | 了解父子 session、配置继承、结果回传和任务控制 |
 | [上下文压缩与 Handoff](context.md) | 了解长会话压缩、`/compact` 和 Agent 主动重建上下文 |
 | [Automation 使用指南](automation.md) | 配置 cron、时区、新建/固定 session 和无人值守任务 |

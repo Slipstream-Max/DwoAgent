@@ -17,6 +17,7 @@ use super::ChannelKind;
 const WEIXIN_CHANNEL: &str = ChannelKind::Weixin.as_str();
 const TELEGRAM_CHANNEL: &str = ChannelKind::Telegram.as_str();
 const FEISHU_CHANNEL: &str = ChannelKind::Feishu.as_str();
+const QQ_CHANNEL: &str = ChannelKind::Qq.as_str();
 const WEBSOCKET_CHANNEL: &str = ChannelKind::Websocket.as_str();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +80,7 @@ pub struct WeixinTransportState {
 pub type WeixinChannelState = ChannelState<WeixinTransportState>;
 pub type TelegramChannelState = ChannelState;
 pub type FeishuChannelState = ChannelState;
+pub type QqChannelState = ChannelState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -162,6 +164,24 @@ impl FeishuChannelConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QqChannelConfig {
+    pub enabled: bool,
+    pub replay_turns: usize,
+    #[serde(default = "default_true")]
+    pub media_input: bool,
+}
+
+impl QqChannelConfig {
+    fn validate(&self) -> Result<()> {
+        if self.replay_turns > 10 {
+            bail!("channels.qq.replayTurns must be at most 10");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TelegramSecret {
     pub(crate) bot_id: u64,
     pub(crate) bot_username: String,
@@ -192,6 +212,29 @@ impl TelegramSecret {
 pub(crate) struct FeishuSecret {
     pub(crate) bound_open_id: String,
     pub(crate) bound_chat_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct QqSecret {
+    pub(crate) app_id: String,
+    pub(crate) app_secret: String,
+    pub(crate) bound_user_openid: String,
+}
+
+impl QqSecret {
+    fn validate(&self) -> Result<()> {
+        if self.app_id.trim().is_empty() {
+            bail!("channels.qq secret field appId must not be empty");
+        }
+        if self.app_secret.trim().is_empty() {
+            bail!("channels.qq secret field appSecret must not be empty");
+        }
+        if self.bound_user_openid.trim().is_empty() {
+            bail!("channels.qq secret field boundUserOpenid must not be empty");
+        }
+        Ok(())
+    }
 }
 
 impl FeishuSecret {
@@ -267,6 +310,14 @@ pub(crate) struct FeishuRuntime {
     pub(crate) app_secret: String,
 }
 
+pub(crate) struct QqRuntime {
+    pub(crate) config: QqChannelConfig,
+    pub(crate) state: QqChannelState,
+    pub(crate) secret: QqSecret,
+    pub(crate) app_id: String,
+    pub(crate) app_secret: String,
+}
+
 pub(crate) struct WebsocketRuntime {
     pub(crate) config: WebsocketChannelConfig,
     pub(crate) token: String,
@@ -329,6 +380,21 @@ pub enum FeishuBindProgress {
     Failed { message: String },
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct QqBindStart {
+    pub binding_id: String,
+    pub qrcode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum QqBindProgress {
+    Waiting,
+    Confirmed { channel: ChannelSummary },
+    Expired,
+    Failed { message: String },
+}
+
 struct PendingLogin {
     session: QrLoginSession,
     config: WeixinConfig,
@@ -348,6 +414,12 @@ struct PendingFeishuBind {
     code: String,
     receiver: mpsc::UnboundedReceiver<Vec<u8>>,
     task: tokio::task::JoinHandle<Result<(), String>>,
+    expires_at: Instant,
+}
+
+struct PendingQqBind {
+    task_id: String,
+    key: String,
     expires_at: Instant,
 }
 
@@ -411,10 +483,12 @@ pub struct ChannelManager {
     weixin: Option<WeixinChannelConfig>,
     telegram: Option<TelegramChannelConfig>,
     feishu: Option<FeishuChannelConfig>,
+    qq: Option<QqChannelConfig>,
     websocket: Option<WebsocketChannelConfig>,
     pending_weixin: Mutex<HashMap<String, Arc<Mutex<PendingLogin>>>>,
     pending_telegram: Mutex<HashMap<String, PendingTelegramBind>>,
     pending_feishu: Mutex<HashMap<String, PendingFeishuBind>>,
+    pending_qq: Mutex<HashMap<String, PendingQqBind>>,
 }
 
 impl ChannelManager {
@@ -425,7 +499,7 @@ impl ChannelManager {
         if let Some(unsupported) = channels.keys().find(|name| {
             !matches!(
                 name.as_str(),
-                WEIXIN_CHANNEL | TELEGRAM_CHANNEL | FEISHU_CHANNEL | WEBSOCKET_CHANNEL
+                WEIXIN_CHANNEL | TELEGRAM_CHANNEL | FEISHU_CHANNEL | QQ_CHANNEL | WEBSOCKET_CHANNEL
             )
         }) {
             bail!("unsupported channel configuration: channels.{unsupported}");
@@ -457,6 +531,15 @@ impl ChannelManager {
         if let Some(config) = &feishu {
             config.validate()?;
         }
+        let qq = channels
+            .get(QQ_CHANNEL)
+            .cloned()
+            .map(serde_yaml::from_value::<QqChannelConfig>)
+            .transpose()
+            .context("parse channels.qq")?;
+        if let Some(config) = &qq {
+            config.validate()?;
+        }
         let websocket = channels
             .get(WEBSOCKET_CHANNEL)
             .cloned()
@@ -476,10 +559,12 @@ impl ChannelManager {
             weixin,
             telegram,
             feishu,
+            qq,
             websocket,
             pending_weixin: Mutex::new(HashMap::new()),
             pending_telegram: Mutex::new(HashMap::new()),
             pending_feishu: Mutex::new(HashMap::new()),
+            pending_qq: Mutex::new(HashMap::new()),
         };
         manager.sync_capabilities().await?;
         Ok(manager)
@@ -490,6 +575,7 @@ impl ChannelManager {
             (ChannelKind::Weixin, self.weixin.is_some()),
             (ChannelKind::Telegram, self.telegram.is_some()),
             (ChannelKind::Feishu, self.feishu.is_some()),
+            (ChannelKind::Qq, self.qq.is_some()),
             (ChannelKind::Websocket, self.websocket.is_some()),
         ];
         let mut summaries = Vec::with_capacity(configured.len());
@@ -574,6 +660,24 @@ impl ChannelManager {
                     bound_user_id,
                 })
             }
+            ChannelKind::Qq => {
+                let config = self.qq.as_ref().context("channels.qq is not configured")?;
+                let state: QqChannelState = store.load_runtime().await?;
+                let (connected, bound_user_id) = if store.secret_path().is_file() {
+                    let secret = store.load_secret::<QqSecret>().await?;
+                    secret.validate()?;
+                    (true, Some(secret.bound_user_openid))
+                } else {
+                    (false, None)
+                };
+                Ok(ChannelSummary {
+                    name: QQ_CHANNEL.to_string(),
+                    enabled: config.enabled,
+                    connected,
+                    selected_session_id: state.selected_session_id,
+                    bound_user_id,
+                })
+            }
             ChannelKind::Websocket => {
                 let config = self
                     .websocket
@@ -603,6 +707,7 @@ impl ChannelManager {
                 Ok(self.load_telegram().await?.secret.bound_chat_id.to_string())
             }
             ChannelKind::Feishu => Ok(self.load_feishu().await?.secret.bound_chat_id),
+            ChannelKind::Qq => Ok(self.load_qq().await?.secret.bound_user_openid),
             ChannelKind::Websocket => bail!("WebSocket channel has no bound target"),
         }
     }
@@ -672,6 +777,20 @@ impl ChannelManager {
             secret,
             app_id,
             app_secret,
+        })
+    }
+
+    pub(crate) async fn load_qq(&self) -> Result<QqRuntime> {
+        let config = self.qq.clone().context("channels.qq is not configured")?;
+        let store = self.store(ChannelKind::Qq);
+        let secret: QqSecret = store.load_secret().await?;
+        secret.validate()?;
+        Ok(QqRuntime {
+            state: store.load_runtime().await?,
+            app_id: secret.app_id.clone(),
+            app_secret: secret.app_secret.clone(),
+            secret,
+            config,
         })
     }
 
@@ -924,6 +1043,75 @@ impl ChannelManager {
         Ok(FeishuBindProgress::Waiting)
     }
 
+    pub async fn begin_qq_bind(&self) -> Result<QqBindStart> {
+        self.qq
+            .as_ref()
+            .context("channels.qq is not configured in profile.yaml")?;
+        let task = super::qq::create_bind_task().await?;
+        let binding_id = format!("binding-{}", Uuid::new_v4());
+        let qrcode = super::qq::bind_qr_url(&task.task_id);
+        let mut pending = self.pending_qq.lock().await;
+        pending.clear();
+        pending.insert(
+            binding_id.clone(),
+            PendingQqBind {
+                task_id: task.task_id,
+                key: task.key,
+                expires_at: Instant::now() + Duration::from_secs(10 * 60),
+            },
+        );
+        Ok(QqBindStart { binding_id, qrcode })
+    }
+
+    pub async fn poll_qq_bind(&self, binding_id: &str) -> Result<QqBindProgress> {
+        let (task_id, key) = {
+            let mut pending = self.pending_qq.lock().await;
+            let binding = pending
+                .get(binding_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown or completed binding: {binding_id}"))?;
+            if Instant::now() >= binding.expires_at {
+                pending.remove(binding_id);
+                return Ok(QqBindProgress::Expired);
+            }
+            (binding.task_id.clone(), binding.key.clone())
+        };
+
+        match super::qq::poll_bind_task(&task_id, &key).await? {
+            super::qq::QqQrPoll::Waiting => Ok(QqBindProgress::Waiting),
+            super::qq::QqQrPoll::Expired => {
+                self.pending_qq.lock().await.remove(binding_id);
+                Ok(QqBindProgress::Expired)
+            }
+            super::qq::QqQrPoll::Completed {
+                app_id,
+                app_secret,
+                user_openid,
+            } => {
+                self.pending_qq.lock().await.remove(binding_id);
+                let Some(bound_user_openid) = user_openid.filter(|value| !value.trim().is_empty())
+                else {
+                    return Ok(QqBindProgress::Failed {
+                        message: "QQ QR binding did not return userOpenid; single-user binding cannot be established"
+                            .to_string(),
+                    });
+                };
+                if let Err(error) = super::qq::validate_credentials(&app_id, &app_secret).await {
+                    return Ok(QqBindProgress::Failed {
+                        message: format!("validate QQ credentials: {error:#}"),
+                    });
+                }
+                self.save_qq(QqSecret {
+                    app_id,
+                    app_secret,
+                    bound_user_openid,
+                })
+                .await?;
+                let channel = self.summary(ChannelKind::Qq).await?;
+                Ok(QqBindProgress::Confirmed { channel })
+            }
+        }
+    }
+
     pub async fn begin_weixin_login(&self) -> Result<WeixinLoginStart> {
         let settings = self
             .weixin
@@ -1026,6 +1214,12 @@ impl ChannelManager {
             .await
     }
 
+    async fn save_qq(&self, secret: QqSecret) -> Result<()> {
+        secret.validate()?;
+        self.save_binding(ChannelKind::Qq, &QqChannelState::default(), &secret)
+            .await
+    }
+
     async fn save_binding(
         &self,
         channel: ChannelKind,
@@ -1088,6 +1282,14 @@ impl ChannelManager {
                     };
                 (available, super::feishu::CAPABILITY_PROMPT)
             }
+            ChannelKind::Qq => (
+                self.qq.as_ref().is_some_and(|config| config.enabled)
+                    && store
+                        .load_secret::<QqSecret>()
+                        .await
+                        .is_ok_and(|secret| secret.validate().is_ok()),
+                super::qq::CAPABILITY_PROMPT,
+            ),
             ChannelKind::Websocket => (false, ""),
         };
         self.sync_capability(channel.as_str(), available, content)
@@ -1486,6 +1688,63 @@ mediaInput: true
         manager.remove(ChannelKind::Feishu).await.unwrap();
         assert!(!store.secret_path().exists());
         assert!(!store.runtime_path().exists());
+    }
+
+    #[tokio::test]
+    async fn qq_qr_secret_and_session_state_are_persisted_separately() {
+        let profile = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+enabled: true
+replayTurns: 5
+mediaInput: true
+"#,
+        )
+        .unwrap();
+        let channels = BTreeMap::from([(QQ_CHANNEL.to_string(), profile)]);
+        let root = tempfile::tempdir().unwrap();
+        let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
+
+        manager
+            .save_qq(QqSecret {
+                app_id: "102000000".to_string(),
+                app_secret: "qq-secret".to_string(),
+                bound_user_openid: "qq-user-openid".to_string(),
+            })
+            .await
+            .unwrap();
+        let state = QqChannelState {
+            selected_session_id: Some("session-test".to_string()),
+            ..Default::default()
+        };
+        manager.save_state(ChannelKind::Qq, &state).await.unwrap();
+
+        let store = manager.store(ChannelKind::Qq);
+        let loaded: QqChannelState = read_yaml(&store.runtime_path()).await.unwrap();
+        assert_eq!(loaded.selected_session_id, state.selected_session_id);
+        let secret_source = tokio::fs::read_to_string(store.secret_path())
+            .await
+            .unwrap();
+        assert!(secret_source.contains("appId: '102000000'"));
+        assert!(secret_source.contains("appSecret: qq-secret"));
+        assert!(secret_source.contains("boundUserOpenid: qq-user-openid"));
+        let runtime_source = tokio::fs::read_to_string(store.runtime_path())
+            .await
+            .unwrap();
+        assert!(!runtime_source.contains("qq-secret"));
+
+        let summary = manager.summary(ChannelKind::Qq).await.unwrap();
+        assert!(summary.connected);
+        assert_eq!(summary.bound_user_id.as_deref(), Some("qq-user-openid"));
+        let capability = tokio::fs::read_to_string(manager.capability_path(QQ_CHANNEL))
+            .await
+            .unwrap();
+        assert!(capability.contains("dwo channel qq send-file"));
+        assert!(!capability.contains("qq-secret"));
+
+        manager.remove(ChannelKind::Qq).await.unwrap();
+        assert!(!store.secret_path().exists());
+        assert!(!store.runtime_path().exists());
+        assert!(!manager.capability_path(QQ_CHANNEL).exists());
     }
 
     #[tokio::test]

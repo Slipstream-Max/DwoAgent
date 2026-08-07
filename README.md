@@ -12,12 +12,12 @@
 
 <p align="center">
   <strong>一个 Agent Runtime，只做一件事：让你的 AI 常驻在身边。</strong><br>
-  Rust 原生，常驻内存 ~6MB，CLI、IDE、微信、Telegram、飞书随时连接。
+  Rust 原生，常驻内存 ~6MB，CLI、IDE、微信、Telegram、飞书、QQ Bot 随时连接。
 </p>
 
 ---
 
-赤铎不是又一层 LLM 包装器，而是你设备上的常住助手。CLI、ACP、微信、Telegram、飞书——随便哪个入口接入，对话都不会断。任务从 IDE 发起，手机上继续，无缝接力。
+赤铎不是又一层 LLM 包装器，而是你设备上的常住助手。CLI、ACP、微信、Telegram、飞书、QQ Bot——随便哪个入口接入，对话都不会断。任务从 IDE 发起，手机上继续，无缝接力。
 
 模型调用、终端、文件编辑、MCP、skills、subsessions、权限控制、上下文压缩和定时任务均已内置。core 可以单独嵌入其他程序，system prompt、agent step、存储和工具都可以按需定制。
 
@@ -36,7 +36,7 @@ OpenClaw 功能很全，但常驻内存、组件数量和整体复杂度也跟�
 | **Rust 原生实现** | daemon 和 agent loop 运行在同一个原生二进制中，基础 daemon 实际常驻内存约 `6 MB`，也能处理多个并行 session。内存占用会随活跃 session、channel 和 MCP 连接变化。 |
 | **完整 Agent 功能** | 内置终端、文件编辑、MCP、skills、subsessions、上下文压缩、权限控制和 cron automation。 |
 | **Responses 原生支持** | OpenAI、DeepSeek 和兼容网关统一使用 Responses API；本地工具与 provider 托管的 Web Search 可以出现在同一轮里，并作为正常工具事件回放。 |
-| **本地与远程入口** | 本地支持 ACP 和 CLI，远程支持微信、Telegram、飞书/Lark，图片和文件也可以进入 session。 |
+| **本地与远程入口** | 本地支持 ACP 和 CLI，远程支持微信、Telegram、飞书/Lark、QQ Bot，图片和文件也可以进入 session。 |
 | **Session 原生广播** | ACP 和各个 channel 可以同时订阅同一个 session，已连接端点都能查看进度、取消任务、处理权限请求和继续发送消息。 |
 | **运行中继续操作** | 新消息按顺序进入队列，在模型响应或工具调用的边界加入当前 turn。一个入口等待回复时，其他入口仍可正常操作。 |
 | **持久化会话** | 当前模型上下文和完整 transcript 分开存储，压缩上下文不会删除原始记录。 |
@@ -151,12 +151,13 @@ args: [acp, --protocol, v2]
 
 ### Channels：从聊天应用连接
 
-赤铎目前支持微信、Telegram、飞书/Lark 私聊和 ACP WebSocket。启用 channel 后重启 daemon；消息 channel 再完成绑定：
+赤铎目前支持微信、Telegram、飞书/Lark、QQ Bot 私聊和 ACP WebSocket。启用 channel 后重启 daemon；消息 channel 再完成绑定：
 
 ```text
 dwo channel weixin bind       # 终端扫码
 dwo channel telegram bind     # 私聊机器人发送一次性 /bind <code>
 dwo channel feishu bind       # 私聊机器人发送一次性 /bind <code>
+dwo channel qq bind           # QQ 官方二维码
 ```
 
 Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不需要公网 webhook。环境变量、开放平台权限和完整部署步骤见 [Channel 部署与使用](docs/channels.md)。
@@ -182,6 +183,7 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
  Weixin ---------------->|                  |----> terminal / file tools
  Telegram -------------->| sessions + MCP   |----> managed MCP servers
  Feishu/Lark ----------->| + automation     |
+ QQ Bot ---------------->|                  |
                          +------------------+
 ```
 
@@ -211,7 +213,7 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | --- | --- |
 | [文档索引](docs/README.md) | 按首次使用、日常操作和深入理解组织的阅读入口 |
 | [ACP 使用指南](docs/acp.md) | ACP 启动、session、权限、内容类型与限制 |
-| [Channel 部署与使用](docs/channels.md) | 微信、Telegram、飞书/Lark 部署和 slash commands |
+| [Channel 部署与使用](docs/channels.md) | 微信、Telegram、飞书/Lark、QQ Bot 部署和 slash commands |
 | [Subsessions 使用指南](docs/subsessions.md) | 父子 session、配置继承、结果回传和常用命令 |
 | [Automation 使用指南](docs/automation.md) | Cron、时区、新建/固定 session 和无人值守行为 |
 | [CLI 命令参考](docs/commands.md) | daemon、session、MCP、channel、automation 命令 |

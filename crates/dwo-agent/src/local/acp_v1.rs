@@ -398,13 +398,12 @@ async fn run_resume(
         }
     };
     let connection = AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
-    if responder.respond(response).is_ok() {
-        if activate_observer(&runtime, &session_id, &connection, prepared)
+    if responder.respond(response).is_ok()
+        && activate_observer(&runtime, &session_id, &connection, prepared)
             .await
             .is_ok()
-        {
-            send_available_commands(&connection, &session_id);
-        }
+    {
+        send_available_commands(&connection, &session_id);
     }
 }
 
@@ -577,28 +576,6 @@ async fn set_config_option(
     result
 }
 
-#[cfg(test)]
-mod compaction_capability_tests {
-    use super::*;
-
-    #[test]
-    fn v1_requires_the_session_compaction_capability() {
-        let unsupported: InitializeRequest = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {"session": {}}
-        }))
-        .unwrap();
-        assert!(!advertises_compaction(&unsupported));
-
-        let supported: InitializeRequest = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {"session": {"compaction": {}}}
-        }))
-        .unwrap();
-        assert!(advertises_compaction(&supported));
-    }
-}
-
 async fn close_session(runtime: &AcpRuntime, session_id: String) -> Result<()> {
     ipc::request(
         &runtime.config_path,
@@ -619,4 +596,26 @@ async fn delete_session(runtime: &AcpRuntime, session_id: String) -> Result<()> 
     .await?;
     runtime.observers.lock().await.remove(&session_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod compaction_capability_tests {
+    use super::*;
+
+    #[test]
+    fn v1_requires_the_session_compaction_capability() {
+        let unsupported: InitializeRequest = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"session": {}}
+        }))
+        .unwrap();
+        assert!(!advertises_compaction(&unsupported));
+
+        let supported: InitializeRequest = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"session": {"compaction": {}}}
+        }))
+        .unwrap();
+        assert!(advertises_compaction(&supported));
+    }
 }

@@ -13,7 +13,8 @@ use crate::automation::{
     AutomationSchedule, AutomationSession,
 };
 use crate::channels::{
-    self, ChannelKind, FeishuBindProgress, TelegramBindProgress, WeixinLoginProgress,
+    self, ChannelKind, FeishuBindProgress, QqBindProgress, TelegramBindProgress,
+    WeixinLoginProgress,
 };
 use crate::host;
 use crate::local::{acp, ipc};
@@ -140,6 +141,10 @@ enum ChannelCommand {
         command: ManagedChannelCommand,
     },
     Feishu {
+        #[command(subcommand)]
+        command: ManagedChannelCommand,
+    },
+    Qq {
         #[command(subcommand)]
         command: ManagedChannelCommand,
     },
@@ -641,6 +646,9 @@ async fn run_channel(command: ChannelCommand, config_path: &Path) -> Result<()> 
         ChannelCommand::Feishu { command } => {
             run_managed_channel(ChannelKind::Feishu, command, config_path).await?
         }
+        ChannelCommand::Qq { command } => {
+            run_managed_channel(ChannelKind::Qq, command, config_path).await?
+        }
         ChannelCommand::Websocket { command } => {
             let action = match command {
                 WebsocketChannelCommand::Status => "status",
@@ -692,6 +700,7 @@ async fn run_managed_channel(
             ChannelKind::Weixin => bind_weixin(config_path).await?,
             ChannelKind::Telegram => bind_telegram(config_path).await?,
             ChannelKind::Feishu => bind_feishu(config_path).await?,
+            ChannelKind::Qq => bind_qq(config_path).await?,
             ChannelKind::Websocket => bail!("WebSocket channel does not use binding"),
         },
     }
@@ -919,6 +928,37 @@ async fn bind_feishu(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn bind_qq(config_path: &Path) -> Result<()> {
+    let start = ipc::request(config_path, "channel.qq.begin", json!({})).await?;
+    let binding_id = start["binding_id"]
+        .as_str()
+        .context("daemon omitted binding_id")?;
+    let qrcode = start["qrcode"].as_str().context("daemon omitted qrcode")?;
+    output::line(format_args!("Scan this QR code with QQ:\n"))?;
+    let rendered_qr = qr2term::generate_qr_string(qrcode).unwrap_or_else(|_| qrcode.to_string());
+    output::line(format_args!("{rendered_qr}"))?;
+    output::line(format_args!("Waiting for QQ binding confirmation..."))?;
+    loop {
+        tokio::time::sleep(channels::BIND_POLL_INTERVAL).await;
+        let progress = ipc::request(
+            config_path,
+            "channel.qq.poll",
+            json!({"binding_id": binding_id}),
+        )
+        .await?;
+        match serde_json::from_value::<QqBindProgress>(progress)? {
+            QqBindProgress::Waiting => {}
+            QqBindProgress::Confirmed { channel } => {
+                output::line(format_args!("Channel {} connected", channel.name))?;
+                break;
+            }
+            QqBindProgress::Expired => bail!("QQ QR code expired"),
+            QqBindProgress::Failed { message } => bail!(message),
+        }
+    }
+    Ok(())
+}
+
 const DEFAULT_PROFILE: &str = r#"name: coder
 description: coding agent
 policyMode: confirm
@@ -942,6 +982,10 @@ channels:
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
+    mediaInput: true
+  qq:
+    enabled: false
+    replayTurns: 5
     mediaInput: true
   websocket:
     enabled: false
@@ -1054,6 +1098,30 @@ mod tests {
                     command: ManagedChannelCommand::SendFile { ref path }
                 }
             } if path == &PathBuf::from("report.pdf")
+        ));
+    }
+
+    #[test]
+    fn parses_qq_commands() {
+        let bind = Cli::try_parse_from(["dwo", "channel", "qq", "bind"]).unwrap();
+        assert!(matches!(
+            bind.command,
+            Command::Channel {
+                command: ChannelCommand::Qq {
+                    command: ManagedChannelCommand::Bind
+                }
+            }
+        ));
+
+        let send =
+            Cli::try_parse_from(["dwo", "channel", "qq", "send-file", "report.zip"]).unwrap();
+        assert!(matches!(
+            send.command,
+            Command::Channel {
+                command: ChannelCommand::Qq {
+                    command: ManagedChannelCommand::SendFile { ref path }
+                }
+            } if path == &PathBuf::from("report.zip")
         ));
     }
 

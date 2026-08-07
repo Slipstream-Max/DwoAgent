@@ -89,6 +89,10 @@ channels:
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
     mediaInput: true
+  qq:
+    enabled: false
+    replayTurns: 5
+    mediaInput: true
 
 automation:
   enabled: false
@@ -131,7 +135,7 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 | `maxModelSteps` | 否 | 单回合 agent 循环的最大模型步数：`0`（无限）或 `5`–`200`，默认 `100`。 |
 | `logging` | 否 | Daemon 文件日志级别和保留天数。 |
 | `externalSkillsDirs` | 否 | 额外 skills 目录列表，可挂载他人的 skill；相对路径相对 profile 根目录解析。 |
-| `channels` | 否 | 微信、Telegram 和飞书/Lark adapter。 |
+| `channels` | 否 | 微信、Telegram、飞书/Lark 和 QQ Bot adapter。 |
 | `automation` | 否 | Cron 定时任务。 |
 | `model` | 是 | Provider、模型 alias 和默认模型。 |
 
@@ -287,9 +291,10 @@ Channels 配置 adapter 是否启动，以及回放、凭据环境变量、代�
 | 微信 | `enabled`、`replayTurns`、`markdownFilter`、`mediaInput` |
 | Telegram | `enabled`、`replayTurns`、`botTokenEnv`、`tgProxy`、`mediaInput` |
 | 飞书/Lark | `enabled`、`replayTurns`、`appIdEnv`、`appSecretEnv`、`platform`、`mediaInput` |
+| QQ Bot | `enabled`、`replayTurns`、`mediaInput` |
 | WebSocket | `enabled`、`port` |
 
-`replayTurns` 最大为 10。`platform` 使用 `feishu` 或 `lark`。Token、App ID 和 App Secret 从环境变量读取。
+`replayTurns` 最大为 10。`platform` 使用 `feishu` 或 `lark`。Token、App ID 和 App Secret 从环境变量读取。QQ Bot 通过 `dwo channel qq bind` 扫码绑定，不在 profile.yaml 中填写凭据。
 
 WebSocket 固定监听 `0.0.0.0:<port>`，ACP 路径固定为 `/acp`。访问 token 自动生成并保存到 `channels/websocket/secret.yaml`，不需要写入 profile。
 
@@ -390,4 +395,4 @@ dwo mcp auth <server> [--logout]
 | `runtime/channel-capabilities/<channel>.md` | 已绑定 channel 提供给模型的能力说明，不含凭据。 |
 | `runtime/attachments/<channel>/...` | 从 channel 下载的图片和文件。 |
 
-Telegram token 和飞书 App ID/Secret 不写入 `secret.yaml`。它们始终从 `profile.yaml` 指定的环境变量读取。
+Telegram token 和飞书 App ID/Secret 不写入 `secret.yaml`，始终从 `profile.yaml` 指定的环境变量读取。QQ Bot 例外：二维码绑定返回的 AppID/AppSecret 会写入 `channels/qq/secret.yaml`，profile.yaml 不填写 QQ 凭据。

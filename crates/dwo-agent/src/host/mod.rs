@@ -18,8 +18,8 @@ use crate::automation::{
     AutomationConfig, AutomationJob, AutomationRuntime, parse_config as parse_automation_config,
 };
 use crate::channels::{
-    ChannelHub, ChannelKind, ChannelManager, FeishuBindProgress, TelegramBindProgress,
-    WeixinLoginProgress,
+    ChannelHub, ChannelKind, ChannelManager, FeishuBindProgress, QqBindProgress,
+    TelegramBindProgress, WeixinLoginProgress,
 };
 
 pub struct Host {
@@ -941,6 +941,24 @@ impl Host {
                 {
                     self.channel_hub
                         .start(ChannelKind::Feishu, self.clone())
+                        .await?;
+                }
+                Ok(serde_json::to_value(progress)?)
+            }
+            "channel.qq.begin" => {
+                self.channel_hub.stop(ChannelKind::Qq).await;
+                Ok(serde_json::to_value(
+                    self.channels().begin_qq_bind().await?,
+                )?)
+            }
+            "channel.qq.poll" => {
+                let params: TelegramPollBindParam = serde_json::from_value(params)?;
+                let progress = self.channels().poll_qq_bind(&params.binding_id).await?;
+                if let QqBindProgress::Confirmed { channel } = &progress
+                    && channel.enabled
+                {
+                    self.channel_hub
+                        .start(ChannelKind::Qq, self.clone())
                         .await?;
                 }
                 Ok(serde_json::to_value(progress)?)

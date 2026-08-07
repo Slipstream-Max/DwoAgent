@@ -4,6 +4,7 @@ mod command;
 mod feishu;
 mod hub;
 mod manager;
+mod qq;
 mod render;
 mod telegram;
 mod websocket;
@@ -11,7 +12,7 @@ mod weixin;
 
 pub(crate) use hub::ChannelHub;
 pub(crate) use manager::{
-    ChannelManager, FeishuBindProgress, TelegramBindProgress, WeixinLoginProgress,
+    ChannelManager, FeishuBindProgress, QqBindProgress, TelegramBindProgress, WeixinLoginProgress,
 };
 
 pub(crate) const BIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -21,17 +22,25 @@ pub(crate) enum ChannelKind {
     Weixin,
     Telegram,
     Feishu,
+    Qq,
     Websocket,
 }
 
 impl ChannelKind {
-    pub(crate) const ALL: [Self; 4] = [Self::Weixin, Self::Telegram, Self::Feishu, Self::Websocket];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Weixin,
+        Self::Telegram,
+        Self::Feishu,
+        Self::Qq,
+        Self::Websocket,
+    ];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Weixin => "weixin",
             Self::Telegram => "telegram",
             Self::Feishu => "feishu",
+            Self::Qq => "qq",
             Self::Websocket => "websocket",
         }
     }
@@ -41,6 +50,7 @@ impl ChannelKind {
             Self::Weixin => "Weixin",
             Self::Telegram => "Telegram",
             Self::Feishu => "Feishu",
+            Self::Qq => "QQ",
             Self::Websocket => "WebSocket",
         }
     }

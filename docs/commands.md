@@ -94,12 +94,17 @@ dwo channel feishu bind
 dwo channel feishu unbind
 dwo channel feishu send-message <message>
 dwo channel feishu send-file <path>
+dwo channel qq status
+dwo channel qq bind
+dwo channel qq unbind
+dwo channel qq send-message <message>
+dwo channel qq send-file <path>
 dwo channel websocket status
 dwo channel websocket token
 dwo channel websocket reset-token
 ```
 
-`weixin bind` 在终端显示 QR 登录流程。`telegram bind` 从 `botTokenEnv` 读取 BotFather token，终端显示一次性 `/bind <code>`；在 bot 私聊中发送后，daemon 把该 user/chat 写入 `channels/telegram/secret.yaml`。`feishu bind` 从 `appIdEnv`/`appSecretEnv` 读取企业自建应用凭据，临时建立长连接并等待同样的私聊命令，随后只把 `open_id/chat_id` 写入 `channels/feishu/secret.yaml`。只有绑定用户和私聊可以使用对应 bot，token/App Secret 都不会落盘。
+`weixin bind` 在终端显示 QR 登录流程。`telegram bind` 从 `botTokenEnv` 读取 BotFather token，终端显示一次性 `/bind <code>`；在 bot 私聊中发送后，daemon 把该 user/chat 写入 `channels/telegram/secret.yaml`。`feishu bind` 从 `appIdEnv`/`appSecretEnv` 读取企业自建应用凭据，临时建立长连接并等待同样的私聊命令，随后只把 `open_id/chat_id` 写入 `channels/feishu/secret.yaml`。`qq bind` 只使用 QQ 官方二维码绑定，并要求扫码结果带有单用户 `userOpenid`。QQ 扫码返回的 AppID/AppSecret 保存在受限权限的 `channels/qq/secret.yaml`。
 
 Telegram 使用 long polling，不需要 webhook 或公网地址。`tgProxy` 是仅作用于 Telegram Bot API 和媒体下载的可选 HTTP 代理。入站 photo、document、video 下载到 `runtime/attachments/telegram/YYYY/MM/DD/<session-id>/` 并作为带本地路径、MIME、文件名和大小的 resource link 提交。输出使用 Telegram plain text，不启用 parse mode，也不修改模型文本。
 

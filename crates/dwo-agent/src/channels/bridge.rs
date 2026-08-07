@@ -20,6 +20,19 @@ use super::render::{
 #[async_trait]
 pub(crate) trait ConversationTransport: Send + Sync {
     async fn send_text(&self, text: &str) -> Result<()>;
+    async fn send_permission_request(
+        &self,
+        _session_id: &SessionId,
+        call: &ActiveToolCall,
+        permission: &PendingPermission,
+    ) -> Result<()> {
+        self.send_text(&render_tool_call(
+            call,
+            "request id",
+            &permission.request_id,
+        ))
+        .await
+    }
     async fn save_selected_session(&self, session_id: Option<&str>) -> Result<()>;
 }
 
@@ -272,6 +285,26 @@ impl SessionBridge {
         Ok(())
     }
 
+    pub(crate) async fn resolve_permission(
+        &self,
+        session_id: &SessionId,
+        request_id: &str,
+        allowed: bool,
+    ) -> Result<()> {
+        self.host
+            .resolve_session_permission(
+                session_id,
+                self.endpoint.clone(),
+                request_id.to_string(),
+                ConfirmationDecision {
+                    allowed,
+                    reason: (!allowed)
+                        .then(|| format!("denied from {}", self.conversation.denial_source())),
+                },
+            )
+            .await
+    }
+
     pub(crate) async fn ensure_prompt_session(&self) -> Result<SessionId> {
         if let Some(id) = self.selected_session_id.lock().await.clone() {
             return SessionId::parse(id).map_err(anyhow::Error::msg);
@@ -353,6 +386,7 @@ impl SessionBridge {
         let task = tokio::spawn(stream_session(
             transport,
             self.endpoint.clone(),
+            id.clone(),
             subscription,
         ));
         *observer = Some(SessionObserver { session_id, task });
@@ -372,6 +406,7 @@ fn resolve_permission_request_id(
 async fn stream_session(
     transport: Arc<dyn ConversationTransport>,
     endpoint: EndpointId,
+    session_id: SessionId,
     mut subscription: dwo_agent_service::SessionSubscription,
 ) {
     let mut stream = SessionStreamState::default();
@@ -413,11 +448,16 @@ async fn stream_session(
                         tool_name: permission.tool_name.clone(),
                         raw_input: serde_json::Value::Null,
                     });
-                send(
-                    &transport,
-                    &render_tool_call(&call, "request id", &permission.request_id),
-                )
-                .await;
+                if let Err(error) = transport
+                    .send_permission_request(&session_id, &call, &permission)
+                    .await
+                {
+                    tracing::warn!(
+                        event = "channel.permission_send_failed",
+                        error = %format!("{error:#}"),
+                        "send permission request failed"
+                    );
+                }
             }
             SessionEventPayload::ToolCompleted { result, .. } => {
                 stream.forget_tool(&result.tool_call_id);
@@ -549,6 +589,7 @@ mod tests {
         let task = tokio::spawn(stream_session(
             transport.clone(),
             EndpointId::new(),
+            session_id.clone(),
             subscription,
         ));
         for (seq, payload) in [

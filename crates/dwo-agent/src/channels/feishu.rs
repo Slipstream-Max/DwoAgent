@@ -27,7 +27,10 @@ use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::command::parse_command;
 #[cfg(test)]
 use super::command::render_command_help;
-use super::gateway::{ChannelAdapter, ChannelRuntime, ChannelStarter, PreparedChannel};
+use super::gateway::{
+    ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
+    ChannelStarter, PreparedChannel,
+};
 use super::manager::{FeishuChannelConfig, FeishuChannelState};
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Feishu/Lark private channel is bound. Your normal reasoning and responses are already streamed to the user through Feishu or Lark.
@@ -42,6 +45,27 @@ const FEISHU_TEXT_CHUNK_CHARS: usize = 20_000;
 const RECENT_MESSAGE_LIMIT: usize = 256;
 
 pub(crate) struct FeishuAdapter;
+
+#[async_trait]
+impl ChannelBinder for FeishuAdapter {
+    async fn begin_bind(&self, host: Arc<Host>) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            host.channels().begin_feishu_bind().await?,
+        )?)
+    }
+
+    async fn poll_bind(
+        &self,
+        host: Arc<Host>,
+        params: ChannelPollParams,
+    ) -> Result<ChannelBindingProgress> {
+        Ok(host
+            .channels()
+            .poll_feishu_bind(&params.binding_id)
+            .await?
+            .into())
+    }
+}
 
 struct FeishuStarter {
     host: Arc<Host>,

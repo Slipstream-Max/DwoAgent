@@ -5,6 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::host::Host;
@@ -16,6 +18,72 @@ use super::qq::QqAdapter;
 use super::telegram::TelegramAdapter;
 use super::websocket::RunningWebsocket;
 use super::weixin::WeixinAdapter;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ChannelBindingProgress {
+    Waiting,
+    Scanned,
+    Confirmed {
+        channel: super::manager::ChannelSummary,
+    },
+    Expired,
+    NeedVerifyCode,
+    Failed {
+        message: String,
+    },
+}
+
+impl From<super::manager::WeixinLoginProgress> for ChannelBindingProgress {
+    fn from(progress: super::manager::WeixinLoginProgress) -> Self {
+        match progress {
+            super::manager::WeixinLoginProgress::Waiting => Self::Waiting,
+            super::manager::WeixinLoginProgress::Scanned => Self::Scanned,
+            super::manager::WeixinLoginProgress::Confirmed { channel } => {
+                Self::Confirmed { channel }
+            }
+            super::manager::WeixinLoginProgress::Expired => Self::Expired,
+            super::manager::WeixinLoginProgress::NeedVerifyCode => Self::NeedVerifyCode,
+            super::manager::WeixinLoginProgress::Failed { message } => Self::Failed { message },
+        }
+    }
+}
+
+impl From<super::manager::TelegramBindProgress> for ChannelBindingProgress {
+    fn from(progress: super::manager::TelegramBindProgress) -> Self {
+        match progress {
+            super::manager::TelegramBindProgress::Waiting => Self::Waiting,
+            super::manager::TelegramBindProgress::Confirmed { channel } => {
+                Self::Confirmed { channel }
+            }
+            super::manager::TelegramBindProgress::Expired => Self::Expired,
+        }
+    }
+}
+
+impl From<super::manager::FeishuBindProgress> for ChannelBindingProgress {
+    fn from(progress: super::manager::FeishuBindProgress) -> Self {
+        match progress {
+            super::manager::FeishuBindProgress::Waiting => Self::Waiting,
+            super::manager::FeishuBindProgress::Confirmed { channel } => {
+                Self::Confirmed { channel }
+            }
+            super::manager::FeishuBindProgress::Expired => Self::Expired,
+            super::manager::FeishuBindProgress::Failed { message } => Self::Failed { message },
+        }
+    }
+}
+
+impl From<super::manager::QqBindProgress> for ChannelBindingProgress {
+    fn from(progress: super::manager::QqBindProgress) -> Self {
+        match progress {
+            super::manager::QqBindProgress::Waiting => Self::Waiting,
+            super::manager::QqBindProgress::Confirmed { channel } => Self::Confirmed { channel },
+            super::manager::QqBindProgress::Expired => Self::Expired,
+            super::manager::QqBindProgress::Failed { message } => Self::Failed { message },
+        }
+    }
+}
 
 #[async_trait]
 pub(crate) trait ChannelRuntime: Send + Sync {
@@ -33,8 +101,24 @@ pub(crate) trait ChannelStarter: Send {
 }
 
 #[async_trait]
-pub(crate) trait ChannelAdapter: Send + Sync {
+pub(crate) trait ChannelAdapter: ChannelBinder + Send + Sync {
     async fn prepare(&self, host: Arc<Host>) -> Result<PreparedChannel>;
+}
+
+#[async_trait]
+pub(crate) trait ChannelBinder: Send + Sync {
+    async fn begin_bind(&self, host: Arc<Host>) -> Result<Value>;
+    async fn poll_bind(
+        &self,
+        host: Arc<Host>,
+        params: ChannelPollParams,
+    ) -> Result<ChannelBindingProgress>;
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChannelPollParams {
+    pub(crate) binding_id: String,
+    pub(crate) verify_code: Option<String>,
 }
 
 pub(crate) struct PreparedChannel {
@@ -83,6 +167,39 @@ impl ChannelGateway {
         }
     }
 
+    pub async fn begin_bind(&self, channel: ChannelKind, host: Arc<Host>) -> Result<Value> {
+        self.stop(channel).await;
+        let adapter =
+            self.adapters.get(&channel).cloned().with_context(|| {
+                format!("{} channel adapter is not registered", channel.as_str())
+            })?;
+        adapter.begin_bind(host).await
+    }
+
+    pub async fn poll_bind(
+        &self,
+        channel: ChannelKind,
+        host: Arc<Host>,
+        params: ChannelPollParams,
+    ) -> Result<ChannelBindingProgress> {
+        let adapter =
+            self.adapters.get(&channel).cloned().with_context(|| {
+                format!("{} channel adapter is not registered", channel.as_str())
+            })?;
+        let progress = adapter.poll_bind(host.clone(), params).await?;
+        if let ChannelBindingProgress::Confirmed { channel: summary } = &progress
+            && summary.enabled
+        {
+            self.start(channel, host).await?;
+        }
+        Ok(progress)
+    }
+
+    pub async fn unbind(&self, channel: ChannelKind, host: Arc<Host>) -> Result<bool> {
+        self.stop(channel).await;
+        host.channels().remove(channel).await
+    }
+
     pub async fn start_all(self: &Arc<Self>, host: Arc<Host>) {
         let channels = match host.channels().list().await {
             Ok(channels) => channels,
@@ -113,7 +230,7 @@ impl ChannelGateway {
         }
     }
 
-    pub async fn start(self: &Arc<Self>, channel: ChannelKind, host: Arc<Host>) -> Result<()> {
+    pub async fn start(&self, channel: ChannelKind, host: Arc<Host>) -> Result<()> {
         let operation = self.operation(channel).await;
         let _operation = operation.lock().await;
         if self.active.lock().await.contains_key(&channel) {

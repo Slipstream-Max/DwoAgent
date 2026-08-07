@@ -17,10 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::automation::{
     AutomationConfig, AutomationJob, AutomationRuntime, parse_config as parse_automation_config,
 };
-use crate::channels::{
-    ChannelGateway, ChannelKind, ChannelManager, FeishuBindProgress, QqBindProgress,
-    TelegramBindProgress, WeixinLoginProgress,
-};
+use crate::channels::{ChannelGateway, ChannelKind, ChannelManager, ChannelPollParams};
 
 pub struct Host {
     service: Arc<AgentService>,
@@ -133,17 +130,6 @@ struct PermissionParam {
     request_id: String,
     allowed: bool,
     reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PollBindParam {
-    binding_id: String,
-    verify_code: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TelegramPollBindParam {
-    binding_id: String,
 }
 
 #[derive(Deserialize)]
@@ -886,84 +872,37 @@ impl Host {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        match method {
-            "channel.list" => Ok(serde_json::to_value(self.channels().list().await?)?),
-            "channel.weixin.begin" => Ok(serde_json::to_value(
-                self.channels().begin_weixin_login().await?,
-            )?),
-            "channel.weixin.poll" => {
-                let params: PollBindParam = serde_json::from_value(params)?;
-                let progress = self
-                    .channels()
-                    .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
-                    .await?;
-                if let WeixinLoginProgress::Confirmed { channel } = &progress {
-                    self.channel_gateway.stop(ChannelKind::Weixin).await;
-                    if channel.enabled {
-                        self.channel_gateway
-                            .start(ChannelKind::Weixin, self.clone())
-                            .await?;
-                    }
-                }
-                Ok(serde_json::to_value(progress)?)
-            }
-            "channel.telegram.begin" => {
-                let start = self.channels().begin_telegram_bind().await?;
-                self.channel_gateway.stop(ChannelKind::Telegram).await;
-                Ok(serde_json::to_value(start)?)
-            }
-            "channel.telegram.poll" => {
-                let params: TelegramPollBindParam = serde_json::from_value(params)?;
-                let progress = self
-                    .channels()
-                    .poll_telegram_bind(&params.binding_id)
-                    .await?;
-                if let TelegramBindProgress::Confirmed { channel } = &progress
-                    && channel.enabled
-                {
-                    self.channel_gateway
-                        .start(ChannelKind::Telegram, self.clone())
-                        .await?;
-                }
-                Ok(serde_json::to_value(progress)?)
-            }
-            "channel.feishu.begin" => {
-                self.channel_gateway.stop(ChannelKind::Feishu).await;
+        if method == "channel.list" {
+            return Ok(serde_json::to_value(self.channels().list().await?)?);
+        }
+        let mut parts = method.split('.');
+        anyhow::ensure!(
+            parts.next() == Some("channel"),
+            "invalid channel method: {method}"
+        );
+        let channel_name = parts
+            .next()
+            .with_context(|| format!("missing channel name in method: {method}"))?;
+        let action = parts
+            .next()
+            .with_context(|| format!("missing channel action in method: {method}"))?;
+        anyhow::ensure!(parts.next().is_none(), "invalid channel method: {method}");
+        let channel = ChannelKind::parse(channel_name)
+            .with_context(|| format!("unknown channel in method: {method}"))?;
+        match action {
+            "begin" => Ok(self
+                .channel_gateway
+                .begin_bind(channel, self.clone())
+                .await?),
+            "poll" => {
+                let params: ChannelPollParams = serde_json::from_value(params)?;
                 Ok(serde_json::to_value(
-                    self.channels().begin_feishu_bind().await?,
+                    self.channel_gateway
+                        .poll_bind(channel, self.clone(), params)
+                        .await?,
                 )?)
             }
-            "channel.feishu.poll" => {
-                let params: TelegramPollBindParam = serde_json::from_value(params)?;
-                let progress = self.channels().poll_feishu_bind(&params.binding_id).await?;
-                if let FeishuBindProgress::Confirmed { channel } = &progress
-                    && channel.enabled
-                {
-                    self.channel_gateway
-                        .start(ChannelKind::Feishu, self.clone())
-                        .await?;
-                }
-                Ok(serde_json::to_value(progress)?)
-            }
-            "channel.qq.begin" => {
-                self.channel_gateway.stop(ChannelKind::Qq).await;
-                Ok(serde_json::to_value(
-                    self.channels().begin_qq_bind().await?,
-                )?)
-            }
-            "channel.qq.poll" => {
-                let params: TelegramPollBindParam = serde_json::from_value(params)?;
-                let progress = self.channels().poll_qq_bind(&params.binding_id).await?;
-                if let QqBindProgress::Confirmed { channel } = &progress
-                    && channel.enabled
-                {
-                    self.channel_gateway
-                        .start(ChannelKind::Qq, self.clone())
-                        .await?;
-                }
-                Ok(serde_json::to_value(progress)?)
-            }
-            other => anyhow::bail!("unknown RPC method: {other}"),
+            other => anyhow::bail!("unknown channel action: {other}"),
         }
     }
 
@@ -1008,10 +947,9 @@ impl Host {
                     .await?;
                 Ok(json!({"sent": true, "to": target, "path": params.path}))
             }
-            ManagedChannelAction::Remove => {
-                self.channel_gateway.stop(channel).await;
-                Ok(json!({"removed": self.channels().remove(channel).await?}))
-            }
+            ManagedChannelAction::Remove => Ok(json!({
+                "removed": self.channel_gateway.unbind(channel, self.clone()).await?
+            })),
             ManagedChannelAction::Token => {
                 anyhow::ensure!(
                     channel == ChannelKind::Websocket,

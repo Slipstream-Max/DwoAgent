@@ -19,7 +19,10 @@ use super::attachments::{
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::command::{command_descriptions, parse_command};
-use super::gateway::{ChannelAdapter, ChannelRuntime, ChannelStarter, PreparedChannel};
+use super::gateway::{
+    ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
+    ChannelStarter, PreparedChannel,
+};
 use super::manager::{TelegramChannelState, telegram_bot};
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Telegram channel is bound. Your normal reasoning and responses are already streamed to the user through Telegram.
@@ -33,6 +36,27 @@ Use `dwo channel telegram --help` to inspect the available commands."#;
 type TelegramHandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub(crate) struct TelegramAdapter;
+
+#[async_trait]
+impl ChannelBinder for TelegramAdapter {
+    async fn begin_bind(&self, host: Arc<Host>) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            host.channels().begin_telegram_bind().await?,
+        )?)
+    }
+
+    async fn poll_bind(
+        &self,
+        host: Arc<Host>,
+        params: ChannelPollParams,
+    ) -> Result<ChannelBindingProgress> {
+        Ok(host
+            .channels()
+            .poll_telegram_bind(&params.binding_id)
+            .await?
+            .into())
+    }
+}
 
 struct TelegramStarter {
     bot: Bot,

@@ -10,7 +10,7 @@ mod telegram;
 mod websocket;
 mod weixin;
 
-pub(crate) use gateway::ChannelGateway;
+pub(crate) use gateway::{ChannelGateway, ChannelPollParams};
 pub(crate) use manager::{
     ChannelManager, FeishuBindProgress, QqBindProgress, TelegramBindProgress, WeixinLoginProgress,
 };

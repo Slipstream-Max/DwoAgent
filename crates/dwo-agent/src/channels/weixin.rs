@@ -21,7 +21,10 @@ use super::attachments::{
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::command::parse_command;
-use super::gateway::{ChannelAdapter, ChannelRuntime, ChannelStarter, PreparedChannel};
+use super::gateway::{
+    ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
+    ChannelStarter, PreparedChannel,
+};
 use super::manager::WeixinChannelState;
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Weixin channel is bound. Your normal reasoning and responses are already streamed to the user through Weixin.
@@ -33,6 +36,27 @@ Only use `dwo channel weixin send-file <path>` when the user explicitly asks you
 Use `dwo channel weixin --help` to inspect the available commands."#;
 
 pub(crate) struct WeixinAdapter;
+
+#[async_trait]
+impl ChannelBinder for WeixinAdapter {
+    async fn begin_bind(&self, host: Arc<Host>) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            host.channels().begin_weixin_login().await?,
+        )?)
+    }
+
+    async fn poll_bind(
+        &self,
+        host: Arc<Host>,
+        params: ChannelPollParams,
+    ) -> Result<ChannelBindingProgress> {
+        Ok(host
+            .channels()
+            .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
+            .await?
+            .into())
+    }
+}
 
 struct WeixinStarter {
     host: Arc<Host>,

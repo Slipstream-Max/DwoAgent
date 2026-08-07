@@ -19,8 +19,9 @@ use super::attachments::{
     attachment_directory, local_file_resource, media_mime_type, sanitize_filename,
     unique_attachment_path,
 };
-use super::bridge::{ConversationId, ConversationTransport, SessionBridge};
+use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::command::parse_command;
+use super::gateway::{ChannelAdapter, ChannelRuntime, ChannelStarter, PreparedChannel};
 use super::manager::WeixinChannelState;
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Weixin channel is bound. Your normal reasoning and responses are already streamed to the user through Weixin.
@@ -31,15 +32,29 @@ Only use `dwo channel weixin send-file <path>` when the user explicitly asks you
 
 Use `dwo channel weixin --help` to inspect the available commands."#;
 
+pub(crate) struct WeixinAdapter;
+
+struct WeixinStarter {
+    host: Arc<Host>,
+    target: String,
+    media_input: bool,
+    bot_token: String,
+    base_url: String,
+    markdown_filter: bool,
+    state: Arc<Mutex<WeixinChannelState>>,
+    client_ref: Arc<OnceLock<Arc<WeixinClient>>>,
+    conversation: Arc<WeixinConversation>,
+}
+
 pub(crate) struct RunningWeixin {
     client: Arc<WeixinClient>,
     target: String,
     client_task: tokio::task::JoinHandle<()>,
-    bridge: Arc<SessionBridge>,
 }
 
-impl RunningWeixin {
-    pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
+#[async_trait]
+impl ChannelAdapter for WeixinAdapter {
+    async fn prepare(&self, host: Arc<Host>) -> Result<PreparedChannel> {
         let runtime = host.channels().load_weixin().await?;
         let target = runtime.secret.bound_user_id.clone();
         let state = Arc::new(Mutex::new(runtime.state));
@@ -51,40 +66,51 @@ impl RunningWeixin {
             state: state.clone(),
             client: client_ref.clone(),
         });
-        let bridge = Arc::new(SessionBridge::new(
-            host.clone(),
-            ConversationId::new("weixin", target.clone()),
-            runtime.config.replay_turns,
+        Ok(PreparedChannel {
+            conversation: ConversationId::new("weixin", target.clone()),
+            replay_turns: runtime.config.replay_turns,
             selected_session_id,
-            conversation.clone(),
-        ));
+            transport: conversation.clone(),
+            starter: Box::new(WeixinStarter {
+                host,
+                target,
+                media_input: runtime.config.media_input,
+                bot_token: runtime.secret.bot_token,
+                base_url: runtime.secret.base_url,
+                markdown_filter: runtime.config.markdown_filter,
+                state,
+                client_ref,
+                conversation,
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl ChannelStarter for WeixinStarter {
+    async fn start(
+        self: Box<Self>,
+        ingress: Arc<dyn ChannelIngress>,
+    ) -> Result<Box<dyn ChannelRuntime>> {
         let handler = WeixinHandler {
-            host,
-            bound_user_id: target.clone(),
-            media_input: runtime.config.media_input,
-            bridge: bridge.clone(),
-            conversation: conversation.clone(),
+            host: self.host.clone(),
+            bound_user_id: self.target.clone(),
+            media_input: self.media_input,
+            ingress,
+            conversation: self.conversation.clone(),
         };
         let config = WeixinConfig::builder()
-            .token(runtime.secret.bot_token)
-            .base_url(runtime.secret.base_url)
-            .markdown_filter(runtime.config.markdown_filter)
+            .token(self.bot_token)
+            .base_url(self.base_url)
+            .markdown_filter(self.markdown_filter)
             .build()?;
         let client = Arc::new(WeixinClient::builder(config).on_message(handler).build()?);
         client
             .context_tokens()
-            .import(state.lock().await.adapter.context_tokens.clone());
-        let _ = client_ref.set(client.clone());
-        if let Err(error) = bridge.resume_observer().await {
-            tracing::warn!(
-                event = "channel.observer_restore_failed",
-                channel = "weixin",
-                error = %format!("{error:#}"),
-                "restore channel session observer failed"
-            );
-        }
+            .import(self.state.lock().await.adapter.context_tokens.clone());
+        let _ = self.client_ref.set(client.clone());
         let running_client = client.clone();
-        let task_state = state.clone();
+        let task_state = self.state.clone();
         let client_task = tokio::spawn(async move {
             let sync_buf = task_state.lock().await.adapter.sync_buf.clone();
             if let Err(error) = running_client.start(sync_buf).await {
@@ -96,17 +122,18 @@ impl RunningWeixin {
                 );
             }
         });
-        Ok(Self {
+        Ok(Box::new(RunningWeixin {
             client,
-            target,
+            target: self.target,
             client_task,
-            bridge,
-        })
+        }))
     }
+}
 
-    pub(crate) async fn stop(self) {
+#[async_trait]
+impl ChannelRuntime for RunningWeixin {
+    async fn stop(self: Box<Self>) {
         self.client.shutdown();
-        self.bridge.stop().await;
         let mut client_task = self.client_task;
         if tokio::time::timeout(Duration::from_secs(5), &mut client_task)
             .await
@@ -116,7 +143,7 @@ impl RunningWeixin {
         }
     }
 
-    pub(crate) async fn send_message(&self, text: &str) -> Result<()> {
+    async fn send_message(&self, text: &str) -> Result<()> {
         let context_token = self.client.context_tokens().get(&self.target);
         self.client
             .send_text(&self.target, text, context_token.as_deref())
@@ -124,7 +151,7 @@ impl RunningWeixin {
         Ok(())
     }
 
-    pub(crate) async fn send_file(&self, path: &Path) -> Result<()> {
+    async fn send_file(&self, path: &Path) -> Result<()> {
         if !path.is_file() {
             bail!("file does not exist: {}", path.display());
         }
@@ -208,7 +235,7 @@ struct WeixinHandler {
     host: Arc<Host>,
     bound_user_id: String,
     media_input: bool,
-    bridge: Arc<SessionBridge>,
+    ingress: Arc<dyn ChannelIngress>,
     conversation: Arc<WeixinConversation>,
 }
 
@@ -261,7 +288,7 @@ impl MessageHandler for WeixinHandler {
 
 impl WeixinHandler {
     async fn handle_command(&self, ctx: &MessageContext, text: &str) -> Result<()> {
-        let messages = self.bridge.execute(parse_command(text)?).await?;
+        let messages = self.ingress.execute(parse_command(text)?).await?;
         for message in messages {
             reply_logical_message(ctx, &message).await?;
         }
@@ -282,9 +309,9 @@ impl WeixinHandler {
             }
         };
         let result = async {
-            let session_id = self.bridge.ensure_prompt_session().await?;
+            let session_id = self.ingress.ensure_prompt_session().await?;
             let content = self.prompt_content(ctx, text, &session_id).await?;
-            self.bridge.submit_prompt(content).await
+            self.ingress.submit_prompt(content).await
         }
         .await;
         if result.is_err()

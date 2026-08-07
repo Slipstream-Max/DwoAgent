@@ -32,8 +32,9 @@ use super::attachments::{
     attachment_directory, local_file_resource, media_mime_type, sanitize_filename,
     unique_attachment_path,
 };
-use super::bridge::{ConversationId, ConversationTransport, SessionBridge};
+use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::command::parse_command;
+use super::gateway::{ChannelAdapter, ChannelRuntime, ChannelStarter, PreparedChannel};
 use super::manager::QqChannelState;
 use super::render::render_tool_call;
 
@@ -225,17 +226,29 @@ fn build_api(token: Token) -> Result<BotApi> {
     Ok(BotApi::new(http, token))
 }
 
+pub(crate) struct QqAdapter;
+
+struct QqStarter {
+    host: Arc<Host>,
+    api: BotApi,
+    token: Token,
+    openid: String,
+    media_input: bool,
+    conversation: Arc<QqConversation>,
+    enabled: Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub(crate) struct RunningQq {
     api: BotApi,
     token: Token,
     openid: String,
     task: tokio::task::JoinHandle<()>,
-    bridge: Arc<SessionBridge>,
     enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl RunningQq {
-    pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
+#[async_trait]
+impl ChannelAdapter for QqAdapter {
+    async fn prepare(&self, host: Arc<Host>) -> Result<PreparedChannel> {
         let runtime = host.channels().load_qq().await?;
         let token = Token::new(runtime.app_id.clone(), runtime.app_secret.clone());
         let api = build_api(token.clone())?;
@@ -252,33 +265,41 @@ impl RunningQq {
             reply: Mutex::new(None),
             approvals: approvals.clone(),
         });
-        let bridge = Arc::new(SessionBridge::new(
-            host.clone(),
-            ConversationId::new("qq", runtime.secret.bound_user_openid.clone()),
-            runtime.config.replay_turns,
-            selected_session_id,
-            conversation.clone(),
-        ));
-        if let Err(error) = bridge.resume_observer().await {
-            tracing::warn!(
-                event = "channel.observer_restore_failed",
-                channel = "qq",
-                error = %format!("{error:#}"),
-                "restore channel session observer failed"
-            );
-        }
-
         let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        Ok(PreparedChannel {
+            conversation: ConversationId::new("qq", runtime.secret.bound_user_openid.clone()),
+            replay_turns: runtime.config.replay_turns,
+            selected_session_id,
+            transport: conversation.clone(),
+            starter: Box::new(QqStarter {
+                host,
+                api,
+                token,
+                openid: runtime.secret.bound_user_openid,
+                media_input: runtime.config.media_input,
+                conversation,
+                enabled,
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl ChannelStarter for QqStarter {
+    async fn start(
+        self: Box<Self>,
+        ingress: Arc<dyn ChannelIngress>,
+    ) -> Result<Box<dyn ChannelRuntime>> {
         let handler = QqHandler {
-            host,
-            bridge: bridge.clone(),
-            conversation,
-            bound_user_openid: runtime.secret.bound_user_openid.clone(),
-            media_input: runtime.config.media_input,
-            enabled: enabled.clone(),
+            host: self.host,
+            ingress,
+            conversation: self.conversation,
+            bound_user_openid: self.openid.clone(),
+            media_input: self.media_input,
+            enabled: self.enabled.clone(),
         };
         let mut client = Client::new(
-            token,
+            self.token.clone(),
             Intents::new().with_public_messages().with_interaction(),
             handler,
             false,
@@ -294,35 +315,36 @@ impl RunningQq {
             }
         });
 
-        Ok(Self {
-            api,
-            token: Token::new(runtime.app_id, runtime.app_secret),
-            openid: runtime.secret.bound_user_openid,
+        Ok(Box::new(RunningQq {
+            api: self.api,
+            token: self.token,
+            openid: self.openid,
             task,
-            bridge,
-            enabled,
-        })
+            enabled: self.enabled,
+        }))
     }
+}
 
-    pub(crate) async fn stop(self) {
+#[async_trait]
+impl ChannelRuntime for RunningQq {
+    async fn stop(self: Box<Self>) {
         self.enabled
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.task.abort();
-        self.bridge.stop().await;
     }
 
-    pub(crate) async fn send_message(&self, text: &str) -> Result<()> {
+    async fn send_message(&self, text: &str) -> Result<()> {
         send_c2c_text(&self.api, &self.openid, text, None).await
     }
 
-    pub(crate) async fn send_file(&self, path: &Path) -> Result<()> {
+    async fn send_file(&self, path: &Path) -> Result<()> {
         send_local_file(&self.api, &self.token, &self.openid, path, None).await
     }
 }
 
 struct QqHandler {
     host: Arc<Host>,
-    bridge: Arc<SessionBridge>,
+    ingress: Arc<dyn ChannelIngress>,
     conversation: Arc<QqConversation>,
     bound_user_openid: String,
     media_input: bool,
@@ -360,7 +382,7 @@ impl EventHandler for QqHandler {
 
         if text.starts_with('/') {
             let result = match parse_command(text) {
-                Ok(command) => self.bridge.execute(command).await,
+                Ok(command) => self.ingress.execute(command).await,
                 Err(error) => Err(error),
             };
             match result {
@@ -409,7 +431,7 @@ impl EventHandler for QqHandler {
         };
         let _ = ctx.on_interaction_result(interaction_id, 0).await;
         if let Err(error) = self
-            .bridge
+            .ingress
             .resolve_permission(&action.session_id, &action.request_id, action.allowed)
             .await
         {
@@ -424,7 +446,7 @@ impl EventHandler for QqHandler {
 
 impl QqHandler {
     async fn process_prompt(&self, message: &C2CMessage, text: &str) -> Result<()> {
-        let session_id = self.bridge.ensure_prompt_session().await?;
+        let session_id = self.ingress.ensure_prompt_session().await?;
         let mut blocks = Vec::new();
         if !text.is_empty() {
             blocks.push(ContentBlock::text(text));
@@ -443,7 +465,7 @@ impl QqHandler {
                 blocks.push(local_file_resource(&path, &mime)?);
             }
         }
-        self.bridge
+        self.ingress
             .submit_prompt(MessageContent::blocks(blocks))
             .await
     }

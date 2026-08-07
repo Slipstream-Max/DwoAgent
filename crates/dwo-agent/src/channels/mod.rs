@@ -2,7 +2,7 @@ mod attachments;
 mod bridge;
 mod command;
 mod feishu;
-mod hub;
+mod gateway;
 mod manager;
 mod qq;
 mod render;
@@ -10,7 +10,7 @@ mod telegram;
 mod websocket;
 mod weixin;
 
-pub(crate) use hub::ChannelHub;
+pub(crate) use gateway::ChannelGateway;
 pub(crate) use manager::{
     ChannelManager, FeishuBindProgress, QqBindProgress, TelegramBindProgress, WeixinLoginProgress,
 };

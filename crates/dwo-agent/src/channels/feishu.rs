@@ -23,10 +23,11 @@ use super::attachments::{
     attachment_directory, local_file_resource, media_mime_type, sanitize_filename,
     unique_attachment_path,
 };
-use super::bridge::{ConversationId, ConversationTransport, SessionBridge};
+use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::command::parse_command;
 #[cfg(test)]
 use super::command::render_command_help;
+use super::gateway::{ChannelAdapter, ChannelRuntime, ChannelStarter, PreparedChannel};
 use super::manager::{FeishuChannelConfig, FeishuChannelState};
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Feishu/Lark private channel is bound. Your normal reasoning and responses are already streamed to the user through Feishu or Lark.
@@ -40,16 +41,24 @@ Use `dwo channel feishu --help` to inspect the available commands."#;
 const FEISHU_TEXT_CHUNK_CHARS: usize = 20_000;
 const RECENT_MESSAGE_LIMIT: usize = 256;
 
+pub(crate) struct FeishuAdapter;
+
+struct FeishuStarter {
+    host: Arc<Host>,
+    api: FeishuApi,
+    access: FeishuAccess,
+}
+
 pub(crate) struct RunningFeishu {
     api: FeishuApi,
     connection_task: tokio::task::JoinHandle<()>,
     message_task: tokio::task::JoinHandle<()>,
     cancel: CancellationToken,
-    bridge: Arc<SessionBridge>,
 }
 
-impl RunningFeishu {
-    pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
+#[async_trait]
+impl ChannelAdapter for FeishuAdapter {
+    async fn prepare(&self, host: Arc<Host>) -> Result<PreparedChannel> {
         let runtime = host.channels().load_feishu().await?;
         let config = openlark_config(
             &runtime.config,
@@ -69,63 +78,64 @@ impl RunningFeishu {
             api: api.clone(),
             state,
         });
-        let bridge = Arc::new(SessionBridge::new(
-            host.clone(),
-            ConversationId::new("feishu", runtime.secret.bound_open_id.clone()),
-            runtime.config.replay_turns,
-            selected_session_id,
-            conversation,
-        ));
-        if let Err(error) = bridge.resume_observer().await {
-            tracing::warn!(
-                event = "channel.observer_restore_failed",
-                channel = "feishu",
-                error = %format!("{error:#}"),
-                "restore channel session observer failed"
-            );
-        }
-
-        let (payload_tx, payload_rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let connection_task = tokio::spawn(run_connection(
-            api.config.clone(),
-            payload_tx,
-            cancel.child_token(),
-        ));
         let access = FeishuAccess {
             open_id: runtime.secret.bound_open_id,
             chat_id: runtime.secret.bound_chat_id,
             media_input: runtime.config.media_input,
         };
+        Ok(PreparedChannel {
+            conversation: ConversationId::new("feishu", access.open_id.clone()),
+            replay_turns: runtime.config.replay_turns,
+            selected_session_id,
+            transport: conversation,
+            starter: Box::new(FeishuStarter { host, api, access }),
+        })
+    }
+}
+
+#[async_trait]
+impl ChannelStarter for FeishuStarter {
+    async fn start(
+        self: Box<Self>,
+        ingress: Arc<dyn ChannelIngress>,
+    ) -> Result<Box<dyn ChannelRuntime>> {
+        let (payload_tx, payload_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let connection_task = tokio::spawn(run_connection(
+            self.api.config.clone(),
+            payload_tx,
+            cancel.child_token(),
+        ));
         let message_task = tokio::spawn(run_messages(
-            host,
-            bridge.clone(),
-            api.clone(),
-            access,
+            self.host,
+            ingress,
+            self.api.clone(),
+            self.access.clone(),
             payload_rx,
             cancel.child_token(),
         ));
-        Ok(Self {
-            api,
+        Ok(Box::new(RunningFeishu {
+            api: self.api,
             connection_task,
             message_task,
             cancel,
-            bridge,
-        })
+        }))
     }
+}
 
-    pub(crate) async fn stop(self) {
+#[async_trait]
+impl ChannelRuntime for RunningFeishu {
+    async fn stop(self: Box<Self>) {
         self.cancel.cancel();
         stop_task(self.connection_task).await;
         stop_task(self.message_task).await;
-        self.bridge.stop().await;
     }
 
-    pub(crate) async fn send_message(&self, text: &str) -> Result<()> {
+    async fn send_message(&self, text: &str) -> Result<()> {
         self.api.send_text(text).await
     }
 
-    pub(crate) async fn send_file(&self, path: &Path) -> Result<()> {
+    async fn send_file(&self, path: &Path) -> Result<()> {
         self.api.send_file(path).await
     }
 }
@@ -195,7 +205,7 @@ async fn run_connection(
 
 async fn run_messages(
     host: Arc<Host>,
-    bridge: Arc<SessionBridge>,
+    ingress: Arc<dyn ChannelIngress>,
     api: FeishuApi,
     access: FeishuAccess,
     mut payload_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -230,7 +240,8 @@ async fn run_messages(
             continue;
         }
         let result =
-            process_bound_message(&host, &bridge, &api, incoming, access.media_input).await;
+            process_bound_message(&host, ingress.as_ref(), &api, incoming, access.media_input)
+                .await;
         match result {
             Ok(messages) => {
                 for message in messages {
@@ -263,7 +274,7 @@ async fn run_messages(
 
 async fn process_bound_message(
     host: &Host,
-    bridge: &SessionBridge,
+    ingress: &dyn ChannelIngress,
     api: &FeishuApi,
     incoming: IncomingMessage,
     media_input: bool,
@@ -274,13 +285,13 @@ async fn process_bound_message(
         .is_some_and(|text| text.starts_with('/'))
         && incoming.media.is_none()
     {
-        return bridge
+        return ingress
             .execute(parse_command(incoming.text.as_deref().unwrap_or_default())?)
             .await;
     }
-    let session_id = bridge.ensure_prompt_session().await?;
+    let session_id = ingress.ensure_prompt_session().await?;
     let content = prompt_content(host, api, incoming, media_input, &session_id).await?;
-    bridge.submit_prompt(content).await?;
+    ingress.submit_prompt(content).await?;
     Ok(Vec::new())
 }
 

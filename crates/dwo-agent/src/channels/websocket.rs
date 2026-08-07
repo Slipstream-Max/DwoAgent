@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::host::Host;
 use crate::local::acp;
+
+use super::gateway::ChannelRuntime;
 
 pub(crate) struct RunningWebsocket {
     shutdown: CancellationToken,
@@ -49,10 +52,21 @@ impl RunningWebsocket {
         });
         Ok(Self { shutdown, task })
     }
+}
 
-    pub(crate) async fn stop(self) {
+#[async_trait]
+impl ChannelRuntime for RunningWebsocket {
+    async fn stop(self: Box<Self>) {
         self.shutdown.cancel();
         let _ = self.task.await;
+    }
+
+    async fn send_message(&self, _text: &str) -> Result<()> {
+        anyhow::bail!("WebSocket channel does not support send-message")
+    }
+
+    async fn send_file(&self, _path: &std::path::Path) -> Result<()> {
+        anyhow::bail!("WebSocket channel does not support send-file")
     }
 }
 

@@ -18,13 +18,13 @@ use crate::automation::{
     AutomationConfig, AutomationJob, AutomationRuntime, parse_config as parse_automation_config,
 };
 use crate::channels::{
-    ChannelHub, ChannelKind, ChannelManager, FeishuBindProgress, QqBindProgress,
+    ChannelGateway, ChannelKind, ChannelManager, FeishuBindProgress, QqBindProgress,
     TelegramBindProgress, WeixinLoginProgress,
 };
 
 pub struct Host {
     service: Arc<AgentService>,
-    pub channel_hub: Arc<ChannelHub>,
+    pub channel_gateway: Arc<ChannelGateway>,
     pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
     channels: RwLock<Arc<ChannelManager>>,
@@ -282,7 +282,7 @@ impl Host {
         )?;
         let host = Arc::new(Self {
             service,
-            channel_hub: Arc::new(ChannelHub::new()),
+            channel_gateway: Arc::new(ChannelGateway::new()),
             mcp,
             automation,
             channels: RwLock::new(channels),
@@ -296,7 +296,7 @@ impl Host {
             profile_reload: tokio::sync::Mutex::new(()),
             shutdown,
         });
-        host.channel_hub.start_all(host.clone()).await;
+        host.channel_gateway.start_all(host.clone()).await;
         host.start_mcp_watcher();
         host.start_profile_watcher();
         host.automation.start();
@@ -313,7 +313,7 @@ impl Host {
 
     pub async fn shutdown(&self) {
         tokio::join!(
-            self.channel_hub.stop_all(),
+            self.channel_gateway.stop_all(),
             self.mcp.shutdown(),
             self.service.shutdown()
         );
@@ -898,9 +898,9 @@ impl Host {
                     .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
                     .await?;
                 if let WeixinLoginProgress::Confirmed { channel } = &progress {
-                    self.channel_hub.stop(ChannelKind::Weixin).await;
+                    self.channel_gateway.stop(ChannelKind::Weixin).await;
                     if channel.enabled {
-                        self.channel_hub
+                        self.channel_gateway
                             .start(ChannelKind::Weixin, self.clone())
                             .await?;
                     }
@@ -909,7 +909,7 @@ impl Host {
             }
             "channel.telegram.begin" => {
                 let start = self.channels().begin_telegram_bind().await?;
-                self.channel_hub.stop(ChannelKind::Telegram).await;
+                self.channel_gateway.stop(ChannelKind::Telegram).await;
                 Ok(serde_json::to_value(start)?)
             }
             "channel.telegram.poll" => {
@@ -921,14 +921,14 @@ impl Host {
                 if let TelegramBindProgress::Confirmed { channel } = &progress
                     && channel.enabled
                 {
-                    self.channel_hub
+                    self.channel_gateway
                         .start(ChannelKind::Telegram, self.clone())
                         .await?;
                 }
                 Ok(serde_json::to_value(progress)?)
             }
             "channel.feishu.begin" => {
-                self.channel_hub.stop(ChannelKind::Feishu).await;
+                self.channel_gateway.stop(ChannelKind::Feishu).await;
                 Ok(serde_json::to_value(
                     self.channels().begin_feishu_bind().await?,
                 )?)
@@ -939,14 +939,14 @@ impl Host {
                 if let FeishuBindProgress::Confirmed { channel } = &progress
                     && channel.enabled
                 {
-                    self.channel_hub
+                    self.channel_gateway
                         .start(ChannelKind::Feishu, self.clone())
                         .await?;
                 }
                 Ok(serde_json::to_value(progress)?)
             }
             "channel.qq.begin" => {
-                self.channel_hub.stop(ChannelKind::Qq).await;
+                self.channel_gateway.stop(ChannelKind::Qq).await;
                 Ok(serde_json::to_value(
                     self.channels().begin_qq_bind().await?,
                 )?)
@@ -957,7 +957,7 @@ impl Host {
                 if let QqBindProgress::Confirmed { channel } = &progress
                     && channel.enabled
                 {
-                    self.channel_hub
+                    self.channel_gateway
                         .start(ChannelKind::Qq, self.clone())
                         .await?;
                 }
@@ -981,7 +981,7 @@ impl Host {
                     let object = value.as_object_mut().expect("channel summary is an object");
                     object.insert(
                         "running".to_string(),
-                        json!(self.channel_hub.is_running(channel).await),
+                        json!(self.channel_gateway.is_running(channel).await),
                     );
                     object.insert(
                         "listen".to_string(),
@@ -995,17 +995,21 @@ impl Host {
             ManagedChannelAction::SendMessage => {
                 let params: SendMessageParam = serde_json::from_value(params)?;
                 let target = self.channels().bound_target(channel).await?;
-                self.channel_hub.send_message(channel, &params.text).await?;
+                self.channel_gateway
+                    .send_message(channel, &params.text)
+                    .await?;
                 Ok(json!({"sent": true, "to": target}))
             }
             ManagedChannelAction::SendFile => {
                 let params: SendFileParam = serde_json::from_value(params)?;
                 let target = self.channels().bound_target(channel).await?;
-                self.channel_hub.send_file(channel, &params.path).await?;
+                self.channel_gateway
+                    .send_file(channel, &params.path)
+                    .await?;
                 Ok(json!({"sent": true, "to": target, "path": params.path}))
             }
             ManagedChannelAction::Remove => {
-                self.channel_hub.stop(channel).await;
+                self.channel_gateway.stop(channel).await;
                 Ok(json!({"removed": self.channels().remove(channel).await?}))
             }
             ManagedChannelAction::Token => {
@@ -1021,11 +1025,11 @@ impl Host {
                     channel == ChannelKind::Websocket,
                     "reset-token is only available for WebSocket"
                 );
-                self.channel_hub.stop(channel).await;
+                self.channel_gateway.stop(channel).await;
                 let token = self.channels().reset_websocket_token().await?;
                 let summary = self.channels().summary(channel).await?;
                 if summary.enabled {
-                    self.channel_hub.start(channel, self.clone()).await?;
+                    self.channel_gateway.start(channel, self.clone()).await?;
                 }
                 Ok(json!({"token": token, "reset": true}))
             }
@@ -1380,12 +1384,12 @@ impl Host {
         crate::logging::reload(&loaded.config.logging)?;
 
         if let Some(channels) = replacement_channels {
-            self.channel_hub.stop_all().await;
+            self.channel_gateway.stop_all().await;
             *self
                 .channels
                 .write()
                 .expect("channel manager lock poisoned") = channels;
-            self.channel_hub.start_all(self.clone()).await;
+            self.channel_gateway.start_all(self.clone()).await;
         }
 
         *self.profile.write().expect("profile lock poisoned") = RuntimeProfile {

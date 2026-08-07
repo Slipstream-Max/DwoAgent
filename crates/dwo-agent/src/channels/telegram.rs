@@ -17,8 +17,9 @@ use super::attachments::{
     attachment_directory, local_file_resource, media_mime_type, sanitize_filename,
     unique_attachment_path,
 };
-use super::bridge::{ConversationId, ConversationTransport, SessionBridge};
+use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::command::{command_descriptions, parse_command};
+use super::gateway::{ChannelAdapter, ChannelRuntime, ChannelStarter, PreparedChannel};
 use super::manager::{TelegramChannelState, telegram_bot};
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Telegram channel is bound. Your normal reasoning and responses are already streamed to the user through Telegram.
@@ -31,16 +32,24 @@ Use `dwo channel telegram --help` to inspect the available commands."#;
 
 type TelegramHandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+pub(crate) struct TelegramAdapter;
+
+struct TelegramStarter {
+    bot: Bot,
+    host: Arc<Host>,
+    access: TelegramAccess,
+}
+
 pub(crate) struct RunningTelegram {
     bot: Bot,
     chat_id: ChatId,
     task: tokio::task::JoinHandle<()>,
     shutdown: teloxide::dispatching::ShutdownToken,
-    bridge: Arc<SessionBridge>,
 }
 
-impl RunningTelegram {
-    pub(crate) async fn start(host: Arc<Host>) -> Result<Self> {
+#[async_trait]
+impl ChannelAdapter for TelegramAdapter {
+    async fn prepare(&self, host: Arc<Host>) -> Result<PreparedChannel> {
         let runtime = host.channels().load_telegram().await?;
         let bot = telegram_bot(&runtime.bot_token, runtime.config.tg_proxy.as_deref())?;
         let me = bot.get_me().await?;
@@ -68,45 +77,47 @@ impl RunningTelegram {
             chat_id,
             state,
         });
-        let bridge = Arc::new(SessionBridge::new(
-            host.clone(),
-            ConversationId::new("telegram", runtime.secret.bound_user_id.to_string()),
-            runtime.config.replay_turns,
-            selected_session_id,
-            conversation,
-        ));
-        if let Err(error) = bridge.resume_observer().await {
-            tracing::warn!(
-                event = "channel.observer_restore_failed",
-                channel = "telegram",
-                error = %format!("{error:#}"),
-                "restore channel session observer failed"
-            );
-        }
-
         let access = TelegramAccess {
             user_id: runtime.secret.bound_user_id,
             chat_id: runtime.secret.bound_chat_id,
             media_input: runtime.config.media_input,
         };
+        Ok(PreparedChannel {
+            conversation: ConversationId::new("telegram", runtime.secret.bound_user_id.to_string()),
+            replay_turns: runtime.config.replay_turns,
+            selected_session_id,
+            transport: conversation,
+            starter: Box::new(TelegramStarter { bot, host, access }),
+        })
+    }
+}
+
+#[async_trait]
+impl ChannelStarter for TelegramStarter {
+    async fn start(
+        self: Box<Self>,
+        ingress: Arc<dyn ChannelIngress>,
+    ) -> Result<Box<dyn ChannelRuntime>> {
         let handler = Update::filter_message().endpoint(handle_message);
-        let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
-            .dependencies(dptree::deps![host, bridge.clone(), access])
+        let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
+            .dependencies(dptree::deps![self.host, ingress, self.access])
             .build();
         let shutdown = dispatcher.shutdown_token();
         let task = tokio::spawn(async move {
             dispatcher.dispatch().await;
         });
-        Ok(Self {
-            bot,
-            chat_id,
+        Ok(Box::new(RunningTelegram {
+            bot: self.bot,
+            chat_id: ChatId(self.access.chat_id),
             task,
             shutdown,
-            bridge,
-        })
+        }))
     }
+}
 
-    pub(crate) async fn stop(self) {
+#[async_trait]
+impl ChannelRuntime for RunningTelegram {
+    async fn stop(self: Box<Self>) {
         if let Ok(stopped) = self.shutdown.shutdown() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stopped).await;
         }
@@ -117,14 +128,13 @@ impl RunningTelegram {
         {
             task.abort();
         }
-        self.bridge.stop().await;
     }
 
-    pub(crate) async fn send_message(&self, text: &str) -> Result<()> {
+    async fn send_message(&self, text: &str) -> Result<()> {
         send_chunks(&self.bot, self.chat_id, text).await
     }
 
-    pub(crate) async fn send_file(&self, path: &Path) -> Result<()> {
+    async fn send_file(&self, path: &Path) -> Result<()> {
         if !path.is_file() {
             bail!("file does not exist: {}", path.display());
         }
@@ -146,7 +156,7 @@ async fn handle_message(
     bot: Bot,
     message: Message,
     host: Arc<Host>,
-    bridge: Arc<SessionBridge>,
+    ingress: Arc<dyn ChannelIngress>,
     access: TelegramAccess,
 ) -> TelegramHandlerResult {
     let Some(user) = message.from.as_ref() else {
@@ -168,7 +178,15 @@ async fn handle_message(
     if text.is_empty() && media.is_none() {
         return Ok(());
     }
-    let result = process_bound_message(&bot, &host, &bridge, text, media, access.media_input).await;
+    let result = process_bound_message(
+        &bot,
+        &host,
+        ingress.as_ref(),
+        text,
+        media,
+        access.media_input,
+    )
+    .await;
     match result {
         Ok(messages) => {
             for text in messages {
@@ -185,17 +203,17 @@ async fn handle_message(
 async fn process_bound_message(
     bot: &Bot,
     host: &Host,
-    bridge: &SessionBridge,
+    ingress: &dyn ChannelIngress,
     text: &str,
     media: Option<IncomingMedia>,
     media_input: bool,
 ) -> Result<Vec<String>> {
     if text.starts_with('/') {
-        return bridge.execute(parse_command(text)?).await;
+        return ingress.execute(parse_command(text)?).await;
     }
-    let session_id = bridge.ensure_prompt_session().await?;
+    let session_id = ingress.ensure_prompt_session().await?;
     let content = prompt_content(bot, host, text, media, media_input, &session_id).await?;
-    bridge.submit_prompt(content).await?;
+    ingress.submit_prompt(content).await?;
     Ok(Vec::new())
 }
 

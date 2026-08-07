@@ -18,6 +18,19 @@ use super::render::{
 };
 
 #[async_trait]
+pub(crate) trait ChannelIngress: Send + Sync {
+    async fn execute(&self, command: ChannelCommand) -> Result<Vec<String>>;
+    async fn ensure_prompt_session(&self) -> Result<SessionId>;
+    async fn submit_prompt(&self, content: MessageContent) -> Result<()>;
+    async fn resolve_permission(
+        &self,
+        session_id: &SessionId,
+        request_id: &str,
+        allowed: bool,
+    ) -> Result<()>;
+}
+
+#[async_trait]
 pub(crate) trait ConversationTransport: Send + Sync {
     async fn send_text(&self, text: &str) -> Result<()>;
     async fn send_permission_request(
@@ -391,6 +404,30 @@ impl SessionBridge {
         ));
         *observer = Some(SessionObserver { session_id, task });
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ChannelIngress for SessionBridge {
+    async fn execute(&self, command: ChannelCommand) -> Result<Vec<String>> {
+        SessionBridge::execute(self, command).await
+    }
+
+    async fn ensure_prompt_session(&self) -> Result<SessionId> {
+        SessionBridge::ensure_prompt_session(self).await
+    }
+
+    async fn submit_prompt(&self, content: MessageContent) -> Result<()> {
+        SessionBridge::submit_prompt(self, content).await
+    }
+
+    async fn resolve_permission(
+        &self,
+        session_id: &SessionId,
+        request_id: &str,
+        allowed: bool,
+    ) -> Result<()> {
+        SessionBridge::resolve_permission(self, session_id, request_id, allowed).await
     }
 }
 

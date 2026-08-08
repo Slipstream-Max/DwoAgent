@@ -9,8 +9,7 @@ mod runtime;
 
 pub use auth::{FileOAuthProvider, oauth_login, oauth_logout};
 pub use catalog::{
-    Catalog, CatalogCache, CatalogServer, CatalogTool, SearchGroup, SearchTool, ServerStatus,
-    ToolRef, read_catalog, read_catalog_cache, write_catalog, write_catalog_cache,
+    Catalog, CatalogServer, CatalogTool, SearchGroup, SearchTool, ServerStatus, ToolRef,
 };
 pub use client::{AuthContext, AuthProvider, AuthStatus, CallResult, McpClient, NoAuthProvider};
 pub use config::{

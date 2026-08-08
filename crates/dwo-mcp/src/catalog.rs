@@ -1,9 +1,5 @@
-use std::{fs, path::Path};
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::{Result, render_list};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -73,14 +69,6 @@ pub struct SearchTool {
     pub show_schema: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CatalogCache {
-    #[serde(flatten)]
-    pub catalog: Catalog,
-    pub summary: String,
-}
-
 impl Catalog {
     pub fn list_all_tools(&self) -> Vec<ToolRef> {
         self.servers
@@ -144,34 +132,6 @@ impl Catalog {
 
 fn matches_terms(terms: &[String], text: &str) -> bool {
     terms.iter().all(|term| text.contains(term))
-}
-
-impl CatalogCache {
-    pub fn new(catalog: Catalog) -> Self {
-        let summary = render_list(&catalog);
-        Self { catalog, summary }
-    }
-}
-
-pub fn write_catalog(path: impl AsRef<Path>, catalog: &Catalog) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(catalog)?)?;
-    Ok(())
-}
-
-pub fn read_catalog(path: impl AsRef<Path>) -> Result<Catalog> {
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
-}
-
-pub fn write_catalog_cache(path: impl AsRef<Path>, catalog: &Catalog) -> Result<()> {
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&CatalogCache::new(catalog.clone()))?,
-    )?;
-    Ok(())
-}
-
-pub fn read_catalog_cache(path: impl AsRef<Path>) -> Result<CatalogCache> {
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
 #[cfg(test)]
@@ -252,15 +212,5 @@ mod tests {
         assert!(value["servers"][0]["tools"][0].get("inputSchema").is_some());
         assert_eq!(value["servers"][1]["status"], "auth_required");
         assert!(value.get("configFingerprint").is_some());
-    }
-
-    #[test]
-    fn cache_round_trips_with_summary() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let catalog = mock_catalog();
-        write_catalog_cache(file.path(), &catalog).unwrap();
-        let cache = read_catalog_cache(file.path()).unwrap();
-        assert_eq!(cache.catalog, catalog);
-        assert_eq!(cache.summary, render_list(&catalog));
     }
 }

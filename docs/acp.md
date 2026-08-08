@@ -39,6 +39,16 @@ dwo acp --protocol v1
 
 切换协议不会复制或迁移 session，也不会改变模型上下文。
 
+### Zed `Send now` 与取消
+
+ACP v2 允许运行中的 session 立即接受新 prompt；Host 会把它加入当前 turn 的 FIFO，并在当前模型响应或工具批次结束后、下一次 agent step 开始前写入上下文。`session/cancel` 在 v2 中仍按规范立即取消当前工作。
+
+Zed 目前通过 ACP v1 调用 `Send now` 时会先发送 `session/cancel`，收到旧 `session/prompt` 的 `cancelled` 响应后再发送替代 prompt。v1 适配器对此提供 500ms 兼容窗口：它先用 `cancelled` 完成旧 prompt，让 Zed 可以继续发送；若窗口内收到且 Host 成功接受替代 prompt，则撤销真正取消并让该 prompt 进入下一 agent step；若没有替代 prompt，或替代 prompt 校验、提交失败，则向 Host 执行真正取消。
+
+这个 v1 行为是针对旧客户端时序的兼容扩展。它保留 v1 的响应形状，但在替代 prompt 成功入队时不会实际中止底层 turn。
+
+v1 适配器不会通过 `session/update` 回显当前 `session/prompt`，因为 Zed 已经持有并显示了这条输入；`load`/`resume` 回放 transcript 时仍会发送历史用户消息，来自其他 endpoint 的新用户消息也会正常转发。
+
 如果 `dwo` 不在客户端进程的 PATH 中，使用安装后的绝对路径：
 
 ```text
@@ -76,7 +86,7 @@ ACP 暂不接受客户端传入的非空 `mcpServers`，也不会为某个编辑
 
 Zed 的 Send now 会先发送 `session/cancel`，紧接着再发送 `session/prompt`。如果照字面执行，刚提交的新消息会先把当前 turn 取消掉，这和赤铎原有的排队语义并不一致。
 
-adapter 会给 cancel 留出 `150ms` 的配对窗口：同一连接、同一 session 在窗口内紧跟 prompt，就把这两条消息识别为 Send now，消费 cancel，并将新 prompt 加入当前 turn 的 FIFO 队列。若没有等到 prompt，则把它当作真正的 Stop 转发给 daemon。换句话说，Send now 继续对话，单独 Stop 仍然停止，只是最多晚 `150ms` 生效。
+adapter 会给 cancel 留出 `500ms` 的配对窗口：同一连接、同一 session 在窗口内紧跟 prompt，就把这两条消息识别为 Send now，消费 cancel，并将新 prompt 加入当前 turn 的 FIFO 队列。若没有等到 prompt，则把它当作真正的 Stop 转发给 daemon。换句话说，Send now 继续对话，单独 Stop 仍然停止，只是最多晚 `500ms` 生效。
 
 ## Slash Commands
 

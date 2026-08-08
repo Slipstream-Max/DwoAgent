@@ -284,7 +284,7 @@ runtime ownership remains daemon-global through `resource/mcp/mcp.json`.
 
 Zed implements Send now as adjacent `session/cancel` and `session/prompt`
 messages. The adapter coalesces that same-connection, same-session pair within
-150ms and submits the prompt to the Host FIFO instead of cancelling the turn.
+500ms and submits the prompt to the Host FIFO instead of cancelling the turn.
 A standalone cancel is forwarded after the grace period. Hosted Responses
 tools are surfaced through the same ACP tool updates as local tools, although
 their execution remains provider-side.

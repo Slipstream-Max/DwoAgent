@@ -240,9 +240,6 @@ where
                         responder: Responder<v1::PromptResponse>,
                         cx: ConnectionTo<Client>| {
                 let runtime = prompt_runtime.clone();
-                runtime
-                    .pending_cancels
-                    .consume(&request.session_id.to_string());
                 cx.clone().spawn(async move {
                     run_prompt(runtime, request, responder, cx).await;
                     Ok(())
@@ -435,9 +432,11 @@ async fn run_prompt(
             return;
         }
     };
+    let replaces_pending_cancel = runtime.pending_cancels.consume(&session_id);
     let prepared = match prepare_observer(&runtime, &session_id, false).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
             let _ = responder.respond_with_error(internal_error(error));
             return;
         }
@@ -446,6 +445,7 @@ async fn run_prompt(
     let observer = match activate_observer(&runtime, &session_id, &connection, prepared).await {
         Ok(observer) => observer,
         Err(error) => {
+            forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
             let _ = responder.respond_with_error(internal_error(error));
             return;
         }
@@ -454,6 +454,7 @@ async fn run_prompt(
     {
         let mut waiters = runtime.prompt_waiters.lock().await;
         if waiters.contains_key(&session_id) {
+            forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
             let _ = responder.respond_with_error(invalid_params(
                 "session already has an active ACP v1 prompt",
             ));
@@ -466,17 +467,15 @@ async fn run_prompt(
         Ok(value) => value,
         Err(error) => {
             runtime.prompt_waiters.lock().await.remove(&session_id);
+            forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
             let _ = responder.respond_with_error(internal_error(error));
             return;
         }
     };
     send_fork_result(&connection, &session_id, &value);
-    if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
-        let prompt = serde_json::to_value(request.prompt).unwrap_or_else(|_| Value::Array(vec![]));
-        send_user_message(&connection, &session_id, message_id, &prompt);
-    }
     if value.get("accepted").and_then(Value::as_bool) == Some(false) {
         runtime.prompt_waiters.lock().await.remove(&session_id);
+        forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
         let _ = responder.respond(v1::PromptResponse::new(v1::StopReason::EndTurn));
         return;
     }
@@ -492,6 +491,16 @@ async fn run_prompt(
         Err(_) => {
             let _ = responder.respond_with_error(internal_error("prompt completion was dropped"));
         }
+    }
+}
+
+fn forward_rejected_replacement(
+    runtime: &AcpRuntime,
+    session_id: &str,
+    replaces_pending_cancel: bool,
+) {
+    if replaces_pending_cancel {
+        spawn_cancel_now(runtime.clone(), session_id.to_string());
     }
 }
 

@@ -66,7 +66,10 @@ struct AcpRuntime {
 
 type PromptCompletion = Result<StopReason, String>;
 
-const SEND_NOW_GRACE_PERIOD: Duration = Duration::from_millis(150);
+// Zed's ACP v1 Send now sends the replacement prompt only after it receives
+// the cancelled response. On Windows ARM64 the observed cancel-to-prompt
+// round trip is about 256ms, so leave enough margin for normal IPC jitter.
+const SEND_NOW_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Default)]
 struct PendingCancels {
@@ -506,9 +509,6 @@ where
                         responder: Responder<PromptResponse>,
                         cx: ConnectionTo<Client>| {
                 let runtime = prompt_runtime.clone();
-                runtime
-                    .pending_cancels
-                    .consume(&request.session_id.to_string());
                 let connection = AcpConnection::new(
                     AcpProtocol::V2,
                     cx.clone(),
@@ -570,7 +570,7 @@ where
         )
         .on_receive_notification(
             async move |notification: CancelSessionNotification, _cx: ConnectionTo<Client>| {
-                defer_cancel(&cancel_runtime, notification.session_id.to_string());
+                cancel_session_now(&cancel_runtime, &notification.session_id.to_string()).await;
                 Ok(())
             },
             on_receive_notification!(),
@@ -852,13 +852,6 @@ async fn prepare_observer(
     })
 }
 
-fn defer_cancel(runtime: &AcpRuntime, session_id: String) {
-    let Some(cancellation) = runtime.pending_cancels.schedule(session_id.clone()) else {
-        return;
-    };
-    spawn_deferred_cancel(runtime.clone(), session_id, cancellation);
-}
-
 async fn defer_cancel_v1(runtime: &AcpRuntime, session_id: String) {
     let Some(cancellation) = runtime.pending_cancels.schedule(session_id.clone()) else {
         complete_prompt(runtime, &session_id, Ok(StopReason::Cancelled)).await;
@@ -880,17 +873,27 @@ fn spawn_deferred_cancel(
         tokio::select! {
             _ = tokio::time::sleep(SEND_NOW_GRACE_PERIOD) => {
                 if runtime.pending_cancels.finish(&session_id, &cancellation) {
-                    let _ = ipc::request(
-                        &runtime.config_path,
-                        "session.cancel",
-                        json!({"session_id": session_id}),
-                    )
-                    .await;
+                    cancel_session_now(&runtime, &session_id).await;
                 }
             }
             _ = cancellation.cancelled() => {}
         }
     });
+}
+
+fn spawn_cancel_now(runtime: AcpRuntime, session_id: String) {
+    tokio::spawn(async move {
+        cancel_session_now(&runtime, &session_id).await;
+    });
+}
+
+async fn cancel_session_now(runtime: &AcpRuntime, session_id: &str) {
+    let _ = ipc::request(
+        &runtime.config_path,
+        "session.cancel",
+        json!({"session_id": session_id}),
+    )
+    .await;
 }
 
 async fn activate_observer(

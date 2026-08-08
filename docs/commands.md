@@ -150,4 +150,4 @@ dwo acp [--protocol v1|v2]
 
 ACP 使用 stdio 连接同一个 daemon，共享 session、事件流、模型配置和 tool runtime，不会创建独立的 Host 或 MCP 连接。非空的 session `mcpServers` 和 `additionalDirectories` 会被拒绝。`--protocol` 默认是 `v2`；v1 保持 `session/prompt` 到 turn 结束，v2 接受 prompt 后立即响应并通过 `state_update` 报告完成。
 
-ACP prompt 会按原顺序处理文本、图片、文本型 embedded resource 和 resource link。embedded resource 保留 URI、MIME 和正文，resource link 保留名称、URI 与可用元数据，因此 Zed 引用的本地文件或目录会作为明确路径进入模型上下文。图片只会交给支持 image input 的模型；audio 和二进制 embedded resource 会被拒绝。Zed 的 Send now 所产生的同 session `cancel + prompt` 会在 150ms 窗口内合并为排队 prompt，单独 cancel 仍会正常中断 turn。
+ACP prompt 会按原顺序处理文本、图片、文本型 embedded resource 和 resource link。embedded resource 保留 URI、MIME 和正文，resource link 保留名称、URI 与可用元数据，因此 Zed 引用的本地文件或目录会作为明确路径进入模型上下文。图片只会交给支持 image input 的模型；audio 和二进制 embedded resource 会被拒绝。Zed 的 Send now 所产生的同 session `cancel + prompt` 会在 500ms 窗口内合并为排队 prompt，单独 cancel 仍会正常中断 turn。

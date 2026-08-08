@@ -146,4 +146,4 @@ Session policy 有三种：
 1. `dwo daemon status`：确认 daemon 可连接。
 2. `dwo profile-list`：确认模型和默认配置可解析。
 3. 检查客户端启动的命令是否为安装后的 `dwo ... acp`。
-4. 查看 `~/.dwoagent/runtime/logs/` 中的 daemon 日志。
+4. 查看 `~/.dwoagent/logs/` 中的 daemon 日志。

@@ -123,7 +123,7 @@ runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
 runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
 runtime/mcp/oauth/
-runtime/logs/
+logs/
 channels/weixin/runtime.yaml
 channels/weixin/secret.yaml
 channels/telegram/runtime.yaml

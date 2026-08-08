@@ -36,7 +36,7 @@ struct BootstrapProfile {
 
 pub fn init(config_path: &Path) -> Result<LoggingGuard> {
     let root = host::profile_root(config_path)?;
-    let log_dir = root.join("runtime/logs");
+    let log_dir = root.join("logs");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("create log directory {}", log_dir.display()))?;
 

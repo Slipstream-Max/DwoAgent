@@ -228,4 +228,4 @@ dwo channel <weixin|telegram|feishu|qq|websocket> status
 2. 确认 daemon 进程能读取相应环境变量。
 3. Telegram 检查 token 与可选代理；飞书检查平台、应用发布状态、事件和权限。
 4. 重新执行 `bind`，确认消息来自目标 bot 的私聊。
-5. 查看 `~/.dwoagent/runtime/logs/`。
+5. 查看 `~/.dwoagent/logs/`。

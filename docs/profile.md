@@ -30,7 +30,7 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 |  |- channel-capabilities/<channel>.md
 |  |- mcp/
 |  |  `- oauth/
-|  `- logs/
+|- logs/
 `- channels/
    |- weixin/
    |  |- runtime.yaml
@@ -55,7 +55,8 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 | `resource/providers/` | 是 | 每个文件定义一个自定义模型 provider type。 |
 | `resource/skills/` | 是 | 本地 skill。 |
 | `resource/mcp.json` | 是 | MCP server。 |
-| `runtime/` | 通常不需要 | Session、附件、OAuth 和日志。 |
+| `runtime/` | 通常不需要 | Session、附件和 OAuth。 |
+| `logs/` | 通常不需要 | Daemon 结构化诊断日志。 |
 | `channels/` | 由命令管理 | 绑定信息和当前选择的 session。 |
 
 ## 完整 profile.yaml
@@ -170,7 +171,7 @@ logging:
   retentionDays: 14
 ```
 
-Daemon 将结构化 JSONL 日志写入 `runtime/logs/`，按日轮转，不向 stdout 或 stderr 输出诊断日志。`level` 支持 `error`、`warn`、`info`、`debug` 和 `trace`；`retentionDays` 的有效范围是 1 到 365。
+Daemon 将结构化 JSONL 日志写入 profile 根目录的 `logs/`，按日轮转，不向 stdout 或 stderr 输出诊断日志。`level` 支持 `error`、`warn`、`info`、`debug` 和 `trace`；`retentionDays` 的有效范围是 1 到 365。
 
 环境变量 `DWO_LOG` 可以临时覆盖配置级别，并接受 `tracing` filter directives，例如：
 

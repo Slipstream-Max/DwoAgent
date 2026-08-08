@@ -24,4 +24,4 @@
 
 - 首次部署：README -> Profile 配置 -> ACP 或 Channels。
 - 日常操作：CLI 命令参考 + 对应入口指南；需要拆分任务时阅读 Subsessions 使用指南。
-- 排查状态：先运行 `dwo daemon status`、`dwo profile-list` 和 `dwo channel <name> status`，再检查 `~/.dwoagent/runtime/logs/`。
+- 排查状态：先运行 `dwo daemon status`、`dwo profile-list` 和 `dwo channel <name> status`，再检查 `~/.dwoagent/logs/`。

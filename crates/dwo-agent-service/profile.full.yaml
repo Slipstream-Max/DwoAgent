@@ -17,7 +17,7 @@ maxModelSteps: 100
 # Additional skills directories. Relative paths are resolved from this profile root.
 externalSkillsDirs: []
 
-# Daemon diagnostics are structured JSONL files under runtime/logs. DWO_LOG
+# Daemon diagnostics are structured JSONL files under logs/. DWO_LOG
 # can temporarily override the configured level with tracing filter directives.
 logging:
   # error | warn | info | debug | trace

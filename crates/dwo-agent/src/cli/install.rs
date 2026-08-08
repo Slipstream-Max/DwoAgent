@@ -17,7 +17,6 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("resource/skills"))?;
     std::fs::create_dir_all(root.join("runtime/sessions"))?;
     std::fs::create_dir_all(root.join("runtime/mcp"))?;
-    std::fs::create_dir_all(root.join("runtime/logs"))?;
     std::fs::create_dir_all(root.join("channels"))?;
     write_if_missing(config_path, DEFAULT_PROFILE)?;
     write_if_missing(
@@ -132,7 +131,7 @@ mod tests {
 #[cfg(windows)]
 fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
     let root = config_path.parent().context("config path has no parent")?;
-    let launcher = root.join("runtime/dwo-daemon.vbs");
+    let launcher = root.join("bin/dwo-daemon.vbs");
     let command = format!("\"{}\" serve", executable.display());
     let script = format!(
         "Set shell = CreateObject(\"WScript.Shell\")\r\nexitCode = shell.Run(\"{}\", 0, True)\r\nWScript.Quit exitCode\r\n",

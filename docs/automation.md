@@ -126,4 +126,4 @@ Automation 不复制完整 session 历史。运行结果保存在所使用 sessi
 3. 确认 cron 只有五个字段，时区名称有效。
 4. 新建模式检查 `cwd` 是否存在；固定模式检查 `sessionId` 是否存在。
 5. 检查 profile 默认 policy 是否允许任务所需的工具。
-6. 查看 `~/.dwoagent/runtime/logs/`。
+6. 查看 `~/.dwoagent/logs/`。

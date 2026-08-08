@@ -40,7 +40,7 @@ model:
 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    let log_dir = root.join("runtime/logs");
+    let log_dir = root.join("logs");
     let files = std::fs::read_dir(&log_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())

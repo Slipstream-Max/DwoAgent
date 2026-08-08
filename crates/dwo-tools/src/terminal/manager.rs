@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use serde::{Serialize, Serializer};
@@ -11,6 +11,12 @@ use uuid::Uuid;
 
 use super::process::{ProcessSnapshot, ProcessStatus, TerminalProcess, resolve_cwd};
 use crate::ToolEventHandler;
+
+/// How long a finished terminal stays listed before it is pruned, so the
+/// model has time to poll any remaining output.
+const FINISHED_RETENTION: Duration = Duration::from_secs(5 * 60);
+/// Hard cap on tracked terminals; overflow evicts the oldest finished ones.
+const TERMINAL_CAP: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TerminalId(String);
@@ -57,6 +63,8 @@ impl Serialize for TerminalId {
 struct TerminalEntry {
     process: Arc<TerminalProcess>,
     operation: Mutex<()>,
+    // Interior mutability: entries are shared behind `Arc` with the map.
+    finished_since: std::sync::Mutex<Option<Instant>>,
 }
 
 pub(crate) struct TerminalTelemetry {
@@ -87,8 +95,6 @@ pub struct TerminalSnapshot {
     pub output: String,
     pub command: String,
     pub cwd: PathBuf,
-    pub tty: bool,
-    pub pid: Option<u32>,
 }
 
 impl TerminalManager {
@@ -100,7 +106,10 @@ impl TerminalManager {
         base_cwd: impl Into<PathBuf>,
         environment: HashMap<String, String>,
     ) -> Result<Self> {
-        let base_cwd = std::fs::canonicalize(base_cwd.into())?;
+        // dunce strips the Windows verbatim prefix (`\\?\`) that
+        // std::fs::canonicalize always adds; children (notably cmd.exe)
+        // cannot use verbatim/UNC paths as their working directory.
+        let base_cwd = dunce::canonicalize(base_cwd.into())?;
         Ok(Self {
             base_cwd,
             environment,
@@ -112,11 +121,10 @@ impl TerminalManager {
         &self,
         command: String,
         cwd: Option<&Path>,
-        tty: bool,
         yield_ms: u64,
-        timeout_ms: Option<u64>,
+        timeout_ms: u64,
     ) -> Result<TerminalSnapshot> {
-        self.run_with_events(command, cwd, tty, yield_ms, timeout_ms, None)
+        self.run_with_events(command, cwd, yield_ms, timeout_ms, None)
             .await
     }
 
@@ -124,9 +132,8 @@ impl TerminalManager {
         &self,
         command: String,
         cwd: Option<&Path>,
-        tty: bool,
         yield_ms: u64,
-        timeout_ms: Option<u64>,
+        timeout_ms: u64,
         telemetry: Option<TerminalTelemetry>,
     ) -> Result<TerminalSnapshot> {
         let (tool_call_id, events) = telemetry
@@ -139,7 +146,6 @@ impl TerminalManager {
             tool_call_id,
             command,
             cwd,
-            tty,
             &self.environment,
             events,
         )
@@ -147,21 +153,26 @@ impl TerminalManager {
         let entry = Arc::new(TerminalEntry {
             process: process.clone(),
             operation: Mutex::new(()),
+            finished_since: std::sync::Mutex::new(None),
         });
-        self.terminals
-            .write()
-            .await
-            .insert(terminal_id, entry.clone());
-
-        if let Some(timeout_ms) = timeout_ms {
-            let process = process.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-                if process.is_running() {
-                    let _ = process.kill().await;
-                }
-            });
+        {
+            let mut terminals = self.terminals.write().await;
+            terminals.insert(terminal_id, entry.clone());
+            prune(&mut terminals);
         }
+
+        let timeout_process = process.clone();
+        tokio::spawn(async move {
+            let timed_out = tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => true,
+                // Do not keep the process (and its PTY/output buffers) alive
+                // for the full timeout after a short-lived command exits.
+                _ = timeout_process.wait_for_exit(timeout_ms.saturating_add(1)) => false,
+            };
+            if timed_out && timeout_process.is_running() {
+                let _ = timeout_process.kill().await;
+            }
+        });
 
         let _operation = entry.operation.lock().await;
         process.wait_for_exit(yield_ms).await;
@@ -180,6 +191,7 @@ impl TerminalManager {
             entry.process.write(data).await?;
         }
         entry.process.wait_for_activity(yield_ms).await;
+        self.prune_terminals().await;
         Ok(render_snapshot(&entry.process, entry.process.snapshot()))
     }
 
@@ -188,10 +200,12 @@ impl TerminalManager {
         let _operation = entry.operation.lock().await;
         entry.process.kill().await?;
         entry.process.wait_for_exit(2_000).await;
+        self.prune_terminals().await;
         Ok(render_snapshot(&entry.process, entry.process.snapshot()))
     }
 
     pub async fn list(&self) -> Vec<TerminalSnapshot> {
+        self.prune_terminals().await;
         let entries: Vec<_> = self.terminals.read().await.values().cloned().collect();
         entries
             .into_iter()
@@ -215,6 +229,65 @@ impl TerminalManager {
             .cloned()
             .ok_or_else(|| anyhow!("terminal not found: {terminal_id}"))
     }
+
+    async fn prune_terminals(&self) {
+        let mut terminals = self.terminals.write().await;
+        prune(&mut terminals);
+    }
+}
+
+/// Drop finished terminals whose output has had time to be polled, and cap
+/// the total so long sessions cannot accumulate unbounded buffers. Running
+/// terminals are never evicted; a terminal removed here simply reports
+/// "terminal not found" on later calls, matching the tool contract.
+fn prune(terminals: &mut HashMap<TerminalId, Arc<TerminalEntry>>) {
+    let now = Instant::now();
+    // Stamp the finish time on first observation after exit.
+    for entry in terminals.values() {
+        if let Ok(mut since) = entry.finished_since.lock()
+            && since.is_none()
+            && entry.process.is_finished()
+        {
+            *since = Some(now);
+        }
+    }
+    let mut removable: Vec<TerminalId> = terminals
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .finished_since
+                .lock()
+                .ok()
+                .and_then(|guard| *guard)
+                .is_some_and(|since| now.duration_since(since) >= FINISHED_RETENTION)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    let live = terminals.len() - removable.len();
+    if live > TERMINAL_CAP {
+        // Evict finished terminals beyond the cap, preferring entries whose
+        // output has already been consumed, then oldest first.
+        let mut candidates: Vec<(TerminalId, Instant, bool)> = terminals
+            .iter()
+            .filter(|(id, _)| !removable.contains(id))
+            .filter_map(|(id, entry)| {
+                entry
+                    .finished_since
+                    .lock()
+                    .ok()
+                    .and_then(|guard| *guard)
+                    .map(|since| (id.clone(), since, entry.process.has_unread()))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, since, has_unread)| (*has_unread, *since));
+        let to_evict = live - TERMINAL_CAP;
+        for (id, _, _) in candidates.into_iter().take(to_evict) {
+            removable.push(id);
+        }
+    }
+    for id in removable {
+        terminals.remove(&id);
+    }
 }
 
 fn render_snapshot(process: &TerminalProcess, snapshot: ProcessSnapshot) -> TerminalSnapshot {
@@ -231,8 +304,6 @@ fn render_snapshot(process: &TerminalProcess, snapshot: ProcessSnapshot) -> Term
         output: snapshot.output,
         command: process.command.clone(),
         cwd: process.cwd.clone(),
-        tty: process.tty,
-        pid: process.pid,
     }
 }
 
@@ -255,7 +326,7 @@ mod tests {
     async fn run_returns_output_and_status() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
-            .run(output_command().to_string(), None, false, 5_000, None)
+            .run(output_command().to_string(), None, 5_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -275,9 +346,8 @@ mod tests {
             .run_with_events(
                 output_command().to_string(),
                 None,
-                false,
                 5_000,
-                None,
+                120_000,
                 Some(TerminalTelemetry::new("call-1".to_string(), Some(events))),
             )
             .await
@@ -332,7 +402,7 @@ mod tests {
             "printf 'first\\n'; sleep 1.5; printf 'second\\n'"
         };
         let first = manager
-            .run(command.to_string(), None, false, 5_000, None)
+            .run(command.to_string(), None, 5_000, 120_000)
             .await
             .unwrap();
         assert!(first.output.contains("first"));
@@ -350,7 +420,7 @@ mod tests {
             "sh -i"
         };
         let started = manager
-            .run(command.to_string(), None, true, 500, Some(10_000))
+            .run(command.to_string(), None, 500, 10_000)
             .await
             .unwrap();
         assert_eq!(
@@ -393,7 +463,7 @@ mod tests {
             "printf 'before-kill\\n'; sleep 30"
         };
         let started = manager
-            .run(command.to_string(), None, false, 5_000, None)
+            .run(command.to_string(), None, 5_000, 120_000)
             .await
             .unwrap();
         assert!(started.output.contains("before-kill"));
@@ -410,7 +480,7 @@ mod tests {
             "sleep 0.5; printf 'later\\n'"
         };
         let started = manager
-            .run(command.to_string(), None, false, 100, None)
+            .run(command.to_string(), None, 100, 120_000)
             .await
             .unwrap();
         let _ = manager.list().await;

@@ -18,12 +18,12 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+#[cfg(not(unix))]
 use std::time::Duration;
 
 use anyhow::Result;
+#[cfg(not(unix))]
 use portable_pty::CommandBuilder;
-#[cfg(not(windows))]
-use portable_pty::native_pty_system;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -33,6 +33,7 @@ use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
 use crate::process::PtyHandles;
 use crate::process::PtyMasterHandle;
+use crate::process::ReaderStop;
 use crate::process::SpawnedProcess;
 use crate::process::TerminalSize;
 #[cfg(unix)]
@@ -50,42 +51,20 @@ pub fn conpty_supported() -> bool {
     true
 }
 
+#[cfg(not(unix))]
 struct PtyChildTerminator {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
-    #[cfg(unix)]
-    process_group_id: Option<u32>,
 }
 
+#[cfg(not(unix))]
 impl ChildTerminator for PtyChildTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
         match signal {
-            ProcessSignal::Interrupt => {
-                #[cfg(unix)]
-                if let Some(process_group_id) = self.process_group_id {
-                    return crate::process_group::interrupt_process_group(process_group_id);
-                }
-
-                Err(crate::process::unsupported_signal(signal))
-            }
+            ProcessSignal::Interrupt => Err(crate::process::unsupported_signal(signal)),
         }
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
-        #[cfg(unix)]
-        if let Some(process_group_id) = self.process_group_id {
-            // Match the pipe backend's hard-kill behavior so descendant
-            // processes from interactive shells/REPLs do not survive shutdown.
-            // Also try the direct child killer in case the cached PGID is stale.
-            let process_group_kill_result =
-                crate::process_group::kill_process_group(process_group_id);
-            let child_kill_result = self.killer.kill();
-            return match child_kill_result {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == ErrorKind::NotFound => process_group_kill_result,
-                Err(err) => process_group_kill_result.or(Err(err)),
-            };
-        }
-
         self.killer.kill()
     }
 }
@@ -110,16 +89,9 @@ impl ChildTerminator for RawPidTerminator {
     }
 }
 
+#[cfg(not(unix))]
 fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
-    #[cfg(windows)]
-    {
-        Box::new(crate::win::ConPtySystem::default())
-    }
-
-    #[cfg(not(windows))]
-    {
-        native_pty_system()
-    }
+    Box::new(crate::win::ConPtySystem::default())
 }
 
 /// Spawn a process attached to a PTY, returning handles for stdin, split output, and exit.
@@ -149,18 +121,19 @@ pub async fn spawn_process_with_inherited_fds(
         anyhow::bail!("missing program for PTY spawn");
     }
 
-    #[cfg(not(unix))]
-    let _ = inherited_fds;
-
     #[cfg(unix)]
-    if !inherited_fds.is_empty() {
-        return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
-            .await;
+    {
+        return spawn_process_unix(program, args, cwd, env, arg0, size, inherited_fds).await;
     }
 
-    spawn_process_portable(program, args, cwd, env, arg0, size).await
+    #[cfg(not(unix))]
+    {
+        let _ = inherited_fds;
+        spawn_process_portable(program, args, cwd, env, arg0, size).await
+    }
 }
 
+#[cfg(not(unix))]
 async fn spawn_process_portable(
     program: &str,
     args: &[String],
@@ -183,11 +156,6 @@ async fn spawn_process_portable(
     }
 
     let mut child = pair.slave.spawn_command(command_builder)?;
-    #[cfg(unix)]
-    // portable-pty establishes the spawned PTY child as a new session leader on
-    // Unix, so PID == PGID and we can reuse the pipe backend's process-group
-    // hard-kill semantics for descendants.
-    let process_group_id = child.process_id();
     let killer = child.clone_killer();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -248,28 +216,20 @@ async fn spawn_process_portable(
     });
 
     let handles = PtyHandles {
-        _slave: if cfg!(windows) {
-            Some(pair.slave)
-        } else {
-            None
-        },
+        _slave: Some(pair.slave),
         _master: PtyMasterHandle::Resizable(pair.master),
     };
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(PtyChildTerminator {
-            killer,
-            #[cfg(unix)]
-            process_group_id,
-        }),
+        Box::new(PtyChildTerminator { killer }),
         reader_handle,
-        Vec::new(),
         writer_handle,
         wait_handle,
         exit_status,
         exit_code,
         Some(handles),
+        ReaderStop::None,
     );
 
     Ok(SpawnedProcess {
@@ -281,7 +241,7 @@ async fn spawn_process_portable(
 }
 
 #[cfg(unix)]
-async fn spawn_process_preserving_fds(
+async fn spawn_process_unix(
     program: &str,
     args: &[String],
     cwd: &Path,
@@ -357,20 +317,42 @@ async fn spawn_process_preserving_fds(
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
     let mut reader = master.try_clone()?;
-    let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 8_192];
-        loop {
-            match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+    let reader_cancel = Arc::new(AtomicBool::new(false));
+    let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking({
+        let reader_cancel = Arc::clone(&reader_cancel);
+        move || {
+            let fd = reader.as_raw_fd();
+            let mut buf = [0u8; 8_192];
+            loop {
+                if reader_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
                 }
-                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
+                let mut poll_fd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let polled = unsafe { libc::poll(&mut poll_fd, 1, 50) };
+                if polled < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if polled == 0 {
+                    // Timed out with no data; loop re-checks the cancel flag.
                     continue;
                 }
-                Err(_) => break,
+                match std::io::Read::read(&mut reader, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
+                    Err(_) => break,
+                }
             }
         }
     });
@@ -417,12 +399,12 @@ async fn spawn_process_preserving_fds(
         writer_tx,
         Box::new(RawPidTerminator { process_group_id }),
         reader_handle,
-        Vec::new(),
         writer_handle,
         wait_handle,
         exit_status,
         exit_code,
         Some(handles),
+        ReaderStop::PollFlag(reader_cancel),
     );
 
     Ok(SpawnedProcess {

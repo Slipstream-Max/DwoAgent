@@ -48,10 +48,17 @@ preserving the assistant tool-call and tool-result protocol pair.
 
 ## Terminal actions
 
-- `run`: starts a PTY or closed-stdin pipe and waits for exit or `yield_ms`.
-- `input`: writes to a PTY, then waits for output, exit, or `yield_ms`.
-- `input` with empty `data`: event-driven poll without writing.
-- `kill`: terminates the process tree and drains trailing output.
+A single `terminal` tool covers every operation; there is no `action` enum and
+no required field:
+
+- no `terminal_id`: starts a new interactive PTY and runs `command`.
+- `terminal_id` with `command`: sends the command as input (trailing newline).
+- `terminal_id` without `command`: event-driven poll for incremental output.
+- `terminal_id` with `kill: true`: terminates the process tree and drains
+  trailing output before returning.
+- `timeout_ms` bounds a new terminal's total runtime (default 10 min);
+  `yield_ms` bounds each wait for output (default 60 s). Unknown `terminal_id`
+  values are reported as errors and never recreated.
 
 Output stays as bytes internally. Each terminal retains at most 1 MiB. Model
 results retain the head and tail with an omission marker and are capped at
@@ -62,8 +69,9 @@ results retain the head and tail with an omission marker and are capped at
 Global terminal deny rules take precedence. `full_access` otherwise allows
 terminal and file operations. `confirm` automatically allows configured or
 simple read-only commands and confirms everything else. `watch` only permits
-simple read-only commands and rejects file edits. `run`, `input`, `kill`, and
-`file_edit` each pass through the same single authorization point.
+simple read-only commands and rejects file edits. Every terminal intent
+(run, input, kill) and `file_edit` passes through the same single
+authorization point.
 
 `SessionMode` is the one persisted mode type. There is no second agent-level or
 tool-level mode enum. A tool batch captures its mode when it is dispatched;

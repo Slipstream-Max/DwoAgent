@@ -193,7 +193,7 @@ mod tests {
                 vec![
                     json!({"id":"a", "name":"file_edit", "arguments":{"patch":"*** Begin Patch\n*** Add File: x\n+one\n*** End Patch"}}),
                     json!({"id":"b", "name":"file_edit", "arguments":{"patch":"*** Begin Patch\n*** Update File: x\n@@\n-one\n+two\n*** End Patch"}}),
-                    json!({"id":"terminal", "name":"terminal", "arguments":{"action":"run", "command":terminal_command}}),
+                    json!({"id":"terminal", "name":"terminal", "arguments":{"command":terminal_command}}),
                 ],
                 &ExecutionContext::new(SessionMode::FullAccess),
             )
@@ -297,7 +297,7 @@ mod tests {
                 manager
                     .execute_batch(
                         vec![
-                            json!({"id":"terminal", "name":"terminal", "arguments":{"action":"run", "command":terminal_command, "yield_ms":5000}}),
+                            json!({"id":"terminal", "name":"terminal", "arguments":{"command":terminal_command, "yield_ms":5000}}),
                             json!({"id":"file", "name":"file_edit", "arguments":{"patch":"*** Begin Patch\n*** Add File: concurrent.txt\n+done\n*** End Patch"}}),
                         ],
                         &context,

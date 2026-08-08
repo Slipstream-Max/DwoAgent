@@ -59,8 +59,6 @@ use winapi::um::winnt::OSVERSIONINFOW;
 pub type HPCON = HANDLE;
 
 pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = 0x2;
-#[allow(dead_code)]
-pub const PSEUDOCONSOLE_PASSTHROUGH_MODE: DWORD = 0x8;
 
 const MIN_CONPTY_BUILD: u32 = 17_763;
 

@@ -10,6 +10,7 @@ use winreg::{
 };
 
 pub(super) fn current() -> HashMap<String, String> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut environment = std::env::vars().collect();
     #[cfg(windows)]
     merge_windows_path(&mut environment);

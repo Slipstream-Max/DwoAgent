@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -297,8 +297,6 @@ struct SlowStreamingLlm {
     _handle: thread::JoinHandle<()>,
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
-    #[allow(dead_code)]
-    cancelled: Arc<AtomicBool>,
 }
 
 impl SlowStreamingLlm {
@@ -307,14 +305,11 @@ impl SlowStreamingLlm {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow LLM");
         let port = listener.local_addr().unwrap().port();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_clone = cancelled.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_clone = requests.clone();
         let handle = thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let cancelled_inner = cancelled_clone.clone();
                 let requests_inner = requests_clone.clone();
                 thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -363,7 +358,6 @@ impl SlowStreamingLlm {
                     let c1 = json!({"id":"m1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]});
                     let chunk1 = format!("data: {}\n\n", serde_json::to_string(&c1).unwrap());
                     if stream.write_all(chunk1.as_bytes()).is_err() {
-                        cancelled_inner.store(true, Ordering::SeqCst);
                         return;
                     }
                     stream.flush().ok();
@@ -379,9 +373,7 @@ impl SlowStreamingLlm {
                         serde_json::to_string(&c2).unwrap(),
                         serde_json::to_string(&c3).unwrap()
                     );
-                    if stream.write_all(rest.as_bytes()).is_err() {
-                        cancelled_inner.store(true, Ordering::SeqCst);
-                    }
+                    let _ = stream.write_all(rest.as_bytes());
                     stream.flush().ok();
                 });
             }
@@ -391,7 +383,6 @@ impl SlowStreamingLlm {
             _handle: handle,
             port,
             requests,
-            cancelled,
         }
     }
 

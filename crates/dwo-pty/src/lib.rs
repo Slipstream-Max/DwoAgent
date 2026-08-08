@@ -1,4 +1,3 @@
-pub mod pipe;
 mod process;
 pub mod process_group;
 pub mod pty;
@@ -9,11 +8,7 @@ mod windows_input;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
 
-/// Spawn a non-interactive process using regular pipes for stdin/stdout/stderr.
-pub use pipe::spawn_process as spawn_pipe_process;
-/// Spawn a non-interactive process using regular pipes, but close stdin immediately.
-pub use pipe::spawn_process_no_stdin as spawn_pipe_process_no_stdin;
-/// Handle for interacting with a spawned process (PTY or pipe).
+/// Handle for interacting with a spawned PTY process.
 pub use process::ProcessHandle;
 /// Process signal supported by spawned-process handles.
 pub use process::ProcessSignal;

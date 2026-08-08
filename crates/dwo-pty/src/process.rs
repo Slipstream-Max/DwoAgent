@@ -2,18 +2,19 @@ use core::fmt;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(unix)]
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::anyhow;
+#[cfg(not(unix))]
 use portable_pty::MasterPty;
 use portable_pty::PtySize;
 use portable_pty::SlavePty;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub enum ProcessSignal {
     Interrupt,
 }
 
+#[cfg(not(unix))]
 pub(crate) fn unsupported_signal(signal: ProcessSignal) -> io::Error {
     match signal {
         ProcessSignal::Interrupt => io::Error::new(
@@ -30,17 +32,15 @@ pub(crate) fn unsupported_signal(signal: ProcessSignal) -> io::Error {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signal) = status.signal() {
+        return 128 + signal;
     }
 
     -1
@@ -50,6 +50,16 @@ pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
     fn kill(&mut self) -> io::Result<()>;
+}
+
+/// How the output reader task is stopped once the child has exited.
+pub(crate) enum ReaderStop {
+    /// The platform PTY teardown closes the reader without an explicit flag.
+    #[cfg(not(unix))]
+    None,
+    /// Unix poll-based readers exit when this flag is set.
+    #[cfg(unix)]
+    PollFlag(Arc<AtomicBool>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +92,7 @@ pub(crate) trait PtyHandleKeepAlive: Send {}
 impl<T: Send + ?Sized> PtyHandleKeepAlive for T {}
 
 pub(crate) enum PtyMasterHandle {
+    #[cfg(not(unix))]
     Resizable(Box<dyn MasterPty + Send>),
     #[cfg(unix)]
     Opaque {
@@ -101,12 +112,11 @@ impl fmt::Debug for PtyHandles {
     }
 }
 
-/// Handle for driving an interactive process (PTY or pipe).
+/// Handle for driving an interactive PTY process.
 pub struct ProcessHandle {
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
-    reader_abort_handles: StdMutex<Vec<AbortHandle>>,
     writer_handle: StdMutex<Option<JoinHandle<()>>>,
     wait_handle: StdMutex<Option<JoinHandle<()>>>,
     exit_status: Arc<AtomicBool>,
@@ -114,6 +124,7 @@ pub struct ProcessHandle {
     // PtyHandles must be preserved because the process will receive Control+C if the
     // slave is closed
     _pty_handles: StdMutex<Option<PtyHandles>>,
+    reader_stop: ReaderStop,
 }
 
 impl fmt::Debug for ProcessHandle {
@@ -128,23 +139,23 @@ impl ProcessHandle {
         writer_tx: mpsc::Sender<Vec<u8>>,
         killer: Box<dyn ChildTerminator>,
         reader_handle: JoinHandle<()>,
-        reader_abort_handles: Vec<AbortHandle>,
         writer_handle: JoinHandle<()>,
         wait_handle: JoinHandle<()>,
         exit_status: Arc<AtomicBool>,
         exit_code: Arc<StdMutex<Option<i32>>>,
         pty_handles: Option<PtyHandles>,
+        reader_stop: ReaderStop,
     ) -> Self {
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
             reader_handle: StdMutex::new(Some(reader_handle)),
-            reader_abort_handles: StdMutex::new(reader_abort_handles),
             writer_handle: StdMutex::new(Some(writer_handle)),
             wait_handle: StdMutex::new(Some(wait_handle)),
             exit_status,
             exit_code,
             _pty_handles: StdMutex::new(pty_handles),
+            reader_stop,
         }
     }
 
@@ -180,6 +191,7 @@ impl ProcessHandle {
                 .map_err(|_| anyhow!("failed to lock PTY handles"))?;
             if let Some(handles) = handles.as_ref() {
                 return match &handles._master {
+                    #[cfg(not(unix))]
                     PtyMasterHandle::Resizable(master) => master.resize(size.into()),
                     #[cfg(unix)]
                     PtyMasterHandle::Opaque { raw_fd, .. } => resize_raw_pty(*raw_fd, size),
@@ -227,11 +239,6 @@ impl ProcessHandle {
         {
             handle.abort();
         }
-        if let Ok(mut handles) = self.reader_abort_handles.lock() {
-            for handle in handles.drain(..) {
-                handle.abort();
-            }
-        }
         if let Ok(mut h) = self.writer_handle.lock()
             && let Some(handle) = h.take()
         {
@@ -239,6 +246,32 @@ impl ProcessHandle {
         }
         if let Ok(mut h) = self.wait_handle.lock()
             && let Some(handle) = h.take()
+        {
+            handle.abort();
+        }
+    }
+
+    /// Stop the output reader task so the stdout channel closes.
+    ///
+    /// Call after the child has exited (or during teardown). On Windows the
+    /// PTY master owns the ConPTY output pipe write end; dropping it fails
+    /// the reader's pending read with `ERROR_BROKEN_PIPE`, so the blocking
+    /// thread exits on its own. On Unix the poll-based reader observes the
+    /// cancel flag within one poll interval.
+    pub fn shutdown_readers(&self) {
+        match &self.reader_stop {
+            #[cfg(unix)]
+            ReaderStop::PollFlag(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            #[cfg(not(unix))]
+            ReaderStop::None => {}
+        }
+        if let Ok(mut handles) = self._pty_handles.lock() {
+            *handles = None;
+        }
+        if let Ok(mut handle) = self.reader_handle.lock()
+            && let Some(handle) = handle.take()
         {
             handle.abort();
         }
@@ -266,7 +299,7 @@ fn resize_raw_pty(raw_fd: RawFd, size: TerminalSize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Return value from PTY or pipe spawn helpers.
+/// Return value from a PTY spawn helper.
 #[derive(Debug)]
 pub struct SpawnedProcess {
     pub session: ProcessHandle,

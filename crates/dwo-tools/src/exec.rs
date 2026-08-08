@@ -54,7 +54,6 @@ pub(crate) async fn execute(
         ToolCall::Terminal(TerminalArgs::Run {
             command,
             cwd,
-            tty,
             yield_ms,
             timeout_ms,
         }) => manager
@@ -62,7 +61,6 @@ pub(crate) async fn execute(
             .run_with_events(
                 command,
                 cwd.as_deref(),
-                tty,
                 yield_ms,
                 timeout_ms,
                 Some(TerminalTelemetry::new(id.clone(), context.events.clone())),
@@ -253,8 +251,6 @@ fn terminal_output(snapshot: crate::terminal::TerminalSnapshot) -> Value {
         "output": snapshot.output,
         "command": snapshot.command,
         "cwd": snapshot.cwd,
-        "tty": snapshot.tty,
-        "pid": snapshot.pid,
     })
 }
 

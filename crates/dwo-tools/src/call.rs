@@ -6,7 +6,8 @@ use thiserror::Error;
 
 use crate::terminal::TerminalId;
 
-const DEFAULT_YIELD_MS: u64 = 10_000;
+const DEFAULT_YIELD_MS: u64 = 60_000;
+const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DEFAULT_READ_FILE_LINES: usize = 500;
 pub(crate) const MAX_READ_FILE_LINES: usize = 500;
 
@@ -43,9 +44,8 @@ pub enum TerminalArgs {
     Run {
         command: String,
         cwd: Option<PathBuf>,
-        tty: bool,
         yield_ms: u64,
-        timeout_ms: Option<u64>,
+        timeout_ms: u64,
     },
     Input {
         terminal_id: TerminalId,
@@ -186,31 +186,32 @@ fn parse_arguments(value: Option<&Value>) -> Result<Map<String, Value>, String> 
 }
 
 fn parse_terminal(args: &Map<String, Value>) -> Result<TerminalArgs, String> {
-    let action = required_string(args, "action")?;
-    match action.as_str() {
-        "run" => {
-            let command = required_string(args, "command")?;
-            if command.trim().is_empty() {
-                return Err("terminal.run command must not be empty.".to_string());
-            }
-            Ok(TerminalArgs::Run {
-                command,
-                cwd: optional_string(args, "cwd")?.map(PathBuf::from),
-                tty: args.get("tty").and_then(Value::as_bool).unwrap_or(false),
-                yield_ms: duration_field(args, "yield_ms", DEFAULT_YIELD_MS)?,
-                timeout_ms: optional_duration_field(args, "timeout_ms")?,
-            })
-        }
-        "input" => Ok(TerminalArgs::Input {
-            terminal_id: TerminalId::parse(&required_string(args, "terminal_id")?)?,
-            data: optional_string(args, "data")?.unwrap_or_default(),
-            yield_ms: duration_field(args, "yield_ms", DEFAULT_YIELD_MS)?,
-        }),
-        "kill" => Ok(TerminalArgs::Kill {
-            terminal_id: TerminalId::parse(&required_string(args, "terminal_id")?)?,
-        }),
-        other => Err(format!("Unknown terminal action: {other}")),
+    let terminal_id = optional_string(args, "terminal_id")?;
+    let kill = args.get("kill").and_then(Value::as_bool).unwrap_or(false);
+    if kill {
+        let terminal_id =
+            terminal_id.ok_or_else(|| "terminal_id is required when kill is true.".to_string())?;
+        return Ok(TerminalArgs::Kill {
+            terminal_id: TerminalId::parse(&terminal_id)?,
+        });
     }
+    if let Some(terminal_id) = terminal_id {
+        return Ok(TerminalArgs::Input {
+            terminal_id: TerminalId::parse(&terminal_id)?,
+            data: optional_string(args, "command")?.unwrap_or_default(),
+            yield_ms: duration_field(args, "yield_ms", DEFAULT_YIELD_MS)?,
+        });
+    }
+    let command = required_string(args, "command")?;
+    if command.trim().is_empty() {
+        return Err("terminal command must not be empty.".to_string());
+    }
+    Ok(TerminalArgs::Run {
+        command,
+        cwd: optional_string(args, "cwd")?.map(PathBuf::from),
+        yield_ms: duration_field(args, "yield_ms", DEFAULT_YIELD_MS)?,
+        timeout_ms: duration_field(args, "timeout_ms", DEFAULT_TIMEOUT_MS)?,
+    })
 }
 
 fn parse_file_edit(args: &Map<String, Value>) -> Result<FileEditArgs, String> {
@@ -318,8 +319,8 @@ mod tests {
     #[test]
     fn accepts_string_and_object_arguments() {
         for arguments in [
-            json!({"action":"run", "command":"rg foo"}),
-            json!(r#"{"action":"run","command":"rg foo"}"#),
+            json!({"command":"rg foo"}),
+            json!(r#"{"command":"rg foo"}"#),
         ] {
             let parsed = ParsedToolCall::parse(json!({
                 "id": "call-1",
@@ -335,17 +336,68 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_is_a_valid_poll() {
+    fn terminal_id_without_command_is_a_poll() {
         let parsed = ParsedToolCall::parse(json!({
             "id": "call-1",
             "name": "terminal",
-            "arguments": {"action":"input", "terminal_id":"term-1", "data":""},
+            "arguments": {"terminal_id":"term-1"},
         }))
         .unwrap();
         assert!(matches!(
             parsed.call,
             ToolCall::Terminal(TerminalArgs::Input { data, .. }) if data.is_empty()
         ));
+    }
+
+    #[test]
+    fn command_with_terminal_id_is_sent_as_input() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id": "call-1",
+            "name": "terminal",
+            "arguments": {"terminal_id":"term-1", "command":"ls\n"},
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed.call,
+            ToolCall::Terminal(TerminalArgs::Input { data, .. }) if data == "ls\n"
+        ));
+    }
+
+    #[test]
+    fn kill_takes_precedence_and_requires_terminal_id() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id": "call-1",
+            "name": "terminal",
+            "arguments": {"terminal_id":"term-1", "kill":true, "command":"ls"},
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed.call,
+            ToolCall::Terminal(TerminalArgs::Kill { .. })
+        ));
+
+        let error = ParsedToolCall::parse(json!({
+            "id": "call-2",
+            "name": "terminal",
+            "arguments": {"kill": true},
+        }))
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("terminal_id is required when kill is true")
+        );
+    }
+
+    #[test]
+    fn new_terminal_requires_a_command() {
+        let error = ParsedToolCall::parse(json!({
+            "id": "call-1",
+            "name": "terminal",
+            "arguments": {},
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("Missing argument: command"));
     }
 
     #[test]

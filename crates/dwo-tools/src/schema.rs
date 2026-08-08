@@ -72,20 +72,41 @@ pub fn terminal_schema() -> Value {
         "type": "function",
         "function": {
             "name": "terminal",
-            "description": "Run a command, write or poll an interactive terminal, or kill it.",
+            "description": "Run a command in a new terminal, interact with or poll an existing terminal, or kill one. Every terminal is interactive. Without terminal_id a new terminal is created and command is executed; with terminal_id the command (include a trailing newline) is sent as input to that terminal, or omitted to poll for new output; kill true terminates the terminal.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type":"string", "enum":["run","input","kill"]},
-                    "command": {"type":"string"},
-                    "cwd": {"type":"string"},
-                    "tty": {"type":"boolean", "default":false},
-                    "yield_ms": {"type":"integer", "minimum":1, "default":10000},
-                    "timeout_ms": {"type":"integer", "minimum":1},
-                    "terminal_id": {"type":"string"},
-                    "data": {"type":"string", "description":"Empty data polls without writing."}
+                    "command": {
+                        "type": "string",
+                        "description": "Command to run in a new terminal, or input to send to the terminal identified by terminal_id (include a trailing newline). Omit to poll for incremental output."
+                    },
+                    "terminal_id": {
+                        "type": "string",
+                        "description": "ID of an existing terminal returned by a previous call. Omit to create a new terminal. An unknown ID is reported as an error and is never recreated."
+                    },
+                    "kill": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Set true to terminate the terminal identified by terminal_id. Trailing output is drained before returning."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the new terminal. Relative paths are resolved from the session workspace. Ignored when terminal_id is provided."
+                    },
+                    "yield_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 60000,
+                        "description": "Maximum milliseconds to wait for output. Returns as soon as the command exits; it does not terminate the command. Default 60000."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 600000,
+                        "description": "Total runtime limit in milliseconds for a new terminal. Reaching it terminates the process tree. Ignored when terminal_id is provided. Default 600000."
+                    }
                 },
-                "required": ["action"],
+                "required": [],
                 "additionalProperties": false
             }
         }

@@ -75,6 +75,7 @@ impl SessionMode {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionModelOption {
     pub(crate) id: String,
+    pub(crate) provider: String,
     pub(crate) reasoning: Vec<String>,
     pub(crate) default_reasoning: String,
 }

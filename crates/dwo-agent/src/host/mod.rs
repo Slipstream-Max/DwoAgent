@@ -202,6 +202,7 @@ struct AutomationDeleteParam {
 #[serde(rename_all = "camelCase")]
 struct SessionModelOption {
     id: String,
+    provider: String,
     reasoning: Vec<String>,
     default_reasoning: String,
 }
@@ -242,6 +243,7 @@ impl Host {
             .iter()
             .map(|(id, model)| SessionModelOption {
                 id: id.clone(),
+                provider: model.provider.clone(),
                 reasoning: model.reasoning.keys().cloned().collect(),
                 default_reasoning: model.default_reasoning_mode.clone(),
             })
@@ -1303,6 +1305,7 @@ impl Host {
             .iter()
             .map(|(id, model)| SessionModelOption {
                 id: id.clone(),
+                provider: model.provider.clone(),
                 reasoning: model.reasoning.keys().cloned().collect(),
                 default_reasoning: model.default_reasoning_mode.clone(),
             })

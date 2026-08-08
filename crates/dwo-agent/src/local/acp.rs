@@ -19,7 +19,8 @@ use agent_client_protocol::schema::v2::{
     PromptImageCapabilities, PromptRequest, PromptResponse, ReplayFrom, RequestPermissionOutcome,
     RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
     RunningStateUpdate, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
+    SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
     SessionInfo, SessionInfoUpdate, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, StateUpdate, StopReason, Terminal, TerminalExitStatus,
     TerminalOutput, TerminalOutputChunk, TerminalUpdate, TextContent, ToolCallContent, ToolCallId,
@@ -1121,16 +1122,46 @@ fn build_session_config_options(snapshot: SessionOptions) -> Result<Vec<SessionC
     let reasoning_options = model.reasoning.clone();
     let policy = snapshot.config.mode.as_str();
 
+    // Group models by provider, preserving the catalog order.
+    let mut provider_order: Vec<String> = Vec::new();
+    let mut provider_options: Vec<Vec<SessionConfigSelectOption>> = Vec::new();
+    for option in &snapshot.models {
+        let index = match provider_order.iter().position(|id| id == &option.provider) {
+            Some(index) => index,
+            None => {
+                provider_order.push(option.provider.clone());
+                provider_options.push(Vec::new());
+                provider_options.len() - 1
+            }
+        };
+        provider_options[index].push(SessionConfigSelectOption::new(
+            option.id.clone(),
+            option.id.clone(),
+        ));
+    }
+    let model_options: SessionConfigSelectOptions = if provider_order.len() > 1 {
+        provider_order
+            .into_iter()
+            .zip(provider_options)
+            .map(|(provider, options)| {
+                SessionConfigSelectGroup::new(provider.clone(), provider, options)
+            })
+            .collect::<Vec<_>>()
+            .into()
+    } else {
+        provider_options
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into()
+    };
+
     Ok(vec![
         SessionConfigOption::select(
             "model",
             "Model",
             snapshot.config.model.clone(),
-            snapshot
-                .models
-                .iter()
-                .map(|model| SessionConfigSelectOption::new(model.id.clone(), model.id.clone()))
-                .collect::<Vec<_>>(),
+            model_options,
         )
         .category(SessionConfigOptionCategory::Model),
         SessionConfigOption::select(
@@ -2167,6 +2198,7 @@ mod tests {
             },
             models: vec![ipc_schema::SessionModelOption {
                 id: "deepseek-v4-flash".to_string(),
+                provider: "deepseek".to_string(),
                 reasoning: vec!["high".to_string(), "max".to_string()],
                 default_reasoning: "high".to_string(),
             }],
@@ -2185,6 +2217,42 @@ mod tests {
         assert_eq!(json[2]["type"], "select");
         assert_eq!(json[2]["currentValue"], "full_access");
         assert_eq!(json[0]["options"][0]["value"], "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn acp_groups_models_by_provider() {
+        let options = build_session_config_options(SessionOptions {
+            config: ipc_schema::SessionConfig {
+                mode: ipc_schema::SessionMode::FullAccess,
+                model: "qwen3.8-max".to_string(),
+                reasoning: Some("high".to_string()),
+            },
+            models: vec![
+                ipc_schema::SessionModelOption {
+                    id: "deepseek-v4-flash".to_string(),
+                    provider: "deepseek".to_string(),
+                    reasoning: vec!["high".to_string(), "max".to_string()],
+                    default_reasoning: "high".to_string(),
+                },
+                ipc_schema::SessionModelOption {
+                    id: "qwen3.8-max".to_string(),
+                    provider: "tokenrhythm".to_string(),
+                    reasoning: vec!["high".to_string()],
+                    default_reasoning: "high".to_string(),
+                },
+            ],
+        })
+        .unwrap();
+        let json = serde_json::to_value(options).unwrap();
+        assert_eq!(json[0]["configId"], "model");
+        assert_eq!(json[0]["currentValue"], "qwen3.8-max");
+        let groups = &json[0]["options"];
+        assert_eq!(groups[0]["groupId"], "deepseek");
+        assert_eq!(groups[0]["name"], "deepseek");
+        assert_eq!(groups[0]["options"][0]["value"], "deepseek-v4-flash");
+        assert_eq!(groups[1]["groupId"], "tokenrhythm");
+        assert_eq!(groups[1]["name"], "tokenrhythm");
+        assert_eq!(groups[1]["options"][0]["value"], "qwen3.8-max");
     }
 
     #[test]

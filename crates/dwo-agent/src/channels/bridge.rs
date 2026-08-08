@@ -15,7 +15,7 @@ use super::command::{ChannelCommand, render_command_help};
 use super::manager::ChannelReplayMode;
 use super::render::{
     SessionStreamState, display_path, policy_name, render_live_user_prompt, render_session_replay,
-    render_status, render_tool_call,
+    render_status, render_tool_call, short_session_id, short_session_id_str,
 };
 
 #[async_trait]
@@ -403,7 +403,7 @@ impl SessionBridge {
                 "Session reference '{reference}' is ambiguous: {}",
                 matches
                     .iter()
-                    .map(|id| short_session_id_string(id))
+                    .map(|id| short_session_id_str(id))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -462,18 +462,6 @@ impl SessionBridge {
         *observer = Some(SessionObserver { session_id, task });
         Ok(())
     }
-}
-
-fn short_session_id(id: &SessionId) -> String {
-    short_session_id_string(id.as_str())
-}
-
-fn short_session_id_string(id: &str) -> String {
-    id.strip_prefix("session-")
-        .unwrap_or(id)
-        .chars()
-        .take(8)
-        .collect()
 }
 
 fn short_session_title(title: &str) -> String {

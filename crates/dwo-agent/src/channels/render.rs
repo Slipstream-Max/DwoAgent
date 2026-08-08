@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use dwo_agent_service::{
-    ActiveToolCall, ClientTranscriptEvent, MessageContent, SessionEventPayload, SessionSnapshot,
+    ActiveToolCall, ClientTranscriptEvent, MessageContent, SessionEventPayload, SessionId,
+    SessionSnapshot,
 };
 use dwo_tools::SessionMode;
 
@@ -27,8 +28,9 @@ pub(crate) fn display_path(path: &Path) -> String {
 
 pub(crate) fn render_status(snapshot: &SessionSnapshot) -> String {
     let mut lines = vec![format!(
-        "Session: {}\nCwd: {}\nPolicy: {}\nModel: {}\nReasoning: {}\nState: {:?}",
+        "Session: {}\nID: {}\nCwd: {}\nPolicy: {}\nModel: {}\nReasoning: {}\nState: {:?}",
         snapshot.record.info.title,
+        short_session_id(&snapshot.record.info.id),
         display_path(&snapshot.record.info.cwd),
         policy_name(snapshot.record.info.mode),
         snapshot.record.llm.model,
@@ -47,6 +49,18 @@ pub(crate) fn render_status(snapshot: &SessionSnapshot) -> String {
         lines.push(format!("Pending permission: {}", permission.request_id));
     }
     lines.join("\n")
+}
+
+pub(crate) fn short_session_id(id: &SessionId) -> String {
+    short_session_id_str(id.as_str())
+}
+
+pub(crate) fn short_session_id_str(id: &str) -> String {
+    id.strip_prefix("session-")
+        .unwrap_or(id)
+        .chars()
+        .take(8)
+        .collect()
 }
 
 pub(crate) fn render_live_user_prompt(content: &MessageContent) -> Option<String> {
@@ -326,6 +340,12 @@ mod tests {
         stream.remember_reasoning(Some("next turn".to_string()));
         stream.finish_turn();
         assert_eq!(stream.take_reasoning(), None);
+    }
+
+    #[test]
+    fn status_uses_the_short_session_id() {
+        let id = SessionId::parse("session-1234567890abcdef").unwrap();
+        assert_eq!(short_session_id(&id), "12345678");
     }
 
     #[test]

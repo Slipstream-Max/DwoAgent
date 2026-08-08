@@ -408,6 +408,57 @@ models:
 }
 
 #[test]
+fn resolved_models_and_reasoning_preserve_config_order() {
+    let catalog = ModelCatalog::from_yaml(
+        r#"
+providers:
+  local:
+    endpoint: https://example.com/v1/responses
+    models:
+      test-model:
+        contextWindowTokens: 100000
+        maxOutputTokens: 4096
+        reasoning:
+          max:
+            reasoning:
+              effort: max
+          auto: {}
+          nonthink:
+            reasoning:
+              effort: none
+"#,
+    )
+    .unwrap();
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+defaultModelId: model-z
+providers:
+  local:
+    type: local
+models:
+  - modelName: model-z
+    provider: local
+    modelId: test-model
+  - modelName: model-a
+    provider: local
+    modelId: test-model
+"#,
+    )
+    .unwrap();
+    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
+
+    let model_ids: Vec<&str> = resolved.models.keys().map(String::as_str).collect();
+    assert_eq!(model_ids, ["model-z", "model-a"]);
+
+    let reasoning: Vec<&str> = resolved.models["model-z"]
+        .reasoning
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(reasoning, ["max", "auto", "nonthink"]);
+}
+
+#[test]
 fn builtin_openai_provider_exposes_verified_model_capabilities() {
     let catalog = ModelCatalog::builtin().unwrap();
     let openai = &catalog.providers["openai"];

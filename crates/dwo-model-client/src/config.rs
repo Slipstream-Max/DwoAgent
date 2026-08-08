@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use indexmap::IndexMap;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -271,7 +272,7 @@ pub struct ModelSpec {
     #[serde(default)]
     pub hosted_tools: Vec<Value>,
     #[serde(default)]
-    pub reasoning: BTreeMap<String, Map<String, Value>>,
+    pub reasoning: IndexMap<String, Map<String, Value>>,
     #[serde(default = "default_reasoning_mode")]
     pub default_reasoning_mode: String,
     #[serde(default)]
@@ -426,7 +427,7 @@ impl AgentModelEntry {
 pub struct ModelClientConfig {
     pub default_model_id: String,
     pub providers: BTreeMap<String, ProviderConfig>,
-    pub models: BTreeMap<String, ModelConfig>,
+    pub models: IndexMap<String, ModelConfig>,
 }
 
 impl ModelClientConfig {
@@ -464,7 +465,7 @@ impl ModelClientConfig {
             providers.insert(provider_id.clone(), provider);
         }
 
-        let mut models = BTreeMap::new();
+        let mut models = IndexMap::new();
         for entry in &agent.models {
             let agent_provider = &agent.providers[&entry.provider];
             let provider_spec = &catalog.providers[&agent_provider.provider_type];
@@ -564,7 +565,7 @@ pub struct ModelConfig {
     pub top_p: Option<f64>,
     pub body: Map<String, Value>,
     pub hosted_tools: Vec<Value>,
-    pub reasoning: BTreeMap<String, Map<String, Value>>,
+    pub reasoning: IndexMap<String, Map<String, Value>>,
     pub default_reasoning_mode: String,
     pub capabilities: ModelCapabilities,
 }
@@ -627,7 +628,7 @@ fn available_input_tokens(
 }
 
 fn validate_reasoning(
-    reasoning: &BTreeMap<String, Map<String, Value>>,
+    reasoning: &IndexMap<String, Map<String, Value>>,
     default_mode: &str,
     source: &str,
 ) -> Result<(), ModelClientError> {

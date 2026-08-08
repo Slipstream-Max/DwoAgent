@@ -2176,9 +2176,12 @@ mod tests {
         assert_eq!(json[1]["configId"], "reasoning_mode");
         assert_eq!(json[1]["type"], "select");
         assert_eq!(json[1]["currentValue"], "max");
+        assert_eq!(json[1]["options"][0]["value"], "high");
+        assert_eq!(json[1]["options"][1]["value"], "max");
         assert_eq!(json[2]["configId"], "policy_mode");
         assert_eq!(json[2]["type"], "select");
         assert_eq!(json[2]["currentValue"], "full_access");
+        assert_eq!(json[0]["options"][0]["value"], "deepseek-v4-flash");
     }
 
     #[test]

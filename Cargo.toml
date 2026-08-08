@@ -30,6 +30,7 @@ diffy = "0.5"
 eventsource-stream = "0.2"
 futures = "0.3"
 getrandom = "0.4"
+indexmap = { version = "2", features = ["serde"] }
 lazy_static = "1"
 libc = "0.2"
 log = "0.4"

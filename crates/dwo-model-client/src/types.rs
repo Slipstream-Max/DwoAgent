@@ -115,7 +115,7 @@ pub trait ModelClient: Send + Sync {
         Ok(false)
     }
 
-    /// Return the reasoning modes configured for a model, in any order.
+    /// Return the reasoning modes configured for a model, in configuration order.
     ///
     /// Clients that do not expose a model catalog may return an empty list;
     /// callers should then use the provider's implicit default.

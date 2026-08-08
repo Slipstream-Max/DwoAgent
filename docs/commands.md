@@ -58,12 +58,13 @@ Session 文件布局和持久化说明见 [Profile 配置指南](profile.md#sess
 ## MCP
 
 ```text
+dwo mcp list
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server> [--logout]
 ```
 
-`search` 只查询 daemon 当前的内存 catalog，不启动或重连 server。查询按 server 名称/描述和 tool 名称/描述匹配：
+`list` 列出已配置的 MCP server 名称、当前状态和工具数量，不展开工具详情。`search` 只查询 daemon 当前的内存 catalog，不启动或重连 server。查询按 server 名称/描述和 tool 名称/描述匹配：
 
 - 只命中 server：列出该 server 的全部工具，但不展开 schema。
 - 只命中 tool：只列出匹配工具，并展开其输入 schema。

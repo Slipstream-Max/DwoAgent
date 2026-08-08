@@ -172,6 +172,8 @@ enum ManagedChannelCommand {
 
 #[derive(Subcommand)]
 enum McpCommand {
+    /// List configured MCP server names and their current status.
+    List,
     /// Search configured MCP servers and tools.
     Search {
         /// Case-insensitive terms matched against server and tool metadata.
@@ -487,6 +489,11 @@ async fn set_automation_enabled(
 
 async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
     match command {
+        McpCommand::List => {
+            let value = ipc::request(config_path, "mcp.list", json!({})).await?;
+            let catalog: dwo_mcp::Catalog = serde_json::from_value(value)?;
+            output::line(format_args!("{}", dwo_mcp::render_list(&catalog)))?;
+        }
         McpCommand::Search { query } => {
             let value = ipc::request(config_path, "mcp.search", json!({"query": query})).await?;
             let groups: Vec<SearchGroup> = serde_json::from_value(value)?;
@@ -1157,6 +1164,14 @@ mod tests {
 
     #[test]
     fn parses_minimal_mcp_commands() {
+        let list = Cli::try_parse_from(["dwo", "mcp", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Mcp {
+                command: McpCommand::List
+            }
+        ));
+
         let search = Cli::try_parse_from(["dwo", "mcp", "search", "install"]).unwrap();
         assert!(matches!(
             search.command,
@@ -1176,7 +1191,6 @@ mod tests {
             } if server == "github"
         ));
 
-        assert!(Cli::try_parse_from(["dwo", "mcp", "list"]).is_err());
         assert!(Cli::try_parse_from(["dwo", "mcp", "show", "github"]).is_err());
     }
 

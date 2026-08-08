@@ -83,7 +83,7 @@ impl McpSnapshot {
 
     pub(crate) fn render(&self) -> String {
         format!(
-            "<mcp>\nconfig: {}\n\nservers:\n{}\n\nMCP servers are initialized by the host before the session starts and their connections stay managed. Search the static catalog with `dwo mcp search <query>`, call a discovered tool with `dwo mcp call <server.tool> --args '<json>'`, and authenticate with `dwo mcp auth <server>` or `--logout`.\n</mcp>",
+            "<mcp>\nconfig: {}\n\nservers:\n{}\n\nMCP servers are initialized by the host before the session starts and their connections stay managed. List server names with `dwo mcp list`, search the static catalog with `dwo mcp search <query>`, call a discovered tool with `dwo mcp call <server.tool> --args '<json>'`, and authenticate with `dwo mcp auth <server>` or `--logout`.\n</mcp>",
             xml_escape(&self.path.display().to_string()),
             xml_escape(&self.summary)
         )

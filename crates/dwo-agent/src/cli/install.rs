@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 #[cfg(not(windows))]
@@ -138,16 +138,6 @@ fn register_service(config_path: &Path, executable: &Path) -> Result<()> {
         command.replace('"', "\"\"")
     );
     std::fs::write(&launcher, script)?;
-    let exists = ProcessCommand::new("schtasks.exe")
-        .args(["/Query", "/TN", "dwoagent"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?
-        .success();
-    if exists {
-        return Ok(());
-    }
-
     let task = format!("wscript.exe \"{}\"", launcher.display());
     let status = ProcessCommand::new("schtasks.exe")
         .args(["/Create", "/SC", "ONLOGON", "/TN", "dwoagent", "/TR"])

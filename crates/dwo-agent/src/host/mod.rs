@@ -842,6 +842,7 @@ impl Host {
 
     async fn dispatch_mcp(&self, method: &str, params: Value) -> Result<Value> {
         match method {
+            "mcp.list" => Ok(serde_json::to_value(self.mcp.catalog_snapshot().await?)?),
             "mcp.search" => {
                 let params: McpSearchParam = serde_json::from_value(params)?;
                 let catalog = self.mcp.catalog_snapshot().await?;

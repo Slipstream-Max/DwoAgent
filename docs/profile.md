@@ -420,6 +420,7 @@ Daemon 启动时并发连接 MCP server，并持续复用成功的 stdio/HTTP �
 MCP catalog 只保存在 daemon 内存中，daemon 每次启动都会从 `resource/mcp/mcp.json` 重新建立；OAuth 凭据保存在同目录的 `resource/mcp/oauth/`；连接和调用由 daemon 内的 MCP runtime 管理。
 
 ```text
+dwo mcp list
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server> [--logout]

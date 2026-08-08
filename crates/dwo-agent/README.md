@@ -67,6 +67,7 @@ dwo channel feishu send-file <path>
 dwo channel websocket status
 dwo channel websocket token
 dwo channel websocket reset-token
+dwo mcp list
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>

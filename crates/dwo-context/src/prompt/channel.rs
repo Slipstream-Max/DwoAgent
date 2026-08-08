@@ -1,10 +1,13 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
 use super::xml_escape;
 
-const CHANNEL_CAPABILITY_DIRECTORY: &str = "runtime/channel-capabilities";
+static RUNTIME_CHANNELS: OnceLock<RwLock<BTreeMap<PathBuf, Vec<ChannelCapabilitySnapshot>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelCapabilitySnapshot {
@@ -13,32 +16,24 @@ pub struct ChannelCapabilitySnapshot {
 }
 
 impl ChannelCapabilitySnapshot {
+    pub fn set_runtime(profile_root: impl Into<PathBuf>, channels: Vec<Self>) {
+        let registry = RUNTIME_CHANNELS.get_or_init(|| RwLock::new(BTreeMap::new()));
+        registry
+            .write()
+            .expect("channel capability registry poisoned")
+            .insert(profile_root.into(), channels);
+    }
+
+    pub fn runtime(profile_root: &Path) -> Vec<Self> {
+        Self::scan(profile_root)
+    }
+
     pub(crate) fn scan(profile_root: &Path) -> Vec<Self> {
-        let directory = profile_root.join(CHANNEL_CAPABILITY_DIRECTORY);
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return Vec::new();
-        };
-        let mut capabilities = entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("md") {
-                    return None;
-                }
-                let name = path.file_stem()?.to_str()?.trim();
-                let content = std::fs::read_to_string(&path).ok()?;
-                let content = content.trim();
-                if name.is_empty() || content.is_empty() {
-                    return None;
-                }
-                Some(Self {
-                    name: name.to_string(),
-                    content: content.to_string(),
-                })
-            })
-            .collect::<Vec<_>>();
-        capabilities.sort_by(|left, right| left.name.cmp(&right.name));
-        capabilities
+        RUNTIME_CHANNELS
+            .get()
+            .and_then(|registry| registry.read().ok())
+            .and_then(|registry| registry.get(profile_root).cloned())
+            .unwrap_or_default()
     }
 
     pub fn render(&self) -> String {

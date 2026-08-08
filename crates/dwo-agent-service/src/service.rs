@@ -28,6 +28,7 @@ pub struct NewSession {
     pub id: Option<SessionId>,
     pub parent_session_id: Option<SessionId>,
     pub title: Option<String>,
+    pub automation_job: Option<String>,
     pub cwd: PathBuf,
     pub mode: SessionMode,
     pub llm: SessionLlmSettings,
@@ -233,6 +234,7 @@ impl AgentService {
             new_session.max_model_steps,
         );
         record.set_parent_session_id(new_session.parent_session_id);
+        record.set_automation_job(new_session.automation_job);
         if automatic_title {
             record.enable_auto_title();
         }
@@ -337,6 +339,18 @@ impl AgentService {
             }
         }
         Ok(records)
+    }
+
+    pub async fn clear_automation_job(&self, job: Option<&str>) -> Result<(), AgentServiceError> {
+        let mut records = self.repository.list().await?;
+        for record in &mut records {
+            if job.is_none() || record.info.automation_job.as_deref() == job {
+                record.set_automation_job(None);
+                record.touch();
+                self.repository.save(record).await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn list_statuses(&self) -> Result<Vec<SessionStatusSnapshot>, AgentServiceError> {

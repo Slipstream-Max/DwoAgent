@@ -130,13 +130,6 @@ struct RuntimeState {
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AutomationBindings {
-    #[serde(default)]
-    sessions: BTreeMap<String, String>,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AutomationHistory {
     #[serde(default)]
     runs: Vec<AutomationRunRecord>,
@@ -160,12 +153,10 @@ struct AutomationDefaults {
 pub struct AutomationRuntime {
     service: Arc<AgentService>,
     profile_root: PathBuf,
-    bindings_path: PathBuf,
     history_path: PathBuf,
     defaults: Mutex<AutomationDefaults>,
     shutdown: CancellationToken,
     state: Mutex<RuntimeState>,
-    bindings: Mutex<AutomationBindings>,
     history: Mutex<AutomationHistory>,
     session_queues: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
@@ -182,8 +173,6 @@ impl AutomationRuntime {
     ) -> Result<Arc<Self>> {
         validate_config(&config)?;
         let next_runs = build_next_runs(&config)?;
-        let bindings_path = profile_root.join("runtime/automation.yaml");
-        let bindings = read_bindings(&bindings_path)?;
         let history_path = profile_root.join("runtime/automation-runs.yaml");
         let mut history = read_history(&history_path)?;
         for run in &mut history.runs {
@@ -199,7 +188,6 @@ impl AutomationRuntime {
         }
         Ok(Arc::new(Self {
             service,
-            bindings_path,
             history_path,
             profile_root,
             defaults: Mutex::new(AutomationDefaults {
@@ -213,7 +201,6 @@ impl AutomationRuntime {
                 next_runs,
                 active: BTreeMap::new(),
             }),
-            bindings: Mutex::new(bindings),
             history: Mutex::new(history),
             session_queues: Mutex::new(BTreeMap::new()),
         }))
@@ -235,31 +222,36 @@ impl AutomationRuntime {
             )
         };
         let history = self.history.lock().await.runs.clone();
-        let bindings = self.bindings.lock().await.sessions.clone();
         let default_model = self.defaults.lock().await.model.clone();
-        let session_models = self
+        let sessions = self
             .service
             .list()
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|record| (record.info.id.to_string(), record.llm.model))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Vec<_>>();
         jobs.iter()
             .cloned()
             .map(|job| {
-                let bound_session_id =
-                    bindings
-                        .get(&job.name)
-                        .cloned()
-                        .or_else(|| match &job.session {
-                            AutomationSession::Fixed { session_id } => Some(session_id.clone()),
-                            AutomationSession::New { .. } => None,
-                        });
+                let bound_session_id = match &job.session {
+                    AutomationSession::New {
+                        behavior: AutomationNewBehavior::Once,
+                        ..
+                    } => sessions
+                        .iter()
+                        .find(|record| record.info.automation_job.as_deref() == Some(&job.name))
+                        .map(|record| record.info.id.to_string()),
+                    AutomationSession::Fixed { session_id } => Some(session_id.clone()),
+                    AutomationSession::New { .. } => None,
+                };
                 let effective_model = bound_session_id
                     .as_ref()
-                    .and_then(|session_id| session_models.get(session_id))
-                    .cloned()
+                    .and_then(|session_id| {
+                        sessions
+                            .iter()
+                            .find(|record| record.info.id.to_string() == *session_id)
+                    })
+                    .map(|record| record.llm.model.clone())
                     .unwrap_or_else(|| default_model.clone());
                 AutomationJobStatus {
                     scheduler_enabled,
@@ -293,14 +285,10 @@ impl AutomationRuntime {
     }
 
     pub async fn remove_job_state(&self, name: Option<&str>, all: bool) -> Result<()> {
-        {
-            let mut bindings = self.bindings.lock().await;
-            if all {
-                bindings.sessions.clear();
-            } else if let Some(name) = name {
-                bindings.sessions.remove(name);
-            }
-            write_bindings(&self.bindings_path, &bindings).await?;
+        if all {
+            self.service.clear_automation_job(None).await?;
+        } else if let Some(name) = name {
+            self.service.clear_automation_job(Some(name)).await?;
         }
         {
             let mut history = self.history.lock().await;
@@ -554,6 +542,14 @@ impl AutomationRuntime {
                 mode: defaults.mode,
                 max_model_steps: defaults.max_model_steps,
                 llm: SessionLlmSettings::new(defaults.model, None),
+                automation_job: matches!(
+                    &job.session,
+                    AutomationSession::New {
+                        behavior: AutomationNewBehavior::Once,
+                        ..
+                    }
+                )
+                .then(|| job.name.clone()),
             })
             .await?)
     }
@@ -564,28 +560,16 @@ impl AutomationRuntime {
         cwd: &Path,
         title: &Option<String>,
     ) -> Result<Arc<SessionAgent>> {
-        let mut bindings = self.bindings.lock().await;
-        if let Some(session_id) = bindings.sessions.get(&job.name) {
-            let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
-            match self.service.load(&id).await {
-                Ok(agent) => return Ok(agent),
-                Err(AgentServiceError::SessionNotFound(_)) => {
-                    bindings.sessions.remove(&job.name);
-                }
-                Err(error) => return Err(error.into()),
-            }
+        if let Some(record) = self
+            .service
+            .list()
+            .await?
+            .into_iter()
+            .find(|record| record.info.automation_job.as_deref() == Some(&job.name))
+        {
+            return Ok(self.service.load(&record.info.id).await?);
         }
-
-        let agent = self.create_session(job, cwd, title).await?;
-        bindings
-            .sessions
-            .insert(job.name.clone(), agent.id().to_string());
-        if let Err(error) = write_bindings(&self.bindings_path, &bindings).await {
-            bindings.sessions.remove(&job.name);
-            let _ = self.service.delete(agent.id()).await;
-            return Err(error);
-        }
-        Ok(agent)
+        self.create_session(job, cwd, title).await
     }
 
     async fn run_queued_job(
@@ -778,21 +762,6 @@ fn automation_timeout_notification(timeout_seconds: u64) -> String {
     format!(
         "<automation_timeout>\nThe automation time limit of {timeout_seconds} seconds has been reached. Stop using tools and provide the final answer now using the information already available.\n</automation_timeout>"
     )
-}
-
-fn read_bindings(path: &Path) -> Result<AutomationBindings> {
-    if !path.is_file() {
-        return Ok(AutomationBindings::default());
-    }
-    let source = std::fs::read_to_string(path)
-        .with_context(|| format!("read automation bindings from {}", path.display()))?;
-    serde_yaml::from_str(&source)
-        .with_context(|| format!("parse automation bindings from {}", path.display()))
-}
-
-async fn write_bindings(path: &Path, bindings: &AutomationBindings) -> Result<()> {
-    let source = serde_yaml::to_string(bindings)?;
-    dwo_agent_service::atomic_file::write(path, source.into_bytes()).await
 }
 
 fn read_history(path: &Path) -> Result<AutomationHistory> {
@@ -1043,19 +1012,6 @@ jobs:
     fn new_session_requires_an_explicit_behavior() {
         let error = serde_yaml::from_str::<AutomationSession>("mode: new\ncwd: .\n").unwrap_err();
         assert!(error.to_string().contains("behavior"));
-    }
-
-    #[tokio::test]
-    async fn automation_bindings_round_trip() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("runtime/automation.yaml");
-        let mut bindings = AutomationBindings::default();
-        bindings
-            .sessions
-            .insert("daily-report".to_string(), "session-test".to_string());
-        write_bindings(&path, &bindings).await.unwrap();
-        let loaded = read_bindings(&path).unwrap();
-        assert_eq!(loaded.sessions, bindings.sessions);
     }
 
     #[tokio::test]

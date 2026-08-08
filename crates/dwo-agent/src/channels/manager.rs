@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use dwo_context::ChannelCapabilitySnapshot;
 use serde::{Deserialize, Serialize};
 use teloxide::prelude::*;
 use teloxide::types::UpdateKind;
@@ -497,8 +498,8 @@ impl ChannelStore {
 }
 
 pub struct ChannelManager {
+    profile_root: PathBuf,
     root: PathBuf,
-    capability_root: PathBuf,
     weixin: Option<WeixinChannelConfig>,
     telegram: Option<TelegramChannelConfig>,
     feishu: Option<FeishuChannelConfig>,
@@ -508,6 +509,7 @@ pub struct ChannelManager {
     pending_telegram: Mutex<HashMap<String, PendingTelegramBind>>,
     pending_feishu: Mutex<HashMap<String, PendingFeishuBind>>,
     pending_qq: Mutex<HashMap<String, PendingQqBind>>,
+    capabilities: Mutex<BTreeMap<String, String>>,
 }
 
 impl ChannelManager {
@@ -569,12 +571,10 @@ impl ChannelManager {
             config.validate()?;
         }
         let root = profile_root.join("channels");
-        let capability_root = profile_root.join("runtime/channel-capabilities");
         tokio::fs::create_dir_all(&root).await?;
-        tokio::fs::create_dir_all(&capability_root).await?;
         let manager = Self {
+            profile_root: profile_root.to_path_buf(),
             root,
-            capability_root,
             weixin,
             telegram,
             feishu,
@@ -584,6 +584,7 @@ impl ChannelManager {
             pending_telegram: Mutex::new(HashMap::new()),
             pending_feishu: Mutex::new(HashMap::new()),
             pending_qq: Mutex::new(HashMap::new()),
+            capabilities: Mutex::new(BTreeMap::new()),
         };
         manager.sync_capabilities().await?;
         Ok(manager)
@@ -1316,23 +1317,25 @@ impl ChannelManager {
     }
 
     async fn sync_capability(&self, name: &str, available: bool, content: &str) -> Result<()> {
-        let path = self.capability_path(name);
+        let mut capabilities = self.capabilities.lock().await;
         if available {
-            write_text(&path, content).await
-        } else if path.is_file() {
-            tokio::fs::remove_file(path).await?;
-            Ok(())
+            capabilities.insert(name.to_string(), content.to_string());
         } else {
-            Ok(())
+            capabilities.remove(name);
         }
+        let current = capabilities
+            .iter()
+            .map(|(name, content)| ChannelCapabilitySnapshot {
+                name: name.clone(),
+                content: content.clone(),
+            })
+            .collect();
+        ChannelCapabilitySnapshot::set_runtime(&self.profile_root, current);
+        Ok(())
     }
 
     fn store(&self, channel: ChannelKind) -> ChannelStore {
         ChannelStore::new(&self.root, channel)
-    }
-
-    fn capability_path(&self, name: &str) -> PathBuf {
-        self.capability_root.join(format!("{name}.md"))
     }
 }
 
@@ -1526,13 +1529,19 @@ markdownFilter: false
             })
             .await
             .unwrap();
-        let capability = tokio::fs::read_to_string(manager.capability_path(WEIXIN_CHANNEL))
-            .await
-            .unwrap();
+        let capability = dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+            .into_iter()
+            .find(|capability| capability.name == WEIXIN_CHANNEL)
+            .unwrap()
+            .content;
         assert!(capability.contains("dwo channel weixin send-file"));
         assert!(!capability.contains("secret-token"));
         manager.remove(ChannelKind::Weixin).await.unwrap();
-        assert!(!manager.capability_path(WEIXIN_CHANNEL).exists());
+        assert!(
+            dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+                .into_iter()
+                .all(|capability| capability.name != WEIXIN_CHANNEL)
+        );
     }
 
     #[tokio::test]
@@ -1589,13 +1598,19 @@ mediaInput: true
         let summary = manager.list().await.unwrap();
         assert_eq!(summary[0].bound_user_id.as_deref(), Some("12345"));
         assert!(!summary[0].connected, "the token environment is absent");
-        let capability = tokio::fs::read_to_string(manager.capability_path(TELEGRAM_CHANNEL))
-            .await
-            .unwrap();
+        let capability = dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+            .into_iter()
+            .find(|capability| capability.name == TELEGRAM_CHANNEL)
+            .unwrap()
+            .content;
         assert!(capability.contains("dwo channel telegram send-file"));
         assert!(!capability.contains("DWO_TEST_MISSING_TELEGRAM_TOKEN"));
         manager.remove(ChannelKind::Telegram).await.unwrap();
-        assert!(!manager.capability_path(TELEGRAM_CHANNEL).exists());
+        assert!(
+            dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+                .into_iter()
+                .all(|capability| capability.name != TELEGRAM_CHANNEL)
+        );
     }
 
     #[tokio::test]
@@ -1702,7 +1717,11 @@ mediaInput: true
             !summary[0].connected,
             "the credential environment is absent"
         );
-        assert!(!manager.capability_path(FEISHU_CHANNEL).exists());
+        assert!(
+            dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+                .into_iter()
+                .all(|capability| capability.name != FEISHU_CHANNEL)
+        );
 
         manager.remove(ChannelKind::Feishu).await.unwrap();
         assert!(!store.secret_path().exists());
@@ -1754,16 +1773,22 @@ mediaInput: true
         let summary = manager.summary(ChannelKind::Qq).await.unwrap();
         assert!(summary.connected);
         assert_eq!(summary.bound_user_id.as_deref(), Some("qq-user-openid"));
-        let capability = tokio::fs::read_to_string(manager.capability_path(QQ_CHANNEL))
-            .await
-            .unwrap();
+        let capability = dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+            .into_iter()
+            .find(|capability| capability.name == QQ_CHANNEL)
+            .unwrap()
+            .content;
         assert!(capability.contains("dwo channel qq send-file"));
         assert!(!capability.contains("qq-secret"));
 
         manager.remove(ChannelKind::Qq).await.unwrap();
         assert!(!store.secret_path().exists());
         assert!(!store.runtime_path().exists());
-        assert!(!manager.capability_path(QQ_CHANNEL).exists());
+        assert!(
+            dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+                .into_iter()
+                .all(|capability| capability.name != QQ_CHANNEL)
+        );
     }
 
     #[tokio::test]

@@ -122,7 +122,6 @@ runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
 runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
-runtime/channel-capabilities/<channel>.md
 runtime/mcp/catalog.json
 runtime/mcp/oauth/
 runtime/logs/
@@ -217,12 +216,10 @@ and split only when the combined text exceeds 4,000 characters. Tool calls are
 sent immediately only when confirmation is required, together with the
 permission request ID.
 
-When Weixin, Telegram, or Feishu is enabled and bound, its adapter publishes a
-concise, secret-free prompt under `runtime/channel-capabilities/`. Each adapter
-owns its own wording, including the proactive `send-message` and `send-file`
-commands; the context builder only discovers generic projections. Binding and
-unbinding changes are reported to existing sessions by the environment
-watcher.
+When a channel is enabled and bound, its adapter publishes a concise,
+secret-free capability snapshot in memory. Binding and unbinding changes are
+reported to existing sessions by the environment watcher; no channel capability
+file is written to `runtime`.
 
 MCP servers are configured in `resource/mcp.json`. Static HTTP headers and
 stdio environment variables are resolved from that file, including `${ENV}`
@@ -313,8 +310,8 @@ restart managed connections; model changes reach existing sessions on their
 next request, while changed defaults apply only to newly created sessions.
 
 Automation jobs use a standard five-field cron expression. New sessions require an explicit
-`behavior`: `every_time` creates one per run, while `once` persists a sticky
-job-to-session binding in `runtime/automation.yaml`. A fixed-session run targets
+`behavior`: `every_time` creates one per run, while `once` marks and reuses one
+session owned by that job. A fixed-session run targets
 an explicit ID and uses the same FIFO prompt semantics as other clients.
 
 Automation is unattended. Tool confirmation requests are denied automatically

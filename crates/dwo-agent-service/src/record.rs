@@ -75,6 +75,8 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<SessionId>,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_job: Option<String>,
     pub cwd: PathBuf,
     pub mode: SessionMode,
     pub created_at_ms: u64,
@@ -161,6 +163,7 @@ impl SessionRecord {
                 id,
                 parent_session_id: None,
                 title,
+                automation_job: None,
                 cwd,
                 mode,
                 created_at_ms: now,
@@ -175,6 +178,10 @@ impl SessionRecord {
 
     pub(crate) fn set_parent_session_id(&mut self, parent_session_id: Option<SessionId>) {
         self.info.parent_session_id = parent_session_id;
+    }
+
+    pub(crate) fn set_automation_job(&mut self, job: Option<String>) {
+        self.info.automation_job = job;
     }
 
     pub(crate) fn enable_auto_title(&mut self) {

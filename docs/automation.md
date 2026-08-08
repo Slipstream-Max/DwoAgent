@@ -57,7 +57,7 @@ session:
   title: Daily report
 ```
 
-`behavior: every_time` 每次运行创建独立 session。`behavior: once` 第一次运行时创建 session，并把 job 到 session 的绑定写入 `runtime/automation.yaml`；daemon 重启后继续复用。若该 session 已被删除，下一次运行会重新创建并更新绑定。
+`behavior: every_time` 每次运行创建独立 session。`behavior: once` 第一次运行时创建一个带有 `automation_job` 归属标记的 session；daemon 重启后直接从 session repository 找回它继续复用。若该 session 已被删除，下一次运行会重新创建。
 
 相对 `cwd` 从 profile 根目录 `~/.dwoagent/` 开始解析，默认值是 `.`。没有设置 `title` 时，session 名称使用 `automation/<job-name>`。模型和权限模式使用 profile 默认值。`behavior` 没有默认值，省略会使 profile 校验失败。
 
@@ -117,7 +117,7 @@ Automation 按无人值守方式运行。出现工具权限确认时，daemon �
 
 需要写文件或执行命令的任务，应提前选择合适的 profile 默认 policy，并确认对应命令能按该 policy 执行。`watch` 只允许简单只读命令；`confirm` 中需要确认的操作会被拒绝；`full_access` 仍会应用显式 deny rule。
 
-Automation 不复制完整 session 历史。运行结果保存在所使用 session 中；`new + once` 的 sticky 绑定保存在 `runtime/automation.yaml`。最近 100 次 run 的状态、session/turn ID 和最多 100 字符的回答预览保存在 `runtime/automation-runs.yaml`，用于 `automation status`，不会无限增长。
+Automation 不复制完整 session 历史。运行结果保存在所使用 session 中；`new + once` 的归属标记保存在该 session 自己的 metadata 中，不再维护单独的 binding 文件。最近 100 次 run 的状态、session/turn ID 和最多 100 字符的回答预览保存在 `runtime/automation-runs.yaml`，用于 `automation status`，不会无限增长。
 
 ## 排查
 

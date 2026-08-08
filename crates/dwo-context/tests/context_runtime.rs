@@ -1,7 +1,7 @@
 use dwo_context::{
-    CompactionPlanner, ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind,
-    MessageRole, SessionContext, SystemPromptBuilder, ToolResultRecord, estimate_content_tokens,
-    estimate_context_tokens,
+    ChannelCapabilitySnapshot, CompactionPlanner, ContentBlock, ContextManager, ContextMessage,
+    MessageContent, MessageKind, MessageRole, SessionContext, SystemPromptBuilder,
+    ToolResultRecord, estimate_content_tokens, estimate_context_tokens,
 };
 use serde_json::json;
 
@@ -323,13 +323,18 @@ fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
     assert!(manager.system_prompt().contains("Channel command guidance"));
     assert!(!manager.system_prompt().contains("name=\"weixin\""));
 
-    write(
-        &profile.join("runtime/channel-capabilities/weixin.md"),
-        "Use `dwo channel weixin send-message` and `send-file`.",
-    );
-    write(
-        &profile.join("runtime/channel-capabilities/telegram.md"),
-        "Use `dwo channel telegram send-message` and `send-file`.",
+    ChannelCapabilitySnapshot::set_runtime(
+        profile.clone(),
+        vec![
+            ChannelCapabilitySnapshot {
+                name: "weixin".to_string(),
+                content: "Use `dwo channel weixin send-message` and `send-file`.".to_string(),
+            },
+            ChannelCapabilitySnapshot {
+                name: "telegram".to_string(),
+                content: "Use `dwo channel telegram send-message` and `send-file`.".to_string(),
+            },
+        ],
     );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let added = &manager.model_messages().last().unwrap().content;
@@ -340,7 +345,13 @@ fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
     assert!(added.contains("<channel name=\"telegram\" state=\"available\">"));
     assert!(added.contains("dwo channel telegram send-message"));
 
-    std::fs::remove_file(profile.join("runtime/channel-capabilities/weixin.md")).unwrap();
+    ChannelCapabilitySnapshot::set_runtime(
+        profile.clone(),
+        vec![ChannelCapabilitySnapshot {
+            name: "telegram".to_string(),
+            content: "Use `dwo channel telegram send-message` and `send-file`.".to_string(),
+        }],
+    );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let removed = &manager.model_messages().last().unwrap().content;
     assert!(removed.contains("<channels>"));

@@ -137,7 +137,7 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 - `externalSkillsDirs` 变化会立即更新所有 session（含已有 session）可用的技能目录。
 - `automation` 会重新计算任务调度；`logging.level` 和 `logging.retentionDays` 也会立即更新。设置了 `DWO_LOG` 时，环境变量仍优先于 profile 日志级别。
 
-`resource/prompts/`、`resource/skills/`、`resource/mcp.json` 和运行时 channel capability 仍由各自 watcher 热加载。已有 session 会在模型步骤边界收到环境变更消息；发生 compaction 时，system prompt 会从当前资源重新构建。
+`resource/prompts/`、`resource/skills/`、`resource/mcp.json` 和运行时 channel capability 仍由各自 watcher 热加载。channel capability 只存在于 daemon 进程内，不写入 runtime；已有 session 会在模型步骤边界收到环境变更消息；发生 compaction 时，system prompt 会从当前资源重新构建。
 
 ## 顶层字段
 
@@ -269,6 +269,19 @@ models:
 自定义文件不能覆盖 `openai`、`deepseek` 等内置 type；需要修改时应使用新的文件名，
 再在 profile provider instance 中引用它。无效文件会使整次 profile reload 失败，
 daemon 会继续保留上一份有效配置。
+
+#### 添加第三方 provider 的最短步骤
+
+如果第三方接口兼容 OpenAI Responses，只需：
+
+1. 在 `resource/providers/<type>.yaml` 定义 `endpoint` 和 `models`；
+2. 在 `profile.yaml` 的 `model.providers` 中增加一个 instance，`type` 指向该文件名；
+3. 在 `model.models` 中增加 model alias，并设置 `modelId`；
+4. 通过 `apiKeyEnv` 指定密钥环境变量。
+
+当前配置式 catalog 的 transport 是 `open_ai_responses`。如果 provider 使用完全不同的
+协议，需要在 Rust 中实现 `ModelClient`，再通过 `AgentService` 注入自定义 client；不能仅靠
+profile YAML 动态加载任意协议实现。
 
 ### Model Alias
 
@@ -432,10 +445,8 @@ dwo mcp auth <server> [--logout]
 | 文件 | 内容 |
 | --- | --- |
 | `channels/<channel>/runtime.yaml` | 当前选择的 session 等运行状态。 |
-| `runtime/automation.yaml` | `new + once` automation job 的 sticky session 绑定。 |
 | `runtime/automation-runs.yaml` | 最近 100 次 automation run 的有界状态与回答预览。 |
 | `channels/<channel>/secret.yaml` | 绑定用户和私聊目标。 |
-| `runtime/channel-capabilities/<channel>.md` | 已绑定 channel 提供给模型的能力说明，不含凭据。 |
 | `runtime/attachments/<channel>/...` | 从 channel 下载的图片和文件。 |
 
 Telegram token 和飞书 App ID/Secret 不写入 `secret.yaml`，始终从 `profile.yaml` 指定的环境变量读取。QQ Bot 例外：二维码绑定返回的 AppID/AppSecret 会写入 `channels/qq/secret.yaml`，profile.yaml 不填写 QQ 凭据。

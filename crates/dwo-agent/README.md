@@ -113,7 +113,7 @@ profile.yaml
 resource/prompts/System.md
 resource/prompts/AGENTS.md
 resource/skills/
-resource/mcp.json
+resource/mcp/mcp.json
 runtime/sessions/YYYY/MM/DD/<session-id>/
   session.json
   model_context.json
@@ -122,7 +122,7 @@ runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
 runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
-runtime/mcp/oauth/
+resource/mcp/oauth/
 logs/
 channels/weixin/runtime.yaml
 channels/weixin/secret.yaml
@@ -220,7 +220,7 @@ secret-free capability snapshot in memory. Binding and unbinding changes are
 reported to existing sessions by the environment watcher; no channel capability
 file is written to `runtime`.
 
-MCP servers are configured in `resource/mcp.json`. Static HTTP headers and
+MCP servers are configured in `resource/mcp/mcp.json`. Static HTTP headers and
 stdio environment variables are resolved from that file, including `${ENV}`
 references. Only servers declaring `auth.type: oauth` use the interactive
 `dwo mcp auth` flow. The daemon initializes configured servers concurrently at
@@ -279,7 +279,7 @@ only when the selected model supports them. Audio and binary embedded
 resources are rejected.
 
 Non-empty ACP `mcpServers` and `additionalDirectories` are rejected. MCP
-runtime ownership remains daemon-global through `resource/mcp.json`.
+runtime ownership remains daemon-global through `resource/mcp/mcp.json`.
 
 Zed implements Send now as adjacent `session/cancel` and `session/prompt`
 messages. The adapter coalesces that same-connection, same-session pair within

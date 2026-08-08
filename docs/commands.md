@@ -17,7 +17,7 @@ dwo daemon status
 
 `install` 把当前 CLI 复制到 `~/.dwoagent/bin/dwo`（Windows 为 `dwo.exe`），在 Windows 用户级 PATH 中幂等加入该目录，创建固定的 profile/resource/runtime/logs 目录，并使用安装后的固定路径注册 daemon 自启动任务。Windows 的隐藏启动 launcher 与 executable 一起放在 `bin/`，不属于 runtime。`--start` 同时启动 daemon。`serve` 在前台运行 host；通常由系统任务或 `daemon start` 管理。`daemon status` 返回 YAML 风格的健康状态、session 数量、channel 数量和 automation 数量。
 
-daemon 启动 host 时会并发初始化 `resource/mcp.json` 中的全部 MCP server。每个 server 会等待到 `ready`、`auth_required` 或 `failed`；stdio/HTTP 连接由 daemon 持续托管并复用。新增或修改配置由 watcher 使用相同流程初始化。MCP catalog 只保存在 daemon 内存中，连接是否可用仍以 daemon 内的运行状态为准。
+daemon 启动 host 时会并发初始化 `resource/mcp/mcp.json` 中的全部 MCP server。每个 server 会等待到 `ready`、`auth_required` 或 `failed`；stdio/HTTP 连接由 daemon 持续托管并复用。新增或修改配置由 watcher 使用相同流程初始化。MCP catalog 只保存在 daemon 内存中，连接是否可用仍以 daemon 内的运行状态为准。
 
 ## Session
 

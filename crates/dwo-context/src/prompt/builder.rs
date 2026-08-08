@@ -30,7 +30,7 @@ impl AgentProfilePaths {
             system_prompt: resource.join("prompts").join("System.md"),
             agents_rules: resource.join("prompts").join("AGENTS.md"),
             skills: resource.join("skills"),
-            mcp: resource.join("mcp.json"),
+            mcp: resource.join("mcp/mcp.json"),
             root,
             resource,
         }

@@ -70,7 +70,7 @@ channels:
 - 加载 session 后，ACP 会保持 observer 连接，接收其他入口提交的 prompt、tool event 和权限请求。
 - session 的 model、reasoning 和 policy 会作为 config options 显示；在客户端修改后，设置会写回持久化 session。
 
-ACP 暂不接受客户端传入的非空 `mcpServers`，也不会为某个编辑器另起一套 MCP runtime；这类 session 请求会直接返回参数错误。MCP server 统一写在 `~/.dwoagent/resource/mcp.json`，由 daemon 托管和复用。
+ACP 暂不接受客户端传入的非空 `mcpServers`，也不会为某个编辑器另起一套 MCP runtime；这类 session 请求会直接返回参数错误。MCP server 统一写在 `~/.dwoagent/resource/mcp/mcp.json`，OAuth 凭据保存在同目录的 `oauth/`，由 daemon 托管和复用。
 
 ### Zed 的 Send now
 

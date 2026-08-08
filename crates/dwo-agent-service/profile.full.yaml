@@ -3,7 +3,7 @@
 #   resource/prompts/System.md   required
 #   resource/prompts/AGENTS.md   optional
 #   resource/skills/*/SKILL.md   optional
-#   resource/mcp.json            optional
+#   resource/mcp/mcp.json        optional
 
 name: coder
 description: coding agent

@@ -16,7 +16,7 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("resource/prompts"))?;
     std::fs::create_dir_all(root.join("resource/skills"))?;
     std::fs::create_dir_all(root.join("runtime/sessions"))?;
-    std::fs::create_dir_all(root.join("runtime/mcp"))?;
+    std::fs::create_dir_all(root.join("resource/mcp"))?;
     std::fs::create_dir_all(root.join("channels"))?;
     write_if_missing(config_path, DEFAULT_PROFILE)?;
     write_if_missing(
@@ -25,7 +25,7 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
     )?;
     write_if_missing(&root.join("resource/prompts/AGENTS.md"), "")?;
     write_if_missing(
-        &root.join("resource/mcp.json"),
+        &root.join("resource/mcp/mcp.json"),
         "{\n  \"mcpServers\": {}\n}\n",
     )?;
     register_service(config_path, &executable)

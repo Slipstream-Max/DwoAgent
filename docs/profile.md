@@ -19,7 +19,9 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 |  |  `- <provider-type>.yaml
 |  |- skills/
 |  |  `- <skill>/SKILL.md
-|  `- mcp.json
+|  `- mcp/
+|     |- mcp.json
+|     `- oauth/
 |- runtime/
 |  |- sessions/YYYY/MM/DD/<session-id>/
 |  |  |- session.json
@@ -27,9 +29,6 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 |  |  `- client_transcript.jsonl
 |  |- workspaces/<session-id>/
 |  |- attachments/<channel>/YYYY/MM/DD/<session-id>/
-|  |- channel-capabilities/<channel>.md
-|  |- mcp/
-|  |  `- oauth/
 |- logs/
 `- channels/
    |- weixin/
@@ -54,7 +53,7 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 | `resource/prompts/` | 是 | System prompt 和 profile 级规则。 |
 | `resource/providers/` | 是 | 每个文件定义一个自定义模型 provider type。 |
 | `resource/skills/` | 是 | 本地 skill。 |
-| `resource/mcp.json` | 是 | MCP server。 |
+| `resource/mcp/mcp.json` | 是 | MCP server 配置。 |
 | `runtime/` | 通常不需要 | Session、附件和 OAuth。 |
 | `logs/` | 通常不需要 | Daemon 结构化诊断日志。 |
 | `channels/` | 由命令管理 | 绑定信息和当前选择的 session。 |
@@ -137,7 +136,7 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 - `externalSkillsDirs` 变化会立即更新所有 session（含已有 session）可用的技能目录。
 - `automation` 会重新计算任务调度；`logging.level` 和 `logging.retentionDays` 也会立即更新。设置了 `DWO_LOG` 时，环境变量仍优先于 profile 日志级别。
 
-`resource/prompts/`、`resource/skills/`、`resource/mcp.json` 和运行时 channel capability 仍由各自 watcher 热加载。channel capability 只存在于 daemon 进程内，不写入 runtime；已有 session 会在模型步骤边界收到环境变更消息；发生 compaction 时，system prompt 会从当前资源重新构建。
+`resource/prompts/`、`resource/skills/`、`resource/mcp/mcp.json` 和运行时 channel capability 仍由各自 watcher 热加载。channel capability 只存在于 daemon 进程内，不写入 runtime；已有 session 会在模型步骤边界收到环境变更消息；发生 compaction 时，system prompt 会从当前资源重新构建。
 
 ## 顶层字段
 
@@ -391,7 +390,7 @@ Daemon 会监听这些固定资源、session 初始工作目录、`.agents/` 和
 
 ## MCP
 
-`resource/mcp.json`：
+`resource/mcp/mcp.json`：
 
 ```json
 {
@@ -418,7 +417,7 @@ Daemon 会监听这些固定资源、session 初始工作目录、`.agents/` 和
 
 Daemon 启动时并发连接 MCP server，并持续复用成功的 stdio/HTTP 连接。配置变化会触发初始化。状态包括 `starting`、`ready`、`auth_required` 和 `failed`。
 
-MCP catalog 只保存在 daemon 内存中，daemon 每次启动都会从 `resource/mcp.json` 重新建立；连接和调用由 daemon 内的 MCP runtime 管理。
+MCP catalog 只保存在 daemon 内存中，daemon 每次启动都会从 `resource/mcp/mcp.json` 重新建立；OAuth 凭据保存在同目录的 `resource/mcp/oauth/`；连接和调用由 daemon 内的 MCP runtime 管理。
 
 ```text
 dwo mcp search <query>

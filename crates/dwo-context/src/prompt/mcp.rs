@@ -51,6 +51,7 @@ impl McpSnapshot {
         let profile_root = path
             .parent()
             .and_then(Path::parent)
+            .and_then(Path::parent)
             .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
         let summary = profile_root
             .as_ref()

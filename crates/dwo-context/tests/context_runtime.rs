@@ -157,7 +157,7 @@ fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
         &profile.join("resource/skills/demo/SKILL.md"),
         "---\nname: demo\ndescription: Demo skill\n---\nInstructions",
     );
-    write(&profile.join("resource/mcp.json"), "{}");
+    write(&profile.join("resource/mcp/mcp.json"), "{}");
 
     let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
@@ -385,14 +385,17 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
         &profile.join("resource/prompts/System.md"),
         "You are an agent.",
     );
-    write(&profile.join("resource/mcp.json"), "{\"mcpServers\":{}}");
+    write(
+        &profile.join("resource/mcp/mcp.json"),
+        "{\"mcpServers\":{}}",
+    );
     std::fs::create_dir_all(&cwd).unwrap();
     let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd);
     let mut manager = ContextManager::initialize(&builder).unwrap();
     assert!(!manager.system_prompt().contains("<mcp>"));
 
     write(
-        &profile.join("resource/mcp.json"),
+        &profile.join("resource/mcp/mcp.json"),
         r#"{"mcpServers":{"github":{"transport":"streamableHttp","url":"https://example.test/mcp"}}}"#,
     );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
@@ -411,7 +414,7 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
     McpSnapshot::set_runtime(
         profile.clone(),
         McpSnapshot {
-            path: profile.join("resource/mcp.json"),
+            path: profile.join("resource/mcp/mcp.json"),
             fingerprint,
             server_count: 1,
             summary: "github    18 tools    ready".to_string(),
@@ -427,7 +430,10 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
             .contains("github    18 tools    ready")
     );
 
-    write(&profile.join("resource/mcp.json"), "{\"mcpServers\":{}}");
+    write(
+        &profile.join("resource/mcp/mcp.json"),
+        "{\"mcpServers\":{}}",
+    );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     assert!(
         manager

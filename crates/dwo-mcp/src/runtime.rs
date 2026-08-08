@@ -63,9 +63,9 @@ impl ManagedServer {
 impl McpRuntime {
     pub fn new(profile_root: impl AsRef<Path>) -> Self {
         let profile_root = profile_root.as_ref();
-        let oauth_root = profile_root.join("runtime/mcp/oauth");
+        let oauth_root = profile_root.join("resource/mcp/oauth");
         Self {
-            config_path: profile_root.join("resource/mcp.json"),
+            config_path: profile_root.join("resource/mcp/mcp.json"),
             client: McpClient::with_file_oauth(
                 Arc::new(crate::FileOAuthProvider::new(oauth_root.clone())),
                 oauth_root.clone(),
@@ -545,9 +545,9 @@ mod tests {
     #[tokio::test]
     async fn startup_records_failed_servers_in_memory() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("resource")).unwrap();
+        std::fs::create_dir_all(root.path().join("resource/mcp")).unwrap();
         std::fs::write(
-            root.path().join("resource/mcp.json"),
+            root.path().join("resource/mcp/mcp.json"),
             r#"{"mcpServers":{"local":{"command":"definitely-not-installed-dwo-mcp"}}}"#,
         )
         .unwrap();
@@ -584,9 +584,9 @@ mod tests {
     #[tokio::test]
     async fn catalog_snapshot_does_not_sync_new_configuration() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("resource")).unwrap();
+        std::fs::create_dir_all(root.path().join("resource/mcp")).unwrap();
         std::fs::write(
-            root.path().join("resource/mcp.json"),
+            root.path().join("resource/mcp/mcp.json"),
             r#"{"mcpServers":{}}"#,
         )
         .unwrap();
@@ -594,7 +594,7 @@ mod tests {
         runtime.sync_and_start().await.unwrap();
 
         std::fs::write(
-            root.path().join("resource/mcp.json"),
+            root.path().join("resource/mcp/mcp.json"),
             r#"{"mcpServers":{"new":{"command":"definitely-not-installed-dwo-mcp"}}}"#,
         )
         .unwrap();
@@ -609,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn startup_and_calls_reuse_one_managed_stdio_server_session() {
         let root = tempfile::tempdir().unwrap();
-        let resource = root.path().join("resource");
+        let resource = root.path().join("resource/mcp");
         std::fs::create_dir_all(&resource).unwrap();
         let script = root.path().join("persistent-server.ps1");
         std::fs::write(&script, POWERSHELL_MCP_SERVER).unwrap();

@@ -14,18 +14,16 @@ use tokio::sync::Mutex;
 use crate::client::{ConnectedClient, ConnectedPeer, catalog_tool, parse_tool_selector};
 use crate::{
     AuthStatus, CallResult, Catalog, CatalogServer, McpClient, McpConfig, McpServerConfig, Result,
-    ServerStatus, oauth_login, oauth_logout, read_catalog_cache, write_catalog_cache,
+    ServerStatus, oauth_login, oauth_logout,
 };
 
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct McpRuntime {
     config_path: PathBuf,
-    catalog_path: PathBuf,
     oauth_root: PathBuf,
     client: McpClient,
     state: Mutex<RuntimeState>,
-    catalog_write: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -65,27 +63,20 @@ impl ManagedServer {
 impl McpRuntime {
     pub fn new(profile_root: impl AsRef<Path>) -> Self {
         let profile_root = profile_root.as_ref();
-        let mcp_root = profile_root.join("runtime/mcp");
-        let oauth_root = mcp_root.join("oauth");
+        let oauth_root = profile_root.join("runtime/mcp/oauth");
         Self {
             config_path: profile_root.join("resource/mcp.json"),
-            catalog_path: mcp_root.join("catalog.json"),
             client: McpClient::with_file_oauth(
                 Arc::new(crate::FileOAuthProvider::new(oauth_root.clone())),
                 oauth_root.clone(),
             ),
             oauth_root,
             state: Mutex::new(RuntimeState::default()),
-            catalog_write: Mutex::new(()),
         }
     }
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
-    }
-
-    pub fn catalog_path(&self) -> &Path {
-        &self.catalog_path
     }
 
     /// Reads changed configuration and reconciles the managed-server set without starting new
@@ -105,10 +96,6 @@ impl McpRuntime {
 
             let previous_config = state.config.take();
             let previous_catalog = state.catalog.take();
-            let cached_catalog = previous_config
-                .is_none()
-                .then(|| self.read_matching_catalog(&config))
-                .flatten();
 
             let mut retained = BTreeMap::new();
             let mut retired = Vec::new();
@@ -125,18 +112,14 @@ impl McpRuntime {
                 }
             }
 
-            let catalog = self.build_catalog(
-                &config,
-                previous_config.as_ref(),
-                previous_catalog.as_ref(),
-                cached_catalog.as_ref(),
-            );
+            let catalog =
+                self.build_catalog(&config, previous_config.as_ref(), previous_catalog.as_ref());
             state.config = Some(config);
             state.catalog = Some(catalog.clone());
             state.servers = retained;
             (catalog, retired)
         };
-        self.persist_current_catalog().await?;
+        self.publish_current_catalog().await?;
         join_all(
             retired
                 .into_iter()
@@ -389,7 +372,7 @@ impl McpRuntime {
             );
             managed
         };
-        self.persist_current_catalog().await?;
+        self.publish_current_catalog().await?;
         if let Some(managed) = managed {
             managed.close().await;
         }
@@ -422,7 +405,7 @@ impl McpRuntime {
                 server,
             );
         }
-        self.persist_current_catalog().await
+        self.publish_current_catalog().await
     }
 
     fn build_catalog(
@@ -430,7 +413,6 @@ impl McpRuntime {
         config: &McpConfig,
         previous_config: Option<&McpConfig>,
         previous_catalog: Option<&Catalog>,
-        cached_catalog: Option<&Catalog>,
     ) -> Catalog {
         let servers = config
             .servers
@@ -446,15 +428,6 @@ impl McpRuntime {
                         })
                     })
                     .flatten()
-                    .or_else(|| {
-                        if previous_config.is_none() {
-                            cached_catalog.and_then(|catalog| {
-                                catalog.servers.iter().find(|server| server.name == *name)
-                            })
-                        } else {
-                            None
-                        }
-                    })
                     .cloned();
                 prior.unwrap_or_else(|| initial_server(&self.client, name, server_config))
             })
@@ -465,27 +438,28 @@ impl McpRuntime {
         }
     }
 
-    fn read_matching_catalog(&self, config: &McpConfig) -> Option<Catalog> {
-        read_catalog_cache(&self.catalog_path)
-            .ok()
-            .map(|cache| cache.catalog)
-            .filter(|catalog| catalog.config_fingerprint == config.fingerprint)
-    }
-
-    fn persist_catalog(&self, catalog: &Catalog) -> Result<()> {
-        if let Some(parent) = self.catalog_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_catalog_cache(&self.catalog_path, catalog)
-    }
-
-    async fn persist_current_catalog(&self) -> Result<()> {
-        let _write = self.catalog_write.lock().await;
+    async fn publish_current_catalog(&self) -> Result<()> {
         let catalog =
             self.state.lock().await.catalog.clone().ok_or_else(|| {
                 crate::Error::InvalidConfig("MCP runtime is not initialized".into())
             })?;
-        self.persist_catalog(&catalog)
+        let profile_root = self
+            .config_path
+            .parent()
+            .and_then(Path::parent)
+            .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+            .ok_or_else(|| crate::Error::InvalidConfig("MCP profile root is unavailable".into()))?;
+        dwo_context::McpSnapshot::set_runtime(
+            profile_root,
+            dwo_context::McpSnapshot {
+                path: std::fs::canonicalize(&self.config_path)
+                    .unwrap_or_else(|_| self.config_path.clone()),
+                fingerprint: catalog.config_fingerprint.clone(),
+                server_count: catalog.servers.len(),
+                summary: crate::render_list(&catalog),
+            },
+        );
+        Ok(())
     }
 
     fn load_config(&self) -> Result<McpConfig> {
@@ -569,7 +543,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn startup_records_failed_servers_and_catalog_is_runtime_scoped() {
+    async fn startup_records_failed_servers_in_memory() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("resource")).unwrap();
         std::fs::write(
@@ -581,11 +555,7 @@ mod tests {
         let runtime = McpRuntime::new(root.path());
         let catalog = runtime.catalog().await.unwrap();
         assert_eq!(catalog.servers[0].status, ServerStatus::Starting);
-        assert_eq!(
-            runtime.catalog_path(),
-            root.path().join("runtime/mcp/catalog.json")
-        );
-        assert!(runtime.catalog_path().is_file());
+        assert!(!root.path().join("runtime/mcp/catalog.json").is_file());
         assert!(!root.path().join("mcp_runtime").exists());
 
         let catalog = runtime.sync_and_start().await.unwrap();

@@ -122,7 +122,6 @@ runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
 runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
-runtime/mcp/catalog.json
 runtime/mcp/oauth/
 runtime/logs/
 channels/weixin/runtime.yaml
@@ -225,7 +224,7 @@ MCP servers are configured in `resource/mcp.json`. Static HTTP headers and
 stdio environment variables are resolved from that file, including `${ENV}`
 references. Only servers declaring `auth.type: oauth` use the interactive
 `dwo mcp auth` flow. The daemon initializes configured servers concurrently at
-startup and stores the resulting catalog under `runtime/mcp/`; each successful
+startup and keeps the resulting catalog in memory; each successful
 connection stays managed by the daemon. New or changed servers are initialized
 the same way by the config watcher. Failed or unauthenticated servers remain in
 the catalog with their status and error. MCP schemas are never registered as

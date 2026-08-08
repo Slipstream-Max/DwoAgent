@@ -1,9 +1,13 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{stable_fingerprint, xml_escape};
+
+static RUNTIME_MCP: OnceLock<RwLock<BTreeMap<PathBuf, McpSnapshot>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpSnapshot {
@@ -16,6 +20,16 @@ pub struct McpSnapshot {
 }
 
 impl McpSnapshot {
+    pub fn set_runtime(profile_root: impl Into<PathBuf>, snapshot: Self) {
+        let profile_root = profile_root.into();
+        let profile_root = std::fs::canonicalize(&profile_root).unwrap_or(profile_root);
+        let registry = RUNTIME_MCP.get_or_init(|| RwLock::new(BTreeMap::new()));
+        registry
+            .write()
+            .expect("MCP snapshot registry poisoned")
+            .insert(profile_root, snapshot);
+    }
+
     pub(crate) fn read(path: &Path) -> std::io::Result<Option<Self>> {
         if !path.is_file() {
             return Ok(None);
@@ -34,24 +48,22 @@ impl McpSnapshot {
             return Ok(None);
         }
         let fingerprint = stable_fingerprint(&bytes);
-        let catalog_path = path
+        let profile_root = path
             .parent()
             .and_then(Path::parent)
-            .map(|root| root.join("runtime/mcp/catalog.json"));
-        let summary = catalog_path
-            .as_deref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|source| serde_json::from_str::<Value>(&source).ok())
-            .filter(|catalog| {
-                catalog.get("configFingerprint").and_then(Value::as_str)
-                    == Some(fingerprint.as_str())
+            .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+        let summary = profile_root
+            .as_ref()
+            .and_then(|root| {
+                RUNTIME_MCP.get().and_then(|registry| {
+                    registry
+                        .read()
+                        .ok()
+                        .and_then(|registry| registry.get(root).cloned())
+                })
             })
-            .and_then(|catalog| {
-                catalog
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
+            .filter(|snapshot| snapshot.fingerprint == fingerprint)
+            .map(|snapshot| snapshot.summary.clone())
             .filter(|summary| !summary.trim().is_empty())
             .unwrap_or_else(|| {
                 servers

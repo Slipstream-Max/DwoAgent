@@ -29,7 +29,6 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 |  |- attachments/<channel>/YYYY/MM/DD/<session-id>/
 |  |- channel-capabilities/<channel>.md
 |  |- mcp/
-|  |  |- catalog.json
 |  |  `- oauth/
 |  `- logs/
 `- channels/
@@ -56,7 +55,7 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 | `resource/providers/` | 是 | 每个文件定义一个自定义模型 provider type。 |
 | `resource/skills/` | 是 | 本地 skill。 |
 | `resource/mcp.json` | 是 | MCP server。 |
-| `runtime/` | 通常不需要 | Session、附件、catalog、OAuth、automation sticky binding 和日志。 |
+| `runtime/` | 通常不需要 | Session、附件、OAuth 和日志。 |
 | `channels/` | 由命令管理 | 绑定信息和当前选择的 session。 |
 
 ## 完整 profile.yaml
@@ -418,7 +417,7 @@ Daemon 会监听这些固定资源、session 初始工作目录、`.agents/` 和
 
 Daemon 启动时并发连接 MCP server，并持续复用成功的 stdio/HTTP 连接。配置变化会触发初始化。状态包括 `starting`、`ready`、`auth_required` 和 `failed`。
 
-`runtime/mcp/catalog.json` 保存当前 catalog 的派生内容。连接和调用由 daemon 内的 MCP runtime 管理。
+MCP catalog 只保存在 daemon 内存中，daemon 每次启动都会从 `resource/mcp.json` 重新建立；连接和调用由 daemon 内的 MCP runtime 管理。
 
 ```text
 dwo mcp search <query>

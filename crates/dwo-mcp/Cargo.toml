@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+dwo-context = { path = "../dwo-context" }
 futures.workspace = true
 http = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }

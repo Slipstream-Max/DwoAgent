@@ -1,6 +1,6 @@
 use dwo_context::{
     ChannelCapabilitySnapshot, CompactionPlanner, ContentBlock, ContextManager, ContextMessage,
-    MessageContent, MessageKind, MessageRole, SessionContext, SystemPromptBuilder,
+    McpSnapshot, MessageContent, MessageKind, MessageRole, SessionContext, SystemPromptBuilder,
     ToolResultRecord, estimate_content_tokens, estimate_context_tokens,
 };
 use serde_json::json;
@@ -408,13 +408,14 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
         .mcp
         .unwrap()
         .fingerprint;
-    write(
-        &profile.join("runtime/mcp/catalog.json"),
-        &serde_json::json!({
-            "configFingerprint": fingerprint,
-            "summary": "github    18 tools    ready"
-        })
-        .to_string(),
+    McpSnapshot::set_runtime(
+        profile.clone(),
+        McpSnapshot {
+            path: profile.join("resource/mcp.json"),
+            fingerprint,
+            server_count: 1,
+            summary: "github    18 tools    ready".to_string(),
+        },
     );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     assert!(

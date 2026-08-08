@@ -98,6 +98,7 @@ pub(crate) struct SessionBridge {
     replay_turns: usize,
     replay_mode: ChannelReplayMode,
     selected_session_id: Mutex<Option<String>>,
+    session_choices: Mutex<Vec<String>>,
     transport: Arc<dyn ConversationTransport>,
     observer: Mutex<Option<SessionObserver>>,
 }
@@ -119,6 +120,7 @@ impl SessionBridge {
             replay_turns,
             replay_mode,
             selected_session_id: Mutex::new(selected_session_id),
+            session_choices: Mutex::new(Vec::new()),
             transport,
             observer: Mutex::new(None),
         }
@@ -130,18 +132,25 @@ impl SessionBridge {
             ChannelCommand::List => {
                 let records = self.host.list_sessions(true, None).await?;
                 let selected = self.selected_session_id.lock().await.clone();
+                let choices = records
+                    .iter()
+                    .map(|record| record.info.id.to_string())
+                    .collect::<Vec<_>>();
+                *self.session_choices.lock().await = choices;
                 let text = records
-                    .into_iter()
-                    .map(|record| {
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| {
                         format!(
-                            "{} {} {}",
+                            "{} {}. {} [{}]",
                             if selected.as_deref() == Some(record.info.id.as_str()) {
                                 "*"
                             } else {
-                                "-"
+                                " "
                             },
-                            record.info.id,
-                            record.info.title
+                            index + 1,
+                            short_session_title(&record.info.title),
+                            short_session_id(&record.info.id),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -171,7 +180,8 @@ impl SessionBridge {
                     snapshot.record.info.id, snapshot.record.info.title
                 )]
             }
-            ChannelCommand::Use { session: id } => {
+            ChannelCommand::Use { session: reference } => {
+                let id = self.resolve_session_reference(&reference).await?;
                 let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
                 self.select_session(&id).await?;
                 let subscription = self
@@ -192,7 +202,8 @@ impl SessionBridge {
                     .await?;
                 vec![render_status(&snapshot)]
             }
-            ChannelCommand::Del { session: id } => {
+            ChannelCommand::Del { session: reference } => {
+                let id = self.resolve_session_reference(&reference).await?;
                 let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
                 self.host.delete_session(&session_id).await?;
                 if self.selected_session_id.lock().await.as_deref() == Some(id.as_str()) {
@@ -359,6 +370,46 @@ impl SessionBridge {
         SessionId::parse(id).map_err(anyhow::Error::msg)
     }
 
+    async fn resolve_session_reference(&self, reference: &str) -> Result<String> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            anyhow::bail!("Session reference must not be empty");
+        }
+        if let Ok(index) = reference.parse::<usize>() {
+            let choices = self.session_choices.lock().await;
+            let Some(id) = index.checked_sub(1).and_then(|index| choices.get(index)) else {
+                anyhow::bail!(
+                    "Session number {index} is not in the last /list result; send /list first"
+                );
+            };
+            return Ok(id.clone());
+        }
+        if let Ok(id) = SessionId::parse(reference.to_string()) {
+            return Ok(id.to_string());
+        }
+
+        let records = self.host.list_sessions(true, None).await?;
+        let matches = records
+            .into_iter()
+            .filter(|record| session_id_matches(&record.info.id, reference))
+            .map(|record| record.info.id.to_string())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => anyhow::bail!(
+                "No session matches '{reference}'. Send /list, then use its number or short ID"
+            ),
+            _ => anyhow::bail!(
+                "Session reference '{reference}' is ambiguous: {}",
+                matches
+                    .iter()
+                    .map(|id| short_session_id_string(id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
     async fn permission_request(&self, requested: Option<String>) -> Result<String> {
         let id = if requested.is_some() {
             resolve_permission_request_id(requested, None)?
@@ -410,6 +461,52 @@ impl SessionBridge {
         ));
         *observer = Some(SessionObserver { session_id, task });
         Ok(())
+    }
+}
+
+fn short_session_id(id: &SessionId) -> String {
+    short_session_id_string(id.as_str())
+}
+
+fn short_session_id_string(id: &str) -> String {
+    id.strip_prefix("session-")
+        .unwrap_or(id)
+        .chars()
+        .take(8)
+        .collect()
+}
+
+fn short_session_title(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        return "Untitled".to_string();
+    }
+    let mut shortened = title.chars().take(32).collect::<String>();
+    if title.chars().count() > 32 {
+        shortened.push_str("...");
+    }
+    shortened
+}
+
+fn session_id_matches(id: &SessionId, reference: &str) -> bool {
+    let id = id.as_str();
+    id.starts_with(reference)
+        || id
+            .strip_prefix("session-")
+            .is_some_and(|short_id| short_id.starts_with(reference))
+}
+
+#[cfg(test)]
+mod session_reference_tests {
+    use super::*;
+
+    #[test]
+    fn short_ids_are_copyable_without_the_session_prefix() {
+        let id = SessionId::parse("session-1234567890abcdef").unwrap();
+        assert_eq!(short_session_id(&id), "12345678");
+        assert!(session_id_matches(&id, "12345678"));
+        assert!(session_id_matches(&id, "session-123456"));
+        assert!(!session_id_matches(&id, "abcdef"));
     }
 }
 

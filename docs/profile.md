@@ -2,8 +2,6 @@
 
 Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默认目录是 `~/.dwoagent/`，入口文件是 `profile.yaml`。
 
-运行 `dwo install` 后，安装器会把这份指南复制到 `<profile-root>/profile.md`，所以可以直接在 `~/.dwoagent/profile.md` 查看配置说明。
-
 安装和启动见 [README](https://github.com/Slipstream-Max/DwoAgent/blob/main/README.md)，channel 部署见 [Channel 部署与使用](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/channels.md)，定时任务见 [Automation 使用指南](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/automation.md)，CLI 参数见 [命令参考](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/commands.md)。
 
 ## 目录结构
@@ -11,7 +9,6 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 ```text
 <profile-root>/
 |- profile.yaml
-|- profile.md              # 本地配置参考，由 dwo install 创建
 |- bin/
 |  `- dwo
 |- resource/

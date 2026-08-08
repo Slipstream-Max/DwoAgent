@@ -20,7 +20,7 @@ struct ChannelCommandLine {
 pub(crate) enum ChannelCommand {
     #[command(about = "Display this command list.")]
     Help,
-    #[command(about = "List sessions and show the selected session.")]
+    #[command(about = "List sessions with numbers and short IDs.")]
     List,
     #[command(about = "Create and select a session.")]
     New {
@@ -31,14 +31,14 @@ pub(crate) enum ChannelCommand {
     },
     #[command(about = "Copy the selected session into a new session.")]
     Fork,
-    #[command(about = "Select a session and replay its recent turns.")]
+    #[command(about = "Select by number, short ID, or full ID and replay recent turns.")]
     Use {
         #[arg(value_name = "SESSION")]
         session: String,
     },
     #[command(about = "Show the selected session state.")]
     Status,
-    #[command(about = "Delete a session.")]
+    #[command(about = "Delete by number, short ID, or full ID.")]
     Del {
         #[arg(value_name = "SESSION")]
         session: String,
@@ -248,6 +248,18 @@ mod tests {
             ChannelCommand::Deny {
                 id: Some(ref id)
             } if id == "request-7"
+        ));
+    }
+
+    #[test]
+    fn session_commands_accept_short_references() {
+        assert!(matches!(
+            parse_command("/use 2").unwrap(),
+            ChannelCommand::Use { session } if session == "2"
+        ));
+        assert!(matches!(
+            parse_command("/del abc12345").unwrap(),
+            ChannelCommand::Del { session } if session == "abc12345"
         ));
     }
 

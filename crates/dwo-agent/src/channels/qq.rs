@@ -535,31 +535,20 @@ impl QqConversation {
     }
 
     async fn reserve_reply(&self) -> Option<(String, u32)> {
-        self.reserve_replies(1).await.into_iter().next().flatten()
-    }
-
-    async fn reserve_replies(&self, count: usize) -> Vec<Option<(String, u32)>> {
-        let mut replies = vec![None; count];
-        if count == 0 {
-            return replies;
-        }
         let mut reply = self.reply.lock().await;
-        let Some(context) = reply.as_mut() else {
-            return replies;
-        };
+        let context = reply.as_mut()?;
         if Instant::now() >= context.expires_at {
             *reply = None;
-            return replies;
+            return None;
         }
-        let passive_count = count.min(context.remaining as usize);
+        if context.remaining == 0 {
+            return None;
+        }
         let msg_id = context.msg_id.clone();
-        let first_seq = context.next_seq;
-        context.next_seq = context.next_seq.saturating_add(passive_count as u32);
-        context.remaining -= passive_count as u32;
-        for (index, slot) in replies.iter_mut().take(passive_count).enumerate() {
-            *slot = Some((msg_id.clone(), first_seq.saturating_add(index as u32)));
-        }
-        replies
+        let msg_seq = context.next_seq;
+        context.next_seq = context.next_seq.saturating_add(1);
+        context.remaining -= 1;
+        Some((msg_id, msg_seq))
     }
 }
 
@@ -571,7 +560,11 @@ impl ConversationTransport for QqConversation {
         let replies = if self.replay_mode == ChannelReplayMode::Full {
             vec![None; chunks.len()]
         } else {
-            self.reserve_replies(chunks.len()).await
+            let mut replies = vec![None; chunks.len()];
+            if let Some(reply) = self.reserve_reply().await {
+                replies[0] = Some(reply);
+            }
+            replies
         };
         send_c2c_chunks(&self.api, &self.openid, chunks, replies).await
     }

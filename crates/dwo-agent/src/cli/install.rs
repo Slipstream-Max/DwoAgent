@@ -9,8 +9,6 @@ use super::DEFAULT_PROFILE;
 #[cfg(target_os = "macos")]
 use super::home_dir;
 
-const PROFILE_GUIDE: &str = include_str!("../../../../docs/profile.md");
-
 pub(super) fn install(config_path: &Path) -> Result<()> {
     let root = config_path.parent().context("config path has no parent")?;
     let executable = install_executable(root)?;
@@ -31,7 +29,6 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
         &root.join("resource/mcp.json"),
         "{\n  \"mcpServers\": {}\n}\n",
     )?;
-    write_if_missing(&root.join("profile.md"), PROFILE_GUIDE)?;
     register_service(config_path, &executable)
 }
 
@@ -129,25 +126,6 @@ mod tests {
             std::fs::read_to_string(path).unwrap(),
             "user configuration\n"
         );
-    }
-
-    #[test]
-    fn bundled_profile_guide_covers_config_sections() {
-        for field in [
-            "maxModelSteps",
-            "externalSkillsDirs",
-            "logging:",
-            "model:",
-            "weixin:",
-            "replayMode: response",
-            "telegram:",
-            "feishu:",
-            "qq:",
-            "websocket:",
-            "automation:",
-        ] {
-            assert!(PROFILE_GUIDE.contains(field), "missing {field}");
-        }
     }
 }
 

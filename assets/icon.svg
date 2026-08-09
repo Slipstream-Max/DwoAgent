@@ -1,11 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="260" viewBox="0 0 960 260" role="img" aria-labelledby="title desc">
-  <title id="title">赤铎 Dwo Agent</title>
-  <desc id="desc">A Chinese bronze bell in front of a rust-red industrial gear beside the ChiDuo wordmark.</desc>
-  <rect width="960" height="260" fill="#f3ead7"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">赤铎</title>
+  <desc id="desc">A Chinese bronze bell in front of a rust-red industrial gear.</desc>
+  <rect width="256" height="256" fill="#f3ead7"/>
   <defs>
     <path id="gear-tooth" d="M102 31l2-15 3-4h6l3 4 2 15z"/>
   </defs>
-  <g transform="translate(48 28)">
+  <g transform="translate(18 26)">
     <g fill="#9f4636">
       <circle cx="110" cy="100" r="75"/>
       <use href="#gear-tooth"/>
@@ -38,22 +38,12 @@
     <path d="M72 61c-9 2-14 9-15 20L45 181c20-13 42-20 65-20s45 7 65 20L163 81c-1-11-6-18-15-20z" fill="#69746b" stroke="#202326" stroke-width="8" stroke-linejoin="round"/>
     <path d="M80 72c-6 20-10 47-12 80M140 72c6 20 10 47 12 80" fill="none" stroke="#8d978e" stroke-width="7" stroke-linecap="round" opacity=".82"/>
     <g fill="#d8a538">
-      <circle cx="78" cy="80" r="3"/>
-      <circle cx="142" cy="80" r="3"/>
-      <circle cx="75" cy="94" r="3"/>
-      <circle cx="145" cy="94" r="3"/>
-      <circle cx="69" cy="128" r="3"/>
-      <circle cx="151" cy="128" r="3"/>
-      <circle cx="68" cy="143" r="3"/>
-      <circle cx="152" cy="143" r="3"/>
+      <circle cx="78" cy="80" r="3"/><circle cx="142" cy="80" r="3"/>
+      <circle cx="75" cy="94" r="3"/><circle cx="145" cy="94" r="3"/>
+      <circle cx="69" cy="128" r="3"/><circle cx="151" cy="128" r="3"/>
+      <circle cx="68" cy="143" r="3"/><circle cx="152" cy="143" r="3"/>
     </g>
     <path d="M62 111c30 8 66 8 96 0" fill="none" stroke="#b4bab3" stroke-width="8" stroke-linecap="round"/>
     <path d="M54 160c19-7 38-11 56-11s37 4 56 11" fill="none" stroke="#303632" stroke-width="6" stroke-linecap="round" opacity=".78"/>
   </g>
-  <g fill="#202326">
-    <text x="270" y="132" font-family="Noto Serif SC, Source Han Serif SC, Microsoft YaHei, serif" font-size="88" font-weight="700">赤铎</text>
-    <text x="274" y="186" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="650" letter-spacing="6">DWO AGENT</text>
-  </g>
-  <rect x="274" y="207" width="370" height="8" rx="4" fill="#9f4636"/>
-  <circle cx="664" cy="211" r="4" fill="#d7a43b"/>
 </svg>

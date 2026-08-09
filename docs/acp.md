@@ -97,6 +97,7 @@ adapter 会给 cancel 留出 `500ms` 的配对窗口：同一连接、同一 ses
 | `/compact` | 手动压缩当前 session context；命令文本不进入模型上下文，并通过下述 compaction update 回显进度与摘要 |
 | `/resume` | session idle 时加入内部继续指令并启动新 turn；运行中静默忽略，不排队也不报错 |
 | `/fork` | 复制当前 session 并显示副本 ID；当前 ACP session 不变 |
+| `/status` | 本地查询当前 session，显示完整 session ID、模型、reasoning 强度和状态；不会调用模型 |
 
 Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执行。ACP 同时声明并实现实验性原生 `session/fork`；它和 `/fork` 都返回副本 ID，但都不会切换当前 ACP session。ACP 协议自身的 `session/resume` 是重新接入已有 session、恢复 observer 和可选回放历史，不会启动模型；它与自定义 `/resume` 命令不是同一功能。
 

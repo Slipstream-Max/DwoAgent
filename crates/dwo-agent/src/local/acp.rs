@@ -20,12 +20,11 @@ use agent_client_protocol::schema::v2::{
     RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
     RunningStateUpdate, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions,
-    SessionDeleteCapabilities, SessionForkCapabilities, SessionId,
-    SessionInfo, SessionInfoUpdate, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StateUpdate, StopReason, Terminal, TerminalExitStatus,
-    TerminalOutput, TerminalOutputChunk, TerminalUpdate, TextContent, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind, UpdateSessionNotification,
-    UsageUpdate, UserMessage,
+    SessionDeleteCapabilities, SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StateUpdate,
+    StopReason, Terminal, TerminalExitStatus, TerminalOutput, TerminalOutputChunk, TerminalUpdate,
+    TextContent, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Error as AcpError, Responder,
@@ -621,6 +620,18 @@ async fn run_prompt(
             return;
         }
     };
+    if command == Some(SlashCommand::Status) {
+        match load_status_snapshot(&runtime, &session_id).await {
+            Ok(snapshot) => {
+                let _ = responder.respond(PromptResponse::new());
+                send_status_message(&cx, &session_id, &snapshot);
+            }
+            Err(error) => {
+                let _ = responder.respond_with_error(internal_error(error));
+            }
+        }
+        return;
+    }
     let observer = match prepare_observer(&runtime, &session_id, false).await {
         Ok(prepared) => match activate_observer(&runtime, &session_id, &cx, prepared).await {
             Ok(observer) => observer,
@@ -665,6 +676,7 @@ async fn run_prompt(
             )
             .await
         }
+        Some(SlashCommand::Status) => unreachable!("status is handled before submitting a prompt"),
         None => {
             ipc::request(
                 &runtime.config_path,
@@ -699,6 +711,7 @@ enum SlashCommand {
     Compact,
     Resume,
     Fork,
+    Status,
 }
 
 fn parse_slash_command(content: &MessageContent) -> Result<Option<SlashCommand>> {
@@ -721,6 +734,10 @@ fn parse_slash_command(content: &MessageContent) -> Result<Option<SlashCommand>>
         "/fork" => {
             anyhow::ensure!(parts.next().is_none(), "/fork does not accept input");
             Ok(Some(SlashCommand::Fork))
+        }
+        "/status" => {
+            anyhow::ensure!(parts.next().is_none(), "/status does not accept input");
+            Ok(Some(SlashCommand::Status))
         }
         _ => Ok(None),
     }
@@ -1293,7 +1310,44 @@ fn available_commands() -> Vec<AvailableCommand> {
         AvailableCommand::new("compact", "Compact the current session context"),
         AvailableCommand::new("resume", "Continue the current session when it is idle"),
         AvailableCommand::new("fork", "Copy the current session into a new session"),
+        AvailableCommand::new(
+            "status",
+            "Show the current session ID, model, and reasoning",
+        ),
     ]
+}
+
+async fn load_status_snapshot(
+    runtime: &AcpRuntime,
+    session_id: &str,
+) -> Result<dwo_agent_service::SessionSnapshot> {
+    let value = ipc::request(
+        &runtime.config_path,
+        "session.snapshot",
+        json!({"session_id": session_id}),
+    )
+    .await?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn send_status_message(
+    cx: &AcpConnection,
+    session_id: &str,
+    snapshot: &dwo_agent_service::SessionSnapshot,
+) {
+    let text = crate::session_status::render_status(
+        snapshot,
+        crate::session_status::SessionIdDisplay::Full,
+    );
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::AgentMessage(
+            AgentMessage::new(format!("message-{}", Uuid::new_v4()))
+                .content(vec![ContentBlock::Text(TextContent::new(text))]),
+        ),
+    );
+    send_idle(cx, session_id, StopReason::EndTurn);
 }
 
 fn send_fork_result(cx: &AcpConnection, source_id: &str, value: &Value) {
@@ -2147,6 +2201,10 @@ mod tests {
             parse_slash_command(&MessageContent::text("/fork")).unwrap(),
             Some(SlashCommand::Fork)
         ));
+        assert!(matches!(
+            parse_slash_command(&MessageContent::text(" /status ")).unwrap(),
+            Some(SlashCommand::Status)
+        ));
         assert!(
             parse_slash_command(&MessageContent::text("/custom value"))
                 .unwrap()
@@ -2170,6 +2228,12 @@ mod tests {
                 .to_string(),
             "/fork does not accept input"
         );
+        assert_eq!(
+            parse_slash_command(&MessageContent::text("/status now"))
+                .unwrap_err()
+                .to_string(),
+            "/status does not accept input"
+        );
     }
 
     #[test]
@@ -2186,6 +2250,7 @@ mod tests {
         );
         assert_eq!(json["availableCommands"][1]["name"], "resume");
         assert_eq!(json["availableCommands"][2]["name"], "fork");
+        assert_eq!(json["availableCommands"][3]["name"], "status");
     }
 
     #[test]

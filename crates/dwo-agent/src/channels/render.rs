@@ -1,66 +1,12 @@
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-
+pub(crate) use crate::session_status::{display_path, policy_name};
+pub(crate) use crate::session_status::{short_session_id, short_session_id_str};
 use dwo_agent_service::{
-    ActiveToolCall, ClientTranscriptEvent, MessageContent, SessionEventPayload, SessionId,
-    SessionSnapshot,
+    ActiveToolCall, ClientTranscriptEvent, MessageContent, SessionEventPayload, SessionSnapshot,
 };
-use dwo_tools::SessionMode;
-
-pub(crate) fn policy_name(mode: SessionMode) -> &'static str {
-    match mode {
-        SessionMode::FullAccess => "full_access",
-        SessionMode::Confirm => "confirm",
-        SessionMode::Watch => "watch",
-    }
-}
-
-pub(crate) fn display_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    if let Some(path) = raw.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{path}")
-    } else if let Some(path) = raw.strip_prefix(r"\\?\") {
-        path.to_string()
-    } else {
-        raw.into_owned()
-    }
-}
+use std::collections::{HashMap, HashSet};
 
 pub(crate) fn render_status(snapshot: &SessionSnapshot) -> String {
-    let mut lines = vec![format!(
-        "Session: {}\nID: {}\nCwd: {}\nPolicy: {}\nModel: {}\nReasoning: {}\nState: {:?}",
-        snapshot.record.info.title,
-        short_session_id(&snapshot.record.info.id),
-        display_path(&snapshot.record.info.cwd),
-        policy_name(snapshot.record.info.mode),
-        snapshot.record.llm.model,
-        snapshot
-            .record
-            .llm
-            .reasoning
-            .as_deref()
-            .unwrap_or("default"),
-        snapshot.phase,
-    )];
-    if !snapshot.partial_message.is_empty() {
-        lines.push(format!("Current: {}", snapshot.partial_message));
-    }
-    if let Some(permission) = &snapshot.pending_permission {
-        lines.push(format!("Pending permission: {}", permission.request_id));
-    }
-    lines.join("\n")
-}
-
-pub(crate) fn short_session_id(id: &SessionId) -> String {
-    short_session_id_str(id.as_str())
-}
-
-pub(crate) fn short_session_id_str(id: &str) -> String {
-    id.strip_prefix("session-")
-        .unwrap_or(id)
-        .chars()
-        .take(8)
-        .collect()
+    crate::session_status::render_status(snapshot, crate::session_status::SessionIdDisplay::Short)
 }
 
 pub(crate) fn render_live_user_prompt(content: &MessageContent) -> Option<String> {
@@ -305,10 +251,11 @@ fn fenced(content: &str) -> String {
 mod tests {
     use super::*;
     use dwo_agent_service::{
-        EndpointId, MessageId, SessionLlmSettings, SessionRecord, SessionUsageSnapshot,
+        EndpointId, MessageId, SessionId, SessionLlmSettings, SessionRecord, SessionUsageSnapshot,
     };
+    use dwo_tools::SessionMode;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn responses_are_buffered_in_commit_order() {
@@ -474,6 +421,14 @@ mod tests {
             pending_permission: None,
             seq: 1,
         };
+
+        let status = crate::session_status::render_status(
+            &snapshot,
+            crate::session_status::SessionIdDisplay::Full,
+        );
+        assert!(status.contains("ID: session-test"));
+        assert!(status.contains("Model: scripted-test-model"));
+        assert!(status.contains("Reasoning: default"));
 
         assert_eq!(
             render_session_replay(&snapshot, 5),

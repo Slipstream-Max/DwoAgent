@@ -433,6 +433,21 @@ async fn run_prompt(
         }
     };
     let replaces_pending_cancel = runtime.pending_cancels.consume(&session_id);
+    if command == Some(SlashCommand::Status) {
+        let connection =
+            AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
+        match load_status_snapshot(&runtime, &session_id).await {
+            Ok(snapshot) => {
+                send_status_message(&connection, &session_id, &snapshot);
+                let _ = responder.respond(v1::PromptResponse::new(v1::StopReason::EndTurn));
+            }
+            Err(error) => {
+                forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
+                let _ = responder.respond_with_error(internal_error(error));
+            }
+        }
+        return;
+    }
     let prepared = match prepare_observer(&runtime, &session_id, false).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -526,6 +541,7 @@ async fn submit_prompt(
             json!({"session_id": session_id, "endpoint_id": observer.endpoint_id}),
         ),
         Some(SlashCommand::Fork) => ("session.fork", json!({"session_id": session_id})),
+        Some(SlashCommand::Status) => unreachable!("status is handled before submitting a prompt"),
         None => (
             "session.prompt",
             json!({

@@ -186,7 +186,8 @@ fn parse_arguments(value: Option<&Value>) -> Result<Map<String, Value>, String> 
 }
 
 fn parse_terminal(args: &Map<String, Value>) -> Result<TerminalArgs, String> {
-    let terminal_id = optional_string(args, "terminal_id")?;
+    let terminal_id =
+        optional_string(args, "terminal_id")?.filter(|terminal_id| !terminal_id.trim().is_empty());
     let kill = args.get("kill").and_then(Value::as_bool).unwrap_or(false);
     if kill {
         let terminal_id =
@@ -346,6 +347,20 @@ mod tests {
         assert!(matches!(
             parsed.call,
             ToolCall::Terminal(TerminalArgs::Input { data, .. }) if data.is_empty()
+        ));
+    }
+
+    #[test]
+    fn empty_terminal_id_creates_a_new_terminal() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id": "call-1",
+            "name": "terminal",
+            "arguments": {"terminal_id":"", "command":"rg foo"},
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed.call,
+            ToolCall::Terminal(TerminalArgs::Run { .. })
         ));
     }
 

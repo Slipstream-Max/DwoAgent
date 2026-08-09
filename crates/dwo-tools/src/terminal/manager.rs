@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, Serializer};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use super::process::{ProcessSnapshot, ProcessStatus, TerminalProcess, resolve_cwd};
+use super::session::{SessionSnapshot, SessionStatus, TerminalSession};
 use crate::ToolEventHandler;
 
 /// How long a finished terminal stays listed before it is pruned, so the
@@ -61,7 +61,7 @@ impl Serialize for TerminalId {
 }
 
 struct TerminalEntry {
-    process: Arc<TerminalProcess>,
+    session: Arc<TerminalSession>,
     operation: Mutex<()>,
     // Interior mutability: entries are shared behind `Arc` with the map.
     finished_since: std::sync::Mutex<Option<Instant>>,
@@ -141,7 +141,7 @@ impl TerminalManager {
             .unwrap_or_default();
         let cwd = resolve_cwd(&self.base_cwd, cwd)?;
         let terminal_id = TerminalId::new();
-        let process = TerminalProcess::spawn(
+        let session = TerminalSession::spawn(
             terminal_id.clone(),
             tool_call_id,
             command,
@@ -151,7 +151,7 @@ impl TerminalManager {
         )
         .await?;
         let entry = Arc::new(TerminalEntry {
-            process: process.clone(),
+            session: session.clone(),
             operation: Mutex::new(()),
             finished_since: std::sync::Mutex::new(None),
         });
@@ -161,22 +161,22 @@ impl TerminalManager {
             prune(&mut terminals);
         }
 
-        let timeout_process = process.clone();
+        let timeout_session = session.clone();
         tokio::spawn(async move {
             let timed_out = tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => true,
                 // Do not keep the process (and its PTY/output buffers) alive
                 // for the full timeout after a short-lived command exits.
-                _ = timeout_process.wait_for_exit(timeout_ms.saturating_add(1)) => false,
+                _ = timeout_session.wait_for_exit(timeout_ms.saturating_add(1)) => false,
             };
-            if timed_out && timeout_process.is_running() {
-                let _ = timeout_process.kill().await;
+            if timed_out && timeout_session.is_running() {
+                let _ = timeout_session.kill().await;
             }
         });
 
         let _operation = entry.operation.lock().await;
-        process.wait_for_exit(yield_ms).await;
-        Ok(render_snapshot(&process, process.snapshot()))
+        session.wait_for_exit(yield_ms).await;
+        Ok(render_snapshot(&session, session.snapshot()))
     }
 
     pub async fn input(
@@ -188,20 +188,20 @@ impl TerminalManager {
         let entry = self.entry(terminal_id).await?;
         let _operation = entry.operation.lock().await;
         if !data.is_empty() {
-            entry.process.write(data).await?;
+            entry.session.input(data).await?;
         }
-        entry.process.wait_for_activity(yield_ms).await;
+        entry.session.wait_for_activity(yield_ms).await;
         self.prune_terminals().await;
-        Ok(render_snapshot(&entry.process, entry.process.snapshot()))
+        Ok(render_snapshot(&entry.session, entry.session.snapshot()))
     }
 
     pub async fn kill(&self, terminal_id: &TerminalId) -> Result<TerminalSnapshot> {
         let entry = self.entry(terminal_id).await?;
         let _operation = entry.operation.lock().await;
-        entry.process.kill().await?;
-        entry.process.wait_for_exit(2_000).await;
+        entry.session.kill().await?;
+        entry.session.wait_for_exit(2_000).await;
         self.prune_terminals().await;
-        Ok(render_snapshot(&entry.process, entry.process.snapshot()))
+        Ok(render_snapshot(&entry.session, entry.session.snapshot()))
     }
 
     pub async fn list(&self) -> Vec<TerminalSnapshot> {
@@ -209,7 +209,7 @@ impl TerminalManager {
         let entries: Vec<_> = self.terminals.read().await.values().cloned().collect();
         entries
             .into_iter()
-            .map(|entry| render_snapshot(&entry.process, entry.process.inspect_snapshot()))
+            .map(|entry| render_snapshot(&entry.session, entry.session.inspect_snapshot()))
             .collect()
     }
 
@@ -217,7 +217,7 @@ impl TerminalManager {
         let entries: Vec<_> = self.terminals.read().await.values().cloned().collect();
         for entry in entries {
             let _operation = entry.operation.lock().await;
-            let _ = entry.process.kill().await;
+            let _ = entry.session.kill().await;
         }
     }
 
@@ -246,7 +246,7 @@ fn prune(terminals: &mut HashMap<TerminalId, Arc<TerminalEntry>>) {
     for entry in terminals.values() {
         if let Ok(mut since) = entry.finished_since.lock()
             && since.is_none()
-            && entry.process.is_finished()
+            && entry.session.is_finished()
         {
             *since = Some(now);
         }
@@ -276,7 +276,7 @@ fn prune(terminals: &mut HashMap<TerminalId, Arc<TerminalEntry>>) {
                     .lock()
                     .ok()
                     .and_then(|guard| *guard)
-                    .map(|since| (id.clone(), since, entry.process.has_unread()))
+                    .map(|since| (id.clone(), since, entry.session.has_unread()))
             })
             .collect();
         candidates.sort_by_key(|(_, since, has_unread)| (*has_unread, *since));
@@ -290,21 +290,39 @@ fn prune(terminals: &mut HashMap<TerminalId, Arc<TerminalEntry>>) {
     }
 }
 
-fn render_snapshot(process: &TerminalProcess, snapshot: ProcessSnapshot) -> TerminalSnapshot {
+fn render_snapshot(session: &TerminalSession, snapshot: SessionSnapshot) -> TerminalSnapshot {
     let status = match snapshot.status {
-        ProcessStatus::Running => "running",
-        ProcessStatus::Killed => "cancelled",
-        ProcessStatus::Exited if snapshot.exit_code == Some(0) => "completed",
-        ProcessStatus::Exited => "error",
+        SessionStatus::Running => "running",
+        SessionStatus::Killed => "cancelled",
+        SessionStatus::Exited if snapshot.exit_code == Some(0) => "completed",
+        SessionStatus::Exited => "error",
     };
     TerminalSnapshot {
-        terminal_id: process.id.clone(),
+        terminal_id: session.id.clone(),
         status,
         exit_code: snapshot.exit_code,
         output: snapshot.output,
-        command: process.command.clone(),
-        cwd: process.cwd.clone(),
+        command: session.command.clone(),
+        cwd: session.cwd.clone(),
     }
+}
+
+fn resolve_cwd(base: &Path, requested: Option<&Path>) -> Result<PathBuf> {
+    let cwd = requested
+        .map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            }
+        })
+        .unwrap_or_else(|| base.to_path_buf());
+    let cwd = dunce::canonicalize(&cwd)
+        .with_context(|| format!("resolve terminal cwd {}", cwd.display()))?;
+    if !cwd.is_dir() {
+        bail!("terminal cwd is not a directory: {}", cwd.display());
+    }
+    Ok(cwd)
 }
 
 #[cfg(test)]
@@ -331,6 +349,39 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.status, "completed");
         assert!(snapshot.output.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn exit_drains_output_without_a_trailing_newline() {
+        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        let command = if cfg!(windows) {
+            "[Console]::Out.Write('tail-without-newline')"
+        } else {
+            "printf 'tail-without-newline'"
+        };
+        let snapshot = manager
+            .run(command.to_string(), None, 5_000, 120_000)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert!(snapshot.output.contains("tail-without-newline"));
+    }
+
+    #[tokio::test]
+    async fn output_larger_than_the_pty_channel_does_not_stall() {
+        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        let command = if cfg!(windows) {
+            "[Console]::Out.Write(('x' * 1200000) + 'END-MARKER')"
+        } else {
+            "head -c 1200000 /dev/zero | tr '\\0' x; printf 'END-MARKER'"
+        };
+        let snapshot = manager
+            .run(command.to_string(), None, 15_000, 120_000)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert!(snapshot.output.contains("output omitted"));
+        assert!(snapshot.output.contains("END-MARKER"));
     }
 
     #[tokio::test]

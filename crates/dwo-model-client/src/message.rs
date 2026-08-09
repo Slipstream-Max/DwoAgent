@@ -58,7 +58,11 @@ pub(crate) fn provider_input(
     let mut output = Vec::new();
     for message in messages {
         if let Some(item) = message.response_item.as_ref() {
-            output.push(item.clone());
+            let mut item = item.clone();
+            if let Some(item) = item.as_object_mut() {
+                item.remove("id");
+            }
+            output.push(item);
             continue;
         }
         match message.role {
@@ -379,7 +383,7 @@ mod tests {
     #[test]
     fn responses_input_replays_native_items_and_function_outputs() {
         let reasoning = ContextMessage::response_item(
-            json!({"type":"reasoning", "summary":[], "encrypted_content":"opaque"}),
+            json!({"type":"reasoning", "id":"reason-1", "summary":[], "encrypted_content":"opaque"}),
             Some("provider-a".to_string()),
         );
         let hosted = ContextMessage::response_item(
@@ -387,7 +391,7 @@ mod tests {
             Some("provider-a".to_string()),
         );
         let message = ContextMessage::response_item(
-            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}),
+            json!({"type":"message", "id":"message-1", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}),
             None,
         );
         let result = dwo_context::ToolResultRecord {
@@ -402,10 +406,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(input[0]["type"], "reasoning");
+        assert!(input[0].get("id").is_none());
         assert_eq!(input[1]["type"], "web_search_call");
+        assert!(input[1].get("id").is_none());
         assert_eq!(input[2]["type"], "message");
+        assert!(input[2].get("id").is_none());
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call-1");
+    }
+
+    #[test]
+    fn response_item_replay_drops_item_id_but_preserves_call_id() {
+        let call = ContextMessage::response_item(
+            json!({
+                "type":"function_call",
+                "id":"fc-1",
+                "call_id":"call-1",
+                "name":"terminal",
+                "arguments":"{\"command\":\"pwd\"}"
+            }),
+            None,
+        );
+        let input = provider_input(&[call], false).unwrap();
+        assert_eq!(input[0]["type"], "function_call");
+        assert!(input[0].get("id").is_none());
+        assert_eq!(input[0]["call_id"], "call-1");
     }
 
     #[test]

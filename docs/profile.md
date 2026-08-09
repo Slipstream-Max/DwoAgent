@@ -112,7 +112,7 @@ automation:
   jobs: []
 
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek
@@ -184,7 +184,7 @@ DWO_LOG=dwo_agent_service=debug,dwo_mcp=trace
 
 ```yaml
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek
@@ -217,7 +217,7 @@ model:
 
 ```yaml
 model:
-  defaultModelId: gpt-5.6-terra
+  defaultModelName: gpt-5.6-terra
   providers:
     newapi:
       type: openai
@@ -294,7 +294,7 @@ profile YAML 动态加载任意协议实现。
 | `compactThreshold` | 触发上下文压缩的比例。 |
 | `defaultReasoningMode` | 新 session 默认 reasoning mode。 |
 
-`defaultModelId` 必须匹配一个 `models[].modelName`。
+`defaultModelName` 必须匹配一个 `models[].modelName`。
 
 Context token 由 daemon 根据 system prompt、消息、reasoning、图片、tool call/result 和 tool schema 估算。压缩阈值为：
 

@@ -1009,7 +1009,7 @@ automation:
   timeoutSeconds: 900
   jobs: []
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek

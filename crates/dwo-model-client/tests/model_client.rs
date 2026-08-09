@@ -96,7 +96,7 @@ providers:
 
 fn agent() -> &'static str {
     r#"
-defaultModelId: chat
+defaultModelName: chat
 providers:
   local:
     type: local
@@ -133,7 +133,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(limits.max_output_tokens, 4_096);
     assert_eq!(limits.max_input_tokens, 95_904);
     assert_eq!(limits.compact_trigger_tokens, 76_723);
-    assert_eq!(client.default_model_id(), "chat");
+    assert_eq!(client.default_model_name(), "chat");
     assert!(client.supports_image_input("chat").unwrap());
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let messages = vec![
@@ -372,7 +372,7 @@ fn builtin_catalog_resolves_two_models_through_one_shared_provider() {
     let catalog = ModelCatalog::builtin().unwrap();
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelId: deepseek-v4-pro
+defaultModelName: deepseek-v4-pro
 providers:
   deepseek:
     type: deepseek
@@ -431,7 +431,7 @@ providers:
     .unwrap();
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelId: model-z
+defaultModelName: model-z
 providers:
   local:
     type: local
@@ -495,7 +495,7 @@ fn openai_provider_instance_only_overrides_endpoint_and_credentials() {
     let catalog = ModelCatalog::builtin().unwrap();
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelId: gpt-5.6-terra
+defaultModelName: gpt-5.6-terra
 providers:
   relay:
     type: openai
@@ -548,7 +548,7 @@ models:
 
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelId: chat
+defaultModelName: chat
 providers:
   relay:
     type: newapi
@@ -590,7 +590,7 @@ fn profile_overrides_only_base_url_credentials_and_model_limits() {
     let catalog = ModelCatalog::builtin().unwrap();
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelId: custom-pro
+defaultModelName: custom-pro
 providers:
   deepseek:
     type: deepseek

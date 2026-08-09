@@ -194,7 +194,7 @@ channels:
     replayTurns: 5
     markdownFilter: true
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek
@@ -234,7 +234,7 @@ logging:
   level: debug
   retentionDays: 30
 model:
-  defaultModelId: chat
+  defaultModelName: chat
   providers:
     local:
       type: local
@@ -260,7 +260,7 @@ policyMode: confirm
 logging:
   retentionDays: 0
 model:
-  defaultModelId: chat
+  defaultModelName: chat
   providers:
     local:
       type: local
@@ -283,7 +283,7 @@ name: coder
 description: coding agent
 policyMode: confirm
 model:
-  defaultModelId: chat
+  defaultModelName: chat
   providers:
     local:
       type: local
@@ -304,7 +304,7 @@ description: coding agent
 policyMode: confirm
 maxModelSteps: {value}
 model:
-  defaultModelId: chat
+  defaultModelName: chat
   providers:
     local:
       type: local
@@ -329,7 +329,7 @@ description: coding agent
 policyMode: confirm
 maxModelSteps: {value}
 model:
-  defaultModelId: chat
+  defaultModelName: chat
   providers:
     local:
       type: local
@@ -353,7 +353,7 @@ description: coding agent
 policyMode: confirm
 tools: {}
 model:
-  defaultModelId: chat
+  defaultModelName: chat
   providers:
     local:
       type: local
@@ -376,7 +376,7 @@ name: coder
 description: coding agent
 policyMode: confirm
 model:
-  defaultModelId: chat
+  defaultModelName: chat
   providers:
     local:
       type: local
@@ -409,7 +409,7 @@ name: coder
 description: coding agent
 policyMode: confirm
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek
@@ -424,7 +424,7 @@ model:
         let loaded = load_profile(root.path()).unwrap();
         assert!(loaded.root.is_absolute());
         assert_eq!(loaded.config.name, "coder");
-        assert_eq!(loaded.models.default_model_id, "deepseek-v4-pro");
+        assert_eq!(loaded.models.default_model_name, "deepseek-v4-pro");
     }
 
     #[test]
@@ -463,7 +463,7 @@ name: coder
 description: coding agent
 policyMode: confirm
 model:
-  defaultModelId: custom
+  defaultModelName: custom
   providers:
     relay:
       type: newapi
@@ -477,7 +477,7 @@ model:
         .unwrap();
 
         let loaded = load_profile(root.path()).unwrap();
-        assert_eq!(loaded.models.default_model_id, "custom");
+        assert_eq!(loaded.models.default_model_name, "custom");
         assert!(loaded.models.models["custom"].capabilities.image_input);
         assert_eq!(
             loaded.models.providers["relay"].endpoint,
@@ -504,7 +504,7 @@ externalSkillsDirs:
   - C:/Users/example/shared-skills
   - team-skills
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek

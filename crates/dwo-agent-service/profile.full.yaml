@@ -136,7 +136,7 @@ automation:
 
 model:
   # Must match one models[*].modelName.
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
 
   # Provider instances select a catalog provider and provide credentials.
   # Transport policy, headers and request fields stay in the model catalog.

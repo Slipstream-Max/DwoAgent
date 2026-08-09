@@ -310,7 +310,7 @@ fn default_reasoning_mode() -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentModelConfig {
-    pub default_model_id: String,
+    pub default_model_name: String,
     pub providers: BTreeMap<String, AgentProviderConfig>,
     pub models: Vec<AgentModelEntry>,
 }
@@ -324,7 +324,7 @@ impl AgentModelConfig {
     }
 
     pub fn validate(&self) -> Result<(), ModelClientError> {
-        validate_identifier(&self.default_model_id, "defaultModelId")?;
+        validate_identifier(&self.default_model_name, "defaultModelName")?;
         if self.providers.is_empty() {
             return Err(ModelClientError::config(
                 "agent model providers must not be empty",
@@ -349,10 +349,10 @@ impl AgentModelConfig {
                 )));
             }
         }
-        if !aliases.contains(self.default_model_id.as_str()) {
+        if !aliases.contains(self.default_model_name.as_str()) {
             return Err(ModelClientError::config(format!(
-                "defaultModelId {} is not listed in models",
-                self.default_model_id
+                "defaultModelName {} is not listed in models",
+                self.default_model_name
             )));
         }
         Ok(())
@@ -425,7 +425,7 @@ impl AgentModelEntry {
 
 #[derive(Debug, Clone)]
 pub struct ModelClientConfig {
-    pub default_model_id: String,
+    pub default_model_name: String,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub models: IndexMap<String, ModelConfig>,
 }
@@ -499,7 +499,7 @@ impl ModelClientConfig {
         }
 
         Ok(Self {
-            default_model_id: agent.default_model_id.clone(),
+            default_model_name: agent.default_model_name.clone(),
             providers,
             models,
         })

@@ -16,7 +16,7 @@ logging:
   level: info
   retentionDays: 3
 model:
-  defaultModelId: test
+  defaultModelName: test
   providers:
     local:
       type: local

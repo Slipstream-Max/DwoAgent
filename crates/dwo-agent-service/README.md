@@ -22,7 +22,7 @@ name: coder
 description: coding agent
 policyMode: confirm
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek

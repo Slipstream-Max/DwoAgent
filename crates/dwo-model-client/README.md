@@ -48,7 +48,7 @@ parameters. The profile selects provider/model entries, supplies credentials,
 and may override a complete provider URL or model limits.
 
 ```yaml
-defaultModelId: deepseek-v4-pro
+defaultModelName: deepseek-v4-pro
 providers:
   deepseek:
     type: deepseek
@@ -79,7 +79,7 @@ The built-in `openai` preset uses the Responses transport. A NewAPI-compatible
 gateway can inherit it by overriding the complete endpoint:
 
 ```yaml
-defaultModelId: gpt-5.6-terra
+defaultModelName: gpt-5.6-terra
 providers:
   newapi:
     type: openai

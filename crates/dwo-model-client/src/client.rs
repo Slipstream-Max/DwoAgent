@@ -44,8 +44,8 @@ impl ConfiguredModelClient {
         )
     }
 
-    pub fn default_model_id(&self) -> &str {
-        &self.config.default_model_id
+    pub fn default_model_name(&self) -> &str {
+        &self.config.default_model_name
     }
 
     fn resolve(&self, alias: &str) -> Result<(&BaseClient, &crate::ModelConfig), ModelClientError> {

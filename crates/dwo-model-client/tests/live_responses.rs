@@ -36,7 +36,7 @@ async fn stream(
 async fn deepseek_responses_supports_hosted_search_and_local_function_round_trip() {
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelId: deepseek-v4-flash
+defaultModelName: deepseek-v4-flash
 providers:
   deepseek:
     type: deepseek
@@ -112,7 +112,7 @@ models:
 async fn newapi_responses_supports_hosted_web_search() {
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelId: gpt-5.6-sol
+defaultModelName: gpt-5.6-sol
 providers:
   newapi:
     type: openai

@@ -233,7 +233,7 @@ impl Host {
         tracing::info!(event = "mcp.synchronized", "MCP configuration synchronized");
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let source = std::fs::read_to_string(profile_root.join("profile.yaml"))?;
-        let default_model = profile.models.default_model_id.clone();
+        let default_model = profile.models.default_model_name.clone();
         let default_mode = profile.config.policy_mode;
         let default_max_model_steps = profile.config.max_model_steps;
         let profile_config = profile.config.clone();
@@ -470,7 +470,7 @@ impl Host {
                         profile.config.name.clone(),
                         profile.config.description.clone(),
                         profile.config.policy_mode,
-                        profile.config.model.default_model_id.clone(),
+                        profile.config.model.default_model_name.clone(),
                         profile.model_options.clone(),
                     )
                 };
@@ -1248,7 +1248,7 @@ impl Host {
     fn defaults(&self) -> (String, SessionMode, usize) {
         let profile = self.profile.read().expect("profile lock poisoned");
         (
-            profile.config.model.default_model_id.clone(),
+            profile.config.model.default_model_name.clone(),
             profile.config.policy_mode,
             profile.config.max_model_steps,
         )
@@ -1310,7 +1310,7 @@ impl Host {
                 default_reasoning: model.default_reasoning_mode.clone(),
             })
             .collect();
-        let default_model = loaded.models.default_model_id.clone();
+        let default_model = loaded.models.default_model_name.clone();
         let default_mode = loaded.config.policy_mode;
         let default_max_model_steps = loaded.config.max_model_steps;
 
@@ -1729,7 +1729,7 @@ mod tests {
         );
         assert_eq!(
             yaml_keys(&document["model"]),
-            ["defaultModelId", "models", "providers"]
+            ["defaultModelName", "models", "providers"]
         );
         assert_eq!(
             yaml_keys(&document["model"]["providers"]["deepseek"]),
@@ -1790,7 +1790,7 @@ mod tests {
 description: test agent
 policyMode: confirm
 model:
-  defaultModelId: deepseek-v4-pro
+  defaultModelName: deepseek-v4-pro
   providers:
     deepseek:
       type: deepseek
@@ -1893,7 +1893,7 @@ logging:
   level: debug
   retentionDays: 7
 model:
-  defaultModelId: backup
+  defaultModelName: backup
   providers:
     deepseek:
       type: deepseek

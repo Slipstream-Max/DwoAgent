@@ -9,12 +9,13 @@ Use `terminal` to inspect the workspace, run builds and tests, execute programs,
 
 # Parameters
 
-- `command`: Command to run in a new terminal, or input to send to the terminal identified by `terminal_id` (include a trailing newline). Omit to poll for new output.
-- `terminal_id`: ID of an existing terminal returned by a previous call. Omit to create a new terminal. An unknown ID is an error and is never recreated.
-- `kill`: Set `true` to terminate the terminal identified by `terminal_id`; trailing output is drained before returning.
-- `cwd`: Working directory for a new terminal. Relative paths are resolved from the session workspace. Ignored when `terminal_id` is given.
-- `yield_ms`: How long to wait for output before returning (ms). The command keeps running; a `running` result includes a `terminal_id` to continue. Default 60000.
-- `timeout_ms`: Total runtime limit for a new terminal (ms); reaching it terminates the process tree. Ignored when `terminal_id` is given. Default 600000.
+The terminal always uses the session workspace. There is no `cwd` parameter.
+
+- `command`: Command for a new terminal, or input for an existing `terminal_id` (include a trailing newline). Empty or omitted means poll when `terminal_id` is present.
+- `terminal_id`: Existing terminal ID. Empty or omitted means create a new terminal from `command`.
+- `kill`: `true` kills `terminal_id`; `false` means run, input, or poll.
+- `yield_ms`: Maximum wait for this call. Default 60000.
+- `timeout_ms`: Total lifetime of a new terminal. Default 600000; ignored for existing terminals.
 
 # Call Shapes
 
@@ -23,6 +24,8 @@ Use `terminal` to inspect the workspace, run builds and tests, execute programs,
 - `{"terminal_id": "term-1"}` — poll for incremental output.
 - `{"terminal_id": "term-1", "command": "ls\n"}` — send input to the existing terminal.
 - `{"terminal_id": "term-1", "kill": true}` — terminate the terminal.
+
+When the endpoint supports sparse arguments, send only fields used by the selected shape: never send an empty `terminal_id`, `kill: false`, or unchanged defaults. Some endpoints fill every schema field; those completed values are accepted, but `cwd` must never be sent because it is not part of the schema.
 
 # Results
 
@@ -36,7 +39,7 @@ Results include only output not already returned to the model. `exit_code` is pr
 # Notes
 
 - Different terminals run concurrently. Calls targeting the same `terminal_id` are serialized.
-- A directory change inside one command does not affect later new-terminal calls. Use `cwd` for a stable working directory.
+- A directory change inside one command does not affect later new-terminal calls. Every new terminal starts in the session workspace.
 - Every terminal accepts input (PTY). Commands that wait on stdin (like `cat` or `read`) hang until you send input or `kill` them.
 - Keep `yield_ms` short enough to stay responsive. Continue a running process by polling its `terminal_id` rather than starting the same command again.
 - Output is decoded as lossy UTF-8 at the model boundary. Large unread output is capped with its beginning and end preserved.

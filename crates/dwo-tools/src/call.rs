@@ -43,7 +43,6 @@ pub struct ReadFileArgs {
 pub enum TerminalArgs {
     Run {
         command: String,
-        cwd: Option<PathBuf>,
         yield_ms: u64,
         timeout_ms: u64,
     },
@@ -209,7 +208,6 @@ fn parse_terminal(args: &Map<String, Value>) -> Result<TerminalArgs, String> {
     }
     Ok(TerminalArgs::Run {
         command,
-        cwd: optional_string(args, "cwd")?.map(PathBuf::from),
         yield_ms: duration_field(args, "yield_ms", DEFAULT_YIELD_MS)?,
         timeout_ms: duration_field(args, "timeout_ms", DEFAULT_TIMEOUT_MS)?,
     })
@@ -356,6 +354,26 @@ mod tests {
             "id": "call-1",
             "name": "terminal",
             "arguments": {"terminal_id":"", "command":"rg foo"},
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed.call,
+            ToolCall::Terminal(TerminalArgs::Run { .. })
+        ));
+    }
+
+    #[test]
+    fn endpoint_completed_run_arguments_create_a_new_terminal() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id": "call-1",
+            "name": "terminal",
+            "arguments": {
+                "command": "rg foo",
+                "terminal_id": "",
+                "kill": false,
+                "yield_ms": 60000,
+                "timeout_ms": 600000
+            },
         }))
         .unwrap();
         assert!(matches!(

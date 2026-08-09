@@ -72,7 +72,7 @@ pub fn terminal_schema() -> Value {
         "type": "function",
         "function": {
             "name": "terminal",
-            "description": "Run a command in a new terminal, interact with or poll an existing terminal, or kill one. Every terminal is interactive. Without terminal_id a new terminal is created and command is executed; with terminal_id the command (include a trailing newline) is sent as input to that terminal, or omitted to poll for new output; kill true terminates the terminal.",
+            "description": "Run, input, poll, or kill a terminal. New: command plus optional yield_ms/timeout_ms, with terminal_id omitted or empty. Input: terminal_id plus command and optional yield_ms. Poll: terminal_id plus optional yield_ms, with command omitted or empty. Kill: terminal_id plus kill=true. The terminal always uses the session workspace; cwd is not a parameter.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -87,11 +87,7 @@ pub fn terminal_schema() -> Value {
                     "kill": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Set true to terminate the terminal identified by terminal_id. Trailing output is drained before returning."
-                    },
-                    "cwd": {
-                        "type": "string",
-                        "description": "Working directory for the new terminal. Relative paths are resolved from the session workspace. Ignored when terminal_id is provided."
+                        "description": "True kills terminal_id. False selects run, input, or poll according to terminal_id and command."
                     },
                     "yield_ms": {
                         "type": "integer",
@@ -153,6 +149,16 @@ mod tests {
     fn handoff_schema_requires_handoff_text() {
         let parameters = &handoff_schema()["function"]["parameters"];
         assert_eq!(parameters["required"], json!(["handoff_text"]));
+        assert_eq!(parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn terminal_schema_has_no_cwd_and_describes_complete_endpoint_defaults() {
+        let parameters = &terminal_schema()["function"]["parameters"];
+        assert!(parameters["properties"].get("cwd").is_none());
+        assert_eq!(parameters["properties"]["kill"]["default"], false);
+        assert_eq!(parameters["properties"]["yield_ms"]["default"], 60_000);
+        assert_eq!(parameters["properties"]["timeout_ms"]["default"], 600_000);
         assert_eq!(parameters["additionalProperties"], false);
     }
 }

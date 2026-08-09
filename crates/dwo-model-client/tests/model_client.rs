@@ -480,10 +480,11 @@ fn builtin_openai_provider_exposes_verified_model_capabilities() {
     }
 
     for id in ["gpt-5.6-sol", "gpt-5.6-terra"] {
-        assert_eq!(
-            openai.models[id].reasoning["max"]["reasoning"]["effort"],
-            "max"
-        );
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let reasoning = &openai.models[id].reasoning[effort]["reasoning"];
+            assert_eq!(reasoning["effort"], effort, "{id}/{effort}");
+            assert_eq!(reasoning["summary"], "auto", "{id}/{effort}");
+        }
     }
     for id in ["gpt-5.5", "gpt-5.4"] {
         assert!(!openai.models[id].reasoning.contains_key("max"), "{id}");

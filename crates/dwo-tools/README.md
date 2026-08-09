@@ -56,6 +56,8 @@ no required field:
 - `terminal_id` without `command`: event-driven poll for incremental output.
 - `terminal_id` with `kill: true`: terminates the process tree and drains
   trailing output before returning.
+- New terminals always start in the session workspace. Terminal tool input has
+  no `cwd` field.
 - `timeout_ms` bounds a new terminal's total runtime (default 10 min);
   `yield_ms` bounds each wait for output (default 60 s). Unknown `terminal_id`
   values are reported as errors and never recreated.

@@ -53,14 +53,12 @@ pub(crate) async fn execute(
     let output = match call.call {
         ToolCall::Terminal(TerminalArgs::Run {
             command,
-            cwd,
             yield_ms,
             timeout_ms,
         }) => manager
             .terminals
             .run_with_events(
                 command,
-                cwd.as_deref(),
                 yield_ms,
                 timeout_ms,
                 Some(TerminalTelemetry::new(id.clone(), context.events.clone())),

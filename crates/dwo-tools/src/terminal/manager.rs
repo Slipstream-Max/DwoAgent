@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use serde::{Serialize, Serializer};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -120,18 +120,16 @@ impl TerminalManager {
     pub async fn run(
         &self,
         command: String,
-        cwd: Option<&Path>,
         yield_ms: u64,
         timeout_ms: u64,
     ) -> Result<TerminalSnapshot> {
-        self.run_with_events(command, cwd, yield_ms, timeout_ms, None)
+        self.run_with_events(command, yield_ms, timeout_ms, None)
             .await
     }
 
     pub(crate) async fn run_with_events(
         &self,
         command: String,
-        cwd: Option<&Path>,
         yield_ms: u64,
         timeout_ms: u64,
         telemetry: Option<TerminalTelemetry>,
@@ -139,7 +137,7 @@ impl TerminalManager {
         let (tool_call_id, events) = telemetry
             .map(|telemetry| (telemetry.tool_call_id, telemetry.events))
             .unwrap_or_default();
-        let cwd = resolve_cwd(&self.base_cwd, cwd)?;
+        let cwd = self.base_cwd.clone();
         let terminal_id = TerminalId::new();
         let session = TerminalSession::spawn(
             terminal_id.clone(),
@@ -307,24 +305,6 @@ fn render_snapshot(session: &TerminalSession, snapshot: SessionSnapshot) -> Term
     }
 }
 
-fn resolve_cwd(base: &Path, requested: Option<&Path>) -> Result<PathBuf> {
-    let cwd = requested
-        .map(|path| {
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                base.join(path)
-            }
-        })
-        .unwrap_or_else(|| base.to_path_buf());
-    let cwd = dunce::canonicalize(&cwd)
-        .with_context(|| format!("resolve terminal cwd {}", cwd.display()))?;
-    if !cwd.is_dir() {
-        bail!("terminal cwd is not a directory: {}", cwd.display());
-    }
-    Ok(cwd)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
@@ -344,7 +324,7 @@ mod tests {
     async fn run_returns_output_and_status() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
-            .run(output_command().to_string(), None, 5_000, 120_000)
+            .run(output_command().to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -360,7 +340,7 @@ mod tests {
             "printf 'tail-without-newline'"
         };
         let snapshot = manager
-            .run(command.to_string(), None, 5_000, 120_000)
+            .run(command.to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -376,7 +356,7 @@ mod tests {
             "head -c 1200000 /dev/zero | tr '\\0' x; printf 'END-MARKER'"
         };
         let snapshot = manager
-            .run(command.to_string(), None, 15_000, 120_000)
+            .run(command.to_string(), 15_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -396,7 +376,6 @@ mod tests {
         manager
             .run_with_events(
                 output_command().to_string(),
-                None,
                 5_000,
                 120_000,
                 Some(TerminalTelemetry::new("call-1".to_string(), Some(events))),
@@ -453,7 +432,7 @@ mod tests {
             "printf 'first\\n'; sleep 1.5; printf 'second\\n'"
         };
         let first = manager
-            .run(command.to_string(), None, 5_000, 120_000)
+            .run(command.to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert!(first.output.contains("first"));
@@ -470,10 +449,7 @@ mod tests {
         } else {
             "sh -i"
         };
-        let started = manager
-            .run(command.to_string(), None, 500, 10_000)
-            .await
-            .unwrap();
+        let started = manager.run(command.to_string(), 500, 10_000).await.unwrap();
         assert_eq!(
             started.status, "running",
             "exit={:?}, output={}",
@@ -514,7 +490,7 @@ mod tests {
             "printf 'before-kill\\n'; sleep 30"
         };
         let started = manager
-            .run(command.to_string(), None, 5_000, 120_000)
+            .run(command.to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert!(started.output.contains("before-kill"));
@@ -531,7 +507,7 @@ mod tests {
             "sleep 0.5; printf 'later\\n'"
         };
         let started = manager
-            .run(command.to_string(), None, 100, 120_000)
+            .run(command.to_string(), 100, 120_000)
             .await
             .unwrap();
         let _ = manager.list().await;

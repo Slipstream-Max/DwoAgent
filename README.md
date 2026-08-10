@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="赤铎 Dwo Agent" width="760">
+  <img src="assets/welcome.svg" alt="赤铎 Dwo Agent">
 </p>
-
-<h1 align="center">赤铎 · Dwo Agent</h1>
 
 <p align="center">
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&amp;logo=rust&amp;logoColor=white" alt="Rust"></a>

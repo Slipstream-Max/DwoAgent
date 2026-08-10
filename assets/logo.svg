@@ -1,59 +1,83 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="260" viewBox="0 0 960 260" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
   <title id="title">赤铎 Dwo Agent</title>
-  <desc id="desc">A Chinese bronze bell in front of a rust-red industrial gear beside the ChiDuo wordmark.</desc>
-  <rect width="960" height="260" fill="#f3ead7"/>
+  <desc id="desc">A dark steel Chinese bell in front of a rust-red industrial gear.</desc>
   <defs>
-    <path id="gear-tooth" d="M102 31l2-15 3-4h6l3 4 2 15z"/>
+    <linearGradient id="gear" x1="220" y1="512" x2="804" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ad472c"/>
+      <stop offset="0.46" stop-color="#a34229"/>
+      <stop offset="0.56" stop-color="#9d3d25"/>
+      <stop offset="1" stop-color="#8f351f"/>
+    </linearGradient>
+    <linearGradient id="bell" x1="300" y1="510" x2="725" y2="510" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#596173"/>
+      <stop offset="0.46" stop-color="#505a6b"/>
+      <stop offset="0.56" stop-color="#46515f"/>
+      <stop offset="1" stop-color="#3f4a55"/>
+    </linearGradient>
+    <linearGradient id="bow" x1="372" y1="576" x2="651" y2="576" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#aeb7bc"/>
+      <stop offset="0.5" stop-color="#abb8be"/>
+      <stop offset="1" stop-color="#b2b9c1"/>
+    </linearGradient>
+    <radialGradient id="rivet" cx="38%" cy="32%" r="68%">
+      <stop offset="0" stop-color="#e4ae58"/>
+      <stop offset="0.72" stop-color="#dca451"/>
+      <stop offset="1" stop-color="#c88a3d"/>
+    </radialGradient>
+    <filter id="gear-shadow" x="-8%" y="-8%" width="116%" height="118%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#6b2419" flood-opacity="0.28"/>
+    </filter>
+    <filter id="bell-shadow" x="-6%" y="-6%" width="112%" height="114%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#202936" flood-opacity="0.34"/>
+    </filter>
+    <filter id="rivet-shadow" x="-35%" y="-35%" width="170%" height="180%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="1" stdDeviation="1.2" flood-color="#5a3d24" flood-opacity="0.38"/>
+    </filter>
+    <clipPath id="gear-crop">
+      <rect width="1024" height="670"/>
+    </clipPath>
+    <path id="tooth" d="M498 220c-5 0-8 3-10 9l-10 37c-1 5-5 8-10 9l-18 5h124l-18-5c-5-1-9-4-10-9l-10-37c-2-6-5-9-10-9z"/>
+    <clipPath id="gear-teeth" clipPathUnits="userSpaceOnUse">
+      <use href="#tooth"/>
+      <use href="#tooth" transform="rotate(24 512 512)"/>
+      <use href="#tooth" transform="rotate(48 512 512)"/>
+      <use href="#tooth" transform="rotate(72 512 512)"/>
+      <use href="#tooth" transform="rotate(96 512 512)"/>
+      <use href="#tooth" transform="rotate(120 512 512)"/>
+      <use href="#tooth" transform="rotate(240 512 512)"/>
+      <use href="#tooth" transform="rotate(264 512 512)"/>
+      <use href="#tooth" transform="rotate(288 512 512)"/>
+      <use href="#tooth" transform="rotate(312 512 512)"/>
+      <use href="#tooth" transform="rotate(336 512 512)"/>
+    </clipPath>
+    <path id="bell-shape" d="M485 312h54c15 0 24 10 24 26v73h32c34 0 55 16 64 48l66 333c3 14-5 18-15 10-57-32-126-50-198-50s-141 18-198 50c-10 8-18 4-15-10l70-333c7-31 29-48 62-48h30v-73c0-16 9-26 24-26z"/>
   </defs>
-  <g transform="translate(48 28)">
-    <g fill="#9f4636">
-      <circle cx="110" cy="100" r="75"/>
-      <use href="#gear-tooth"/>
-      <use href="#gear-tooth" transform="rotate(15 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(30 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(45 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(60 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(75 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(90 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(105 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(120 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(135 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(150 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(165 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(180 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(195 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(210 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(225 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(240 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(255 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(270 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(285 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(300 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(315 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(330 110 100)"/>
-      <use href="#gear-tooth" transform="rotate(345 110 100)"/>
+
+  <rect width="1024" height="1024" fill="#fff"/>
+
+  <g filter="url(#gear-shadow)">
+    <g clip-path="url(#gear-teeth)">
+      <rect width="1024" height="1024" fill="url(#gear)"/>
     </g>
-    <circle cx="110" cy="100" r="63" fill="#f3ead7"/>
-    <path d="M94 24h32v39H94z" fill="#59645d" stroke="#202326" stroke-width="7" stroke-linejoin="round"/>
-    <path d="M72 61c-9 2-14 9-15 20L45 181c20-13 42-20 65-20s45 7 65 20L163 81c-1-11-6-18-15-20z" fill="#69746b" stroke="#202326" stroke-width="8" stroke-linejoin="round"/>
-    <path d="M80 72c-6 20-10 47-12 80M140 72c6 20 10 47 12 80" fill="none" stroke="#8d978e" stroke-width="7" stroke-linecap="round" opacity=".82"/>
-    <g fill="#d8a538">
-      <circle cx="78" cy="80" r="3"/>
-      <circle cx="142" cy="80" r="3"/>
-      <circle cx="75" cy="94" r="3"/>
-      <circle cx="145" cy="94" r="3"/>
-      <circle cx="69" cy="128" r="3"/>
-      <circle cx="151" cy="128" r="3"/>
-      <circle cx="68" cy="143" r="3"/>
-      <circle cx="152" cy="143" r="3"/>
-    </g>
-    <path d="M62 111c30 8 66 8 96 0" fill="none" stroke="#b4bab3" stroke-width="8" stroke-linecap="round"/>
-    <path d="M54 160c19-7 38-11 56-11s37 4 56 11" fill="none" stroke="#303632" stroke-width="6" stroke-linecap="round" opacity=".78"/>
+    <path d="M512 274a238 238 0 1 1 0 476 238 238 0 1 1 0-476zm0 27a211 211 0 1 0 0 422 211 211 0 1 0 0-422z" fill="url(#gear)" fill-rule="evenodd" clip-path="url(#gear-crop)"/>
+    <circle cx="512" cy="512" r="194" fill="none" stroke="url(#gear)" stroke-width="11"/>
   </g>
-  <g fill="#202326">
-    <text x="270" y="132" font-family="Noto Serif SC, Source Han Serif SC, Microsoft YaHei, serif" font-size="88" font-weight="700">赤铎</text>
-    <text x="274" y="186" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="650" letter-spacing="6">DWO AGENT</text>
+
+  <use href="#bell-shape" fill="#fff" stroke="#fff" stroke-width="20" stroke-linejoin="round"/>
+  <use href="#bell-shape" fill="url(#bell)" filter="url(#bell-shadow)"/>
+
+  <path d="M382 576c84 24 176 24 260 0" fill="none" stroke="url(#bow)" stroke-width="19" stroke-linecap="round"/>
+
+  <g fill="url(#rivet)" filter="url(#rivet-shadow)">
+    <circle cx="422" cy="477" r="10.8"/>
+    <circle cx="602" cy="477" r="10.8"/>
+    <circle cx="413" cy="527" r="10.8"/>
+    <circle cx="611" cy="527" r="10.8"/>
+    <circle cx="394" cy="633" r="10.6"/>
+    <circle cx="630" cy="633" r="10.6"/>
+    <circle cx="385" cy="685" r="10.6"/>
+    <circle cx="639" cy="685" r="10.6"/>
   </g>
-  <rect x="274" y="207" width="370" height="8" rx="4" fill="#9f4636"/>
-  <circle cx="664" cy="211" r="4" fill="#d7a43b"/>
+
+  <path d="M306 800c55-45 126-69 206-69s151 24 206 69c-61-37-130-61-206-61s-145 24-206 61z" fill="#fff"/>
 </svg>

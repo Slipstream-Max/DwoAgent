@@ -8,7 +8,7 @@ models:
       imageInput: true
       toolCalls: true
     hostedTools:
-      - type: web_search_preview
+      - type: web_search
     defaultReasoningMode: medium
     reasoning:
       low:
@@ -38,7 +38,7 @@ models:
       imageInput: true
       toolCalls: true
     hostedTools:
-      - type: web_search_preview
+      - type: web_search
     defaultReasoningMode: medium
     reasoning:
       low:
@@ -68,7 +68,7 @@ models:
       imageInput: true
       toolCalls: true
     hostedTools:
-      - type: web_search_preview
+      - type: web_search
     defaultReasoningMode: medium
     reasoning:
       low:
@@ -90,7 +90,7 @@ models:
       imageInput: true
       toolCalls: true
     hostedTools:
-      - type: web_search_preview
+      - type: web_search
     defaultReasoningMode: medium
     reasoning:
       low:

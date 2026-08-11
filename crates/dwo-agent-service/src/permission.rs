@@ -48,7 +48,7 @@ impl PermissionRequester {
                 }
 
                 let permission = PendingPermission {
-                    request_id: format!("permission-{}", Uuid::new_v4()),
+                    request_id: format!("permission-{}", &Uuid::new_v4().simple().to_string()[..8]),
                     tool_call_id: request.tool_call_id,
                     tool_name: request.tool_name,
                 };

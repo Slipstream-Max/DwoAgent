@@ -23,7 +23,10 @@ pub struct TerminalId(String);
 
 impl TerminalId {
     pub fn new() -> Self {
-        Self(format!("term-{}", Uuid::new_v4()))
+        // Short id: "term-" + first 8 hex chars of a uuid v4. Collision-safe
+        // enough for the bounded terminal map (TERMINAL_CAP = 64).
+        let short = Uuid::new_v4().simple().to_string();
+        Self(format!("term-{}", &short[..8]))
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {

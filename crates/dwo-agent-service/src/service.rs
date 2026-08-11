@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use dwo_context::{CompactionView, ContextManager, ContextMessage, SystemPromptBuilder};
+use dwo_context::{
+    CompactionView, ContextManager, ContextMessage, PromptBuildError, SkillSnapshot,
+    SystemPromptBuilder,
+};
 use dwo_model_client::{
     ConfiguredModelClient, ModelClient, ModelClientConfig, ModelClientError, ModelLimits,
     ModelReply, ModelSelection, ModelStreamEvent, SummaryReply,
@@ -195,6 +198,10 @@ impl AgentService {
             .external_skill_dirs
             .write()
             .expect("external skill dirs lock poisoned") = dirs;
+    }
+
+    pub fn skill_snapshots(&self, cwd: &Path) -> Result<Vec<SkillSnapshot>, PromptBuildError> {
+        self.prompt_builder(cwd.to_path_buf()).scan_skills()
     }
 
     pub fn replace_models(&self, config: ModelClientConfig) -> Result<(), AgentServiceError> {

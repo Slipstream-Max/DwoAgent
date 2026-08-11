@@ -17,6 +17,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::host::Host;
+#[cfg(test)]
+use crate::slash_commands::render_command_help;
+use crate::slash_commands::{parse_command, routes_to_channel_command};
 
 use super::ChannelKind;
 use super::attachments::{
@@ -24,9 +27,6 @@ use super::attachments::{
     unique_attachment_path,
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
-use super::command::parse_command;
-#[cfg(test)]
-use super::command::render_command_help;
 use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
     ChannelStarter, PreparedChannel,
@@ -307,7 +307,7 @@ async fn process_bound_message(
     if incoming
         .text
         .as_deref()
-        .is_some_and(|text| text.starts_with('/'))
+        .is_some_and(routes_to_channel_command)
         && incoming.media.is_none()
     {
         return ingress

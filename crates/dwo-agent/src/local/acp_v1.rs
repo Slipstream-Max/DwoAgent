@@ -127,7 +127,7 @@ where
                     if let Some((used, size)) = snapshot_usage(&value) {
                         send_usage_update(&connection, id, used, size);
                     }
-                    send_available_commands(&connection, id);
+                    send_available_commands(&new_runtime.config_path, &connection, id).await;
                 }
                 result
             },
@@ -356,7 +356,7 @@ async fn run_load(
             tracing::warn!(error = %format!("{error:#}"), "activate ACP v1 load observer failed");
             return;
         }
-        send_available_commands(&connection, &session_id);
+        send_available_commands(&runtime.config_path, &connection, &session_id).await;
     }
 }
 
@@ -400,7 +400,7 @@ async fn run_resume(
             .await
             .is_ok()
     {
-        send_available_commands(&connection, &session_id);
+        send_available_commands(&runtime.config_path, &connection, &session_id).await;
     }
 }
 

@@ -38,6 +38,21 @@ pub(crate) struct SessionSnapshot {
     pub(crate) record: SessionRecord,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptDirectiveOptions {
+    #[serde(default)]
+    pub(crate) skills: Vec<PromptDirectiveOption>,
+    #[serde(default)]
+    pub(crate) mcp_servers: Vec<PromptDirectiveOption>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PromptDirectiveOption {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionOptions {

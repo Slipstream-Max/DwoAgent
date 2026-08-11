@@ -185,6 +185,16 @@ const ws = new WebSocket(
 | `/policy [full_access\|confirm\|watch]` | 不带参数查看 policy，带参数修改 |
 | `/allow [ID]` | 允许当前 pending permission，或指定 request ID |
 | `/deny [ID]` | 拒绝当前 pending permission，或指定 request ID |
+| `/skill <NAME> [PROMPT]` | 要求 Agent 使用当前 session 可用的指定 skill |
+| `/mcp <NAME> [PROMPT]` | 要求 Agent 使用已配置的指定 MCP server |
+
+`/skill` 和 `/mcp` 是进入模型的 prompt directive，不是本地 session 控制命令。它们可以出现在正文任意位置，同一条消息可以重复或混合使用，例如：
+
+```text
+先 /skill review 检查改动，再 /mcp github 创建 issue，最后 /skill summarize
+```
+
+daemon 只替换名称与当前有效 catalog 精确匹配的 directive：skill 使用 profile、`externalSkillsDirs` 和 `<session-cwd>/.agents/skills/` 合并后的结果，MCP 使用当前 daemon catalog。匹配成功后会插入带名称和路径或 MCP 搜索要求的 XML block，提示 Agent 先用 `read_file` 读取 `SKILL.md`，或先在终端运行 `dwo mcp search`。未知名称、单独的 `/skill`、`/skill `、`/mcp` 和 `/mcp ` 都保持原文并作为普通 prompt 透传，不产生额外提示。
 
 带空格的工作目录需要引号：
 

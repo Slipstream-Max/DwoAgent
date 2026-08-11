@@ -26,6 +26,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::host::Host;
+use crate::slash_commands::{parse_command, routes_to_channel_command};
 
 use super::ChannelKind;
 use super::attachments::{
@@ -33,7 +34,6 @@ use super::attachments::{
     unique_attachment_path,
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
-use super::command::parse_command;
 use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
     ChannelStarter, PreparedChannel,
@@ -408,7 +408,7 @@ impl EventHandler for QqHandler {
         };
         self.conversation.begin_reply(message_id).await;
 
-        if text.starts_with('/') {
+        if routes_to_channel_command(text) {
             let result = match parse_command(text) {
                 Ok(command) => self.ingress.execute(command).await,
                 Err(error) => Err(error),

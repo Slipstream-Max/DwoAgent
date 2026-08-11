@@ -18,6 +18,9 @@ use crate::automation::{
     AutomationConfig, AutomationJob, AutomationRuntime, parse_config as parse_automation_config,
 };
 use crate::channels::{ChannelGateway, ChannelKind, ChannelManager, ChannelPollParams};
+use crate::slash_commands::{
+    AvailableSkill, DirectiveKinds, directive_kinds, expand as expand_prompt_directives,
+};
 
 pub struct Host {
     service: Arc<AgentService>,
@@ -371,12 +374,81 @@ impl Host {
         endpoint: EndpointId,
         content: MessageContent,
     ) -> Result<PromptAccepted> {
-        Ok(self
+        let agent = self.service.load(id).await?;
+        let snapshot = agent.snapshot().await?;
+        let content = self
+            .expand_prompt_directives(&snapshot.record.info.cwd, content)
+            .await?;
+        Ok(agent.prompt_content(endpoint, content).await?)
+    }
+
+    async fn expand_prompt_directives(
+        &self,
+        cwd: &Path,
+        content: MessageContent,
+    ) -> Result<MessageContent> {
+        let kinds: DirectiveKinds = directive_kinds(&content);
+        if kinds.is_empty() {
+            return Ok(content);
+        }
+        let skills = if kinds.skill {
+            self.service
+                .skill_snapshots(cwd)?
+                .into_iter()
+                .map(|skill| AvailableSkill {
+                    name: skill.name,
+                    path: skill.path,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mcp_servers = if kinds.mcp {
+            self.mcp
+                .catalog_snapshot()
+                .await?
+                .servers
+                .into_iter()
+                .map(|server| server.name)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(expand_prompt_directives(content, &skills, &mcp_servers))
+    }
+
+    async fn prompt_directive_options(&self, id: &SessionId) -> Result<Value> {
+        let snapshot = self.session_snapshot(id).await?;
+        let skills = self
             .service
-            .load(id)
+            .skill_snapshots(&snapshot.record.info.cwd)?
+            .into_iter()
+            .filter(|skill| !skill.name.chars().any(char::is_whitespace))
+            .map(|skill| {
+                json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mcp_servers = self
+            .mcp
+            .catalog_snapshot()
             .await?
-            .prompt_content(endpoint, content)
-            .await?)
+            .servers
+            .into_iter()
+            .filter(|server| !server.name.chars().any(char::is_whitespace))
+            .map(|server| {
+                json!({
+                    "name": server.name,
+                    "description": server.description,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "skills": skills,
+            "mcpServers": mcp_servers,
+        }))
     }
 
     pub async fn compact_session(
@@ -506,6 +578,10 @@ impl Host {
                 let id = parse_session(params)?;
                 Ok(serde_json::to_value(self.session_snapshot(&id).await?)?)
             }
+            "session.prompt-directives" => {
+                let id = parse_session(params)?;
+                self.prompt_directive_options(&id).await
+            }
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
                 let snapshot = self.setup_session(params.title, params.cwd).await?;
@@ -540,10 +616,15 @@ impl Host {
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
                 let (agent, parent_id) = self.resolve_prompt_session(&params, caller).await?;
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
-                let subscription = agent.attach(EndpointId::new()).await?;
-                let accepted = agent
-                    .prompt_content(endpoint, params.message.into_content())
+                let snapshot = agent.snapshot().await?;
+                let content = self
+                    .expand_prompt_directives(
+                        &snapshot.record.info.cwd,
+                        params.message.into_content(),
+                    )
                     .await?;
+                let subscription = agent.attach(EndpointId::new()).await?;
+                let accepted = agent.prompt_content(endpoint, content).await?;
                 if let Some(parent_id) = parent_id {
                     self.spawn_result_delivery(
                         subscription,
@@ -1803,6 +1884,53 @@ model:
         )
         .unwrap();
         config
+    }
+
+    #[tokio::test]
+    async fn prompt_directives_use_the_effective_session_skill_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        let profile_skill = root.path().join("resource/skills/shared");
+        std::fs::create_dir_all(&profile_skill).unwrap();
+        std::fs::write(
+            profile_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: profile version\n---\nProfile instructions",
+        )
+        .unwrap();
+        let project = root.path().join("project");
+        let project_skill = project.join(".agents/skills/shared");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::write(
+            project_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: project version\n---\nProject instructions",
+        )
+        .unwrap();
+
+        let host = Host::load(&config).await.unwrap();
+        let expanded = host
+            .expand_prompt_directives(
+                &project,
+                MessageContent::text(
+                    "use /skill shared now; keep /skill missing and bare /mcp unchanged",
+                ),
+            )
+            .await
+            .unwrap();
+        let text = expanded.as_text().unwrap();
+        let expected_path = std::fs::canonicalize(project_skill.join("SKILL.md")).unwrap();
+        assert!(text.contains(&expected_path.display().to_string()));
+        assert!(!text.contains(&profile_skill.display().to_string()));
+        assert!(text.contains("/skill missing"));
+        assert!(text.contains("bare /mcp unchanged"));
+
+        let session = host.setup_session(None, Some(project)).await.unwrap();
+        let options = host
+            .prompt_directive_options(&session.record.info.id)
+            .await
+            .unwrap();
+        assert_eq!(options["skills"][0]["name"], "shared");
+        assert_eq!(options["skills"][0]["description"], "project version");
+        host.shutdown().await;
     }
 
     #[tokio::test]

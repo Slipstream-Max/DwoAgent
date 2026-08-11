@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::v1;
 use agent_client_protocol::schema::v2::{
-    AgentCapabilities, AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate,
-    CancelSessionNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
-    Content as ToolContent, ContentBlock, ContentChunk, DeleteSessionRequest,
+    AgentCapabilities, AgentMessage, AgentThought, AvailableCommand, AvailableCommandInput,
+    AvailableCommandsUpdate, CancelSessionNotification, CloseSessionRequest, CloseSessionResponse,
+    ConfigOptionUpdate, Content as ToolContent, ContentBlock, ContentChunk, DeleteSessionRequest,
     DeleteSessionResponse, Diff, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
     IdleStateUpdate, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
     ListSessionsResponse, NewSessionRequest, NewSessionResponse, OtherSessionUpdate,
@@ -23,8 +23,8 @@ use agent_client_protocol::schema::v2::{
     SessionDeleteCapabilities, SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StateUpdate,
     StopReason, Terminal, TerminalExitStatus, TerminalOutput, TerminalOutputChunk, TerminalUpdate,
-    TextContent, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
+    TextCommandInput, TextContent, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
+    ToolCallUpdate, ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Error as AcpError, Responder,
@@ -42,6 +42,10 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use crate::slash_commands::{
+    SessionCommand as SlashCommand, parse_session_command as parse_slash_command,
+};
 
 use super::ipc;
 use super::ipc_schema::{self, SessionOptions};
@@ -351,7 +355,7 @@ where
                                 if let Some((used, size)) = snapshot_usage(&value) {
                                     send_usage_update(&connection, id, used, size);
                                 }
-                                send_available_commands(&connection, id);
+                                send_available_commands(&new_config, &connection, id).await;
                                 result
                             }
                             Err(error) => responder.respond_with_error(internal_error(error)),
@@ -445,7 +449,12 @@ where
                                             prepared,
                                         )
                                         .await?;
-                                        send_available_commands(&connection, &session_id);
+                                        send_available_commands(
+                                            &runtime.config_path,
+                                            &connection,
+                                            &session_id,
+                                        )
+                                        .await;
                                     }
                                     result
                                 }
@@ -703,43 +712,6 @@ async fn run_prompt(
         Err(error) => {
             let _ = responder.respond_with_error(internal_error(error));
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SlashCommand {
-    Compact,
-    Resume,
-    Fork,
-    Status,
-}
-
-fn parse_slash_command(content: &MessageContent) -> Result<Option<SlashCommand>> {
-    let Some(text) = content.as_text() else {
-        return Ok(None);
-    };
-    let mut parts = text.split_whitespace();
-    let Some(name) = parts.next() else {
-        return Ok(None);
-    };
-    match name {
-        "/compact" => {
-            anyhow::ensure!(parts.next().is_none(), "/compact does not accept input");
-            Ok(Some(SlashCommand::Compact))
-        }
-        "/resume" => {
-            anyhow::ensure!(parts.next().is_none(), "/resume does not accept input");
-            Ok(Some(SlashCommand::Resume))
-        }
-        "/fork" => {
-            anyhow::ensure!(parts.next().is_none(), "/fork does not accept input");
-            Ok(Some(SlashCommand::Fork))
-        }
-        "/status" => {
-            anyhow::ensure!(parts.next().is_none(), "/status does not accept input");
-            Ok(Some(SlashCommand::Status))
-        }
-        _ => Ok(None),
     }
 }
 
@@ -1298,16 +1270,36 @@ fn send_update(cx: &AcpConnection, session_id: &str, update: SessionUpdate) {
     }
 }
 
-fn send_available_commands(cx: &AcpConnection, session_id: &str) {
+async fn send_available_commands(config_path: &Path, cx: &AcpConnection, session_id: &str) {
+    let options = match ipc::request(
+        config_path,
+        "session.prompt-directives",
+        json!({"session_id": session_id}),
+    )
+    .await
+    {
+        Ok(value) => serde_json::from_value(value).unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(
+                event = "acp.prompt_directives_failed",
+                session_id,
+                error = %format!("{error:#}"),
+                "load ACP prompt directive completions failed"
+            );
+            ipc_schema::PromptDirectiveOptions::default()
+        }
+    };
     send_update(
         cx,
         session_id,
-        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands())),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(available_commands(
+            options,
+        ))),
     );
 }
 
-fn available_commands() -> Vec<AvailableCommand> {
-    vec![
+fn available_commands(options: ipc_schema::PromptDirectiveOptions) -> Vec<AvailableCommand> {
+    let mut commands = vec![
         AvailableCommand::new("compact", "Compact the current session context"),
         AvailableCommand::new("resume", "Continue the current session when it is idle"),
         AvailableCommand::new("fork", "Copy the current session into a new session"),
@@ -1315,7 +1307,28 @@ fn available_commands() -> Vec<AvailableCommand> {
             "status",
             "Show the current session ID, model, and reasoning",
         ),
-    ]
+    ];
+    // ACP has free-text command input but no schema for completing individual arguments.
+    // Publishing the directive and name together lets clients complete `/skill review `.
+    commands.extend(options.skills.into_iter().map(|skill| {
+        let description = skill
+            .description
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or_else(|| format!("Use the {} skill", skill.name));
+        AvailableCommand::new(format!("skill {}", skill.name), description).input(
+            AvailableCommandInput::Text(TextCommandInput::new("optional prompt")),
+        )
+    }));
+    commands.extend(options.mcp_servers.into_iter().map(|server| {
+        let description = server
+            .description
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or_else(|| format!("Use the {} MCP server", server.name));
+        AvailableCommand::new(format!("mcp {}", server.name), description).input(
+            AvailableCommandInput::Text(TextCommandInput::new("optional prompt")),
+        )
+    }));
+    commands
 }
 
 async fn load_status_snapshot(
@@ -2259,9 +2272,18 @@ mod tests {
     }
 
     #[test]
-    fn acp_advertises_session_commands_as_v2_slash_commands() {
+    fn acp_advertises_session_and_prompt_directive_completions() {
         let update = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-            available_commands(),
+            available_commands(ipc_schema::PromptDirectiveOptions {
+                skills: vec![ipc_schema::PromptDirectiveOption {
+                    name: "review".to_string(),
+                    description: Some("Review changes".to_string()),
+                }],
+                mcp_servers: vec![ipc_schema::PromptDirectiveOption {
+                    name: "github".to_string(),
+                    description: None,
+                }],
+            }),
         ));
         let json = serde_json::to_value(update).unwrap();
         assert_eq!(json["sessionUpdate"], "available_commands_update");
@@ -2273,6 +2295,12 @@ mod tests {
         assert_eq!(json["availableCommands"][1]["name"], "resume");
         assert_eq!(json["availableCommands"][2]["name"], "fork");
         assert_eq!(json["availableCommands"][3]["name"], "status");
+        assert_eq!(json["availableCommands"][4]["name"], "skill review");
+        assert_eq!(
+            json["availableCommands"][4]["input"]["hint"],
+            "optional prompt"
+        );
+        assert_eq!(json["availableCommands"][5]["name"], "mcp github");
     }
 
     #[test]

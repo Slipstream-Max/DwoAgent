@@ -1,6 +1,5 @@
 mod attachments;
 mod bridge;
-mod command;
 mod feishu;
 mod gateway;
 mod manager;

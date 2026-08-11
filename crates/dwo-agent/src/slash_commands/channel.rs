@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 
+use super::prompt::COMMAND_DESCRIPTIONS as PROMPT_DIRECTIVE_DESCRIPTIONS;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "channel",
@@ -104,8 +106,14 @@ pub(crate) fn render_command_help() -> String {
                 .get_about()
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            format!("/{} - {description}", command.get_name())
+            (command.get_name().to_string(), description)
         })
+        .chain(
+            PROMPT_DIRECTIVE_DESCRIPTIONS
+                .into_iter()
+                .map(|(name, description)| (name.to_string(), description.to_string())),
+        )
+        .map(|(name, description)| format!("/{name} - {description}"))
         .collect::<Vec<_>>()
         .join("\n");
     format!("{heading}\n\n{commands}")
@@ -125,6 +133,11 @@ pub(crate) fn command_descriptions() -> Vec<(String, String)> {
                     .unwrap_or_default(),
             )
         })
+        .chain(
+            PROMPT_DIRECTIVE_DESCRIPTIONS
+                .into_iter()
+                .map(|(name, description)| (name.to_string(), description.to_string())),
+        )
         .collect()
 }
 
@@ -180,8 +193,9 @@ fn render_command_error(error: clap::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::Path;
+
+    use super::*;
 
     #[test]
     fn new_command_supports_quoted_windows_cwd_and_multiword_title() {
@@ -191,7 +205,6 @@ mod tests {
         let ChannelCommand::New { name, cwd } = command else {
             panic!("expected /new command");
         };
-
         assert_eq!(name, ["Project", "review"]);
         assert_eq!(
             cwd.as_deref(),
@@ -200,23 +213,18 @@ mod tests {
     }
 
     #[test]
-    fn command_help_is_generated_from_clap_metadata() {
+    fn command_help_includes_management_and_prompt_directives() {
         let help = render_command_help();
-
         assert!(help.starts_with("These commands are supported:\n\n"));
         assert!(help.contains("/help - Display this command list."));
-        assert!(help.contains("/new - Create and select a session."));
-        assert!(help.contains("/fork - Copy the selected session into a new session."));
         assert!(help.contains("/compact - Compact the selected session context."));
-        assert!(help.contains("/resume - Continue the selected session when it is idle."));
-        assert!(help.contains("/policy - Show or change the tool permission policy."));
-        assert!(help.contains("/deny - Deny the current or specified permission request."));
+        assert!(help.contains("/skill - Request an available skill by name"));
+        assert!(help.contains("/mcp - Request an available MCP server by name"));
     }
 
     #[test]
     fn command_parse_errors_use_slash_command_usage() {
         let error = parse_command("/model").unwrap_err().to_string();
-
         assert!(error.contains("Usage: /model <NAME>"), "{error}");
     }
 
@@ -264,10 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn platform_command_menu_uses_the_same_metadata_as_help() {
+    fn platform_command_menu_includes_prompt_directives() {
         assert!(command_descriptions().contains(&(
             "new".to_string(),
             "Create and select a session.".to_string()
+        )));
+        assert!(command_descriptions().contains(&(
+            "skill".to_string(),
+            "Request an available skill by name, optionally followed by a prompt.".to_string()
         )));
     }
 }

@@ -10,8 +10,8 @@ use dwo_tools::{ConfirmationDecision, SessionMode};
 use tokio::sync::Mutex;
 
 use crate::host::Host;
+use crate::slash_commands::{ChannelCommand, render_command_help};
 
-use super::command::{ChannelCommand, render_command_help};
 use super::manager::ChannelReplayMode;
 use super::render::{
     SessionStreamState, display_path, policy_name, render_live_user_prompt, render_session_replay,

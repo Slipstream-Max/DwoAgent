@@ -11,6 +11,7 @@ use teloxide::types::{FileId, InputFile};
 use tokio::sync::Mutex;
 
 use crate::host::Host;
+use crate::slash_commands::{command_descriptions, parse_command, routes_to_channel_command};
 
 use super::ChannelKind;
 use super::attachments::{
@@ -18,7 +19,6 @@ use super::attachments::{
     unique_attachment_path,
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
-use super::command::{command_descriptions, parse_command};
 use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
     ChannelStarter, PreparedChannel,
@@ -233,7 +233,7 @@ async fn process_bound_message(
     media: Option<IncomingMedia>,
     media_input: bool,
 ) -> Result<Vec<String>> {
-    if text.starts_with('/') {
+    if routes_to_channel_command(text) {
         return ingress.execute(parse_command(text)?).await;
     }
     let session_id = ingress.ensure_prompt_session().await?;

@@ -11,6 +11,7 @@ use weixin_agent::{
 };
 
 use crate::host::Host;
+use crate::slash_commands::{parse_command, routes_to_channel_command};
 
 use super::ChannelKind;
 #[cfg(test)]
@@ -20,7 +21,6 @@ use super::attachments::{
     unique_attachment_path,
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
-use super::command::parse_command;
 use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
     ChannelStarter, PreparedChannel,
@@ -271,7 +271,7 @@ impl MessageHandler for WeixinHandler {
             return Ok(());
         }
         let text = ctx.body.as_deref().unwrap_or("").trim();
-        let result = if text.starts_with('/') {
+        let result = if routes_to_channel_command(text) {
             self.handle_command(ctx, text).await
         } else if text.is_empty() && ctx.media.is_none() {
             Ok(())

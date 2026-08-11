@@ -151,6 +151,10 @@ impl SystemPromptBuilder {
         })
     }
 
+    pub fn scan_skills(&self) -> Result<Vec<SkillSnapshot>, PromptBuildError> {
+        self.read_skills()
+    }
+
     fn build_current(&self) -> Result<SystemPromptBlock, PromptBuildError> {
         let dynamic = self.scan_dynamic()?;
         let snapshot = PromptSnapshot {

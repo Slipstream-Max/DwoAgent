@@ -92,6 +92,9 @@ pub(crate) enum TurnEvent {
 pub(crate) enum TurnOutcome {
     Completed,
     Cancelled,
+    /// The model response stream died mid-generation. The session should
+    /// auto-resume the turn (same mechanism as the /resume command).
+    Interrupted,
     Failed(String),
 }
 
@@ -170,6 +173,13 @@ pub(crate) async fn run(mut turn: RunTurn) {
             duration_ms = started.elapsed().as_millis() as u64,
             "turn cancelled"
         ),
+        TurnOutcome::Interrupted => tracing::warn!(
+            event = "turn.interrupted",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "model stream interrupted; turn will be auto-resumed"
+        ),
         TurnOutcome::Failed(error) => tracing::error!(
             event = "turn.failed",
             session_id = %turn.session_id,
@@ -208,6 +218,13 @@ pub(crate) async fn run_manual_compaction(mut turn: RunTurn) {
             turn_id = %turn.turn_id,
             duration_ms = started.elapsed().as_millis() as u64,
             "manual context compaction cancelled"
+        ),
+        TurnOutcome::Interrupted => tracing::warn!(
+            event = "turn.manual_compaction_interrupted",
+            session_id = %turn.session_id,
+            turn_id = %turn.turn_id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "manual context compaction interrupted"
         ),
         TurnOutcome::Failed(error) => tracing::error!(
             event = "turn.manual_compaction_failed",
@@ -303,8 +320,18 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
 
         let response = match request_with_context_recovery(turn, &model_step.selection).await {
             Ok(response) => response,
-            Err(_) if turn.cancellation.is_cancelled() => return TurnOutcome::Cancelled,
-            Err(error) => return TurnOutcome::Failed(format!("{error:#}")),
+            Err(error) => {
+                if error
+                    .downcast_ref::<dwo_model_client::ModelClientError>()
+                    .is_some_and(dwo_model_client::ModelClientError::is_stream_interrupted)
+                {
+                    return TurnOutcome::Interrupted;
+                }
+                if turn.cancellation.is_cancelled() {
+                    return TurnOutcome::Cancelled;
+                }
+                return TurnOutcome::Failed(format!("{error:#}"));
+            }
         };
 
         let active_tool_calls = response

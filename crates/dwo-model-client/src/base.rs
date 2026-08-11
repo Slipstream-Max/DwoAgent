@@ -186,16 +186,20 @@ impl BaseClient {
             let next = tokio::select! {
                 _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
                 next = tokio::time::timeout(self.provider.request.stream_idle_timeout(), stream.next()) => {
-                    next.map_err(|_| ModelClientError::StreamIdleTimeout)?
+                    next.map_err(|_| ModelClientError::StreamInterrupted {
+                        text_chars: accumulated.content.chars().count(),
+                        has_tool_calls: !accumulated.output_items.is_empty(),
+                    })?
                 }
             };
             let Some(event) = next else {
                 if accumulated.response.is_some() {
                     break;
                 }
-                return Err(ModelClientError::protocol(
-                    "stream closed before response.completed",
-                ));
+                return Err(ModelClientError::StreamInterrupted {
+                    text_chars: accumulated.content.chars().count(),
+                    has_tool_calls: !accumulated.output_items.is_empty(),
+                });
             };
             let event = event.map_err(|error| ModelClientError::protocol(error.to_string()))?;
             if event.data == "[DONE]" {

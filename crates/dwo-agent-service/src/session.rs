@@ -28,6 +28,11 @@ use crate::repository::SessionRepository;
 #[serde(transparent)]
 pub struct EndpointId(String);
 
+/// Maximum number of automatic retries when the model response stream is
+/// interrupted mid-generation. After this many consecutive interruptions the
+/// turn fails for real.
+const MAX_AUTO_RESUMES: usize = 2;
+
 impl EndpointId {
     pub fn new() -> Self {
         Self(format!("endpoint-{}", Uuid::new_v4()))
@@ -131,6 +136,7 @@ impl SessionAgent {
             pending_messages: VecDeque::new(),
             closing_response: None,
             title_cancellation: None,
+            auto_resumes: 0,
         };
         tokio::spawn(actor.run());
         Arc::new(Self {
@@ -480,6 +486,7 @@ struct SessionActor {
     pending_messages: VecDeque<PendingMessage>,
     closing_response: Option<oneshot::Sender<Result<(), AgentServiceError>>>,
     title_cancellation: Option<CancellationToken>,
+    auto_resumes: usize,
 }
 
 enum PendingMessage {
@@ -646,7 +653,7 @@ impl SessionActor {
                     let _ = response.send(Ok(None));
                     return false;
                 }
-                let result = self.start_resume(origin).await.map(Some);
+                let result = self.start_resume(origin, true).await.map(Some);
                 let _ = response.send(result);
             }
             Control::AppendInternal {
@@ -944,15 +951,18 @@ impl SessionActor {
     async fn start_resume(
         &mut self,
         origin: EndpointId,
+        inject_instruction: bool,
     ) -> Result<PromptAccepted, AgentServiceError> {
         let previous_usage = self.usage_snapshot();
         let turn_id = TurnId::new();
         let message_id = MessageId::new();
         let mut context = ContextManager::new(self.record.context.clone());
-        context.append_internal(
-            MessageKind::Runtime,
-            "<resume>Continue the previous task from the current session state.</resume>",
-        );
+        if inject_instruction {
+            context.append_internal(
+                MessageKind::Runtime,
+                "<resume>Continue the previous task from the current session state.</resume>",
+            );
+        }
         context.refresh_usage(self.tools.schemas());
         self.record.context = context.into_context();
         self.record.touch();
@@ -1388,12 +1398,32 @@ impl SessionActor {
                 self.permission.reject("turn finished");
                 self.phase = RuntimePhase::Idle;
                 let allow_pending_wake = !matches!(outcome, TurnOutcome::Cancelled);
+                let mut auto_resumed = false;
                 match outcome {
                     TurnOutcome::Completed => {
+                        self.auto_resumes = 0;
                         self.emit(SessionEventPayload::TurnCompleted { turn_id })
                     }
                     TurnOutcome::Cancelled => {
                         self.emit(SessionEventPayload::TurnCancelled { turn_id })
+                    }
+                    TurnOutcome::Interrupted => {
+                        self.emit(SessionEventPayload::TurnFailed {
+                            turn_id: turn_id.clone(),
+                            error: "model stream interrupted; resuming automatically".to_string(),
+                        });
+                        if self.auto_resumes < MAX_AUTO_RESUMES {
+                            self.auto_resumes += 1;
+                            // Inject the <resume> instruction only on the first retry;
+                            // subsequent retries are plain re-requests of the same
+                            // context and must not grow the prompt.
+                            let result = self
+                                .start_resume(EndpointId::new(), self.auto_resumes == 1)
+                                .await;
+                            if result.is_ok() {
+                                auto_resumed = true;
+                            }
+                        }
                     }
                     TurnOutcome::Failed(error) => {
                         self.emit(SessionEventPayload::TurnFailed { turn_id, error })
@@ -1407,7 +1437,9 @@ impl SessionActor {
                     let _ = response.send(result);
                     return true;
                 }
-                self.process_pending_idle(allow_pending_wake).await;
+                if !auto_resumed {
+                    self.process_pending_idle(allow_pending_wake).await;
+                }
             }
         }
         false

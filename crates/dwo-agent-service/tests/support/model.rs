@@ -48,6 +48,11 @@ pub enum ScriptedStep {
         events: Vec<ModelStreamEvent>,
         result: Result<ModelReply, String>,
     },
+    /// Emits a few events and then fails with `StreamInterrupted`, simulating
+    /// an SSE connection that dies mid-generation.
+    StreamedInterrupt {
+        events: Vec<ModelStreamEvent>,
+    },
     ContextLengthExceeded,
 }
 
@@ -118,6 +123,10 @@ impl ScriptedStep {
             events,
             result: Err(message.into()),
         }
+    }
+
+    pub fn streamed_interrupt(events: Vec<ModelStreamEvent>) -> Self {
+        Self::StreamedInterrupt { events }
     }
 }
 
@@ -369,6 +378,24 @@ impl ModelClient for ScriptedModelGateway {
                     let _ = events.send(event);
                 }
                 result.map_err(ModelClientError::Protocol)
+            }
+            ScriptedStep::StreamedInterrupt {
+                events: streamed,
+            } => {
+                let mut text_chars = 0usize;
+                for event in streamed {
+                    if cancellation.is_cancelled() {
+                        return Err(ModelClientError::Cancelled);
+                    }
+                    if let ModelStreamEvent::TextDelta(delta) = &event {
+                        text_chars += delta.chars().count();
+                    }
+                    let _ = events.send(event);
+                }
+                Err(ModelClientError::StreamInterrupted {
+                    text_chars,
+                    has_tool_calls: false,
+                })
             }
             ScriptedStep::ContextLengthExceeded => Err(ModelClientError::ContextLengthExceeded {
                 status: 400,

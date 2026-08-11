@@ -3158,3 +3158,113 @@ async fn model_and_reasoning_changes_apply_to_the_next_model_step() {
     assert_eq!(requests[1].selection.model, "next-model");
     assert_eq!(requests[1].selection.reasoning.as_deref(), Some("high"));
 }
+
+/// Waits for a turn to finish, skipping the automatic-resume TurnFailed
+/// events that the session emits when an interrupted stream is retried.
+async fn wait_for_turn_end_after_auto_resume(
+    events: &mut tokio::sync::mpsc::Receiver<dwo_agent_service::SessionEvent>,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.expect("event stream closed");
+            if let SessionEventPayload::TurnFailed { error, .. } = &event.payload {
+                assert!(
+                    error.contains("interrupted"),
+                    "unexpected turn failure: {error}"
+                );
+                continue;
+            }
+            if matches!(event.payload, SessionEventPayload::TurnCompleted { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn did not finish")
+}
+
+#[tokio::test]
+async fn interrupted_stream_auto_resumes_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta(
+            "partial ".to_string(),
+        )]),
+        ScriptedStep::text("final answer"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::Confirm))
+        .await
+        .unwrap();
+    let origin = EndpointId::new();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(origin.clone(), "hello").await.unwrap();
+
+    wait_for_turn_end_after_auto_resume(&mut events).await;
+
+    let requests = model.requests().await;
+    assert_eq!(requests.len(), 2);
+    let last_message = requests[1].messages.last().unwrap();
+    assert!(
+        last_message
+            .content
+            .as_text()
+            .is_some_and(|text| text.contains("<resume>"))
+    );
+}
+
+#[tokio::test]
+async fn interrupted_stream_injects_resume_instruction_only_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta(
+            "partial ".to_string(),
+        )]),
+        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta(
+            "more ".to_string(),
+        )]),
+        ScriptedStep::text("done"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::Confirm))
+        .await
+        .unwrap();
+    let origin = EndpointId::new();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(origin.clone(), "hello").await.unwrap();
+
+    wait_for_turn_end_after_auto_resume(&mut events).await;
+
+    let requests = model.requests().await;
+    assert_eq!(requests.len(), 3);
+    // The <resume> instruction is injected only on the first retry; the
+    // second retry is a plain re-request with the same context, so the
+    // prompt must not grow between retries.
+    let resume_counts = requests
+        .iter()
+        .map(|request| {
+            request
+                .messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .content
+                        .as_text()
+                        .is_some_and(|text| text.contains("<resume>"))
+                })
+                .count()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(resume_counts, vec![0, 1, 1]);
+    assert_eq!(requests[1].messages.len(), requests[2].messages.len());
+}

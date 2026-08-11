@@ -665,3 +665,55 @@ providers:
     let error = ModelCatalog::from_yaml(invalid).unwrap_err();
     assert!(error.to_string().contains("reserved field max_tokens"));
 }
+
+#[tokio::test]
+async fn interrupted_stream_reports_stream_interrupted_error() {
+    let chunks = [
+        json!({"type":"response.output_text.delta","delta":"hello "}).to_string(),
+        json!({"type":"response.output_text.delta","delta":"world"}).to_string(),
+    ];
+    let sse = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+    );
+    let (endpoint, _request_rx) = one_response_server(response).await;
+    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let messages = vec![
+        ContextMessage::system("system"),
+        ContextMessage::user("hello"),
+    ];
+    let cancellation = CancellationToken::new();
+    let error = client
+        .stream_turn(
+            ModelSelection {
+                model: "chat".to_string(),
+                reasoning: None,
+            },
+            &messages,
+            &[],
+            events_tx,
+            &cancellation,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ModelClientError::StreamInterrupted {
+            text_chars: 11,
+            has_tool_calls: false
+        }
+    ));
+    assert!(error.is_stream_interrupted());
+    assert_eq!(
+        events_rx.recv().await.unwrap(),
+        ModelStreamEvent::TextDelta("hello ".to_string())
+    );
+    assert_eq!(
+        events_rx.recv().await.unwrap(),
+        ModelStreamEvent::TextDelta("world".to_string())
+    );
+}

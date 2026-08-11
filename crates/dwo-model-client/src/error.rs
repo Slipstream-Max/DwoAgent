@@ -8,8 +8,11 @@ pub enum ModelClientError {
     MissingApiKey(String),
     #[error("model request was cancelled")]
     Cancelled,
-    #[error("model request timed out while waiting for stream data")]
-    StreamIdleTimeout,
+    #[error("model stream interrupted after {text_chars} chars of output (tool calls in flight: {has_tool_calls})")]
+    StreamInterrupted {
+        text_chars: usize,
+        has_tool_calls: bool,
+    },
     #[error("model input exceeds the context window (HTTP {status}): {body}")]
     ContextLengthExceeded { status: u16, body: String },
     #[error("model provider authentication failed (HTTP {status}): {body}")]
@@ -37,5 +40,9 @@ impl ModelClientError {
 
     pub fn is_context_length_exceeded(&self) -> bool {
         matches!(self, Self::ContextLengthExceeded { .. })
+    }
+
+    pub fn is_stream_interrupted(&self) -> bool {
+        matches!(self, Self::StreamInterrupted { .. })
     }
 }

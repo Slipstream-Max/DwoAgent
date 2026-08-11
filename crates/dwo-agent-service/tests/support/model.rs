@@ -44,6 +44,10 @@ pub enum ScriptedStep {
         reasoning: String,
         content: String,
     },
+    Streamed {
+        events: Vec<ModelStreamEvent>,
+        result: Result<ModelReply, String>,
+    },
     ContextLengthExceeded,
 }
 
@@ -99,6 +103,20 @@ impl ScriptedStep {
         Self::ReasoningResponse {
             reasoning: reasoning.into(),
             content: content.into(),
+        }
+    }
+
+    pub fn streamed(events: Vec<ModelStreamEvent>, reply: ModelReply) -> Self {
+        Self::Streamed {
+            events,
+            result: Ok(reply),
+        }
+    }
+
+    pub fn streamed_failure(events: Vec<ModelStreamEvent>, message: impl Into<String>) -> Self {
+        Self::Streamed {
+            events,
+            result: Err(message.into()),
         }
     }
 }
@@ -339,6 +357,18 @@ impl ModelClient for ScriptedModelGateway {
                     finish_reason: FinishReason::Stop,
                     usage: ModelUsage::default(),
                 })
+            }
+            ScriptedStep::Streamed {
+                events: streamed,
+                result,
+            } => {
+                for event in streamed {
+                    if cancellation.is_cancelled() {
+                        return Err(ModelClientError::Cancelled);
+                    }
+                    let _ = events.send(event);
+                }
+                result.map_err(ModelClientError::Protocol)
             }
             ScriptedStep::ContextLengthExceeded => Err(ModelClientError::ContextLengthExceeded {
                 status: 400,

@@ -1003,6 +1003,7 @@ async fn handle_session_event(
             StateUpdate::Running(RunningStateUpdate::new()),
         ),
         "tool_started" => send_tool_started(cx, session_id, payload),
+        "tool_updated" => send_tool_updated(cx, session_id, payload),
         "tool_completed" => send_tool_completed(cx, session_id, payload),
         "terminal_opened" => send_terminal_opened(cx, session_id, payload),
         "terminal_output" => send_terminal_output(cx, session_id, payload),
@@ -1567,6 +1568,14 @@ fn send_tool_started(cx: &AcpConnection, session_id: &str, payload: &Value) {
     }
 }
 
+fn send_tool_updated(cx: &AcpConnection, session_id: &str, payload: &Value) {
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::ToolCallUpdate(tool_started(payload)),
+    );
+}
+
 fn send_tool_completed(cx: &AcpConnection, session_id: &str, payload: &Value) {
     let result = &payload["result"];
     if result["tool_name"].as_str() == Some("terminal")
@@ -1713,12 +1722,21 @@ fn tool_started(payload: &Value) -> ToolCallUpdate {
     let mut tool = ToolCallUpdate::new(id)
         .title(name.to_string())
         .kind(tool_kind())
-        .status(ToolCallStatus::InProgress)
+        .status(acp_tool_status(call.get("status").and_then(Value::as_str)))
         .raw_input(raw_input.clone());
     if let Some(text) = render_tool_input(name, &raw_input) {
         tool = tool.content(text_content(text));
     }
     tool
+}
+
+fn acp_tool_status(status: Option<&str>) -> ToolCallStatus {
+    match status {
+        Some("pending") => ToolCallStatus::Pending,
+        Some("completed") => ToolCallStatus::Completed,
+        Some("failed" | "cancelled" | "canceled") => ToolCallStatus::Failed,
+        _ => ToolCallStatus::InProgress,
+    }
 }
 
 fn tool_completed(payload: &Value) -> ToolCallUpdate {
@@ -1728,9 +1746,12 @@ fn tool_completed(payload: &Value) -> ToolCallUpdate {
         .unwrap_or("unknown")
         .to_string()
         .into();
-    let failed = result["output"]["status"]
-        .as_str()
-        .is_some_and(|status| matches!(status, "error" | "cancelled" | "blocked_by_policy"));
+    let failed = result["output"]["status"].as_str().is_some_and(|status| {
+        matches!(
+            status,
+            "error" | "failed" | "cancelled" | "canceled" | "blocked_by_policy"
+        )
+    });
     let output = result.get("output").cloned().unwrap_or(Value::Null);
     let mut update = ToolCallUpdate::new(id)
         .status(if failed {
@@ -1846,6 +1867,7 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
             }
             Some("assistant_completed") => send_assistant_completed(cx, session_id, payload),
             Some("tool_started") => send_tool_started(cx, session_id, payload),
+            Some("tool_updated") => send_tool_updated(cx, session_id, payload),
             Some("tool_completed") => send_tool_completed(cx, session_id, payload),
             Some("terminal_opened") => send_terminal_opened(cx, session_id, payload),
             Some("terminal_exited") => send_terminal_exited(cx, session_id, payload),
@@ -2453,6 +2475,23 @@ mod tests {
         let tool = v1::ToolCall::try_from(update).unwrap();
         let json = serde_json::to_value(v1::SessionUpdate::ToolCall(tool)).unwrap();
         assert_eq!(json["sessionUpdate"], "tool_call");
+        assert_eq!(json["toolCallId"], "call-1");
+        assert_eq!(json["status"], "in_progress");
+    }
+
+    #[test]
+    fn v1_tool_update_remains_an_update_event() {
+        let update = SessionUpdate::ToolCallUpdate(tool_started(&json!({
+            "call": {
+                "tool_call_id": "call-1",
+                "tool_name": "terminal",
+                "raw_input": { "command": "pwd" },
+                "status": "in_progress"
+            }
+        })));
+        let updates = Vec::<v1::SessionUpdate>::try_from(update).unwrap();
+        let json = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(json["sessionUpdate"], "tool_call_update");
         assert_eq!(json["toolCallId"], "call-1");
         assert_eq!(json["status"], "in_progress");
     }

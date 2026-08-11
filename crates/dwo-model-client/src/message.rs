@@ -5,7 +5,7 @@ use dwo_context::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::{FinishReason, ModelClientError, ModelReply, ModelUsage};
+use crate::{FinishReason, ModelClientError, ModelReply, ModelUsage, StreamToolCall};
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamAccumulator {
@@ -20,20 +20,54 @@ impl StreamAccumulator {
         self.output_items.insert(index, item);
     }
 
-    pub fn append_function_arguments(&mut self, index: u64, delta: &str) {
+    pub fn update_function_arguments(
+        &mut self,
+        index: u64,
+        arguments: &str,
+        append: bool,
+    ) -> Option<&Value> {
         let item = self
             .output_items
             .entry(index)
             .or_insert_with(|| json!({"type":"function_call", "arguments":""}));
-        let Some(object) = item.as_object_mut() else {
-            return;
+        let object = item.as_object_mut()?;
+        let arguments = if append {
+            format!(
+                "{}{}",
+                object
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                arguments
+            )
+        } else {
+            arguments.to_string()
         };
-        let arguments = object
-            .entry("arguments")
-            .or_insert_with(|| Value::String(String::new()));
-        if let Some(current) = arguments.as_str().map(str::to_string) {
-            *arguments = Value::String(format!("{current}{delta}"));
-        }
+        object.insert("arguments".to_string(), Value::String(arguments));
+        Some(item)
+    }
+
+    pub fn set_output_item_status(
+        &mut self,
+        index: Option<u64>,
+        item_id: Option<&str>,
+        status: &str,
+    ) -> Option<&Value> {
+        let item = match index {
+            Some(index) => self.output_items.get_mut(&index),
+            None => {
+                let item_id = item_id?;
+                self.output_items.values_mut().find(|item| {
+                    item.get("id")
+                        .or_else(|| item.get("call_id"))
+                        .and_then(Value::as_str)
+                        == Some(item_id)
+                })
+            }
+        }?;
+        item.as_object_mut()?
+            .insert("status".to_string(), Value::String(status.to_string()));
+        Some(item)
     }
 
     pub fn finish(self) -> Result<ModelReply, ModelClientError> {
@@ -353,6 +387,86 @@ fn normalize_arguments(arguments: &str) -> Value {
     }
 }
 
+pub(crate) fn stream_tool_call(item: &Value, hosted_tools: &[Value]) -> Option<StreamToolCall> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    let provider_hosted = kind != "function_call";
+    if provider_hosted && !kind.ends_with("_call") {
+        return None;
+    }
+    let tool_call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)?
+        .to_string();
+    if tool_call_id.is_empty() {
+        return None;
+    }
+    let kind_name = canonical_tool_kind(kind);
+    let tool_name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            hosted_tools.iter().find_map(|tool| {
+                let configured = tool.get("type").and_then(Value::as_str)?;
+                (canonical_tool_kind(configured) == kind_name)
+                    .then(|| tool.get("name").and_then(Value::as_str))
+                    .flatten()
+                    .filter(|name| !name.is_empty())
+            })
+        })
+        .unwrap_or(kind_name)
+        .to_string();
+    let raw_input = if provider_hosted {
+        item.clone()
+    } else {
+        match item.get("arguments") {
+            Some(Value::String(arguments)) => normalize_arguments(arguments),
+            Some(arguments) => arguments.clone(),
+            None => Value::Object(Map::new()),
+        }
+    };
+    let status = if provider_hosted {
+        match item.get("status").and_then(Value::as_str) {
+            Some("searching" | "running" | "interpreting" | "generating") => "in_progress",
+            Some("canceled") => "cancelled",
+            Some(status) => status,
+            None => "in_progress",
+        }
+    } else {
+        "pending"
+    }
+    .to_string();
+    Some(StreamToolCall {
+        tool_call_id,
+        tool_name,
+        raw_input,
+        status,
+    })
+}
+
+pub(crate) fn provider_tool_event_state(event_type: &str) -> Option<&'static str> {
+    let (kind, phase) = event_type.strip_prefix("response.")?.rsplit_once('.')?;
+    if kind == "function_call" || !kind.ends_with("_call") {
+        return None;
+    }
+    match phase {
+        "in_progress" | "searching" | "running" | "interpreting" | "generating" => {
+            Some("in_progress")
+        }
+        "completed" => Some("completed"),
+        "failed" => Some("failed"),
+        "cancelled" | "canceled" => Some("cancelled"),
+        _ => None,
+    }
+}
+
+fn canonical_tool_kind(kind: &str) -> &str {
+    kind.strip_suffix("_call")
+        .or_else(|| kind.strip_suffix("_preview"))
+        .unwrap_or(kind)
+}
+
 pub(crate) fn usage(value: Option<&Value>) -> ModelUsage {
     let Some(value) = value else {
         return ModelUsage::default();
@@ -463,5 +577,50 @@ mod tests {
         assert_eq!(tools[0]["type"], "web_search");
         assert_eq!(tools[1]["name"], "terminal");
         assert!(tools[1].get("function").is_none());
+    }
+
+    #[test]
+    fn streamed_tools_use_call_id_and_generic_hosted_names() {
+        let local = stream_tool_call(
+            &json!({
+                "type":"function_call",
+                "id":"fc-1",
+                "call_id":"call-1",
+                "name":"terminal",
+                "arguments":""
+            }),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(local.tool_call_id, "call-1");
+        assert_eq!(local.status, "pending");
+
+        let hosted = stream_tool_call(
+            &json!({
+                "type":"file_search_call",
+                "id":"fs-1",
+                "status":"in_progress"
+            }),
+            &[json!({"type":"file_search", "name":"knowledge_search"})],
+        )
+        .unwrap();
+        assert_eq!(hosted.tool_call_id, "fs-1");
+        assert_eq!(hosted.tool_name, "knowledge_search");
+    }
+
+    #[test]
+    fn provider_tool_event_states_are_type_agnostic() {
+        assert_eq!(
+            provider_tool_event_state("response.file_search_call.searching"),
+            Some("in_progress")
+        );
+        assert_eq!(
+            provider_tool_event_state("response.image_generation_call.completed"),
+            Some("completed")
+        );
+        assert_eq!(
+            provider_tool_event_state("response.output_text.delta"),
+            None
+        );
     }
 }

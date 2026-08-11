@@ -25,6 +25,15 @@ pub struct ModelLimits {
 pub enum ModelStreamEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    ToolCall(StreamToolCall),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamToolCall {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub raw_input: Value,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

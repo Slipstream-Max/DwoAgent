@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 
 use dwo_agent_service::{
     AgentService, AgentServiceError, CompactionTrigger, ConfirmationDecision, ContentBlock,
-    ContextMessage, EndpointId, FsSessionRepository, MemorySessionRepository, MessageContent,
-    MessageKind, ModelLimits, NewSession, RuntimePhase, SessionConfigUpdate, SessionEventPayload,
-    SessionId, SessionLlmSettings, SessionMode, SessionRepository,
+    ContextMessage, EndpointId, FinishReason, FsSessionRepository, MemorySessionRepository,
+    MessageContent, MessageKind, ModelLimits, ModelReply, ModelStreamEvent, ModelUsage, NewSession,
+    RuntimePhase, SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings,
+    SessionMode, SessionRepository, StreamToolCall,
 };
 use dwo_tools::PolicyConfig;
 use serde_json::{Value, json};
@@ -44,6 +45,19 @@ async fn wait_for_turn_end(
     })
     .await
     .expect("turn did not finish")
+}
+
+fn streamed_hosted_call(status: &str) -> ModelStreamEvent {
+    ModelStreamEvent::ToolCall(StreamToolCall {
+        tool_call_id: "fs-1".to_string(),
+        tool_name: "file_search".to_string(),
+        raw_input: json!({
+            "type": "file_search_call",
+            "id": "fs-1",
+            "status": status
+        }),
+        status: status.to_string(),
+    })
 }
 
 fn write(path: &std::path::Path, content: &str) {
@@ -453,6 +467,122 @@ async fn reasoning_and_answer_deltas_are_broadcast_separately() {
     assert_eq!(content, "done");
     assert_eq!(committed_reasoning.as_deref(), Some("inspect first"));
     assert!(tool_calls.is_empty());
+}
+
+#[tokio::test]
+async fn streamed_hosted_tool_is_created_once_and_updated_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let item = json!({
+        "type": "file_search_call",
+        "id": "fs-1",
+        "status": "completed",
+        "results": []
+    });
+    let reply = ModelReply {
+        content: String::new(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        remote_tool_calls: vec![json!({
+            "id": "fs-1",
+            "name": "file_search",
+            "arguments": item,
+            "status": "completed",
+            "remote": true
+        })],
+        output_items: vec![item],
+        finish_reason: FinishReason::Stop,
+        usage: ModelUsage::default(),
+    };
+    let model = ScriptedModelGateway::new([ScriptedStep::streamed(
+        vec![
+            streamed_hosted_call("in_progress"),
+            streamed_hosted_call("completed"),
+        ],
+        reply,
+    )]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "search").await.unwrap();
+
+    let mut started = Vec::new();
+    let mut updated = Vec::new();
+    let mut completed = Vec::new();
+    loop {
+        match events.recv().await.unwrap().payload {
+            SessionEventPayload::ToolStarted { call, .. } => started.push(call),
+            SessionEventPayload::ToolUpdated { call, .. } => updated.push(call),
+            SessionEventPayload::ToolCompleted { result, .. } => completed.push(result),
+            SessionEventPayload::TurnCompleted { .. } => break,
+            SessionEventPayload::TurnFailed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].tool_call_id, "fs-1");
+    assert_eq!(started[0].status, "in_progress");
+    assert!(!updated.is_empty());
+    assert!(updated.iter().all(|call| call.tool_call_id == "fs-1"));
+    assert_eq!(updated.last().unwrap().status, "completed");
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].tool_call_id, "fs-1");
+    assert!(
+        agent
+            .attach(EndpointId::new())
+            .await
+            .unwrap()
+            .snapshot
+            .active_tool_calls
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_model_stream_completes_observed_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::streamed_failure(
+        vec![streamed_hosted_call("in_progress")],
+        "stream failed",
+    )]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "search").await.unwrap();
+
+    let mut saw_start = false;
+    let mut failed = None;
+    loop {
+        match events.recv().await.unwrap().payload {
+            SessionEventPayload::ToolStarted { call, .. } => {
+                saw_start = call.tool_call_id == "fs-1";
+            }
+            SessionEventPayload::ToolUpdated { call, .. } if call.status == "failed" => {
+                failed = Some(call)
+            }
+            SessionEventPayload::TurnFailed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(saw_start);
+    assert_eq!(
+        failed.expect("streamed tool was not failed").tool_call_id,
+        "fs-1"
+    );
 }
 
 #[tokio::test]

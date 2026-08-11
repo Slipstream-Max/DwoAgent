@@ -600,6 +600,9 @@ async fn stream_session_with_mode(
                 }
                 stream.remember_tool(call);
             }
+            SessionEventPayload::ToolUpdated { call, .. } => {
+                stream.remember_tool(call);
+            }
             SessionEventPayload::PermissionRequested { permission, .. } => {
                 if !stream.mark_permission_sent(&permission.tool_call_id) {
                     continue;
@@ -611,6 +614,7 @@ async fn stream_session_with_mode(
                         tool_call_id: permission.tool_call_id.clone(),
                         tool_name: permission.tool_name.clone(),
                         raw_input: serde_json::Value::Null,
+                        status: "pending".to_string(),
                     });
                 if let Err(error) = transport
                     .send_permission_request(&session_id, &call, &permission)

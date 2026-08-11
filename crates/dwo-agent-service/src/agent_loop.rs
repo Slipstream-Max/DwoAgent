@@ -48,9 +48,13 @@ pub(crate) enum TurnEvent {
         reasoning: Option<String>,
         tool_calls: Vec<ActiveToolCall>,
     },
-    ToolStarted {
+    ToolChanged {
         turn_id: TurnId,
         call: ActiveToolCall,
+    },
+    ToolCallsInterrupted {
+        turn_id: TurnId,
+        status: &'static str,
     },
     ToolCompleted {
         turn_id: TurnId,
@@ -328,9 +332,11 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                 .collect(),
         });
         for call in &remote_tool_calls {
-            turn.emit(TurnEvent::ToolStarted {
+            let mut started = call.clone();
+            started.status = "in_progress".to_string();
+            turn.emit(TurnEvent::ToolChanged {
                 turn_id: turn.turn_id.clone(),
-                call: call.clone(),
+                call: started,
             });
             let raw_output = response
                 .remote_tool_calls
@@ -370,8 +376,9 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             return TurnOutcome::Completed;
         }
 
-        for call in active_tool_calls {
-            turn.emit(TurnEvent::ToolStarted {
+        for mut call in active_tool_calls {
+            call.status = "in_progress".to_string();
+            turn.emit(TurnEvent::ToolChanged {
                 turn_id: turn.turn_id.clone(),
                 call,
             });
@@ -534,7 +541,7 @@ async fn request_model(
             biased;
             response = &mut model_call => {
                 while let Ok(event) = chunk_rx.try_recv() {
-                    emit_model_delta(&actor, &turn_id, event);
+                    emit_model_event(&actor, &turn_id, event);
                 }
                 match &response {
                     Ok(reply) => tracing::info!(
@@ -560,10 +567,21 @@ async fn request_model(
                         "model request failed"
                     ),
                 }
+                if let Err(error) = &response {
+                    let status = if matches!(error, dwo_model_client::ModelClientError::Cancelled) {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    let _ = actor.send(TurnActorMessage::Event(TurnEvent::ToolCallsInterrupted {
+                        turn_id,
+                        status,
+                    }));
+                }
                 return response;
             }
             Some(event) = chunk_rx.recv() => {
-                emit_model_delta(&actor, &turn_id, event);
+                emit_model_event(&actor, &turn_id, event);
             }
         }
     }
@@ -600,7 +618,7 @@ async fn prepare_context_for_step(turn: &mut RunTurn, step: &ModelStep) -> anyho
     Ok(())
 }
 
-fn emit_model_delta(
+fn emit_model_event(
     actor: &mpsc::UnboundedSender<TurnActorMessage>,
     turn_id: &TurnId,
     event: ModelStreamEvent,
@@ -609,14 +627,30 @@ fn emit_model_delta(
         let _ = actor.send(TurnActorMessage::Event(event));
     };
     match event {
-        ModelStreamEvent::TextDelta(delta) => emit(TurnEvent::AssistantDelta {
-            turn_id: turn_id.clone(),
-            delta,
-        }),
-        ModelStreamEvent::ReasoningDelta(delta) => emit(TurnEvent::AssistantReasoningDelta {
-            turn_id: turn_id.clone(),
-            delta,
-        }),
+        ModelStreamEvent::TextDelta(delta) => {
+            emit(TurnEvent::AssistantDelta {
+                turn_id: turn_id.clone(),
+                delta,
+            });
+        }
+        ModelStreamEvent::ReasoningDelta(delta) => {
+            emit(TurnEvent::AssistantReasoningDelta {
+                turn_id: turn_id.clone(),
+                delta,
+            });
+        }
+        ModelStreamEvent::ToolCall(call) => {
+            let call = ActiveToolCall {
+                tool_call_id: call.tool_call_id,
+                tool_name: call.tool_name,
+                raw_input: call.raw_input,
+                status: call.status,
+            };
+            emit(TurnEvent::ToolChanged {
+                turn_id: turn_id.clone(),
+                call,
+            });
+        }
     }
 }
 
@@ -806,11 +840,17 @@ fn active_tool_call(raw: &Value) -> ActiveToolCall {
             tool_call_id: call.id,
             tool_name: call.call.name().to_string(),
             raw_input: Value::Object(call.raw_arguments),
+            status: "pending".to_string(),
         },
         Err(error) => ActiveToolCall {
             tool_call_id: error.id,
             tool_name: error.name,
             raw_input: raw.get("arguments").cloned().unwrap_or(Value::Null),
+            status: raw
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("in_progress")
+                .to_string(),
         },
     }
 }

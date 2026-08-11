@@ -21,7 +21,7 @@ pub use dwo_model_client::{
     AgentModelConfig, AgentModelEntry, AgentProviderConfig, ConfiguredModelClient, FinishReason,
     ModelCapabilities, ModelCatalog, ModelClient, ModelClientConfig, ModelClientError, ModelConfig,
     ModelLimits, ModelReply, ModelSelection, ModelSpec, ModelStreamEvent, ModelUsage,
-    ProviderConfig, ProviderProtocol, ProviderSpec, RequestPolicy, SummaryReply,
+    ProviderConfig, ProviderProtocol, ProviderSpec, RequestPolicy, StreamToolCall, SummaryReply,
 };
 pub use dwo_tools::{ConfirmationDecision, ConfirmationRequest, SessionMode};
 pub use error::AgentServiceError;

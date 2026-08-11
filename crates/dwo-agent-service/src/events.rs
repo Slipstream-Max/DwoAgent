@@ -14,11 +14,13 @@ pub enum RuntimePhase {
     Closing,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActiveToolCall {
     pub tool_call_id: String,
     pub tool_name: String,
     pub raw_input: serde_json::Value,
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +130,10 @@ pub enum SessionEventPayload {
         tool_calls: Vec<ActiveToolCall>,
     },
     ToolStarted {
+        turn_id: TurnId,
+        call: ActiveToolCall,
+    },
+    ToolUpdated {
         turn_id: TurnId,
         call: ActiveToolCall,
     },

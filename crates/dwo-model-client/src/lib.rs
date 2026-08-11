@@ -17,5 +17,5 @@ pub use config::{
 pub use error::ModelClientError;
 pub use types::{
     FinishReason, ModelClient, ModelLimits, ModelReply, ModelSelection, ModelStreamEvent,
-    ModelUsage, SummaryReply,
+    ModelUsage, StreamToolCall, SummaryReply,
 };

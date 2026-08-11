@@ -1225,18 +1225,28 @@ impl SessionActor {
                     .await;
                 }
             }
-            TurnEvent::ToolStarted { turn_id, call } => {
-                let accepted = if let Some(active) =
-                    self.active.as_mut().filter(|active| active.id == turn_id)
-                {
-                    active.tools.push(call.clone());
-                    true
-                } else {
-                    false
-                };
-                if accepted {
-                    self.emit_client_event(SessionEventPayload::ToolStarted { turn_id, call })
-                        .await;
+            TurnEvent::ToolChanged { turn_id, call } => {
+                if let Some(payload) = self.upsert_tool_call(&turn_id, call) {
+                    self.emit_client_event(payload).await;
+                }
+            }
+            TurnEvent::ToolCallsInterrupted { turn_id, status } => {
+                let calls = self
+                    .active
+                    .as_mut()
+                    .filter(|active| active.id == turn_id)
+                    .map(|active| std::mem::take(&mut active.tools))
+                    .unwrap_or_default();
+                for mut call in calls {
+                    if terminal_tool_status(&call.status) {
+                        continue;
+                    }
+                    call.status = status.to_string();
+                    self.emit_client_event(SessionEventPayload::ToolUpdated {
+                        turn_id: turn_id.clone(),
+                        call,
+                    })
+                    .await;
                 }
             }
             TurnEvent::ToolCompleted { turn_id, result } => {
@@ -1624,6 +1634,43 @@ impl SessionActor {
         self.emit(payload);
     }
 
+    fn upsert_tool_call(
+        &mut self,
+        turn_id: &TurnId,
+        mut call: ActiveToolCall,
+    ) -> Option<SessionEventPayload> {
+        let active = self
+            .active
+            .as_mut()
+            .filter(|active| active.id == *turn_id)?;
+        match active
+            .tools
+            .iter_mut()
+            .find(|current| current.tool_call_id == call.tool_call_id)
+        {
+            Some(current) => {
+                if terminal_tool_status(&current.status) && !terminal_tool_status(&call.status) {
+                    call.status.clone_from(&current.status);
+                }
+                if *current == call {
+                    return None;
+                }
+                current.clone_from(&call);
+                Some(SessionEventPayload::ToolUpdated {
+                    turn_id: turn_id.clone(),
+                    call,
+                })
+            }
+            None => {
+                active.tools.push(call.clone());
+                Some(SessionEventPayload::ToolStarted {
+                    turn_id: turn_id.clone(),
+                    call,
+                })
+            }
+        }
+    }
+
     fn emit(&mut self, payload: SessionEventPayload) {
         self.seq = self.seq.saturating_add(1);
         let _ = self.events.send(SessionEvent {
@@ -1632,6 +1679,10 @@ impl SessionActor {
             payload,
         });
     }
+}
+
+fn terminal_tool_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "canceled")
 }
 
 fn apply_step_delta(step: &mut Option<ActiveStepSnapshot>, payload: &SessionEventPayload) -> bool {

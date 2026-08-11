@@ -9,7 +9,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ModelConfig, ProviderConfig, ProviderProtocol};
-use crate::message::{StreamAccumulator, parse_response, provider_input, provider_tools};
+use crate::message::{
+    StreamAccumulator, parse_response, provider_input, provider_tool_event_state, provider_tools,
+    stream_tool_call,
+};
 use crate::{ModelClientError, ModelReply, ModelStreamEvent, RequestPolicy};
 
 pub struct BaseClient {
@@ -71,7 +74,8 @@ impl BaseClient {
         let tools = provider_tools(tools, &model.hosted_tools)?;
         let body = self.request_body(model, input, &tools, reasoning, true)?;
         let response = self.send_with_retries(&body, cancellation).await?;
-        self.read_stream(response, events, cancellation).await
+        self.read_stream(response, &model.hosted_tools, events, cancellation)
+            .await
     }
 
     pub async fn complete(
@@ -172,6 +176,7 @@ impl BaseClient {
     async fn read_stream(
         &self,
         response: Response,
+        hosted_tools: &[Value],
         events: &mpsc::UnboundedSender<ModelStreamEvent>,
         cancellation: &CancellationToken,
     ) -> Result<ModelReply, ModelClientError> {
@@ -218,6 +223,9 @@ impl BaseClient {
                         payload.get("item"),
                     ) {
                         accumulated.add_output_item(index, item.clone());
+                        if let Some(call) = stream_tool_call(item, hosted_tools) {
+                            let _ = events.send(ModelStreamEvent::ToolCall(call));
+                        }
                     }
                 }
                 Some("response.function_call_arguments.delta") => {
@@ -225,7 +233,20 @@ impl BaseClient {
                         payload.get("output_index").and_then(Value::as_u64),
                         payload.get("delta").and_then(Value::as_str),
                     ) {
-                        accumulated.append_function_arguments(index, delta);
+                        let _ = accumulated.update_function_arguments(index, delta, true);
+                    }
+                }
+                Some("response.function_call_arguments.done") => {
+                    if let (Some(index), Some(arguments)) = (
+                        payload.get("output_index").and_then(Value::as_u64),
+                        payload.get("arguments").and_then(Value::as_str),
+                    ) {
+                        if let Some(call) = accumulated
+                            .update_function_arguments(index, arguments, false)
+                            .and_then(|item| stream_tool_call(item, hosted_tools))
+                        {
+                            let _ = events.send(ModelStreamEvent::ToolCall(call));
+                        }
                     }
                 }
                 Some("response.completed" | "response.incomplete") => {
@@ -238,7 +259,22 @@ impl BaseClient {
                         payload.get("response").unwrap_or(&payload)
                     )));
                 }
-                _ => {}
+                Some(event_type) => {
+                    let Some(status) = provider_tool_event_state(event_type) else {
+                        continue;
+                    };
+                    if let Some(call) = accumulated
+                        .set_output_item_status(
+                            payload.get("output_index").and_then(Value::as_u64),
+                            payload.get("item_id").and_then(Value::as_str),
+                            status,
+                        )
+                        .and_then(|item| stream_tool_call(item, hosted_tools))
+                    {
+                        let _ = events.send(ModelStreamEvent::ToolCall(call));
+                    }
+                }
+                None => {}
             }
         }
         accumulated.finish()

@@ -184,7 +184,7 @@ impl SessionStreamState {
     }
 
     pub(crate) fn remember_tool(&mut self, call: ActiveToolCall) {
-        self.tools.entry(call.tool_call_id.clone()).or_insert(call);
+        self.tools.insert(call.tool_call_id.clone(), call);
     }
 
     pub(crate) fn tool(&self, tool_call_id: &str) -> Option<&ActiveToolCall> {
@@ -444,6 +444,7 @@ mod tests {
             tool_call_id: "call-terminal".to_string(),
             tool_name: "terminal".to_string(),
             raw_input: json!({"action":"run", "command":"ls -a"}),
+            status: "in_progress".to_string(),
         };
         let rendered = render_tool_call(&terminal, "request id", "permission-1");
         assert_eq!(
@@ -455,6 +456,7 @@ mod tests {
             tool_call_id: "call-edit".to_string(),
             tool_name: "file_edit".to_string(),
             raw_input: json!({"patch":"*** Begin Patch\n```\n*** End Patch"}),
+            status: "in_progress".to_string(),
         };
         let rendered = render_tool_call(&file_edit, "tool call id", "call-edit");
         assert!(rendered.contains("````\n*** Begin Patch\n```\n*** End Patch\n````"));

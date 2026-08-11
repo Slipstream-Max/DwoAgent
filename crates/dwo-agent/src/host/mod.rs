@@ -1561,6 +1561,7 @@ fn is_content_event(payload: &SessionEventPayload) -> bool {
         SessionEventPayload::UserPromptSubmitted { .. }
             | SessionEventPayload::AssistantCompleted { .. }
             | SessionEventPayload::ToolStarted { .. }
+            | SessionEventPayload::ToolUpdated { .. }
             | SessionEventPayload::ToolCompleted { .. }
             | SessionEventPayload::TerminalOpened { .. }
             | SessionEventPayload::TerminalExited { .. }

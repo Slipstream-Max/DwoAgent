@@ -264,7 +264,6 @@ fn spawn_pump(
                 result = &mut exit_rx => break result.ok(),
             }
         };
-        session.pty.shutdown_readers();
         let drain = async {
             while stdout_open || stderr_open {
                 tokio::select! {
@@ -280,6 +279,10 @@ fn spawn_pump(
             }
         };
         let _ = tokio::time::timeout(Duration::from_millis(1_000), drain).await;
+        // Tear down the reader only after draining: the ConPTY output pipe
+        // may still hold buffered data when the child exits. Aborting the
+        // reader first would drop that data and truncate the output.
+        session.pty.shutdown_readers();
         session.mark_exited(exit_code);
     });
 }

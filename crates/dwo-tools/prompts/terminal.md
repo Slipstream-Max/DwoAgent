@@ -43,3 +43,12 @@ Results include only output not already returned to the model. `exit_code` is pr
 - Every terminal accepts input (PTY). Commands that wait on stdin (like `cat` or `read`) hang until you send input or `kill` them.
 - Keep `yield_ms` short enough to stay responsive. Continue a running process by polling its `terminal_id` rather than starting the same command again.
 - Output is decoded as lossy UTF-8 at the model boundary. Large unread output is capped with its beginning and end preserved.
+
+# Lifecycle
+
+A terminal is bound to the process started by its command — a channel for that command, not a persistent console.
+
+- While the process is alive and interactive (a persistent shell, a REPL, a command waiting on stdin, or a long-running task), you can keep sending input and polling it.
+- One-shot commands (`cargo test`, `git status`) exit on their own. Once the process exits, the terminal is locked: further input fails with `terminal is not running`; results report a status (`completed`/`error`/`cancelled`) plus `exit_code`; after a short retention period (~5 minutes) the terminal is removed and later calls report `terminal not found`.
+- Never reuse a terminal to start a new command after its process has exited — create a new terminal instead.
+- For continuous use, start a persistent shell (e.g. `powershell`) and keep feeding it commands.

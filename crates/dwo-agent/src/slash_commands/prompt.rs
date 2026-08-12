@@ -5,8 +5,9 @@ use dwo_context::{ContentBlock, MessageContent};
 
 const SKILL_COMMAND: &str = "/skill";
 const MCP_COMMAND: &str = "/mcp";
+const PLAN_COMMAND: &str = "/plan";
 
-pub(super) const COMMAND_DESCRIPTIONS: [(&str, &str); 2] = [
+pub(super) const COMMAND_DESCRIPTIONS: [(&str, &str); 3] = [
     (
         "skill",
         "Request an available skill by name, optionally followed by a prompt.",
@@ -15,17 +16,22 @@ pub(super) const COMMAND_DESCRIPTIONS: [(&str, &str); 2] = [
         "mcp",
         "Request an available MCP server by name, optionally followed by a prompt.",
     ),
+    (
+        "plan",
+        "Pause and plan together before acting, without writing code.",
+    ),
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DirectiveKinds {
     pub(crate) skill: bool,
     pub(crate) mcp: bool,
+    pub(crate) plan: bool,
 }
 
 impl DirectiveKinds {
     pub(crate) fn is_empty(&self) -> bool {
-        !self.skill && !self.mcp
+        !self.skill && !self.mcp && !self.plan
     }
 }
 
@@ -39,6 +45,7 @@ pub(crate) struct AvailableSkill {
 enum DirectiveKind {
     Skill,
     Mcp,
+    Plan,
 }
 
 #[derive(Debug)]
@@ -54,7 +61,7 @@ pub(crate) fn routes_to_channel_command(text: &str) -> bool {
 
 fn starts_with_prompt_directive(text: &str) -> bool {
     let text = text.trim_start();
-    [SKILL_COMMAND, MCP_COMMAND].into_iter().any(|command| {
+    [SKILL_COMMAND, MCP_COMMAND, PLAN_COMMAND].into_iter().any(|command| {
         text.strip_prefix(command).is_some_and(|remainder| {
             remainder.is_empty() || remainder.chars().next().is_some_and(char::is_whitespace)
         })
@@ -74,8 +81,9 @@ pub(crate) fn directive_kinds(content: &MessageContent) -> DirectiveKinds {
             match directive.kind {
                 DirectiveKind::Skill => kinds.skill = true,
                 DirectiveKind::Mcp => kinds.mcp = true,
+                DirectiveKind::Plan => kinds.plan = true,
             }
-            if kinds.skill && kinds.mcp {
+            if kinds.skill && kinds.mcp && kinds.plan {
                 return kinds;
             }
         }
@@ -137,6 +145,7 @@ fn expand_text(
             DirectiveKind::Mcp => mcp_servers
                 .contains(directive.name)
                 .then(|| render_mcp_request(directive.name)),
+            DirectiveKind::Plan => Some(render_plan_request()),
         };
         if let Some(replacement) = replacement {
             covered_until = directive.end;
@@ -164,13 +173,23 @@ fn expand_text(
 
 fn parse_at(text: &str, start: usize) -> Option<ParsedDirective<'_>> {
     let suffix = text.get(start..)?;
-    let (kind, command) = if suffix.starts_with(SKILL_COMMAND) {
+    let (kind, command) = if suffix.starts_with(PLAN_COMMAND) {
+        (DirectiveKind::Plan, PLAN_COMMAND)
+    } else if suffix.starts_with(SKILL_COMMAND) {
         (DirectiveKind::Skill, SKILL_COMMAND)
     } else if suffix.starts_with(MCP_COMMAND) {
         (DirectiveKind::Mcp, MCP_COMMAND)
     } else {
         return None;
     };
+    if matches!(kind, DirectiveKind::Plan) {
+        // /plan takes no argument; anything after it stays as the prompt.
+        return Some(ParsedDirective {
+            kind,
+            name: "",
+            end: start + command.len(),
+        });
+    }
     let remainder = suffix.get(command.len()..)?;
     if !remainder.chars().next().is_some_and(char::is_whitespace) {
         return None;
@@ -201,6 +220,52 @@ fn render_mcp_request(name: &str) -> String {
     format!(
         "<mcp_request name=\"{name}\">\nThe user wants to use the {name} MCP server. Use `dwo mcp search` in the terminal with {name} as the query to discover its tools, then use the matching MCP tool for the request.\n</mcp_request>"
     )
+}
+
+fn render_plan_request() -> String {
+    let body = "The user wants to stop and plan together before any code is written.
+
+━━━ 1. Goal ━━━
+Enter planning mode: think the work through together until consensus. The only deliverable of this phase is a plan, not code.
+
+━━━ 2. Principles ━━━
+· Whole before parts: gather information, then reason through the logic and architecture before discussing implementation.
+· Make assumptions explicit: every assumption goes on the table for discussion; never silently decide for the user.
+· Iterate deeply: whenever the user clarifies or adds details, revisit the architecture, as many times as needed.
+· Pace yourself: thinking more beats writing sooner. Do not write code during planning unless the user is extremely explicit about starting.
+
+━━━ 3. Interview method: the design tree ━━━
+· Model the discussion as a design tree: every decision is a branch, with further decisions hanging off it.
+· Work in rounds: each round ask only the frontier — decisions whose preconditions are established and answerable now; never guess about things you haven't heard answers to.
+· Ask the whole frontier in one round: number every question and give your recommended answer, then stop and wait for the user before the next round.
+· Each round of answers reshapes the tree: settled decisions push the frontier outward and unlock dependent questions; recompute the frontier and ask again.
+· Questions depending on unanswered questions belong to later rounds — don't ask them early.
+
+━━━ 4. Format ━━━
+Use one format for every question (body may span paragraphs and include choices):
+❓ **Q1** - **<question title>**: <question body>
+➡️ <your recommended answer>
+
+━━━ 5. Division of labor ━━━
+· Finding facts is your job, never the user's: when frontier questions need environment facts (filesystem, tools, etc.), dispatch a subagent — don't make the user look anything up.
+· Don't block: ongoing exploration is an unresolved precondition, so only its downstream questions wait for the report — ask the rest of the frontier now.
+· The user holds every decision: hand each one to them, then wait.
+
+━━━ 6. Done ━━━
+Planning completes when the frontier is empty: every branch of the tree visited, nothing silently assumed. Do not take any action until the user explicitly confirms consensus.";
+    format!(
+        "<plan_request>\n{}\n</plan_request>",
+        xml_text_escape(body)
+    )
+}
+
+/// Escapes text for an XML text node: only `&`, `<` and `>` are mandatory;
+/// quotes and apostrophes stay readable.
+fn xml_text_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn xml_escape(value: &str) -> String {
@@ -266,6 +331,38 @@ mod tests {
                 content
             );
         }
+    }
+
+    #[test]
+    fn expands_bare_plan_directive_and_keeps_following_prompt() {
+        let content = MessageContent::text("/plan 我想做一个新的 CLI 工具");
+        let expanded = expand(content, &[], &[]);
+        let text = expanded.as_text().unwrap();
+        assert!(text.starts_with("<plan_request>"));
+        assert!(text.ends_with("</plan_request> 我想做一个新的 CLI 工具"));
+        assert!(text.contains("the design tree"));
+        assert!(text.contains("❓ **Q1**"));
+        assert!(text.contains("haven't heard answers to"));
+        assert!(text.contains("&lt;question title&gt;"));
+        assert!(text.contains("Do not take any action until the user explicitly confirms consensus"));
+
+        let bare = expand(MessageContent::text("/plan"), &[], &[]);
+        let bare_text = bare.as_text().unwrap();
+        assert!(bare_text.starts_with("<plan_request>"));
+        assert!(bare_text.ends_with("</plan_request>"));
+        assert_eq!(bare_text.matches("<plan_request>").count(), 1);
+    }
+
+    #[test]
+    fn recognizes_plan_as_a_prompt_directive() {
+        assert!(starts_with_prompt_directive("/plan"));
+        assert!(starts_with_prompt_directive(" /plan 设计一下"));
+        assert!(!starts_with_prompt_directive("/planner"));
+        assert!(!routes_to_channel_command("/plan"));
+        let kinds = directive_kinds(&MessageContent::text("/plan"));
+        assert!(kinds.plan);
+        assert!(!kinds.is_empty());
+        assert!(directive_kinds(&MessageContent::text("hello")).is_empty());
     }
 
     #[test]

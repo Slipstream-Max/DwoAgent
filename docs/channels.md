@@ -166,32 +166,12 @@ const ws = new WebSocket(
 
 ## Slash Commands
 
-四个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP client 会收到 Agent 宣告的 `/compact`、`/resume` 和 `/fork`。
-
-| 命令 | 说明 |
-| --- | --- |
-| `/help` | 显示当前支持的命令 |
-| `/list` | 列出全局 session，`*` 表示当前 channel 选择的 session |
-| `/new [NAME] [--cwd <PATH>]` | 创建并选择 session；名称可包含空格 |
-| `/fork` | 把当前 session 复制为一个新 session，并返回新 ID；当前选择不变 |
-| `/use <SESSION>` | 选择已有 session，并回放最近 turn |
-| `/status` | 显示当前 session 的 cwd、模型、reasoning、policy 和运行状态 |
-| `/del <SESSION>` | 删除指定 session |
-| `/cancel` | 请求取消当前 turn |
-| `/compact` | 手动压缩当前 session context；命令本身不进入模型上下文 |
-| `/resume` | 仅在 session idle 时继续上一项工作；运行中静默忽略 |
-| `/model <NAME>` | 切换当前 session 的模型 alias |
-| `/reasoning <LEVEL\|off>` | 修改 reasoning mode，或使用 `off` 关闭 |
-| `/policy [full_access\|confirm\|watch]` | 不带参数查看 policy，带参数修改 |
-| `/allow [ID]` | 允许当前 pending permission，或指定 request ID |
-| `/deny [ID]` | 拒绝当前 pending permission，或指定 request ID |
-| `/skill <NAME> [PROMPT]` | 要求 Agent 使用当前 session 可用的指定 skill |
-| `/mcp <NAME> [PROMPT]` | 要求 Agent 使用已配置的指定 MCP server |
+四个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP client 会收到 Agent 宣告的 `/compact`、`/resume`、`/fork` 和 `/plan`。所有命令的完整说明见 [Slash Commands 使用指南](slash-commands.md)，这里只保留消息渠道特有细节。
 
 `/skill` 和 `/mcp` 是进入模型的 prompt directive，不是本地 session 控制命令。它们可以出现在正文任意位置，同一条消息可以重复或混合使用，例如：
 
 ```text
-先 /skill review 检查改动，再 /mcp github 创建 issue，最后 /skill summarize
+先 /skill <skill-name> 检查改动，再 /mcp <server-name> 创建 issue
 ```
 
 daemon 只替换名称与当前有效 catalog 精确匹配的 directive：skill 使用 profile、`externalSkillsDirs` 和 `<session-cwd>/.agents/skills/` 合并后的结果，MCP 使用当前 daemon catalog。匹配成功后会插入带名称和路径或 MCP 搜索要求的 XML block，提示 Agent 先用 `read_file` 读取 `SKILL.md`，或先在终端运行 `dwo mcp search`。未知名称、单独的 `/skill`、`/skill `、`/mcp` 和 `/mcp ` 都保持原文并作为普通 prompt 透传，不产生额外提示。

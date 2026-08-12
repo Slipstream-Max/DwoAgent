@@ -90,20 +90,11 @@ adapter 会给 cancel 留出 `500ms` 的配对窗口：同一连接、同一 ses
 
 ## Slash Commands
 
-创建或恢复 session 后，Agent 通过 ACP v1/v2 `available_commands_update` 宣告以下命令：
+创建或恢复 session 后，Agent 通过 ACP v1/v2 `available_commands_update` 宣告 `/compact`、`/resume`、`/fork`、`/status`、`/plan`，以及按当前 catalog 动态生成的 `skill <name>`、`mcp <name>`。命令说明见 [Slash Commands 使用指南](slash-commands.md)，这里只保留 ACP 特有行为。
 
-| 命令 | 行为 |
-| --- | --- |
-| `/compact` | 手动压缩当前 session context；命令文本不进入模型上下文，并通过下述 compaction update 回显进度与摘要 |
-| `/resume` | session idle 时加入内部继续指令并启动新 turn；运行中静默忽略，不排队也不报错 |
-| `/fork` | 复制当前 session 并显示副本 ID；当前 ACP session 不变 |
-| `/status` | 本地查询当前 session，显示完整 session ID、模型、reasoning 强度和状态；不会调用模型 |
-| `/skill <NAME> [PROMPT]` | 使用当前 session 可见的指定 skill；名称候选按 session cwd 动态生成 |
-| `/mcp <NAME> [PROMPT]` | 使用 daemon 当前 catalog 中的指定 MCP server |
+ACP 的 command input 目前只有自由文本 hint，没有参数候选列表。为支持名称补全，adapter 会把每个可用项发布为完整命令名，例如 `skill <skill-name>`、`mcp <server-name>`，并把后续输入声明为文本。因此在支持继续显示 slash command popup 的客户端中，键入 `/skill ` 或 `/mcp ` 后可以选择名称并回车补全；当前 Zed 的 slash completion 会把选中项插入为 `/skill <skill-name> ` 或 `/mcp <server-name> `。名称含空白的 skill/MCP 不会发布为候选，因为 directive 的 `NAME` 是单个 token。
 
-ACP 的 command input 目前只有自由文本 hint，没有参数候选列表。为支持名称补全，adapter 会把每个可用项发布为完整命令名，例如 `skill review`、`mcp github`，并把后续输入声明为文本。因此在支持继续显示 slash command popup 的客户端中，键入 `/skill ` 或 `/mcp ` 后可以选择名称并回车补全；当前 Zed 的 slash completion 会把选中项插入为 `/skill review ` 或 `/mcp github `。名称含空白的 skill/MCP 不会发布为候选，因为 directive 的 `NAME` 是单个 token。
-
-这两个 directive 也可以放在正文中并重复或混合使用。daemon 仅替换与当前有效 skill/MCP catalog 精确匹配的名称；未知名称和只有 `/skill`、`/mcp` 的文本保持原样并作为普通 prompt 发送。具体 XML 提示和各消息 channel 的一致行为见 [Channel 部署与使用](channels.md#slash-commands)。
+这两个 directive 也可以放在正文中并重复或混合使用。daemon 仅替换与当前有效 skill/MCP catalog 精确匹配的名称；未知名称和只有 `/skill`、`/mcp` 的文本保持原样并作为普通 prompt 发送。具体 XML 提示和各消息 channel 的一致行为见 [Slash Commands 使用指南](slash-commands.md)。
 
 Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执行。ACP 同时声明并实现实验性原生 `session/fork`；它和 `/fork` 都返回副本 ID，但都不会切换当前 ACP session。ACP 协议自身的 `session/resume` 是重新接入已有 session、恢复 observer 和可选回放历史，不会启动模型；它与自定义 `/resume` 命令不是同一功能。
 

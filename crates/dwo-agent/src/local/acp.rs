@@ -1307,6 +1307,13 @@ fn available_commands(options: ipc_schema::PromptDirectiveOptions) -> Vec<Availa
             "status",
             "Show the current session ID, model, and reasoning",
         ),
+        AvailableCommand::new(
+            "plan",
+            "Pause and plan together before acting, without writing code",
+        )
+        .input(AvailableCommandInput::Text(TextCommandInput::new(
+            "optional context",
+        ))),
     ];
     // ACP has free-text command input but no schema for completing individual arguments.
     // Publishing the directive and name together lets clients complete `/skill review `.
@@ -2295,12 +2302,17 @@ mod tests {
         assert_eq!(json["availableCommands"][1]["name"], "resume");
         assert_eq!(json["availableCommands"][2]["name"], "fork");
         assert_eq!(json["availableCommands"][3]["name"], "status");
-        assert_eq!(json["availableCommands"][4]["name"], "skill review");
+        assert_eq!(json["availableCommands"][4]["name"], "plan");
         assert_eq!(
             json["availableCommands"][4]["input"]["hint"],
+            "optional context"
+        );
+        assert_eq!(json["availableCommands"][5]["name"], "skill review");
+        assert_eq!(
+            json["availableCommands"][5]["input"]["hint"],
             "optional prompt"
         );
-        assert_eq!(json["availableCommands"][5]["name"], "mcp github");
+        assert_eq!(json["availableCommands"][6]["name"], "mcp github");
     }
 
     #[test]

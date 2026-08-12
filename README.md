@@ -160,7 +160,25 @@ dwo channel qq bind           # QQ 官方二维码
 
 Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不需要公网 webhook。环境变量、开放平台权限和完整部署步骤见 [Channel 部署与使用](docs/channels.md)。
 
-普通文本直接作为 prompt 发送；在 `confirm` 模式下回复 `/allow` 或 `/deny` 即可处理权限请求。完整 slash commands → [Channel 部署与使用](docs/channels.md#slash-commands)
+普通文本直接作为 prompt 发送；在 `confirm` 模式下回复 `/allow` 或 `/deny` 即可处理权限请求。
+
+常用 slash commands：
+
+| 命令 | 用途 |
+| --- | --- |
+| `/skill <名称> [提示]` | 要求 Agent 使用指定 skill |
+| `/mcp <名称> [提示]` | 要求 Agent 使用指定 MCP server |
+| `/plan [上下文]` | 暂停并先一起规划，达成共识前不写代码 |
+| `/compact` | 手动压缩当前 session 上下文 |
+| `/resume` | session 空闲时继续上一项工作 |
+| `/fork` | 把当前 session 复制为新 session |
+| `/status` | 查看当前 session 状态 |
+| `/new [名称] [--cwd <路径>]` | 创建并选择 session（channel） |
+| `/use <session>` | 切换到已有 session（channel） |
+| `/model <名称>` | 切换当前 session 的模型（channel） |
+| `/allow` `/deny` | 处理权限请求（channel，confirm 模式） |
+
+完整命令列表、示例和入口对照 → [Slash Commands 使用指南](docs/slash-commands.md)
 
 ## 🧩 一个不够？派小弟
 
@@ -212,6 +230,7 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | [文档索引](docs/README.md) | 按首次使用、日常操作和深入理解组织的阅读入口 |
 | [ACP 使用指南](docs/acp.md) | ACP 启动、session、权限、内容类型与限制 |
 | [Channel 部署与使用](docs/channels.md) | 微信、Telegram、飞书/Lark、QQ Bot 部署和 slash commands |
+| [Slash Commands 使用指南](docs/slash-commands.md) | 所有 `/` 命令的用途、示例与入口对照 |
 | [Subsessions 使用指南](docs/subsessions.md) | 父子 session、配置继承、结果回传和常用命令 |
 | [Automation 使用指南](docs/automation.md) | Cron、时区、新建/固定 session 和无人值守行为 |
 | [CLI 命令参考](docs/commands.md) | daemon、session、MCP、channel、automation 命令 |

@@ -2,7 +2,7 @@
 
 `dwo` 是本地 daemon 的控制 CLI。除 `serve` 外，命令都通过本地 IPC 连接已经运行的 daemon。配置固定为 `~/.dwoagent/profile.yaml`。
 
-面向首次使用者的安装与对话流程见根目录 [README](../README.md)；ACP 客户端接入见 [ACP 使用指南](acp.md)，消息平台部署和 slash commands 见 [Channel 部署与使用](channels.md)。
+面向首次使用者的安装与对话流程见根目录 [README](../README.md)；ACP 客户端接入见 [ACP 使用指南](acp.md)，消息平台部署见 [Channel 部署与使用](channels.md)，对话中的 `/` 命令见 [Slash Commands 使用指南](slash-commands.md)。
 
 ## 生命周期
 

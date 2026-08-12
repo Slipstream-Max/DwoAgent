@@ -84,9 +84,7 @@ fn shell_command(command: &str) -> (String, Vec<String>) {
                 "-ExecutionPolicy".to_string(),
                 "Bypass".to_string(),
                 "-Command".to_string(),
-                // PowerShell 5.1 attached to a PTY keeps running after
-                // -Command finishes; an explicit exit returns to the caller.
-                format!("chcp 65001 >$null;$ProgressPreference='SilentlyContinue';{command}; exit"),
+                format!("chcp 65001 >$null;$ProgressPreference='SilentlyContinue';{command}"),
             ],
         )
     } else {

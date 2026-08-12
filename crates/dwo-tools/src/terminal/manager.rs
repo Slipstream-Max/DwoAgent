@@ -368,6 +368,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interactive_input_reaches_the_child() {
+        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        // Character-at-a-time reads work through ConPTY; line-mode reads
+        // (ReadConsole with ENABLE_LINE_INPUT) are tracked separately.
+        let command = if cfg!(windows) {
+            "python -c \"import msvcrt; print('GOT:' + repr(msvcrt.getwch()))\""
+        } else {
+            "read -n1 c; echo GOT:$c"
+        };
+        let snapshot = manager
+            .run(command.to_string(), 1_500, 120_000)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, "running");
+
+        let terminal_id = snapshot.terminal_id.clone();
+        let input = manager
+            .input(&terminal_id, "x", 3_000)
+            .await
+            .unwrap();
+        assert!(
+            input.output.contains("GOT:'x'"),
+            "interactive input lost: {:?}",
+            input.output
+        );
+        manager.kill(&terminal_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn combined_commands_keep_all_output() {
+        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        // Table rendering (screen-buffer API) used to be dropped when the
+        // shell wrapper appended `; exit`; every later command's output was
+        // silently lost. Regression guard for the wrapper change.
+        let command = if cfg!(windows) {
+            "Write-Output 'TEST1'; Write-Output '===SEP==='; Get-ChildItem prompts | Select-Object Name; Write-Output '===SEP2==='; (Get-ChildItem prompts).Name; Write-Output '===SEP3==='; Get-Content prompts/terminal.md -TotalCount 3"
+        } else {
+            "printf 'TEST1\\nSEP\\n'; ls prompts; printf 'SEP2\\n'; ls prompts"
+        };
+        let snapshot = manager
+            .run(command.to_string(), 10_000, 120_000)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert!(snapshot.output.contains("TEST1"));
+        assert!(snapshot.output.contains("===SEP==="));
+        assert!(snapshot.output.contains("===SEP2==="));
+        assert!(snapshot.output.contains("===SEP3==="));
+        assert!(snapshot.output.contains("terminal.md"));
+        assert!(snapshot.output.contains("name: terminal"));
+    }
+
+    #[tokio::test]
     async fn telemetry_streams_open_output_and_exit_in_order() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let recorded = Arc::new(StdMutex::new(Vec::new()));

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
@@ -71,6 +72,8 @@ struct PromptParam {
     policy: Option<SessionMode>,
     model: Option<String>,
     reasoning: Option<String>,
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +290,7 @@ impl Host {
             profile_reload: tokio::sync::Mutex::new(()),
             shutdown,
         });
+        host.restore_ephemeral_cleanup().await;
         host.channel_gateway.start_all(host.clone()).await;
         host.start_mcp_watcher();
         host.start_profile_watcher();
@@ -303,11 +307,23 @@ impl Host {
     }
 
     pub async fn shutdown(&self) {
+        let ephemeral = self
+            .service
+            .list()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| record.info.ephemeral)
+            .map(|record| record.info.id)
+            .collect::<Vec<_>>();
         tokio::join!(
             self.channel_gateway.stop_all(),
             self.mcp.shutdown(),
             self.service.shutdown()
         );
+        for id in ephemeral {
+            let _ = delete_session_resources(&self.service, &self.profile_root, &id).await;
+        }
     }
 
     pub async fn list_sessions(
@@ -379,7 +395,7 @@ impl Host {
         let content = self
             .expand_prompt_directives(&snapshot.record.info.cwd, content)
             .await?;
-        Ok(agent.prompt_content(endpoint, content).await?)
+        Ok(self.service.prompt(id, endpoint, content).await?)
     }
 
     async fn expand_prompt_directives(
@@ -606,6 +622,11 @@ impl Host {
                 self.delete_session(&id).await?;
                 Ok(json!({"deleted": true}))
             }
+            "session.keep" => {
+                let id = parse_session(params)?;
+                let changed = self.service.keep(&id).await?;
+                Ok(json!({"session_id": id, "persistent": true, "changed": changed}))
+            }
             "session.close" => {
                 let id = parse_session(params)?;
                 self.close_session(&id).await?;
@@ -624,12 +645,24 @@ impl Host {
                     )
                     .await?;
                 let subscription = agent.attach(EndpointId::new()).await?;
-                let accepted = agent.prompt_content(endpoint, content).await?;
+                let cleanup_subscription = if snapshot.record.info.ephemeral {
+                    Some(agent.attach(EndpointId::new()).await?)
+                } else {
+                    None
+                };
+                let accepted = self.service.prompt(agent.id(), endpoint, content).await?;
                 if let Some(parent_id) = parent_id {
                     self.spawn_result_delivery(
                         subscription,
                         agent.id().clone(),
                         parent_id,
+                        accepted.turn_id.clone(),
+                    );
+                }
+                if let Some(subscription) = cleanup_subscription {
+                    self.spawn_ephemeral_cleanup(
+                        subscription,
+                        agent.id().clone(),
                         accepted.turn_id.clone(),
                     );
                 }
@@ -1092,6 +1125,7 @@ impl Host {
                 cwd,
                 mode: default_mode,
                 max_model_steps: default_max_model_steps,
+                ephemeral: false,
                 llm: SessionLlmSettings::new(default_model, None),
             })
             .await;
@@ -1135,6 +1169,10 @@ impl Host {
                 params.title.is_none() && params.cwd.is_none(),
                 "--title and --cwd can only be used when creating a subsession"
             );
+            anyhow::ensure!(
+                !params.ephemeral,
+                "--ephemeral can only be used when creating a new session"
+            );
             let id = SessionId::parse(target.clone()).map_err(anyhow::Error::msg)?;
             let record = records
                 .iter()
@@ -1158,6 +1196,10 @@ impl Host {
             anyhow::ensure!(
                 params.cwd.is_none(),
                 "--cwd cannot be used when forking a session"
+            );
+            anyhow::ensure!(
+                !params.ephemeral,
+                "--ephemeral can only be used when creating a new session"
             );
             let source_id = SessionId::parse(source.clone()).map_err(anyhow::Error::msg)?;
             let source_record = records
@@ -1232,6 +1274,7 @@ impl Host {
                 mode,
                 max_model_steps: default_max_model_steps,
                 llm: SessionLlmSettings::new(model, reasoning),
+                ephemeral: params.ephemeral,
             })
             .await;
         match created {
@@ -1263,56 +1306,62 @@ impl Host {
         );
     }
 
-    pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
-        let record = self
-            .service
-            .list()
-            .await?
-            .into_iter()
-            .find(|record| &record.info.id == id);
-        self.service.delete(id).await?;
+    fn spawn_ephemeral_cleanup(
+        &self,
+        mut subscription: SessionSubscription,
+        child_id: SessionId,
+        watched_turn: TurnId,
+    ) {
+        let service = self.service.clone();
+        let profile_root = self.profile_root.clone();
+        tokio::spawn(async move {
+            while let Some(event) = subscription.events.recv().await {
+                let terminal = match event.payload {
+                    SessionEventPayload::TurnCompleted { turn_id } if turn_id == watched_turn => {
+                        true
+                    }
+                    SessionEventPayload::TurnFailed { turn_id, .. } if turn_id == watched_turn => {
+                        true
+                    }
+                    SessionEventPayload::TurnCancelled { turn_id } if turn_id == watched_turn => {
+                        true
+                    }
+                    _ => false,
+                };
+                if terminal {
+                    let Some(deadline) = service
+                        .status(&child_id)
+                        .await
+                        .ok()
+                        .and_then(|status| status.record.info.delete_after_ms)
+                    else {
+                        continue;
+                    };
+                    spawn_ephemeral_expiry(service, profile_root, child_id, deadline);
+                    break;
+                }
+            }
+        });
+    }
 
-        let generated_workspace = self
-            .profile_root
-            .join("runtime")
-            .join("workspaces")
-            .join(id.as_str());
-        let resolved_generated_workspace = std::fs::canonicalize(&generated_workspace)
-            .unwrap_or_else(|_| generated_workspace.clone());
-        if record
-            .as_ref()
-            .is_some_and(|record| record.info.cwd == resolved_generated_workspace)
-            && generated_workspace.is_dir()
-        {
-            tokio::fs::remove_dir_all(&generated_workspace).await?;
+    async fn restore_ephemeral_cleanup(&self) {
+        let schedule = self
+            .service
+            .recover_ephemeral_sessions(now_ms(), EPHEMERAL_GRACE_MS)
+            .await
+            .unwrap_or_default();
+        for (id, deadline) in schedule {
+            spawn_ephemeral_expiry(
+                self.service.clone(),
+                self.profile_root.clone(),
+                id,
+                deadline,
+            );
         }
-        remove_session_attachment_dirs(
-            &self
-                .profile_root
-                .join("runtime")
-                .join("attachments")
-                .join("weixin"),
-            id.as_str(),
-        )
-        .await?;
-        remove_session_attachment_dirs(
-            &self
-                .profile_root
-                .join("runtime")
-                .join("attachments")
-                .join("telegram"),
-            id.as_str(),
-        )
-        .await?;
-        remove_session_attachment_dirs(
-            &self
-                .profile_root
-                .join("runtime")
-                .join("attachments")
-                .join("feishu"),
-            id.as_str(),
-        )
-        .await
+    }
+
+    pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
+        delete_session_resources(&self.service, &self.profile_root, id).await
     }
 
     pub fn profile_root_path(&self) -> &Path {
@@ -1552,6 +1601,75 @@ fn spawn_result_delivery(
             ),
         }
     });
+}
+
+async fn delete_session_resources(
+    service: &AgentService,
+    profile_root: &Path,
+    id: &SessionId,
+) -> Result<()> {
+    let record = service
+        .list()
+        .await?
+        .into_iter()
+        .find(|record| &record.info.id == id);
+    service.delete(id).await?;
+
+    if let Some(record) = record {
+        cleanup_deleted_session_resources(profile_root, id, &record).await?;
+    }
+    Ok(())
+}
+
+const EPHEMERAL_GRACE_MS: u64 = 5 * 60 * 1000;
+
+fn spawn_ephemeral_expiry(
+    service: Arc<AgentService>,
+    profile_root: PathBuf,
+    id: SessionId,
+    deadline: u64,
+) {
+    tokio::spawn(async move {
+        let delay = deadline.saturating_sub(now_ms());
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        let Ok(Some(record)) = service.delete_if_ephemeral_expired(&id, now_ms()).await else {
+            return;
+        };
+        let _ = cleanup_deleted_session_resources(&profile_root, &id, &record).await;
+    });
+}
+
+async fn cleanup_deleted_session_resources(
+    profile_root: &Path,
+    id: &SessionId,
+    record: &SessionRecord,
+) -> Result<()> {
+    let generated_workspace = profile_root
+        .join("runtime")
+        .join("workspaces")
+        .join(id.as_str());
+    let resolved_generated_workspace =
+        std::fs::canonicalize(&generated_workspace).unwrap_or_else(|_| generated_workspace.clone());
+    if record.info.cwd == resolved_generated_workspace && generated_workspace.is_dir() {
+        tokio::fs::remove_dir_all(&generated_workspace).await?;
+    }
+    for channel in ["weixin", "telegram", "feishu"] {
+        remove_session_attachment_dirs(
+            &profile_root.join("runtime/attachments").join(channel),
+            id.as_str(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 async fn remove_session_attachment_dirs(root: &Path, session_id: &str) -> Result<()> {
@@ -1952,6 +2070,7 @@ model:
             policy: None,
             model: None,
             reasoning: None,
+            ephemeral: false,
         };
         let (source, _) = host
             .resolve_prompt_session(&create, Some(parent.id().clone()))

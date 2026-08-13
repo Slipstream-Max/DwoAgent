@@ -550,6 +550,7 @@ impl AutomationRuntime {
                     }
                 )
                 .then(|| job.name.clone()),
+                ephemeral: false,
             })
             .await?)
     }

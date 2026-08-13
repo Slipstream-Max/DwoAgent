@@ -32,6 +32,7 @@ pub struct EndpointId(String);
 /// interrupted mid-generation. After this many consecutive interruptions the
 /// turn fails for real.
 const MAX_AUTO_RESUMES: usize = 2;
+const EPHEMERAL_GRACE_MS: u64 = 5 * 60 * 1000;
 
 impl EndpointId {
     pub fn new() -> Self {
@@ -347,6 +348,13 @@ impl SessionAgent {
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub(crate) async fn keep(&self) -> Result<bool, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::Keep { response }).await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
     pub async fn notify_internal(
         &self,
         content: impl Into<String>,
@@ -429,6 +437,9 @@ enum Control {
     SetConfig {
         update: SessionConfigUpdate,
         response: oneshot::Sender<Result<(), AgentServiceError>>,
+    },
+    Keep {
+        response: oneshot::Sender<Result<bool, AgentServiceError>>,
     },
     InternalMessage {
         content: MessageContent,
@@ -573,6 +584,21 @@ impl SessionActor {
                     };
                     let _ = response.send(Err(error));
                     return false;
+                }
+                if self.record.info.ephemeral && self.record.info.completed {
+                    let _ = response.send(Err(AgentServiceError::InvalidConfig(format!(
+                        "session {} has completed and cannot accept more prompts; keep it first",
+                        self.record.info.id
+                    ))));
+                    return false;
+                }
+                if self.record.info.ephemeral && self.record.info.delete_after_ms.is_some() {
+                    self.record.info.delete_after_ms = None;
+                    self.record.touch();
+                    if let Err(error) = self.repository.save(&self.record).await {
+                        let _ = response.send(Err(AgentServiceError::from(error)));
+                        return false;
+                    }
                 }
                 if self.active.is_none() {
                     let result = self.start_prompt(origin, content).await;
@@ -781,6 +807,25 @@ impl SessionActor {
                     }
                 }
                 let _ = response.send(result);
+            }
+            Control::Keep { response } => {
+                let mut updated = self.record.clone();
+                let changed = updated.info.ephemeral || updated.info.delete_after_ms.is_some();
+                updated.info.ephemeral = false;
+                updated.info.delete_after_ms = None;
+                let result = if changed {
+                    updated.touch();
+                    self.repository
+                        .save(&updated)
+                        .await
+                        .map_err(AgentServiceError::from)
+                } else {
+                    Ok(())
+                };
+                if result.is_ok() {
+                    self.record = updated;
+                }
+                let _ = response.send(result.map(|()| changed));
             }
             Control::InternalMessage {
                 content,
@@ -1399,6 +1444,20 @@ impl SessionActor {
                 self.phase = RuntimePhase::Idle;
                 let allow_pending_wake = !matches!(outcome, TurnOutcome::Cancelled);
                 let mut auto_resumed = false;
+                if self.record.info.ephemeral && !matches!(outcome, TurnOutcome::Interrupted) {
+                    self.record.info.completed |= matches!(outcome, TurnOutcome::Completed);
+                    self.record.info.delete_after_ms =
+                        Some(current_time_ms().saturating_add(EPHEMERAL_GRACE_MS));
+                    self.record.touch();
+                    if let Err(error) = self.repository.save(&self.record).await {
+                        tracing::error!(
+                            event = "session.ephemeral_outcome_save_failed",
+                            session_id = %self.record.info.id,
+                            error = %error,
+                            "persist ephemeral session outcome failed"
+                        );
+                    }
+                }
                 match outcome {
                     TurnOutcome::Completed => {
                         self.auto_resumes = 0;
@@ -1884,6 +1943,15 @@ fn title_source(content: &MessageContent) -> Option<String> {
 fn title_source_excerpt(source: &str) -> String {
     const TITLE_SOURCE_CHARS: usize = 2_000;
     source.chars().take(TITLE_SOURCE_CHARS).collect()
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn clean_generated_session_title(raw: &str) -> Option<String> {

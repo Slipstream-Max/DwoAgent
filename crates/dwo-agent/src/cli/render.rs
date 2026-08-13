@@ -61,6 +61,13 @@ pub fn write_session_status(value: &Value) -> Result<()> {
     if let Some(parent) = &status.record.info.parent_session_id {
         output::line(format_args!("parentSessionId: {parent}"))?;
     }
+    if status.record.info.ephemeral {
+        output::line(format_args!("ephemeral: true"))?;
+        output::line(format_args!("completed: {}", status.record.info.completed))?;
+        if let Some(delete_after_ms) = status.record.info.delete_after_ms {
+            output::line(format_args!("deleteAfter: {}", timestamp(delete_after_ms)))?;
+        }
+    }
     output::line(format_args!("cwd: {}", status.record.info.cwd.display()))?;
     output::line(format_args!(
         "policy: {}",

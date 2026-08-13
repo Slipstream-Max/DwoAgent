@@ -87,6 +87,9 @@ enum SessionCommand {
     Delete {
         id: String,
     },
+    Keep {
+        id: String,
+    },
     Status {
         id: String,
         #[arg(long)]
@@ -104,6 +107,8 @@ enum SessionCommand {
         model: Option<String>,
         #[arg(long)]
         reasoning: Option<String>,
+        #[arg(long, conflicts_with_all = ["to", "from"])]
+        ephemeral: bool,
         #[arg(long, conflicts_with = "from")]
         to: Option<String>,
         #[arg(long, conflicts_with = "to")]
@@ -544,6 +549,18 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             ipc::request(config_path, "session.delete", json!({"session_id": id})).await?;
             output::line(format_args!("Deleted session"))?;
         }
+        SessionCommand::Keep { id } => {
+            let value =
+                ipc::request(config_path, "session.keep", json!({"session_id": id})).await?;
+            output::line(format_args!(
+                "{}",
+                if value["changed"] == true {
+                    "Session kept"
+                } else {
+                    "Session already persistent"
+                }
+            ))?;
+        }
         SessionCommand::Status { id, json } => {
             let value =
                 ipc::request(config_path, "session.status", json!({"session_id": id})).await?;
@@ -562,6 +579,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             reasoning,
             to,
             from,
+            ephemeral,
         } => {
             let policy = policy
                 .map(|value| dwo_tools::SessionMode::parse(&value).map_err(anyhow::Error::msg))
@@ -580,6 +598,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                     "policy": policy,
                     "model": model,
                     "reasoning": reasoning,
+                    "ephemeral": ephemeral,
                 }),
             )
             .await?;
@@ -1254,6 +1273,29 @@ mod tests {
 
     #[test]
     fn parses_subsession_commands() {
+        let ephemeral =
+            Cli::try_parse_from(["dwo", "session", "prompt", "inspect once", "--ephemeral"])
+                .unwrap();
+        assert!(matches!(
+            ephemeral.command,
+            Command::Session {
+                command: SessionCommand::Prompt {
+                    ephemeral: true,
+                    to: None,
+                    from: None,
+                    ..
+                }
+            }
+        ));
+
+        let keep = Cli::try_parse_from(["dwo", "session", "keep", "session-child"]).unwrap();
+        assert!(matches!(
+            keep.command,
+            Command::Session {
+                command: SessionCommand::Keep { ref id }
+            } if id == "session-child"
+        ));
+
         let prompt = Cli::try_parse_from([
             "dwo",
             "session",
@@ -1303,6 +1345,7 @@ mod tests {
                 command: SessionCommand::Prompt {
                     from: Some(ref id),
                     to: None,
+                    ephemeral: false,
                     ..
                 }
             } if id == "session-child"
@@ -1317,6 +1360,30 @@ mod tests {
                 "session-a",
                 "--to",
                 "session-b",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "dwo",
+                "session",
+                "prompt",
+                "invalid",
+                "--from",
+                "session-a",
+                "--ephemeral",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "dwo",
+                "session",
+                "prompt",
+                "invalid",
+                "--to",
+                "session-a",
+                "--ephemeral",
             ])
             .is_err()
         );

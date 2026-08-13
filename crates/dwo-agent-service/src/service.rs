@@ -25,7 +25,8 @@ use crate::record::{
     SessionConfigUpdate, SessionId, SessionLlmSettings, SessionRecord, title_from_user_content,
 };
 use crate::repository::SessionRepository;
-use crate::session::SessionAgent;
+use crate::session::{EndpointId, PromptAccepted, SessionAgent};
+use dwo_context::MessageContent;
 
 pub struct NewSession {
     pub id: Option<SessionId>,
@@ -36,6 +37,7 @@ pub struct NewSession {
     pub mode: SessionMode,
     pub llm: SessionLlmSettings,
     pub max_model_steps: usize,
+    pub ephemeral: bool,
 }
 
 pub struct AgentService {
@@ -242,6 +244,7 @@ impl AgentService {
         );
         record.set_parent_session_id(new_session.parent_session_id);
         record.set_automation_job(new_session.automation_job);
+        record.info.ephemeral = new_session.ephemeral;
         if automatic_title {
             record.enable_auto_title();
         }
@@ -432,6 +435,32 @@ impl AgentService {
     pub async fn delete(&self, id: &SessionId) -> Result<(), AgentServiceError> {
         let operation = self.session_operation(id).await;
         let _operation = operation.lock().await;
+        self.delete_locked(id).await
+    }
+
+    pub async fn delete_if_ephemeral_expired(
+        &self,
+        id: &SessionId,
+        now_ms: u64,
+    ) -> Result<Option<SessionRecord>, AgentServiceError> {
+        let operation = self.session_operation(id).await;
+        let _operation = operation.lock().await;
+        let Some(record) = self.repository.load(id).await? else {
+            return Ok(None);
+        };
+        if !record.info.ephemeral
+            || record
+                .info
+                .delete_after_ms
+                .is_none_or(|deadline| deadline > now_ms)
+        {
+            return Ok(None);
+        }
+        self.delete_locked(id).await?;
+        Ok(Some(record))
+    }
+
+    async fn delete_locked(&self, id: &SessionId) -> Result<(), AgentServiceError> {
         let agent = {
             let mut loaded = self.loaded.lock().await;
             if !loaded.deleting.insert(id.clone()) {
@@ -457,12 +486,56 @@ impl AgentService {
         Ok(())
     }
 
+    pub async fn keep(&self, id: &SessionId) -> Result<bool, AgentServiceError> {
+        let agent = self.load(id).await?;
+        let operation = self.session_operation(id).await;
+        let _operation = operation.lock().await;
+        agent.keep().await
+    }
+
+    pub async fn recover_ephemeral_sessions(
+        &self,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<Vec<(SessionId, u64)>, AgentServiceError> {
+        let mut schedule = Vec::new();
+        for mut record in self.repository.list().await? {
+            if !record.info.ephemeral {
+                continue;
+            }
+            let deadline = match record.info.delete_after_ms {
+                Some(deadline) => deadline,
+                None => {
+                    let deadline = now_ms.saturating_add(grace_ms);
+                    record.info.delete_after_ms = Some(deadline);
+                    record.touch();
+                    self.repository.save(&record).await?;
+                    deadline
+                }
+            };
+            schedule.push((record.info.id, deadline));
+        }
+        Ok(schedule)
+    }
+
     pub async fn set_config(
         &self,
         id: &SessionId,
         update: SessionConfigUpdate,
     ) -> Result<(), AgentServiceError> {
         self.load(id).await?.set_config(update).await
+    }
+
+    pub async fn prompt(
+        &self,
+        id: &SessionId,
+        origin: EndpointId,
+        content: MessageContent,
+    ) -> Result<PromptAccepted, AgentServiceError> {
+        let agent = self.load(id).await?;
+        let operation = self.session_operation(id).await;
+        let _operation = operation.lock().await;
+        agent.prompt_content(origin, content).await
     }
 
     pub async fn shutdown(&self) {

@@ -43,7 +43,8 @@ dwo profile-list
 dwo session list [--all]
 dwo session status <id> [--json]
 dwo session delete <id>
-dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <id> | --from <id>]
+dwo session keep <id>
+dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--ephemeral] [--to <id> | --from <id>]
 dwo session cancel <id>
 dwo session watch <id> [--cursor <cursor>] [--limit <count>]
 dwo session approve|deny <id> <permission-id>
@@ -90,6 +91,14 @@ and prompts the copy. They are mutually exclusive. Agent callers can target
 only direct children, and child policy cannot be more permissive than its
 parent. A fork keeps the source cwd and parent; `--title` may override its
 title, while `--cwd` is rejected with either `--to` or `--from`.
+
+`--ephemeral` is available only when creating a new session. It cannot be used
+with `--to` or `--from`; forked sessions are persistent. An ephemeral session
+accepts `--to` follow-ups until a turn completes successfully. Successful,
+failed, and cancelled turns start a five-minute deletion grace period; failed
+or cancelled sessions can be prompted again during that period. Use
+`dwo session keep <id>` to make the session persistent. A graceful daemon stop
+deletes all remaining ephemeral sessions immediately.
 
 `dwo install` deploys the running executable to `~/.dwoagent/bin`, adds that
 directory to the Windows user PATH, and registers the daemon using the stable

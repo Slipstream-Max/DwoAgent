@@ -81,6 +81,12 @@ pub struct SessionInfo {
     pub mode: SessionMode,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ephemeral: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +174,9 @@ impl SessionRecord {
                 mode,
                 created_at_ms: now,
                 updated_at_ms: now,
+                ephemeral: false,
+                completed: false,
+                delete_after_ms: None,
             },
             llm,
             context: SessionContext::default(),

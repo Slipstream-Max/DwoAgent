@@ -24,6 +24,7 @@ fn new_session(cwd: &std::path::Path, mode: SessionMode) -> NewSession {
         mode,
         max_model_steps: 100,
         llm: SessionLlmSettings::default(),
+        ephemeral: false,
     }
 }
 
@@ -45,6 +46,168 @@ async fn wait_for_turn_end(
     })
     .await
     .expect("turn did not finish")
+}
+
+fn ephemeral_session(cwd: &std::path::Path) -> NewSession {
+    NewSession {
+        ephemeral: true,
+        ..new_session(cwd, SessionMode::FullAccess)
+    }
+}
+
+#[tokio::test]
+async fn completed_ephemeral_session_is_sealed_until_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::text("first answer"),
+        ScriptedStep::text("continued answer"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service.create(ephemeral_session(dir.path())).await.unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+
+    agent.prompt(EndpointId::new(), "first").await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { .. }
+    ));
+    let snapshot = agent.snapshot().await.unwrap();
+    assert!(snapshot.record.info.ephemeral);
+    assert!(snapshot.record.info.completed);
+    assert!(snapshot.record.info.delete_after_ms.is_some());
+
+    let error = agent
+        .prompt(EndpointId::new(), "too late")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("has completed"));
+
+    assert!(service.keep(agent.id()).await.unwrap());
+    let kept = agent.snapshot().await.unwrap();
+    assert!(!kept.record.info.ephemeral);
+    assert!(kept.record.info.delete_after_ms.is_none());
+    agent.prompt(EndpointId::new(), "continue").await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn failed_ephemeral_session_can_be_prompted_during_grace_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        ScriptedStep::streamed_failure(Vec::new(), "boom"),
+        ScriptedStep::text("recovered"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service.create(ephemeral_session(dir.path())).await.unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+
+    agent.prompt(EndpointId::new(), "fail first").await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnFailed { .. }
+    ));
+    let failed = agent.snapshot().await.unwrap();
+    assert!(!failed.record.info.completed);
+    assert!(failed.record.info.delete_after_ms.is_some());
+
+    agent.prompt(EndpointId::new(), "retry").await.unwrap();
+    assert!(
+        agent
+            .snapshot()
+            .await
+            .unwrap()
+            .record
+            .info
+            .delete_after_ms
+            .is_none()
+    );
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn keep_wins_over_expired_ephemeral_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([ScriptedStep::streamed_failure(Vec::new(), "boom")]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model,
+        PolicyConfig::default(),
+    );
+    let agent = service.create(ephemeral_session(dir.path())).await.unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "fail").await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnFailed { .. }
+    ));
+    service.keep(agent.id()).await.unwrap();
+
+    assert!(
+        service
+            .delete_if_ephemeral_expired(agent.id(), u64::MAX)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !service
+            .status(agent.id())
+            .await
+            .unwrap()
+            .record
+            .info
+            .ephemeral
+    );
+}
+
+#[tokio::test]
+async fn recovery_assigns_a_deadline_to_interrupted_ephemeral_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let repository = Arc::new(MemorySessionRepository::default());
+    let service = AgentService::new(
+        repository.clone(),
+        ScriptedModelGateway::new([]),
+        PolicyConfig::default(),
+    );
+    let agent = service.create(ephemeral_session(dir.path())).await.unwrap();
+    let id = agent.id().clone();
+    service.shutdown().await;
+    let recovered = AgentService::new(
+        repository,
+        ScriptedModelGateway::new([]),
+        PolicyConfig::default(),
+    );
+
+    let schedule = recovered
+        .recover_ephemeral_sessions(100, 300)
+        .await
+        .unwrap();
+
+    assert_eq!(schedule, [(id.clone(), 400)]);
+    assert_eq!(
+        recovered
+            .status(&id)
+            .await
+            .unwrap()
+            .record
+            .info
+            .delete_after_ms,
+        Some(400)
+    );
 }
 
 fn streamed_hosted_call(status: &str) -> ModelStreamEvent {
@@ -185,6 +348,7 @@ async fn unnamed_session_gets_model_generated_title() {
             mode: SessionMode::FullAccess,
             max_model_steps: 100,
             llm: SessionLlmSettings::default(),
+            ephemeral: false,
         })
         .await
         .unwrap();
@@ -2220,6 +2384,7 @@ async fn prompt_is_stable_while_agents_changes_are_appended_as_watcher_messages(
             mode: SessionMode::FullAccess,
             max_model_steps: 100,
             llm: SessionLlmSettings::default(),
+            ephemeral: false,
         })
         .await
         .unwrap();

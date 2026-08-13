@@ -5,6 +5,58 @@ use dwo_model_client::{
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+fn grok_client_with_hosted_tool(tool: &str) -> std::sync::Arc<ConfiguredModelClient> {
+    let catalog = format!(
+        r#"
+providers:
+  grok:
+    endpoint: https://api.kkrich.ltd/v1/responses
+    models:
+      grok-4.5:
+        contextWindowTokens: 500000
+        maxOutputTokens: 128000
+        capabilities:
+          imageInput: true
+          toolCalls: true
+        hostedTools:
+          - type: {tool}
+        defaultReasoningMode: High
+        reasoning:
+          High:
+            reasoning:
+              effort: high
+      grok-4.6:
+        contextWindowTokens: 500000
+        maxOutputTokens: 128000
+        capabilities:
+          imageInput: true
+          toolCalls: true
+        hostedTools:
+          - type: {tool}
+        defaultReasoningMode: High
+        reasoning:
+          High:
+            reasoning:
+              effort: high
+"#
+    );
+    let agent = r#"
+defaultModelName: grok-4.6
+providers:
+  grok:
+    type: grok
+    apiKeyEnv: GROK_API_KEY
+models:
+  - modelName: grok-4.5
+    provider: grok
+    modelId: grok-4.5
+  - modelName: grok-4.6
+    provider: grok
+    modelId: grok-4.6
+"#;
+    ConfiguredModelClient::from_yaml(&catalog, agent).unwrap()
+}
+
 fn selection(model: &str) -> ModelSelection {
     ModelSelection {
         model: model.to_string(),
@@ -195,6 +247,8 @@ models:
     )
     .unwrap();
     let client = ConfiguredModelClient::new(&ModelCatalog::builtin().unwrap(), &agent).unwrap();
+    let web_client = grok_client_with_hosted_tool("web_search");
+    let x_client = grok_client_with_hosted_tool("x_search");
 
     for model in ["grok-4.5", "grok-4.6"] {
         for reasoning in ["Low", "Medium", "High", "XHigh"] {
@@ -213,7 +267,7 @@ models:
         }
 
         let searched = stream(
-            &client,
+            &web_client,
             model,
             &[
                 ContextMessage::system(
@@ -237,7 +291,7 @@ models:
         );
 
         let x_searched = stream(
-            &client,
+            &x_client,
                 model,
                 &[
                     ContextMessage::system(

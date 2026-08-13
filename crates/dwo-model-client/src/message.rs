@@ -157,14 +157,18 @@ fn provider_content(
     role: MessageRole,
     allow_image_input: bool,
 ) -> Result<Vec<Value>, ModelClientError> {
+    let text_type = match role {
+        MessageRole::Assistant => "output_text",
+        MessageRole::System | MessageRole::User | MessageRole::Tool => "input_text",
+    };
     if let Some(text) = content.as_text() {
-        return Ok(vec![json!({"type":"input_text", "text":text})]);
+        return Ok(vec![json!({"type":text_type, "text":text})]);
     }
     let mut blocks = Vec::with_capacity(content.as_blocks().len());
     for block in content.as_blocks() {
         match block {
             ContentBlock::Text { text, .. } => blocks.push(json!({
-                "type":"input_text",
+                "type":text_type,
                 "text":text,
             })),
             ContentBlock::Image {
@@ -195,7 +199,7 @@ fn provider_content(
             } => {
                 let mime = mime_type.as_deref().unwrap_or("text/plain");
                 blocks.push(json!({
-                    "type":"input_text",
+                    "type":text_type,
                     "text":format!("<embedded_resource uri=\"{uri}\" mime_type=\"{mime}\">\n{text}\n</embedded_resource>")
                 }));
             }
@@ -226,7 +230,7 @@ fn provider_content(
                 if let Some(description) = description {
                     text.push_str(&format!("\n{description}"));
                 }
-                blocks.push(json!({"type":"input_text", "text":text}));
+                blocks.push(json!({"type":text_type, "text":text}));
             }
             ContentBlock::Audio { .. } => {
                 return Err(ModelClientError::protocol(
@@ -493,6 +497,25 @@ pub(crate) fn usage(value: Option<&Value>) -> ModelUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_input_uses_output_text_for_plain_assistant_messages() {
+        let input = provider_input(
+            &[
+                ContextMessage::system("system"),
+                ContextMessage::user("question"),
+                ContextMessage::assistant("answer", Vec::new()),
+                ContextMessage::summary("handoff summary"),
+            ],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert_eq!(input[2]["content"][0]["type"], "output_text");
+        assert_eq!(input[3]["content"][0]["type"], "output_text");
+    }
 
     #[test]
     fn responses_input_replays_native_items_and_function_outputs() {

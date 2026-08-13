@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use eventsource_stream::Eventsource;
@@ -182,6 +183,7 @@ impl BaseClient {
     ) -> Result<ModelReply, ModelClientError> {
         let mut stream = response.bytes_stream().eventsource();
         let mut accumulated = StreamAccumulator::default();
+        let mut emitted_tool_calls = HashSet::new();
         loop {
             let next = tokio::select! {
                 _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
@@ -221,13 +223,17 @@ impl BaseClient {
                         let _ = events.send(ModelStreamEvent::ReasoningDelta(delta.to_string()));
                     }
                 }
-                Some("response.output_item.added" | "response.output_item.done") => {
+                Some(event_type @ ("response.output_item.added" | "response.output_item.done")) => {
                     if let (Some(index), Some(item)) = (
                         payload.get("output_index").and_then(Value::as_u64),
                         payload.get("item"),
                     ) {
                         accumulated.add_output_item(index, item.clone());
-                        if let Some(call) = stream_tool_call(item, hosted_tools) {
+                        if event_type == "response.output_item.done"
+                            && !emitted_tool_calls.contains(&index)
+                            && let Some(call) = stream_tool_call(item, hosted_tools)
+                        {
+                            emitted_tool_calls.insert(index);
                             let _ = events.send(ModelStreamEvent::ToolCall(call));
                         }
                     }
@@ -245,10 +251,13 @@ impl BaseClient {
                         payload.get("output_index").and_then(Value::as_u64),
                         payload.get("arguments").and_then(Value::as_str),
                     ) {
-                        if let Some(call) = accumulated
+                        let call = accumulated
                             .update_function_arguments(index, arguments, false)
-                            .and_then(|item| stream_tool_call(item, hosted_tools))
+                            .and_then(|item| stream_tool_call(item, hosted_tools));
+                        if !emitted_tool_calls.contains(&index)
+                            && let Some(call) = call
                         {
+                            emitted_tool_calls.insert(index);
                             let _ = events.send(ModelStreamEvent::ToolCall(call));
                         }
                     }
@@ -267,16 +276,11 @@ impl BaseClient {
                     let Some(status) = provider_tool_event_state(event_type) else {
                         continue;
                     };
-                    if let Some(call) = accumulated
-                        .set_output_item_status(
-                            payload.get("output_index").and_then(Value::as_u64),
-                            payload.get("item_id").and_then(Value::as_str),
-                            status,
-                        )
-                        .and_then(|item| stream_tool_call(item, hosted_tools))
-                    {
-                        let _ = events.send(ModelStreamEvent::ToolCall(call));
-                    }
+                    let _ = accumulated.set_output_item_status(
+                        payload.get("output_index").and_then(Value::as_u64),
+                        payload.get("item_id").and_then(Value::as_str),
+                        status,
+                    );
                 }
                 None => {}
             }

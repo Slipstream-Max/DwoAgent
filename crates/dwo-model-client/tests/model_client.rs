@@ -119,6 +119,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
         json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call-1","name":"terminal","arguments":""}}).to_string(),
         json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"action\":\"run\",\"comm"}).to_string(),
         json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"and\":\"echo hi\"}"}).to_string(),
+        json!({"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}).to_string(),
         json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}}).to_string(),
         json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"think "}]},{"type":"file_search_call","id":"fs-1","status":"completed","results":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]},{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}).to_string(),
     ];
@@ -171,25 +172,20 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
         events_rx.recv().await.unwrap(),
         ModelStreamEvent::TextDelta("working".to_string())
     );
-    for expected in ["in_progress", "in_progress", "completed", "completed"] {
-        let ModelStreamEvent::ToolCall(call) = events_rx.recv().await.unwrap() else {
-            panic!("expected hosted tool progress");
-        };
-        assert_eq!(call.tool_call_id, "fs-1");
-        assert_eq!(call.tool_name, "file_search");
-        assert_eq!(call.status, expected);
-    }
+    let ModelStreamEvent::ToolCall(hosted) = events_rx.recv().await.unwrap() else {
+        panic!("expected completed hosted tool call");
+    };
+    assert_eq!(hosted.tool_call_id, "fs-1");
+    assert_eq!(hosted.tool_name, "file_search");
+    assert_eq!(hosted.status, "completed");
+    assert_eq!(hosted.raw_input["results"], json!([]));
     let ModelStreamEvent::ToolCall(started) = events_rx.recv().await.unwrap() else {
         panic!("expected streamed tool call start");
     };
     assert_eq!(started.tool_call_id, "call-1");
     assert_eq!(started.status, "pending");
-    assert_eq!(started.raw_input, json!({}));
-    let ModelStreamEvent::ToolCall(updated) = events_rx.recv().await.unwrap() else {
-        panic!("expected streamed tool call input update");
-    };
-    assert_eq!(updated.tool_call_id, "call-1");
-    assert_eq!(updated.raw_input["command"], "echo hi");
+    assert_eq!(started.raw_input["command"], "echo hi");
+    assert!(events_rx.try_recv().is_err());
     assert_eq!(reply.content, "working");
     assert_eq!(reply.reasoning.as_deref(), Some("think "));
     assert_eq!(reply.finish_reason, FinishReason::ToolCalls);
@@ -215,6 +211,52 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(request["reasoning"]["effort"], "low");
     assert_eq!(request["extra_body"]["provider_flag"], true);
     assert_eq!(request["extra_body"]["thinking"]["type"], "enabled");
+}
+
+#[tokio::test]
+async fn streamed_function_call_waits_for_complete_output_item_without_arguments_done() {
+    let chunks = [
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"terminal","arguments":""}}).to_string(),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"echo hi\"}"}).to_string(),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"command\":\"echo hi\"}"}}).to_string(),
+        json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"command\":\"echo hi\"}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}).to_string(),
+    ];
+    let sse = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>()
+        + "data: [DONE]\n\n";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+    );
+    let (endpoint, _request_rx) = one_response_server(response).await;
+    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let reply = client
+        .stream_turn(
+            ModelSelection {
+                model: "chat".to_string(),
+                reasoning: None,
+            },
+            &[
+                ContextMessage::system("system prompt"),
+                ContextMessage::user("run it"),
+            ],
+            &[json!({"type":"function","function":{"name":"terminal"}})],
+            events_tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let ModelStreamEvent::ToolCall(call) = events_rx.recv().await.unwrap() else {
+        panic!("expected complete streamed tool call");
+    };
+    assert_eq!(call.tool_call_id, "call-1");
+    assert_eq!(call.raw_input["command"], "echo hi");
+    assert!(events_rx.try_recv().is_err());
+    assert_eq!(reply.tool_calls[0]["arguments"]["command"], "echo hi");
 }
 
 #[tokio::test]

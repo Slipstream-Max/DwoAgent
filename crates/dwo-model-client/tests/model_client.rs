@@ -524,6 +524,35 @@ fn builtin_openai_provider_exposes_verified_model_capabilities() {
 }
 
 #[test]
+fn builtin_grok_provider_exposes_responses_models_and_reasoning() {
+    let catalog = ModelCatalog::builtin().unwrap();
+    let grok = &catalog.providers["grok"];
+    assert_eq!(grok.endpoint, "https://api.kkrich.ltd/v1/responses");
+
+    for id in ["grok-4.5", "grok-4.6"] {
+        let model = &grok.models[id];
+        assert_eq!(model.context_window_tokens, 500_000, "{id}");
+        assert_eq!(model.max_output_tokens, 128_000, "{id}");
+        assert!(model.capabilities.image_input, "{id}");
+        assert!(model.capabilities.tool_calls, "{id}");
+        assert_eq!(
+            model.hosted_tools,
+            [json!({"type":"web_search"}), json!({"type":"x_search"})],
+            "{id}"
+        );
+        assert_eq!(model.default_reasoning_mode, "High", "{id}");
+        for (mode, effort) in [
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("XHigh", "xhigh"),
+        ] {
+            assert_eq!(model.reasoning[mode]["reasoning"]["effort"], effort, "{id}");
+        }
+    }
+}
+
+#[test]
 fn openai_provider_instance_only_overrides_endpoint_and_credentials() {
     let catalog = ModelCatalog::builtin().unwrap();
     let agent = AgentModelConfig::from_yaml(

@@ -1,0 +1,51 @@
+protocol: open_ai_responses
+endpoint: https://api.kkrich.ltd/v1/responses
+models:
+  grok-4.5:
+    contextWindowTokens: 500000
+    maxOutputTokens: 128000
+    compactThreshold: 0.5
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    hostedTools:
+      - type: web_search
+      - type: x_search
+    defaultReasoningMode: High
+    reasoning:
+      Low:
+        reasoning:
+          effort: low
+      Medium:
+        reasoning:
+          effort: medium
+      High:
+        reasoning:
+          effort: high
+      XHigh:
+        reasoning:
+          effort: xhigh
+  grok-4.6:
+    contextWindowTokens: 500000
+    maxOutputTokens: 128000
+    compactThreshold: 0.5
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    hostedTools:
+      - type: web_search
+      - type: x_search
+    defaultReasoningMode: High
+    reasoning:
+      Low:
+        reasoning:
+          effort: low
+      Medium:
+        reasoning:
+          effort: medium
+      High:
+        reasoning:
+          effort: high
+      XHigh:
+        reasoning:
+          effort: xhigh

@@ -14,6 +14,7 @@ const BUILTIN_PROVIDER_YAMLS: &[(&str, &str)] = &[
         "deepseek",
         include_str!("../resources/providers/deepseek.yaml"),
     ),
+    ("grok", include_str!("../resources/providers/grok.yaml")),
     ("openai", include_str!("../resources/providers/openai.yaml")),
 ];
 const RESERVED_BODY_FIELDS: &[&str] = &[

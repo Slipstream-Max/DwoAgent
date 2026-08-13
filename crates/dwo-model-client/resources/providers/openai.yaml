@@ -9,25 +9,25 @@ models:
       toolCalls: true
     hostedTools:
       - type: web_search
-    defaultReasoningMode: medium
+    defaultReasoningMode: Medium
     reasoning:
-      low:
+      Low:
         reasoning:
           effort: low
           summary: auto
-      medium:
+      Medium:
         reasoning:
           effort: medium
           summary: auto
-      high:
+      High:
         reasoning:
           effort: high
           summary: auto
-      xhigh:
+      XHigh:
         reasoning:
           effort: xhigh
           summary: auto
-      max:
+      Max:
         reasoning:
           effort: max
           summary: auto
@@ -39,25 +39,25 @@ models:
       toolCalls: true
     hostedTools:
       - type: web_search
-    defaultReasoningMode: medium
+    defaultReasoningMode: Medium
     reasoning:
-      low:
+      Low:
         reasoning:
           effort: low
           summary: auto
-      medium:
+      Medium:
         reasoning:
           effort: medium
           summary: auto
-      high:
+      High:
         reasoning:
           effort: high
           summary: auto
-      xhigh:
+      XHigh:
         reasoning:
           effort: xhigh
           summary: auto
-      max:
+      Max:
         reasoning:
           effort: max
           summary: auto
@@ -69,18 +69,18 @@ models:
       toolCalls: true
     hostedTools:
       - type: web_search
-    defaultReasoningMode: medium
+    defaultReasoningMode: Medium
     reasoning:
-      low:
+      Low:
         reasoning:
           effort: low
-      medium:
+      Medium:
         reasoning:
           effort: medium
-      high:
+      High:
         reasoning:
           effort: high
-      xhigh:
+      XHigh:
         reasoning:
           effort: xhigh
   gpt-5.4:
@@ -91,17 +91,17 @@ models:
       toolCalls: true
     hostedTools:
       - type: web_search
-    defaultReasoningMode: medium
+    defaultReasoningMode: Medium
     reasoning:
-      low:
+      Low:
         reasoning:
           effort: low
-      medium:
+      Medium:
         reasoning:
           effort: medium
-      high:
+      High:
         reasoning:
           effort: high
-      xhigh:
+      XHigh:
         reasoning:
           effort: xhigh

@@ -84,9 +84,9 @@ providers:
         hostedTools:
           - type: web_search
         reasoning:
-          high:
+          Low:
             reasoning:
-              effort: high
+              effort: low
             extra_body:
               thinking:
                 type: enabled
@@ -153,7 +153,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
         .stream_turn(
             ModelSelection {
                 model: "chat".to_string(),
-                reasoning: Some("high".to_string()),
+                reasoning: Some("Low".to_string()),
             },
             &messages,
             &tools,
@@ -212,7 +212,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(request["tools"].as_array().unwrap().len(), 2);
     assert_eq!(request["tools"][0]["type"], "web_search");
     assert_eq!(request["tools"][1]["name"], "terminal");
-    assert_eq!(request["reasoning"]["effort"], "high");
+    assert_eq!(request["reasoning"]["effort"], "low");
     assert_eq!(request["extra_body"]["provider_flag"], true);
     assert_eq!(request["extra_body"]["thinking"]["type"], "enabled");
 }
@@ -426,7 +426,7 @@ models:
     client
         .validate_selection(&ModelSelection {
             model: "deepseek-v4-flash".to_string(),
-            reasoning: Some("high".to_string()),
+            reasoning: Some("High".to_string()),
         })
         .unwrap();
 }
@@ -494,24 +494,32 @@ fn builtin_openai_provider_exposes_verified_model_capabilities() {
         assert_eq!(model.max_output_tokens, 128_000, "{id}");
         assert!(model.capabilities.image_input, "{id}");
         assert!(model.capabilities.tool_calls, "{id}");
-        assert_eq!(model.default_reasoning_mode, "medium", "{id}");
-        for effort in ["low", "medium", "high", "xhigh"] {
-            assert_eq!(
-                model.reasoning[effort]["reasoning"]["effort"], effort,
-                "{id}"
-            );
+        assert_eq!(model.default_reasoning_mode, "Medium", "{id}");
+        for (mode, effort) in [
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("XHigh", "xhigh"),
+        ] {
+            assert_eq!(model.reasoning[mode]["reasoning"]["effort"], effort, "{id}");
         }
     }
 
     for id in ["gpt-5.6-sol", "gpt-5.6-terra"] {
-        for effort in ["low", "medium", "high", "xhigh", "max"] {
-            let reasoning = &openai.models[id].reasoning[effort]["reasoning"];
+        for (mode, effort) in [
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("XHigh", "xhigh"),
+            ("Max", "max"),
+        ] {
+            let reasoning = &openai.models[id].reasoning[mode]["reasoning"];
             assert_eq!(reasoning["effort"], effort, "{id}/{effort}");
             assert_eq!(reasoning["summary"], "auto", "{id}/{effort}");
         }
     }
     for id in ["gpt-5.5", "gpt-5.4"] {
-        assert!(!openai.models[id].reasoning.contains_key("max"), "{id}");
+        assert!(!openai.models[id].reasoning.contains_key("Max"), "{id}");
     }
 }
 
@@ -540,7 +548,7 @@ models:
     assert_eq!(provider.api_key_env.as_deref(), Some("RELAY_API_KEY"));
     let model = &resolved.models["gpt-5.6-terra"];
     assert!(model.capabilities.image_input);
-    assert_eq!(model.default_reasoning_mode, "medium");
+    assert_eq!(model.default_reasoning_mode, "Medium");
 }
 
 #[test]
@@ -628,7 +636,7 @@ models:
     contextWindowTokens: 800000
     maxOutputTokens: 200000
     compactThreshold: 0.6
-    defaultReasoningMode: max
+    defaultReasoningMode: Max
 "#,
     )
     .unwrap();
@@ -644,7 +652,7 @@ models:
     assert_eq!(model.max_output_tokens, 200_000);
     assert_eq!(model.max_input_tokens().unwrap(), 600_000);
     assert_eq!(model.compact_threshold, 0.6);
-    assert_eq!(model.default_reasoning_mode, "max");
+    assert_eq!(model.default_reasoning_mode, "Max");
 }
 
 #[test]

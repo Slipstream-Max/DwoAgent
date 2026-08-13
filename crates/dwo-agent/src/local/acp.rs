@@ -2321,13 +2321,13 @@ mod tests {
             config: ipc_schema::SessionConfig {
                 mode: ipc_schema::SessionMode::FullAccess,
                 model: "deepseek-v4-flash".to_string(),
-                reasoning: Some("max".to_string()),
+                reasoning: Some("Max".to_string()),
             },
             models: vec![ipc_schema::SessionModelOption {
                 id: "deepseek-v4-flash".to_string(),
                 provider: "deepseek".to_string(),
-                reasoning: vec!["high".to_string(), "max".to_string()],
-                default_reasoning: "high".to_string(),
+                reasoning: vec!["Low".to_string(), "High".to_string(), "Max".to_string()],
+                default_reasoning: "High".to_string(),
             }],
         })
         .unwrap();
@@ -2337,9 +2337,10 @@ mod tests {
         assert_eq!(json[0]["currentValue"], "deepseek-v4-flash");
         assert_eq!(json[1]["configId"], "reasoning_mode");
         assert_eq!(json[1]["type"], "select");
-        assert_eq!(json[1]["currentValue"], "max");
-        assert_eq!(json[1]["options"][0]["value"], "high");
-        assert_eq!(json[1]["options"][1]["value"], "max");
+        assert_eq!(json[1]["currentValue"], "Max");
+        assert_eq!(json[1]["options"][0]["value"], "Low");
+        assert_eq!(json[1]["options"][1]["value"], "High");
+        assert_eq!(json[1]["options"][2]["value"], "Max");
         assert_eq!(json[2]["configId"], "policy_mode");
         assert_eq!(json[2]["type"], "select");
         assert_eq!(json[2]["currentValue"], "full_access");

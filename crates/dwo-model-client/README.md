@@ -61,7 +61,7 @@ models:
     contextWindowTokens: 1000000
     maxOutputTokens: 384000
     compactThreshold: 0.5
-    defaultReasoningMode: high
+    defaultReasoningMode: High
   - modelName: deepseek-v4-flash
     provider: deepseek
     modelId: deepseek-v4-flash

@@ -10,16 +10,19 @@ models:
       toolCalls: true
     hostedTools:
       - type: web_search
-    defaultReasoningMode: high
+    defaultReasoningMode: High
     reasoning:
-      auto: {}
-      nonthink:
+      Auto: {}
+      Off:
         reasoning:
           effort: none
-      high:
+      Low:
+        reasoning:
+          effort: low
+      High:
         reasoning:
           effort: high
-      max:
+      Max:
         reasoning:
           effort: max
   deepseek-v4-flash:
@@ -31,15 +34,18 @@ models:
       toolCalls: true
     hostedTools:
       - type: web_search
-    defaultReasoningMode: high
+    defaultReasoningMode: High
     reasoning:
-      auto: {}
-      nonthink:
+      Auto: {}
+      Off:
         reasoning:
           effort: none
-      high:
+      Low:
+        reasoning:
+          effort: low
+      High:
         reasoning:
           effort: high
-      max:
+      Max:
         reasoning:
           effort: max

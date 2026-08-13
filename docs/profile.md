@@ -211,6 +211,9 @@ model:
 
 请求 headers、retry、request body 和模型 capabilities 来自内置 catalog。Profile 可以覆盖 provider 地址和凭据。
 
+Provider catalog 文件的完整格式、内置 provider 清单、请求构造、重试策略与错误分类
+见 [Model Client 与 Provider Catalog](model-client.md)。
+
 内置 catalog 按 provider 分文件维护在
 `dwo-model-client/resources/providers/`。OpenAI-compatible 网关可以继承
 `openai`，只覆盖完整的 Responses URL：
@@ -233,6 +236,10 @@ model:
 `input`、`max_output_tokens` 和 Responses SSE 事件。Provider catalog 可以通过
 模型级 `hostedTools` 声明服务端工具；本地 function tools 会在请求时与其合并。
 
+用户自定义 provider 放在 profile 根目录的 `resource/providers/<type>.yaml`，
+文件名（不含扩展名）就是 `type`。完整文件格式、内置 provider 清单、请求构造、
+重试策略与添加步骤见 [Model Client 与 Provider Catalog](model-client.md)。
+
 ### Responses 上下文与 provider 切换
 
 Responses 返回的不是一整块 assistant message。赤铎会按原始顺序保存 reasoning、assistant message、本地 `function_call`/output 和 provider 托管的 tool call。下一次请求仍按这个顺序回放，不会把它们重新揉成一条消息；压缩和 usage 估算也使用同一套结构。
@@ -240,47 +247,6 @@ Responses 返回的不是一整块 assistant message。赤铎会按原始顺序�
 其中 reasoning 和托管工具调用可能包含只对当前 provider instance 有效的状态，因此带有 provider 归属。切换 provider instance 时，daemon 会在下一次模型请求前永久移除这些私有项，同时保留用户与 assistant 可见消息，以及本地工具的 call/result。只在同一个 provider 下切换模型不会触发这项清理。
 
 这里改变的是 `model_context.json`，不是 `client_transcript.jsonl`。客户端回放仍能看到完整的 reasoning、远端工具事件和原始消息。类似地，切换到纯文本模型时，图片只会从模型上下文移除，transcript 仍保留原始输入。
-
-用户自定义 provider 放在 `resource/providers/<type>.yaml`。文件名（不含扩展名）
-就是 `profile.yaml` 中引用的 `type`；文件内容只定义一个 provider，不再包含顶层
-`providers` map。例如：
-
-```yaml
-# resource/providers/newapi.yaml
-protocol: open_ai_responses
-endpoint: https://gateway.example.com/v1/responses
-models:
-  custom-model:
-    contextWindowTokens: 200000
-    maxOutputTokens: 32000
-    capabilities:
-      imageInput: true
-      toolCalls: true
-    hostedTools:
-      - type: web_search_preview
-    defaultReasoningMode: medium
-    reasoning:
-      low: {reasoning: {effort: low}}
-      medium: {reasoning: {effort: medium}}
-      high: {reasoning: {effort: high}}
-```
-
-自定义文件不能覆盖 `openai`、`deepseek` 等内置 type；需要修改时应使用新的文件名，
-再在 profile provider instance 中引用它。无效文件会使整次 profile reload 失败，
-daemon 会继续保留上一份有效配置。
-
-#### 添加第三方 provider 的最短步骤
-
-如果第三方接口兼容 OpenAI Responses，只需：
-
-1. 在 `resource/providers/<type>.yaml` 定义 `endpoint` 和 `models`；
-2. 在 `profile.yaml` 的 `model.providers` 中增加一个 instance，`type` 指向该文件名；
-3. 在 `model.models` 中增加 model alias，并设置 `modelId`；
-4. 通过 `apiKeyEnv` 指定密钥环境变量。
-
-当前配置式 catalog 的 transport 是 `open_ai_responses`。如果 provider 使用完全不同的
-协议，需要在 Rust 中实现 `ModelClient`，再通过 `AgentService` 注入自定义 client；不能仅靠
-profile YAML 动态加载任意协议实现。
 
 ### Model Alias
 

@@ -184,6 +184,7 @@ impl BaseClient {
         let mut stream = response.bytes_stream().eventsource();
         let mut accumulated = StreamAccumulator::default();
         let mut emitted_tool_calls = HashSet::new();
+        let mut reasoning_part = None;
         loop {
             let next = tokio::select! {
                 _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
@@ -217,8 +218,22 @@ impl BaseClient {
                         let _ = events.send(ModelStreamEvent::TextDelta(delta.to_string()));
                     }
                 }
-                Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+                Some(
+                    event_type @ ("response.reasoning_summary_text.delta"
+                    | "response.reasoning_text.delta"),
+                ) => {
                     if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                        let part = reasoning_part_key(&payload, event_type);
+                        let starts_new_part =
+                            reasoning_part.is_some() && part.is_some() && reasoning_part != part;
+                        if starts_new_part {
+                            accumulated.reasoning.push_str("\n\n");
+                            let _ =
+                                events.send(ModelStreamEvent::ReasoningDelta("\n\n".to_string()));
+                        }
+                        if part.is_some() {
+                            reasoning_part = part;
+                        }
                         accumulated.reasoning.push_str(delta);
                         let _ = events.send(ModelStreamEvent::ReasoningDelta(delta.to_string()));
                     }
@@ -286,6 +301,30 @@ impl BaseClient {
             }
         }
         accumulated.finish()
+    }
+}
+
+fn reasoning_part_key(payload: &Value, event_type: &str) -> Option<(String, u64, &'static str)> {
+    let item_id = payload
+        .get("item_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            payload
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|index| index.to_string())
+        })?;
+    if event_type == "response.reasoning_summary_text.delta" {
+        payload
+            .get("summary_index")
+            .and_then(Value::as_u64)
+            .map(|index| (item_id, index, "summary"))
+    } else {
+        payload
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .map(|index| (item_id, index, "content"))
     }
 }
 

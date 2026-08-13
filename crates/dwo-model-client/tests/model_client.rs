@@ -110,7 +110,9 @@ models:
 #[tokio::test]
 async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     let chunks = [
-        json!({"type":"response.reasoning_summary_text.delta","delta":"think "}).to_string(),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reason-1","output_index":0,"summary_index":0,"delta":"think "}).to_string(),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reason-1","output_index":0,"summary_index":0,"delta":"more"}).to_string(),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reason-1","output_index":0,"summary_index":1,"delta":"next"}).to_string(),
         json!({"type":"response.output_text.delta","delta":"working"}).to_string(),
         json!({"type":"response.output_item.added","output_index":0,"item":{"type":"file_search_call","id":"fs-1","status":"in_progress"}}).to_string(),
         json!({"type":"response.file_search_call.searching","output_index":0,"item_id":"fs-1"}).to_string(),
@@ -121,7 +123,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
         json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"and\":\"echo hi\"}"}).to_string(),
         json!({"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}).to_string(),
         json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}}).to_string(),
-        json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"think "}]},{"type":"file_search_call","id":"fs-1","status":"completed","results":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]},{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}).to_string(),
+        json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"think more"},{"type":"summary_text","text":"next"}]},{"type":"file_search_call","id":"fs-1","status":"completed","results":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]},{"type":"function_call","call_id":"call-1","name":"terminal","arguments":"{\"action\":\"run\",\"command\":\"echo hi\"}"}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}).to_string(),
     ];
     let sse = chunks
         .iter()
@@ -170,6 +172,18 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     );
     assert_eq!(
         events_rx.recv().await.unwrap(),
+        ModelStreamEvent::ReasoningDelta("more".to_string())
+    );
+    assert_eq!(
+        events_rx.recv().await.unwrap(),
+        ModelStreamEvent::ReasoningDelta("\n\n".to_string())
+    );
+    assert_eq!(
+        events_rx.recv().await.unwrap(),
+        ModelStreamEvent::ReasoningDelta("next".to_string())
+    );
+    assert_eq!(
+        events_rx.recv().await.unwrap(),
         ModelStreamEvent::TextDelta("working".to_string())
     );
     let ModelStreamEvent::ToolCall(hosted) = events_rx.recv().await.unwrap() else {
@@ -187,7 +201,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(started.raw_input["command"], "echo hi");
     assert!(events_rx.try_recv().is_err());
     assert_eq!(reply.content, "working");
-    assert_eq!(reply.reasoning.as_deref(), Some("think "));
+    assert_eq!(reply.reasoning.as_deref(), Some("think more\n\nnext"));
     assert_eq!(reply.finish_reason, FinishReason::ToolCalls);
     assert_eq!(reply.tool_calls[0]["id"], "call-1");
     assert_eq!(reply.tool_calls[0]["name"], "terminal");

@@ -341,7 +341,9 @@ fn response_reasoning(output: &[Value]) -> Option<String> {
         .filter_map(|item| item.get("summary").and_then(Value::as_array))
         .flatten()
         .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .collect::<String>();
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     (!text.is_empty()).then_some(text)
 }
 
@@ -568,6 +570,26 @@ mod tests {
         assert_eq!(input[0]["type"], "function_call");
         assert!(input[0].get("id").is_none());
         assert_eq!(input[0]["call_id"], "call-1");
+    }
+
+    #[test]
+    fn response_parser_separates_reasoning_summary_parts() {
+        let reply = parse_response(&json!({
+            "status":"completed",
+            "output":[{
+                "type":"reasoning",
+                "summary":[
+                    {"type":"summary_text", "text":"**Inspecting details**"},
+                    {"type":"summary_text", "text":"**Planning replacement**"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            reply.reasoning.as_deref(),
+            Some("**Inspecting details**\n\n**Planning replacement**")
+        );
     }
 
     #[test]

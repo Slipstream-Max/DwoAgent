@@ -1,12 +1,16 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use dwo_agent_service::{ContentBlock, MessageContent, SessionId};
+use dwo_agent_service::{
+    ActiveToolCall, ContentBlock, MessageContent, PendingPermission, SessionId,
+};
 use open_lark::auth::AuthService;
+use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
+use open_lark::communication::im::v1::message::models::ReceiveIdType;
 use open_lark::communication::im::v1::message::resource::get::{
     GetMessageResourceRequest, MessageResourceType,
 };
@@ -32,6 +36,11 @@ use super::gateway::{
     ChannelStarter, PreparedChannel,
 };
 use super::manager::{FeishuChannelConfig, FeishuChannelState};
+use super::permission::{
+    PermissionAction, PermissionActionStore, new_action_id, remove_group, take_action,
+};
+use super::render::render_tool_call;
+use super::render::split_message;
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Feishu/Lark private channel is bound. Your normal reasoning and responses are already streamed to the user through Feishu or Lark.
 
@@ -71,6 +80,7 @@ struct FeishuStarter {
     host: Arc<Host>,
     api: FeishuApi,
     access: FeishuAccess,
+    approvals: Arc<PermissionActionStore>,
 }
 
 pub(crate) struct RunningFeishu {
@@ -93,6 +103,7 @@ impl ChannelAdapter for FeishuAdapter {
 
         let state = Arc::new(Mutex::new(runtime.state));
         let selected_session_id = state.lock().await.selected_session_id.clone();
+        let approvals = Arc::new(Mutex::new(HashMap::new()));
         let api = FeishuApi {
             config,
             open_id: runtime.secret.bound_open_id.clone(),
@@ -101,6 +112,7 @@ impl ChannelAdapter for FeishuAdapter {
             host: host.clone(),
             api: api.clone(),
             state,
+            approvals: approvals.clone(),
         });
         let access = FeishuAccess {
             open_id: runtime.secret.bound_open_id,
@@ -110,10 +122,15 @@ impl ChannelAdapter for FeishuAdapter {
         Ok(PreparedChannel {
             conversation: ConversationId::new("feishu", access.open_id.clone()),
             replay_turns: runtime.config.replay_turns,
-            replay_mode: runtime.config.replay_mode,
+            output_mode: runtime.config.output_mode,
             selected_session_id,
             transport: conversation,
-            starter: Box::new(FeishuStarter { host, api, access }),
+            starter: Box::new(FeishuStarter {
+                host,
+                api,
+                access,
+                approvals,
+            }),
         })
     }
 }
@@ -136,6 +153,7 @@ impl ChannelStarter for FeishuStarter {
             ingress,
             self.api.clone(),
             self.access.clone(),
+            self.approvals,
             payload_rx,
             cancel.child_token(),
         ));
@@ -233,6 +251,7 @@ async fn run_messages(
     ingress: Arc<dyn ChannelIngress>,
     api: FeishuApi,
     access: FeishuAccess,
+    approvals: Arc<PermissionActionStore>,
     mut payload_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     cancel: CancellationToken,
 ) {
@@ -245,6 +264,40 @@ async fn run_messages(
                 None => break,
             }
         };
+        match parse_feishu_action(&payload) {
+            Ok(Some(action)) => {
+                if action.open_id != access.open_id || action.chat_id != access.chat_id {
+                    continue;
+                }
+                if let Some(pending) = take_action(&approvals, &action.action_id).await
+                    && let Err(error) = ingress
+                        .resolve_permission(
+                            &pending.session_id,
+                            &pending.request_id,
+                            pending.allowed,
+                        )
+                        .await
+                {
+                    tracing::debug!(
+                        event = "channel.feishu_permission_already_resolved",
+                        error = %format!("{error:#}"),
+                        "Feishu permission action lost the cross-channel race"
+                    );
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    event = "channel.event_parse_failed",
+                    channel = "feishu",
+                    kind = "card_action",
+                    error = %format!("{error:#}"),
+                    "parse channel card action failed"
+                );
+                continue;
+            }
+        }
         let incoming = match parse_incoming(&payload) {
             Ok(Some(incoming)) => incoming,
             Ok(None) => continue,
@@ -451,6 +504,58 @@ impl FeishuApi {
             .context("send Feishu file")?;
         Ok(())
     }
+
+    async fn send_permission_card(&self, text: &str, allow: &str, deny: &str) -> Result<()> {
+        CreateMessageRequest::new(self.config.clone())
+            .receive_id_type(ReceiveIdType::OpenId)
+            .execute(CreateMessageBody {
+                receive_id: self.open_id.clone(),
+                msg_type: "interactive".to_string(),
+                content: serde_json::to_string(&feishu_permission_card(text, allow, deny))?,
+                uuid: None,
+            })
+            .await
+            .context("send Feishu permission card")?;
+        Ok(())
+    }
+}
+
+struct FeishuAction {
+    open_id: String,
+    chat_id: String,
+    action_id: String,
+}
+
+fn feishu_permission_card(text: &str, allow: &str, deny: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": {"update_multi": true},
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": text},
+                {
+                    "tag": "button",
+                    "element_id": "allow_button",
+                    "text": {"tag": "plain_text", "content": "允许"},
+                    "type": "primary_filled",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {"action_id": allow}
+                    }]
+                },
+                {
+                    "tag": "button",
+                    "element_id": "deny_button",
+                    "text": {"tag": "plain_text", "content": "拒绝"},
+                    "type": "danger_filled",
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {"action_id": deny}
+                    }]
+                }
+            ]
+        }
+    })
 }
 
 pub(crate) async fn send_text_to(
@@ -473,26 +578,7 @@ pub(crate) async fn send_text_to(
 }
 
 fn split_logical_message(text: &str) -> Vec<String> {
-    let mut remaining = text;
-    let mut chunks = Vec::new();
-    while remaining.chars().count() > FEISHU_TEXT_CHUNK_CHARS {
-        let hard_boundary = remaining
-            .char_indices()
-            .nth(FEISHU_TEXT_CHUNK_CHARS)
-            .map(|(index, _)| index)
-            .unwrap_or(remaining.len());
-        let preferred_boundary = remaining[..hard_boundary]
-            .rfind("\n\n")
-            .map(|index| index + 2)
-            .filter(|index| remaining[..*index].chars().count() >= FEISHU_TEXT_CHUNK_CHARS / 2);
-        let boundary = preferred_boundary.unwrap_or(hard_boundary);
-        chunks.push(remaining[..boundary].to_string());
-        remaining = &remaining[boundary..];
-    }
-    if !remaining.is_empty() {
-        chunks.push(remaining.to_string());
-    }
-    chunks
+    split_message(text, FEISHU_TEXT_CHUNK_CHARS)
 }
 
 #[derive(Clone)]
@@ -506,12 +592,69 @@ struct FeishuConversation {
     host: Arc<Host>,
     api: FeishuApi,
     state: Arc<Mutex<FeishuChannelState>>,
+    approvals: Arc<PermissionActionStore>,
 }
 
 #[async_trait]
 impl ConversationTransport for FeishuConversation {
     async fn send_text(&self, text: &str) -> Result<()> {
         self.api.send_text(text).await
+    }
+
+    fn max_text_chars(&self) -> usize {
+        FEISHU_TEXT_CHUNK_CHARS
+    }
+
+    fn defer_tool_call_to_permission(&self, mode: dwo_tools::SessionMode) -> bool {
+        mode == dwo_tools::SessionMode::Confirm
+    }
+
+    async fn send_permission_request(
+        &self,
+        session_id: &SessionId,
+        call: &ActiveToolCall,
+        permission: &PendingPermission,
+    ) -> Result<()> {
+        let allow = new_action_id()?;
+        let deny = new_action_id()?;
+        let group_id = new_action_id()?;
+        let expires_at = Instant::now() + Duration::from_secs(10 * 60);
+        {
+            let mut approvals = self.approvals.lock().await;
+            approvals.retain(|_, action| Instant::now() < action.expires_at);
+            approvals.insert(
+                allow.clone(),
+                PermissionAction {
+                    group_id: group_id.clone(),
+                    session_id: session_id.clone(),
+                    request_id: permission.request_id.clone(),
+                    allowed: true,
+                    expires_at,
+                },
+            );
+            approvals.insert(
+                deny.clone(),
+                PermissionAction {
+                    group_id: group_id.clone(),
+                    session_id: session_id.clone(),
+                    request_id: permission.request_id.clone(),
+                    allowed: false,
+                    expires_at,
+                },
+            );
+        }
+        let result = self
+            .api
+            .send_permission_card(
+                &render_tool_call(call, "request id", &permission.request_id),
+                &allow,
+                &deny,
+            )
+            .await;
+        if result.is_err() {
+            remove_group(&self.approvals, &group_id).await;
+        }
+        result
     }
 
     async fn save_selected_session(&self, session_id: Option<&str>) -> Result<()> {
@@ -546,6 +689,54 @@ enum IncomingMedia {
 struct EventEnvelope {
     header: EventHeader,
     event: MessageEvent,
+}
+
+#[derive(Deserialize)]
+struct CardActionEnvelope {
+    header: EventHeader,
+    event: CardActionEvent,
+}
+
+#[derive(Deserialize)]
+struct CardActionEvent {
+    operator: CardActionOperator,
+    action: CardActionData,
+    context: CardActionContext,
+}
+
+#[derive(Deserialize)]
+struct CardActionOperator {
+    #[serde(default)]
+    open_id: String,
+    #[serde(default)]
+    operator_id: Option<SenderId>,
+}
+
+impl CardActionOperator {
+    fn open_id(self) -> String {
+        if self.open_id.is_empty() {
+            self.operator_id.map(|id| id.open_id).unwrap_or_default()
+        } else {
+            self.open_id
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CardActionData {
+    value: CardActionValue,
+}
+
+#[derive(Deserialize)]
+struct CardActionValue {
+    #[serde(default)]
+    action_id: String,
+}
+
+#[derive(Deserialize)]
+struct CardActionContext {
+    #[serde(default)]
+    open_chat_id: String,
 }
 
 #[derive(Deserialize)]
@@ -668,6 +859,29 @@ fn parse_incoming(payload: &[u8]) -> Result<Option<IncomingMessage>> {
     }))
 }
 
+fn parse_feishu_action(payload: &[u8]) -> Result<Option<FeishuAction>> {
+    let value: serde_json::Value = serde_json::from_slice(payload)?;
+    if value["header"]["event_type"].as_str() != Some("card.action.trigger") {
+        return Ok(None);
+    }
+    let envelope: CardActionEnvelope = serde_json::from_value(value)?;
+    let open_id = envelope.event.operator.open_id();
+    let chat_id = envelope.event.context.open_chat_id;
+    let action_id = envelope.event.action.value.action_id;
+    if envelope.header.event_type != "card.action.trigger"
+        || open_id.is_empty()
+        || chat_id.is_empty()
+        || action_id.is_empty()
+    {
+        bail!("Feishu card action omitted identity fields");
+    }
+    Ok(Some(FeishuAction {
+        open_id,
+        chat_id,
+        action_id,
+    }))
+}
+
 pub(crate) fn bind_identity(payload: &[u8], code: &str) -> Option<(String, String)> {
     let incoming = parse_incoming(payload).ok()??;
     let text = incoming.text.as_deref()?;
@@ -782,5 +996,85 @@ mod tests {
     fn command_help_is_shared_with_other_channels() {
         assert!(render_command_help().contains("/allow"));
         assert!(render_command_help().contains("/deny"));
+    }
+
+    #[test]
+    fn permission_card_contains_allow_and_deny_action_ids() {
+        let card = feishu_permission_card("tool", "allow-id", "deny-id");
+        assert_eq!(
+            card["body"]["elements"][1]["behaviors"][0]["value"]["action_id"],
+            "allow-id"
+        );
+        assert_eq!(
+            card["body"]["elements"][2]["behaviors"][0]["value"]["action_id"],
+            "deny-id"
+        );
+        assert_eq!(card["body"]["elements"][1]["tag"], "button");
+        assert_eq!(card["body"]["elements"][2]["tag"], "button");
+    }
+
+    #[test]
+    fn card_action_is_parsed_for_the_bound_identity() {
+        let payload = serde_json::to_vec(&json!({
+            "header": {"event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"open_id": "ou_user"},
+                "action": {"value": {"action_id": "allow-id"}},
+                "context": {"open_chat_id": "oc_chat"}
+            }
+        }))
+        .unwrap();
+        let action = parse_feishu_action(&payload).unwrap().unwrap();
+
+        assert_eq!(action.open_id, "ou_user");
+        assert_eq!(action.chat_id, "oc_chat");
+        assert_eq!(action.action_id, "allow-id");
+    }
+
+    #[test]
+    fn card_action_accepts_nested_operator_identity_for_compatible_providers() {
+        let payload = serde_json::to_vec(&json!({
+            "header": {"event_type": "card.action.trigger"},
+            "event": {
+                "operator": {"operator_id": {"open_id": "ou_nested"}},
+                "action": {"value": {"action_id": "deny-id"}},
+                "context": {"open_chat_id": "oc_chat"}
+            }
+        }))
+        .unwrap();
+        let action = parse_feishu_action(&payload).unwrap().unwrap();
+
+        assert_eq!(action.open_id, "ou_nested");
+        assert_eq!(action.action_id, "deny-id");
+    }
+
+    #[tokio::test]
+    async fn consuming_feishu_permission_action_removes_its_sibling() {
+        let approvals = Mutex::new(HashMap::from([
+            (
+                "allow".to_string(),
+                PermissionAction {
+                    group_id: "group".to_string(),
+                    session_id: SessionId::parse("session-test").unwrap(),
+                    request_id: "request-test".to_string(),
+                    allowed: true,
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            ),
+            (
+                "deny".to_string(),
+                PermissionAction {
+                    group_id: "group".to_string(),
+                    session_id: SessionId::parse("session-test").unwrap(),
+                    request_id: "request-test".to_string(),
+                    allowed: false,
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            ),
+        ]));
+
+        let action = take_action(&approvals, "allow").await.unwrap();
+        assert!(action.allowed);
+        assert!(approvals.lock().await.is_empty());
     }
 }

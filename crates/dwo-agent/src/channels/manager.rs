@@ -43,7 +43,7 @@ pub struct WeixinChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
     #[serde(default)]
-    pub replay_mode: ChannelReplayMode,
+    pub output_mode: ChannelOutputMode,
     pub markdown_filter: bool,
     #[serde(default = "default_true")]
     pub media_input: bool,
@@ -55,9 +55,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ChannelReplayMode {
+pub(crate) enum ChannelOutputMode {
     #[default]
-    Response,
+    Final,
     Full,
 }
 
@@ -66,8 +66,8 @@ impl WeixinChannelConfig {
         if self.replay_turns > 10 {
             bail!("channels.weixin.replayTurns must be at most 10");
         }
-        if self.replay_mode != ChannelReplayMode::Response {
-            bail!("channels.weixin.replayMode only supports response");
+        if self.output_mode != ChannelOutputMode::Final {
+            bail!("channels.weixin.outputMode only supports final");
         }
         Ok(())
     }
@@ -102,7 +102,7 @@ pub struct TelegramChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
     #[serde(default)]
-    pub replay_mode: ChannelReplayMode,
+    pub output_mode: ChannelOutputMode,
     pub bot_token_env: String,
     #[serde(default)]
     pub tg_proxy: Option<String>,
@@ -157,7 +157,7 @@ pub struct FeishuChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
     #[serde(default)]
-    pub replay_mode: ChannelReplayMode,
+    pub output_mode: ChannelOutputMode,
     pub app_id_env: String,
     pub app_secret_env: String,
     pub(crate) platform: FeishuPlatform,
@@ -186,7 +186,7 @@ pub struct QqChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
     #[serde(default)]
-    pub replay_mode: ChannelReplayMode,
+    pub output_mode: ChannelOutputMode,
     #[serde(default = "default_true")]
     pub media_input: bool,
 }
@@ -1422,6 +1422,20 @@ async fn set_private_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_mode_is_the_only_supported_channel_output_field() {
+        let full = serde_yaml::from_str::<QqChannelConfig>(
+            "enabled: true\nreplayTurns: 1\noutputMode: full\nmediaInput: true\n",
+        )
+        .unwrap();
+        assert_eq!(full.output_mode, ChannelOutputMode::Full);
+
+        let old = serde_yaml::from_str::<QqChannelConfig>(
+            "enabled: true\nreplayTurns: 1\nreplayMode: full\nmediaInput: true\n",
+        );
+        assert!(old.is_err(), "replayMode must not be accepted");
+    }
 
     #[tokio::test]
     async fn profile_settings_are_validated_before_channel_state_is_loaded() {

@@ -12,10 +12,11 @@ use tokio::sync::Mutex;
 use crate::host::Host;
 use crate::slash_commands::{ChannelCommand, render_command_help};
 
-use super::manager::ChannelReplayMode;
+use super::manager::ChannelOutputMode;
 use super::render::{
-    SessionStreamState, display_path, policy_name, render_live_user_prompt, render_session_replay,
-    render_status, render_tool_call, short_session_id, short_session_id_str,
+    OutputSegment, SessionStreamState, display_path, policy_name, render_live_user_prompt,
+    render_output_segment, render_session_replay, render_status, render_tool_call,
+    short_session_id, short_session_id_str,
 };
 
 #[async_trait]
@@ -34,6 +35,15 @@ pub(crate) trait ChannelIngress: Send + Sync {
 #[async_trait]
 pub(crate) trait ConversationTransport: Send + Sync {
     async fn send_text(&self, text: &str) -> Result<()>;
+    fn max_text_chars(&self) -> usize {
+        4_000
+    }
+    async fn send_segment(&self, segment: &OutputSegment) -> Result<()> {
+        self.send_text(&render_output_segment(segment)).await
+    }
+    fn defer_tool_call_to_permission(&self, _mode: SessionMode) -> bool {
+        false
+    }
     async fn send_permission_request(
         &self,
         _session_id: &SessionId,
@@ -96,7 +106,7 @@ pub(crate) struct SessionBridge {
     conversation: ConversationId,
     endpoint: EndpointId,
     replay_turns: usize,
-    replay_mode: ChannelReplayMode,
+    output_mode: ChannelOutputMode,
     selected_session_id: Mutex<Option<String>>,
     session_choices: Mutex<Vec<String>>,
     transport: Arc<dyn ConversationTransport>,
@@ -108,7 +118,7 @@ impl SessionBridge {
         host: Arc<Host>,
         conversation: ConversationId,
         replay_turns: usize,
-        replay_mode: ChannelReplayMode,
+        output_mode: ChannelOutputMode,
         selected_session_id: Option<String>,
         transport: Arc<dyn ConversationTransport>,
     ) -> Self {
@@ -118,7 +128,7 @@ impl SessionBridge {
             conversation,
             endpoint,
             replay_turns,
-            replay_mode,
+            output_mode,
             selected_session_id: Mutex::new(selected_session_id),
             session_choices: Mutex::new(Vec::new()),
             transport,
@@ -451,12 +461,12 @@ impl SessionBridge {
             .subscribe_session(id, self.endpoint.clone(), None)
             .await?;
         let transport = self.transport.clone();
-        let replay_mode = self.replay_mode;
+        let output_mode = self.output_mode;
         let task = tokio::spawn(stream_session_with_mode(
             transport,
             self.endpoint.clone(),
             id.clone(),
-            replay_mode,
+            output_mode,
             subscription,
         ));
         *observer = Some(SessionObserver { session_id, task });
@@ -542,7 +552,7 @@ async fn stream_session(
         transport,
         endpoint,
         session_id,
-        ChannelReplayMode::Response,
+        ChannelOutputMode::Final,
         subscription,
     )
     .await;
@@ -552,10 +562,11 @@ async fn stream_session_with_mode(
     transport: Arc<dyn ConversationTransport>,
     endpoint: EndpointId,
     session_id: SessionId,
-    replay_mode: ChannelReplayMode,
+    output_mode: ChannelOutputMode,
     mut subscription: dwo_agent_service::SessionSubscription,
 ) {
     let mut stream = SessionStreamState::default();
+    let mut session_mode = subscription.snapshot.record.info.mode;
     loop {
         let Some(event) = subscription.events.recv().await else {
             break;
@@ -577,28 +588,31 @@ async fn stream_session_with_mode(
                 tool_calls,
                 ..
             } => {
-                if replay_mode == ChannelReplayMode::Full {
+                if output_mode == ChannelOutputMode::Full {
                     stream.remember_reasoning(reasoning);
-                }
-                stream.remember_response(content);
-                for call in tool_calls {
-                    stream.remember_tool(call);
-                }
-                if replay_mode == ChannelReplayMode::Full
-                    && let Some(reasoning) = stream.take_reasoning()
-                {
-                    send(&transport, &reasoning).await;
+                    for reasoning in stream.take_reasoning(transport.max_text_chars()) {
+                        send_segment(&transport, &reasoning).await;
+                    }
+                    for call in &tool_calls {
+                        stream.remember_tool(call.clone());
+                    }
+                    stream.remember_full_response(content, &tool_calls);
+                    send_ready_full_responses(&transport, &mut stream).await;
+                } else {
+                    stream.remember_response(content);
+                    for call in tool_calls {
+                        stream.remember_tool(call);
+                    }
                 }
             }
             SessionEventPayload::ToolStarted { call, .. } => {
-                if replay_mode == ChannelReplayMode::Full {
-                    send(
-                        &transport,
-                        &render_tool_call(&call, "tool call id", &call.tool_call_id),
-                    )
-                    .await;
+                let defer_to_permission = transport.defer_tool_call_to_permission(session_mode);
+                if output_mode == ChannelOutputMode::Full && !defer_to_permission {
+                    send_segment(&transport, &OutputSegment::ToolCall(call.clone())).await;
+                    stream.mark_tool_presented(&call.tool_call_id);
                 }
                 stream.remember_tool(call);
+                send_ready_full_responses(&transport, &mut stream).await;
             }
             SessionEventPayload::ToolUpdated { call, .. } => {
                 stream.remember_tool(call);
@@ -625,33 +639,84 @@ async fn stream_session_with_mode(
                         error = %format!("{error:#}"),
                         "send permission request failed"
                     );
+                } else if output_mode == ChannelOutputMode::Full {
+                    stream.mark_tool_presented(&permission.tool_call_id);
+                    send_ready_full_responses(&transport, &mut stream).await;
                 }
             }
             SessionEventPayload::ToolCompleted { result, .. } => {
+                if output_mode == ChannelOutputMode::Full
+                    && !stream.tool_was_presented(&result.tool_call_id)
+                    && let Some(call) = stream.tool(&result.tool_call_id).cloned()
+                {
+                    send_segment(&transport, &OutputSegment::ToolCall(call)).await;
+                    stream.mark_tool_presented(&result.tool_call_id);
+                    send_ready_full_responses(&transport, &mut stream).await;
+                }
                 stream.forget_tool(&result.tool_call_id);
             }
             SessionEventPayload::TurnCompleted { .. } => {
-                if let Some(response) = stream.take_response() {
+                if output_mode == ChannelOutputMode::Full {
+                    for response in stream.take_all_full_responses() {
+                        send_segment(&transport, &response).await;
+                    }
+                } else if let Some(response) = stream.take_response() {
                     send(&transport, &response).await;
                 }
                 stream.finish_turn();
             }
             SessionEventPayload::TurnCancelled { .. } => {
-                stream.remember_response("Turn cancelled".to_string());
-                if let Some(response) = stream.take_response() {
-                    send(&transport, &response).await;
+                if output_mode == ChannelOutputMode::Full {
+                    for response in stream.take_all_full_responses() {
+                        send_segment(&transport, &response).await;
+                    }
+                    send(&transport, "Turn cancelled").await;
+                } else {
+                    stream.remember_response("Turn cancelled".to_string());
+                    if let Some(response) = stream.take_response() {
+                        send(&transport, &response).await;
+                    }
                 }
                 stream.finish_turn();
             }
             SessionEventPayload::TurnFailed { error, .. } => {
-                stream.remember_response(format!("Turn failed: {error}"));
-                if let Some(response) = stream.take_response() {
-                    send(&transport, &response).await;
+                if output_mode == ChannelOutputMode::Full {
+                    for response in stream.take_all_full_responses() {
+                        send_segment(&transport, &response).await;
+                    }
+                    send(&transport, &format!("Turn failed: {error}")).await;
+                } else {
+                    stream.remember_response(format!("Turn failed: {error}"));
+                    if let Some(response) = stream.take_response() {
+                        send(&transport, &response).await;
+                    }
                 }
                 stream.finish_turn();
             }
+            SessionEventPayload::ConfigChanged { config } => {
+                session_mode = config.mode;
+            }
             _ => {}
         }
+    }
+}
+
+async fn send_ready_full_responses(
+    transport: &Arc<dyn ConversationTransport>,
+    stream: &mut SessionStreamState,
+) {
+    for response in stream.take_ready_full_responses() {
+        send_segment(transport, &response).await;
+    }
+}
+
+async fn send_segment(transport: &Arc<dyn ConversationTransport>, segment: &OutputSegment) {
+    if let Err(error) = transport.send_segment(segment).await {
+        tracing::warn!(
+            event = "channel.message_send_failed",
+            error = %format!("{error:#}"),
+            "send channel message failed"
+        );
     }
 }
 
@@ -672,18 +737,37 @@ mod tests {
         ClientTranscriptEvent, MessageId, RuntimePhase, SessionLlmSettings, SessionRecord,
         SessionSnapshot, SessionSubscription, SessionUsageSnapshot, TurnId,
     };
+    use serde_json::json;
     use std::path::PathBuf;
 
     #[derive(Default)]
     struct FakeTransport {
         messages: Mutex<Vec<String>>,
         selected: Mutex<Option<String>>,
+        defer_to_permission: bool,
     }
 
     #[async_trait]
     impl ConversationTransport for FakeTransport {
         async fn send_text(&self, text: &str) -> Result<()> {
             self.messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        fn defer_tool_call_to_permission(&self, mode: SessionMode) -> bool {
+            self.defer_to_permission && mode == SessionMode::Confirm
+        }
+
+        async fn send_permission_request(
+            &self,
+            _session_id: &SessionId,
+            call: &ActiveToolCall,
+            _permission: &PendingPermission,
+        ) -> Result<()> {
+            self.messages
+                .lock()
+                .await
+                .push(format!("CARD:{}", call.tool_call_id));
             Ok(())
         }
 
@@ -796,5 +880,269 @@ mod tests {
             *transport.messages.lock().await,
             ["User: question", "answer"]
         );
+    }
+
+    #[tokio::test]
+    async fn full_replay_preserves_thinking_tool_answer_step_order() {
+        let transport = Arc::new(FakeTransport::default());
+        let session_id = SessionId::parse("session-full-order").unwrap();
+        let turn_id = TurnId::parse("turn-full-order").unwrap();
+        let call = ActiveToolCall {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "terminal".to_string(),
+            raw_input: json!({"command":"echo hi"}),
+            status: "in_progress".to_string(),
+        };
+        let (events_tx, events) = tokio::sync::mpsc::channel(16);
+        let subscription = test_subscription(
+            session_id.clone(),
+            turn_id.clone(),
+            SessionMode::FullAccess,
+            events,
+        );
+        let task = tokio::spawn(stream_session_with_mode(
+            transport.clone(),
+            EndpointId::new(),
+            session_id.clone(),
+            ChannelOutputMode::Full,
+            subscription,
+        ));
+        send_events(
+            &events_tx,
+            &session_id,
+            [
+                SessionEventPayload::AssistantCompleted {
+                    message_id: MessageId::new(),
+                    thought_message_id: MessageId::new(),
+                    turn_id: turn_id.clone(),
+                    content: "first answer".to_string(),
+                    reasoning: Some("first thought".to_string()),
+                    tool_calls: vec![call.clone()],
+                },
+                SessionEventPayload::ToolStarted {
+                    turn_id: turn_id.clone(),
+                    call: call.clone(),
+                },
+                SessionEventPayload::ToolCompleted {
+                    turn_id: turn_id.clone(),
+                    result: dwo_tools::ToolResult {
+                        tool_call_id: call.tool_call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        output: json!({"status":"completed"}),
+                        model_context: Vec::new(),
+                    },
+                },
+                SessionEventPayload::AssistantCompleted {
+                    message_id: MessageId::new(),
+                    thought_message_id: MessageId::new(),
+                    turn_id: turn_id.clone(),
+                    content: "final answer".to_string(),
+                    reasoning: Some("final thought".to_string()),
+                    tool_calls: Vec::new(),
+                },
+                SessionEventPayload::TurnCompleted { turn_id },
+            ],
+        )
+        .await;
+        drop(events_tx);
+        task.await.unwrap();
+
+        assert_eq!(
+            *transport.messages.lock().await,
+            [
+                "🧠 Thinking:\nfirst thought",
+                "🔧Tool Call:\n```\necho hi\n```\ntool call id：call-1",
+                "first answer",
+                "🧠 Thinking:\nfinal thought",
+                "final answer",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_card_replaces_the_duplicate_full_replay_tool_message() {
+        let transport = Arc::new(FakeTransport {
+            defer_to_permission: true,
+            ..Default::default()
+        });
+        let session_id = SessionId::parse("session-confirm-card").unwrap();
+        let turn_id = TurnId::parse("turn-confirm-card").unwrap();
+        let call = ActiveToolCall {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "terminal".to_string(),
+            raw_input: json!({"command":"echo hi"}),
+            status: "in_progress".to_string(),
+        };
+        let (events_tx, events) = tokio::sync::mpsc::channel(16);
+        let subscription = test_subscription(
+            session_id.clone(),
+            turn_id.clone(),
+            SessionMode::Confirm,
+            events,
+        );
+        let task = tokio::spawn(stream_session_with_mode(
+            transport.clone(),
+            EndpointId::new(),
+            session_id.clone(),
+            ChannelOutputMode::Full,
+            subscription,
+        ));
+        send_events(
+            &events_tx,
+            &session_id,
+            [
+                SessionEventPayload::AssistantCompleted {
+                    message_id: MessageId::new(),
+                    thought_message_id: MessageId::new(),
+                    turn_id: turn_id.clone(),
+                    content: "answer after permission".to_string(),
+                    reasoning: Some("inspect first".to_string()),
+                    tool_calls: vec![call.clone()],
+                },
+                SessionEventPayload::ToolStarted {
+                    turn_id: turn_id.clone(),
+                    call,
+                },
+                SessionEventPayload::PermissionRequested {
+                    turn_id: turn_id.clone(),
+                    permission: PendingPermission {
+                        request_id: "permission-1".to_string(),
+                        tool_call_id: "call-1".to_string(),
+                        tool_name: "terminal".to_string(),
+                    },
+                },
+                SessionEventPayload::TurnCompleted { turn_id },
+            ],
+        )
+        .await;
+        drop(events_tx);
+        task.await.unwrap();
+
+        assert_eq!(
+            *transport.messages.lock().await,
+            [
+                "🧠 Thinking:\ninspect first",
+                "CARD:call-1",
+                "answer after permission",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_card_transport_still_shows_tools_that_need_no_permission() {
+        let transport = Arc::new(FakeTransport {
+            defer_to_permission: true,
+            ..Default::default()
+        });
+        let session_id = SessionId::parse("session-confirm-hosted").unwrap();
+        let turn_id = TurnId::parse("turn-confirm-hosted").unwrap();
+        let call = ActiveToolCall {
+            tool_call_id: "search-1".to_string(),
+            tool_name: "web_search".to_string(),
+            raw_input: json!({"query":"latest release"}),
+            status: "in_progress".to_string(),
+        };
+        let (events_tx, events) = tokio::sync::mpsc::channel(16);
+        let subscription = test_subscription(
+            session_id.clone(),
+            turn_id.clone(),
+            SessionMode::Confirm,
+            events,
+        );
+        let task = tokio::spawn(stream_session_with_mode(
+            transport.clone(),
+            EndpointId::new(),
+            session_id.clone(),
+            ChannelOutputMode::Full,
+            subscription,
+        ));
+        send_events(
+            &events_tx,
+            &session_id,
+            [
+                SessionEventPayload::AssistantCompleted {
+                    message_id: MessageId::new(),
+                    thought_message_id: MessageId::new(),
+                    turn_id: turn_id.clone(),
+                    content: "search answer".to_string(),
+                    reasoning: Some("search first".to_string()),
+                    tool_calls: vec![call.clone()],
+                },
+                SessionEventPayload::ToolStarted {
+                    turn_id: turn_id.clone(),
+                    call: call.clone(),
+                },
+                SessionEventPayload::ToolCompleted {
+                    turn_id: turn_id.clone(),
+                    result: dwo_tools::ToolResult {
+                        tool_call_id: call.tool_call_id,
+                        tool_name: call.tool_name,
+                        output: json!({"status":"completed"}),
+                        model_context: Vec::new(),
+                    },
+                },
+                SessionEventPayload::TurnCompleted { turn_id },
+            ],
+        )
+        .await;
+        drop(events_tx);
+        task.await.unwrap();
+
+        assert_eq!(
+            *transport.messages.lock().await,
+            [
+                "🧠 Thinking:\nsearch first",
+                "🔧Tool Call:\n```\n{\n  \"query\": \"latest release\"\n}\n```\ntool call id：search-1",
+                "search answer",
+            ]
+        );
+    }
+
+    fn test_subscription(
+        session_id: SessionId,
+        turn_id: TurnId,
+        mode: SessionMode,
+        events: tokio::sync::mpsc::Receiver<dwo_agent_service::SessionEvent>,
+    ) -> SessionSubscription {
+        SessionSubscription {
+            snapshot: SessionSnapshot {
+                record: SessionRecord::new(
+                    session_id,
+                    "Test".to_string(),
+                    PathBuf::from("."),
+                    mode,
+                    SessionLlmSettings::default(),
+                    dwo_agent_service::DEFAULT_MAX_MODEL_STEPS,
+                ),
+                transcript: Vec::new(),
+                checkpoint_cursor: 0,
+                usage: SessionUsageSnapshot { used: 1, size: 2 },
+                phase: RuntimePhase::Running,
+                active_turn_id: Some(turn_id),
+                active_step: None,
+                partial_message: String::new(),
+                active_tool_calls: Vec::new(),
+                pending_permission: None,
+                seq: 0,
+            },
+            events,
+        }
+    }
+
+    async fn send_events<const N: usize>(
+        events: &tokio::sync::mpsc::Sender<dwo_agent_service::SessionEvent>,
+        session_id: &SessionId,
+        payloads: [SessionEventPayload; N],
+    ) {
+        for (seq, payload) in payloads.into_iter().enumerate() {
+            events
+                .send(dwo_agent_service::SessionEvent {
+                    seq: seq as u64 + 1,
+                    session_id: session_id.clone(),
+                    payload,
+                })
+                .await
+                .unwrap();
+        }
     }
 }

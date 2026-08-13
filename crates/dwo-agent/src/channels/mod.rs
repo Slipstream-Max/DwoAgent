@@ -3,6 +3,7 @@ mod bridge;
 mod feishu;
 mod gateway;
 mod manager;
+mod permission;
 mod qq;
 mod render;
 mod telegram;

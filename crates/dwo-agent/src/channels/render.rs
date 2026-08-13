@@ -3,7 +3,46 @@ pub(crate) use crate::session_status::{short_session_id, short_session_id_str};
 use dwo_agent_service::{
     ActiveToolCall, ClientTranscriptEvent, MessageContent, SessionEventPayload, SessionSnapshot,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+#[derive(Clone, Debug)]
+pub(crate) enum OutputSegment {
+    Thinking(String),
+    ToolCall(ActiveToolCall),
+    Answer(String),
+}
+
+pub(crate) fn render_output_segment(segment: &OutputSegment) -> String {
+    match segment {
+        OutputSegment::Thinking(text) => render_reasoning(text),
+        OutputSegment::ToolCall(call) => render_tool_call(call, "tool call id", &call.tool_call_id),
+        OutputSegment::Answer(text) => text.clone(),
+    }
+}
+
+pub(crate) fn split_message(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let mut remaining = text;
+    let mut chunks = Vec::new();
+    while remaining.chars().count() > max_chars {
+        let hard_boundary = remaining
+            .char_indices()
+            .nth(max_chars)
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        let preferred_boundary = remaining[..hard_boundary]
+            .rfind("\n\n")
+            .map(|index| index + 2)
+            .filter(|index| remaining[..*index].chars().count() >= max_chars / 2);
+        let boundary = preferred_boundary.unwrap_or(hard_boundary);
+        chunks.push(remaining[..boundary].to_string());
+        remaining = &remaining[boundary..];
+    }
+    if !remaining.is_empty() {
+        chunks.push(remaining.to_string());
+    }
+    chunks
+}
 
 pub(crate) fn render_status(snapshot: &SessionSnapshot) -> String {
     crate::session_status::render_status(snapshot, crate::session_status::SessionIdDisplay::Short)
@@ -153,6 +192,13 @@ pub(crate) struct SessionStreamState {
     responses: Vec<String>,
     tools: HashMap<String, ActiveToolCall>,
     permission_messages: HashSet<String>,
+    presented_tools: HashSet<String>,
+    pending_full_responses: VecDeque<PendingFullResponse>,
+}
+
+struct PendingFullResponse {
+    content: String,
+    tool_call_ids: HashSet<String>,
 }
 
 impl SessionStreamState {
@@ -166,9 +212,9 @@ impl SessionStreamState {
         }
     }
 
-    pub(crate) fn take_reasoning(&mut self) -> Option<String> {
+    pub(crate) fn take_reasoning(&mut self, max_message_chars: usize) -> Vec<OutputSegment> {
         let reasoning = std::mem::take(&mut self.reasoning).join("\n\n");
-        (!reasoning.is_empty()).then(|| render_reasoning(&reasoning))
+        split_reasoning(&reasoning, max_message_chars)
     }
 
     pub(crate) fn remember_response(&mut self, content: String) {
@@ -181,6 +227,56 @@ impl SessionStreamState {
     pub(crate) fn take_response(&mut self) -> Option<String> {
         let response = std::mem::take(&mut self.responses).join("\n\n");
         (!response.is_empty()).then_some(response)
+    }
+
+    pub(crate) fn remember_full_response(
+        &mut self,
+        content: String,
+        tool_calls: &[ActiveToolCall],
+    ) {
+        let content = content.trim();
+        if content.is_empty() {
+            return;
+        }
+        self.pending_full_responses.push_back(PendingFullResponse {
+            content: content.to_string(),
+            tool_call_ids: tool_calls
+                .iter()
+                .map(|call| call.tool_call_id.clone())
+                .collect(),
+        });
+    }
+
+    pub(crate) fn mark_tool_presented(&mut self, tool_call_id: &str) {
+        self.presented_tools.insert(tool_call_id.to_string());
+    }
+
+    pub(crate) fn tool_was_presented(&self, tool_call_id: &str) -> bool {
+        self.presented_tools.contains(tool_call_id)
+    }
+
+    pub(crate) fn take_ready_full_responses(&mut self) -> Vec<OutputSegment> {
+        let mut responses = Vec::new();
+        while self.pending_full_responses.front().is_some_and(|response| {
+            response
+                .tool_call_ids
+                .iter()
+                .all(|id| self.presented_tools.contains(id))
+        }) {
+            let response = self
+                .pending_full_responses
+                .pop_front()
+                .expect("front response was present");
+            responses.push(OutputSegment::Answer(response.content));
+        }
+        responses
+    }
+
+    pub(crate) fn take_all_full_responses(&mut self) -> Vec<OutputSegment> {
+        self.pending_full_responses
+            .drain(..)
+            .map(|response| OutputSegment::Answer(response.content))
+            .collect()
     }
 
     pub(crate) fn remember_tool(&mut self, call: ActiveToolCall) {
@@ -205,6 +301,8 @@ impl SessionStreamState {
         self.responses.clear();
         self.tools.clear();
         self.permission_messages.clear();
+        self.presented_tools.clear();
+        self.pending_full_responses.clear();
     }
 }
 
@@ -230,6 +328,24 @@ pub(crate) fn render_tool_call(call: &ActiveToolCall, id_label: &str, id: &str) 
 
 pub(crate) fn render_reasoning(reasoning: &str) -> String {
     format!("🧠 Thinking:\n{}", reasoning.trim())
+}
+
+fn split_reasoning(reasoning: &str, max_message_chars: usize) -> Vec<OutputSegment> {
+    let mut remaining = reasoning.trim();
+    let mut chunks = Vec::new();
+    let label_chars = render_reasoning("").chars().count();
+    let content_chars = max_message_chars.saturating_sub(label_chars).max(1);
+    while !remaining.is_empty() {
+        let boundary = remaining
+            .char_indices()
+            .nth(content_chars)
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        let (chunk, rest) = remaining.split_at(boundary);
+        chunks.push(OutputSegment::Thinking(chunk.to_string()));
+        remaining = rest.trim_start();
+    }
+    chunks
 }
 
 fn fenced(content: &str) -> String {
@@ -278,15 +394,30 @@ mod tests {
         stream.remember_reasoning(Some("  ".to_string()));
         stream.remember_reasoning(Some("second thought".to_string()));
 
-        assert_eq!(
-            stream.take_reasoning().as_deref(),
-            Some("🧠 Thinking:\nfirst thought\n\nsecond thought")
-        );
-        assert_eq!(stream.take_reasoning(), None);
+        let reasoning = stream
+            .take_reasoning(1_800)
+            .iter()
+            .map(render_output_segment)
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning, ["🧠 Thinking:\nfirst thought\n\nsecond thought"]);
+        assert!(stream.take_reasoning(1_800).is_empty());
 
         stream.remember_reasoning(Some("next turn".to_string()));
         stream.finish_turn();
-        assert_eq!(stream.take_reasoning(), None);
+        assert!(stream.take_reasoning(1_800).is_empty());
+    }
+
+    #[test]
+    fn long_reasoning_repeats_the_label_for_each_chunk() {
+        let chunks = split_reasoning(&"思".repeat(2_000), 1_800);
+        assert_eq!(chunks.len(), 2);
+        let chunks = chunks.iter().map(render_output_segment).collect::<Vec<_>>();
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.starts_with("🧠 Thinking:\n"))
+        );
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 1_800));
     }
 
     #[test]

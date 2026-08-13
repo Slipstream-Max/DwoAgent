@@ -38,7 +38,7 @@ use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
     ChannelStarter, PreparedChannel,
 };
-use super::manager::{ChannelReplayMode, QqChannelState};
+use super::manager::{ChannelOutputMode, QqChannelState};
 use super::render::render_tool_call;
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A QQ channel is bound to one private C2C user. Normal reasoning and responses are already delivered through QQ.
@@ -290,13 +290,13 @@ impl ChannelAdapter for QqAdapter {
             state,
             reply: Mutex::new(None),
             approvals: approvals.clone(),
-            replay_mode: runtime.config.replay_mode,
+            output_mode: runtime.config.output_mode,
         });
         let enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
         Ok(PreparedChannel {
             conversation: ConversationId::new("qq", runtime.secret.bound_user_openid.clone()),
             replay_turns: runtime.config.replay_turns,
-            replay_mode: runtime.config.replay_mode,
+            output_mode: runtime.config.output_mode,
             selected_session_id,
             transport: conversation.clone(),
             starter: Box::new(QqStarter {
@@ -521,7 +521,7 @@ struct QqConversation {
     state: Arc<Mutex<QqChannelState>>,
     reply: Mutex<Option<ReplyContext>>,
     approvals: Arc<Mutex<HashMap<String, PendingAction>>>,
-    replay_mode: ChannelReplayMode,
+    output_mode: ChannelOutputMode,
 }
 
 impl QqConversation {
@@ -557,7 +557,7 @@ impl ConversationTransport for QqConversation {
     async fn send_text(&self, text: &str) -> Result<()> {
         ensure!(!text.is_empty(), "QQ message must not be empty");
         let chunks = split_text(text);
-        let replies = if self.replay_mode == ChannelReplayMode::Full {
+        let replies = if self.output_mode == ChannelOutputMode::Full {
             vec![None; chunks.len()]
         } else {
             let mut replies = vec![None; chunks.len()];
@@ -567,6 +567,14 @@ impl ConversationTransport for QqConversation {
             replies
         };
         send_c2c_chunks(&self.api, &self.openid, chunks, replies).await
+    }
+
+    fn max_text_chars(&self) -> usize {
+        QQ_TEXT_CHUNK_CHARS
+    }
+
+    fn defer_tool_call_to_permission(&self, mode: dwo_tools::SessionMode) -> bool {
+        mode == dwo_tools::SessionMode::Confirm
     }
 
     async fn send_permission_request(
@@ -626,7 +634,7 @@ impl ConversationTransport for QqConversation {
             }),
             ..Default::default()
         };
-        if self.replay_mode == ChannelReplayMode::Response
+        if self.output_mode == ChannelOutputMode::Final
             && let Some((msg_id, msg_seq)) = self.reserve_reply().await
         {
             params.msg_id = Some(msg_id);

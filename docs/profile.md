@@ -77,14 +77,14 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     markdownFilter: true
     mediaInput: true
 
   telegram:
     enabled: false
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
     mediaInput: true
@@ -92,7 +92,7 @@ channels:
   feishu:
     enabled: false
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
@@ -100,7 +100,7 @@ channels:
   qq:
     enabled: false
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     mediaInput: true
   websocket:
     enabled: false
@@ -280,10 +280,10 @@ Channels 配置 adapter 是否启动，以及回放、凭据环境变量、代�
 
 | Channel | 关键字段 |
 | --- | --- |
-| 微信 | `enabled`、`replayTurns`、`replayMode`、`markdownFilter`、`mediaInput` |
-| Telegram | `enabled`、`replayTurns`、`replayMode`、`botTokenEnv`、`tgProxy`、`mediaInput` |
-| 飞书/Lark | `enabled`、`replayTurns`、`replayMode`、`appIdEnv`、`appSecretEnv`、`platform`、`mediaInput` |
-| QQ Bot | `enabled`、`replayTurns`、`replayMode`、`mediaInput` |
+| 微信 | `enabled`、`replayTurns`、`outputMode`、`markdownFilter`、`mediaInput` |
+| Telegram | `enabled`、`replayTurns`、`outputMode`、`botTokenEnv`、`tgProxy`、`mediaInput` |
+| 飞书/Lark | `enabled`、`replayTurns`、`outputMode`、`appIdEnv`、`appSecretEnv`、`platform`、`mediaInput` |
+| QQ Bot | `enabled`、`replayTurns`、`outputMode`、`mediaInput` |
 | WebSocket | `enabled`、`port` |
 
 ### Channel 字段
@@ -292,7 +292,7 @@ Channels 配置 adapter 是否启动，以及回放、凭据环境变量、代�
 | --- | --- | --- | --- |
 | 全部消息 channel | `enabled` | 必填，`false` 或 `true` | 是否启动该 channel。修改后会热重启对应 adapter。 |
 | 全部消息 channel | `replayTurns` | 必填，范围 `0..=10`；安装模板为 `5` | `/use` 切换 session 后回放的最近完成 turn 数。 |
-| 微信、Telegram、飞书、QQ | `replayMode` | 默认 `response`；`response` 或 `full` | `response` 只发送最终回答；`full` 还发送 reasoning 和 tool-call 阶段。微信只允许 `response`。 |
+| 微信、Telegram、飞书、QQ | `outputMode` | 默认 `final`；`final` 或 `full` | `final` 只发送最终回答；`full` 按顺序发送 thinking、tool-call 和每个阶段的回答。微信只允许 `final`。 |
 | 微信、Telegram、飞书、QQ | `mediaInput` | 默认 `true` | 是否接收图片和文件；关闭后只处理文本。 |
 | 微信 | `markdownFilter` | 必填 | 是否将 assistant Markdown 转成微信兼容文本。 |
 | Telegram | `botTokenEnv` | 非空环境变量名 | BotFather token 所在的环境变量。token 不写入 profile 或 secret。 |

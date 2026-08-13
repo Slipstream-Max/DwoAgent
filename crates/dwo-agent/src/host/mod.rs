@@ -1872,7 +1872,7 @@ mod tests {
                 "enabled",
                 "markdownFilter",
                 "mediaInput",
-                "replayMode",
+                "outputMode",
                 "replayTurns"
             ]
         );
@@ -1882,7 +1882,7 @@ mod tests {
                 "botTokenEnv",
                 "enabled",
                 "mediaInput",
-                "replayMode",
+                "outputMode",
                 "replayTurns",
                 "tgProxy"
             ]
@@ -1894,14 +1894,14 @@ mod tests {
                 "appSecretEnv",
                 "enabled",
                 "mediaInput",
+                "outputMode",
                 "platform",
-                "replayMode",
                 "replayTurns"
             ]
         );
         assert_eq!(
             yaml_keys(&document["channels"]["qq"]),
-            ["enabled", "mediaInput", "replayMode", "replayTurns"]
+            ["enabled", "mediaInput", "outputMode", "replayTurns"]
         );
         assert_eq!(
             yaml_keys(&document["channels"]["websocket"]),

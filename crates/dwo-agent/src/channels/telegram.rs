@@ -1,13 +1,17 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use dwo_agent_service::{ContentBlock, MessageContent, SessionId};
+use dwo_agent_service::{
+    ActiveToolCall, ContentBlock, MessageContent, PendingPermission, SessionId,
+};
 use teloxide::dispatching::Dispatcher;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{FileId, InputFile};
+use teloxide::types::{FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
 use tokio::sync::Mutex;
 
 use crate::host::Host;
@@ -24,6 +28,10 @@ use super::gateway::{
     ChannelStarter, PreparedChannel,
 };
 use super::manager::{TelegramChannelState, telegram_bot};
+use super::permission::{
+    PermissionAction, PermissionActionStore, new_action_id, remove_group, take_action,
+};
+use super::render::{render_tool_call, split_message};
 
 pub(super) const CAPABILITY_PROMPT: &str = r#"A Telegram channel is bound. Your normal reasoning and responses are already streamed to the user through Telegram.
 
@@ -62,6 +70,7 @@ struct TelegramStarter {
     bot: Bot,
     host: Arc<Host>,
     access: TelegramAccess,
+    approvals: Arc<PermissionActionStore>,
 }
 
 pub(crate) struct RunningTelegram {
@@ -95,11 +104,13 @@ impl ChannelAdapter for TelegramAdapter {
         let state = Arc::new(Mutex::new(runtime.state));
         let selected_session_id = state.lock().await.selected_session_id.clone();
         let chat_id = ChatId(runtime.secret.bound_chat_id);
+        let approvals = Arc::new(Mutex::new(HashMap::new()));
         let conversation = Arc::new(TelegramConversation {
             host: host.clone(),
             bot: bot.clone(),
             chat_id,
             state,
+            approvals: approvals.clone(),
         });
         let access = TelegramAccess {
             user_id: runtime.secret.bound_user_id,
@@ -109,10 +120,15 @@ impl ChannelAdapter for TelegramAdapter {
         Ok(PreparedChannel {
             conversation: ConversationId::new("telegram", runtime.secret.bound_user_id.to_string()),
             replay_turns: runtime.config.replay_turns,
-            replay_mode: runtime.config.replay_mode,
+            output_mode: runtime.config.output_mode,
             selected_session_id,
             transport: conversation,
-            starter: Box::new(TelegramStarter { bot, host, access }),
+            starter: Box::new(TelegramStarter {
+                bot,
+                host,
+                access,
+                approvals,
+            }),
         })
     }
 }
@@ -123,9 +139,16 @@ impl ChannelStarter for TelegramStarter {
         self: Box<Self>,
         ingress: Arc<dyn ChannelIngress>,
     ) -> Result<Box<dyn ChannelRuntime>> {
-        let handler = Update::filter_message().endpoint(handle_message);
+        let handler = dptree::entry()
+            .branch(Update::filter_message().endpoint(handle_message))
+            .branch(Update::filter_callback_query().endpoint(handle_callback_query));
         let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
-            .dependencies(dptree::deps![self.host, ingress, self.access])
+            .dependencies(dptree::deps![
+                self.host,
+                ingress,
+                self.access,
+                self.approvals
+            ])
             .build();
         let shutdown = dispatcher.shutdown_token();
         let task = tokio::spawn(async move {
@@ -221,6 +244,43 @@ async fn handle_message(
         Err(error) => {
             send_chunks(&bot, message.chat.id, &format!("dwoagent error: {error:#}")).await?;
         }
+    }
+    Ok(())
+}
+
+async fn handle_callback_query(
+    bot: Bot,
+    query: CallbackQuery,
+    ingress: Arc<dyn ChannelIngress>,
+    access: TelegramAccess,
+    approvals: Arc<PermissionActionStore>,
+) -> TelegramHandlerResult {
+    if query.from.id.0 != access.user_id {
+        return Ok(());
+    }
+    let Some(message) = query.regular_message() else {
+        return Ok(());
+    };
+    if message.chat.id.0 != access.chat_id {
+        return Ok(());
+    }
+    let Some(action_id) = query.data.as_deref() else {
+        return Ok(());
+    };
+    bot.answer_callback_query(query.id).await?;
+    let action = take_action(&approvals, action_id).await;
+    let Some(action) = action else {
+        return Ok(());
+    };
+    if let Err(error) = ingress
+        .resolve_permission(&action.session_id, &action.request_id, action.allowed)
+        .await
+    {
+        tracing::debug!(
+            event = "channel.telegram_permission_already_resolved",
+            error = %format!("{error:#}"),
+            "Telegram permission action lost the cross-channel race"
+        );
     }
     Ok(())
 }
@@ -347,12 +407,74 @@ struct TelegramConversation {
     bot: Bot,
     chat_id: ChatId,
     state: Arc<Mutex<TelegramChannelState>>,
+    approvals: Arc<PermissionActionStore>,
 }
 
 #[async_trait]
 impl ConversationTransport for TelegramConversation {
     async fn send_text(&self, text: &str) -> Result<()> {
         send_chunks(&self.bot, self.chat_id, text).await
+    }
+
+    fn max_text_chars(&self) -> usize {
+        TELEGRAM_TEXT_CHUNK_CHARS
+    }
+
+    fn defer_tool_call_to_permission(&self, mode: dwo_tools::SessionMode) -> bool {
+        mode == dwo_tools::SessionMode::Confirm
+    }
+
+    async fn send_permission_request(
+        &self,
+        session_id: &SessionId,
+        call: &ActiveToolCall,
+        permission: &PendingPermission,
+    ) -> Result<()> {
+        let allow = new_action_id()?;
+        let deny = new_action_id()?;
+        let group_id = new_action_id()?;
+        let expires_at = Instant::now() + Duration::from_secs(10 * 60);
+        {
+            let mut approvals = self.approvals.lock().await;
+            approvals.retain(|_, action| Instant::now() < action.expires_at);
+            approvals.insert(
+                allow.clone(),
+                PermissionAction {
+                    group_id: group_id.clone(),
+                    session_id: session_id.clone(),
+                    request_id: permission.request_id.clone(),
+                    allowed: true,
+                    expires_at,
+                },
+            );
+            approvals.insert(
+                deny.clone(),
+                PermissionAction {
+                    group_id: group_id.clone(),
+                    session_id: session_id.clone(),
+                    request_id: permission.request_id.clone(),
+                    allowed: false,
+                    expires_at,
+                },
+            );
+        }
+        let keyboard = InlineKeyboardMarkup::new([[
+            InlineKeyboardButton::callback("允许", allow),
+            InlineKeyboardButton::callback("拒绝", deny),
+        ]]);
+        let result = self
+            .bot
+            .send_message(
+                self.chat_id,
+                render_tool_call(call, "request id", &permission.request_id),
+            )
+            .reply_markup(keyboard)
+            .await;
+        if result.is_err() {
+            remove_group(&self.approvals, &group_id).await;
+        }
+        result?;
+        Ok(())
     }
 
     async fn save_selected_session(&self, session_id: Option<&str>) -> Result<()> {
@@ -371,26 +493,7 @@ impl ConversationTransport for TelegramConversation {
 const TELEGRAM_TEXT_CHUNK_CHARS: usize = 4096;
 
 fn split_logical_message(text: &str) -> Vec<String> {
-    let mut remaining = text;
-    let mut chunks = Vec::new();
-    while remaining.chars().count() > TELEGRAM_TEXT_CHUNK_CHARS {
-        let hard_boundary = remaining
-            .char_indices()
-            .nth(TELEGRAM_TEXT_CHUNK_CHARS)
-            .map(|(index, _)| index)
-            .unwrap_or(remaining.len());
-        let preferred_boundary = remaining[..hard_boundary]
-            .rfind("\n\n")
-            .map(|index| index + 2)
-            .filter(|index| remaining[..*index].chars().count() >= TELEGRAM_TEXT_CHUNK_CHARS / 2);
-        let boundary = preferred_boundary.unwrap_or(hard_boundary);
-        chunks.push(remaining[..boundary].to_string());
-        remaining = &remaining[boundary..];
-    }
-    if !remaining.is_empty() {
-        chunks.push(remaining.to_string());
-    }
-    chunks
+    split_message(text, TELEGRAM_TEXT_CHUNK_CHARS)
 }
 
 async fn send_chunks(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
@@ -435,5 +538,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(state.selected_session_id.as_deref(), Some("session-test"));
+    }
+
+    #[tokio::test]
+    async fn consuming_telegram_permission_action_removes_its_sibling() {
+        let approvals = Mutex::new(std::collections::HashMap::from([
+            (
+                "allow".to_string(),
+                PermissionAction {
+                    group_id: "group".to_string(),
+                    session_id: SessionId::parse("session-test").unwrap(),
+                    request_id: "request-test".to_string(),
+                    allowed: true,
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            ),
+            (
+                "deny".to_string(),
+                PermissionAction {
+                    group_id: "group".to_string(),
+                    session_id: SessionId::parse("session-test").unwrap(),
+                    request_id: "request-test".to_string(),
+                    allowed: false,
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            ),
+        ]));
+
+        let action = take_action(&approvals, "allow").await.unwrap();
+        assert!(action.allowed);
+        assert!(approvals.lock().await.is_empty());
     }
 }

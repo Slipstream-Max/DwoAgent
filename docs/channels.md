@@ -19,19 +19,19 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     markdownFilter: true
   telegram:
     enabled: false
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
     mediaInput: true
   feishu:
     enabled: false
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
@@ -39,14 +39,14 @@ channels:
   qq:
     enabled: false
     replayTurns: 5
-    replayMode: response
+    outputMode: final
     mediaInput: true
   websocket:
     enabled: false
     port: 8765
 ```
 
-`replayTurns` 最大为 10，控制 `/use` session 时回放多少个最近 turn。`replayMode` 支持 `response` 和 `full`：前者只发送最终回答，后者还发送 reasoning 和 tool-call 阶段；微信固定使用 `response`。`mediaInput` 控制是否接收平台图片和文件。
+`replayTurns` 最大为 10，控制 `/use` session 时回放多少个最近 turn。`outputMode` 支持 `final` 和 `full`：前者只发送最终回答，后者按顺序发送 thinking、tool-call 和每个阶段的回答；微信固定使用 `final`。`mediaInput` 控制是否接收平台图片和文件。
 
 ## QQ Bot
 

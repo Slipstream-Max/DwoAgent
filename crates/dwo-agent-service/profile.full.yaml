@@ -39,7 +39,7 @@ channels:
     replayTurns: 5
 
     # Apply the Weixin markdown compatibility filter to assistant responses.
-    replayMode: response
+    outputMode: final
     markdownFilter: true
 
     # Download inbound images/files and submit structured content blocks.
@@ -55,7 +55,7 @@ channels:
     replayTurns: 5
 
     # Environment variable containing the BotFather token.
-    replayMode: response
+    outputMode: final
     botTokenEnv: TELEGRAM_BOT_TOKEN
 
     # Optional HTTP proxy used only for Telegram Bot API and media downloads.
@@ -75,7 +75,7 @@ channels:
     replayTurns: 5
 
     # Environment variables containing enterprise application credentials.
-    replayMode: response
+    outputMode: final
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
 
@@ -93,7 +93,7 @@ channels:
     # Number of completed turns replayed after selecting an existing session.
     # Valid range: 0..=10.
     replayTurns: 5
-    replayMode: response
+    outputMode: final
 
     # Download inbound attachments and submit structured resources.
     mediaInput: true

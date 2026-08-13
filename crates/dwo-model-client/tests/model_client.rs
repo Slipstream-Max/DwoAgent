@@ -527,9 +527,20 @@ fn builtin_openai_provider_exposes_verified_model_capabilities() {
 fn builtin_grok_provider_exposes_responses_models_and_reasoning() {
     let catalog = ModelCatalog::builtin().unwrap();
     let grok = &catalog.providers["grok"];
-    assert_eq!(grok.endpoint, "https://api.kkrich.ltd/v1/responses");
+    assert_eq!(grok.endpoint, "https://api.x.ai/v1/responses");
 
-    for id in ["grok-4.5", "grok-4.6"] {
+    for (id, modes) in [
+        ("grok-4.5", &[("Low", "low"), ("Medium", "medium"), ("High", "high")][..]),
+        (
+            "grok-4.6",
+            &[
+                ("Low", "low"),
+                ("Medium", "medium"),
+                ("High", "high"),
+                ("XHigh", "xhigh"),
+            ][..],
+        ),
+    ] {
         let model = &grok.models[id];
         assert_eq!(model.context_window_tokens, 500_000, "{id}");
         assert_eq!(model.max_output_tokens, 128_000, "{id}");
@@ -541,13 +552,10 @@ fn builtin_grok_provider_exposes_responses_models_and_reasoning() {
             "{id}"
         );
         assert_eq!(model.default_reasoning_mode, "High", "{id}");
-        for (mode, effort) in [
-            ("Low", "low"),
-            ("Medium", "medium"),
-            ("High", "high"),
-            ("XHigh", "xhigh"),
-        ] {
-            assert_eq!(model.reasoning[mode]["reasoning"]["effort"], effort, "{id}");
+        for (mode, effort) in modes {
+            let reasoning = &model.reasoning[*mode]["reasoning"];
+            assert_eq!(reasoning["effort"], *effort, "{id}/{mode}");
+            assert_eq!(reasoning["summary"], "auto", "{id}/{mode}");
         }
     }
 }

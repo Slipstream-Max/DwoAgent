@@ -1,5 +1,5 @@
 protocol: open_ai_responses
-endpoint: https://api.kkrich.ltd/v1/responses
+endpoint: https://api.x.ai/v1/responses
 models:
   grok-4.5:
     contextWindowTokens: 500000
@@ -16,15 +16,15 @@ models:
       Low:
         reasoning:
           effort: low
+          summary: auto
       Medium:
         reasoning:
           effort: medium
+          summary: auto
       High:
         reasoning:
           effort: high
-      XHigh:
-        reasoning:
-          effort: xhigh
+          summary: auto
   grok-4.6:
     contextWindowTokens: 500000
     maxOutputTokens: 128000
@@ -40,12 +40,16 @@ models:
       Low:
         reasoning:
           effort: low
+          summary: auto
       Medium:
         reasoning:
           effort: medium
+          summary: auto
       High:
         reasoning:
           effort: high
+          summary: auto
       XHigh:
         reasoning:
           effort: xhigh
+          summary: auto

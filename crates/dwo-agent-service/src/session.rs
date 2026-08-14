@@ -17,8 +17,9 @@ use crate::TurnId;
 use crate::agent_loop::{self, RunTurn, TurnActorMessage, TurnEvent, TurnOutcome};
 use crate::error::AgentServiceError;
 use crate::events::{
-    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, FileChange, RuntimePhase,
-    SessionEvent, SessionEventPayload, SessionSnapshot, SessionSubscription, SessionUsageSnapshot,
+    ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, FileChange, NotificationLevel,
+    RuntimePhase, SessionEvent, SessionEventPayload, SessionSnapshot, SessionSubscription,
+    SessionUsageSnapshot,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord, title_from_user_content};
@@ -28,10 +29,6 @@ use crate::repository::SessionRepository;
 #[serde(transparent)]
 pub struct EndpointId(String);
 
-/// Maximum number of automatic retries when the model response stream is
-/// interrupted mid-generation. After this many consecutive interruptions the
-/// turn fails for real.
-const MAX_AUTO_RESUMES: usize = 2;
 const EPHEMERAL_GRACE_MS: u64 = 5 * 60 * 1000;
 
 impl EndpointId {
@@ -137,7 +134,6 @@ impl SessionAgent {
             pending_messages: VecDeque::new(),
             closing_response: None,
             title_cancellation: None,
-            auto_resumes: 0,
         };
         tokio::spawn(actor.run());
         Arc::new(Self {
@@ -370,6 +366,28 @@ impl SessionAgent {
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub async fn publish_notification(
+        &self,
+        origin: Option<EndpointId>,
+        category: impl Into<String>,
+        level: NotificationLevel,
+        text: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Result<MessageId, AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::PublishNotification {
+            origin,
+            category: category.into(),
+            level,
+            text: text.into(),
+            data,
+            response,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
     pub async fn respond_permission(
         &self,
         origin: EndpointId,
@@ -446,6 +464,14 @@ enum Control {
         wake: bool,
         response: oneshot::Sender<Result<Option<TurnId>, AgentServiceError>>,
     },
+    PublishNotification {
+        origin: Option<EndpointId>,
+        category: String,
+        level: NotificationLevel,
+        text: String,
+        data: serde_json::Value,
+        response: oneshot::Sender<Result<MessageId, AgentServiceError>>,
+    },
     RespondPermission {
         origin: EndpointId,
         request_id: String,
@@ -468,6 +494,8 @@ struct ActiveTurn {
     message_id: MessageId,
     thought_message_id: MessageId,
     tools: Vec<ActiveToolCall>,
+    absorbed_user_message: bool,
+    uncommitted_pending: Vec<PendingContextMessage>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -497,7 +525,6 @@ struct SessionActor {
     pending_messages: VecDeque<PendingMessage>,
     closing_response: Option<oneshot::Sender<Result<(), AgentServiceError>>>,
     title_cancellation: Option<CancellationToken>,
-    auto_resumes: usize,
 }
 
 enum PendingMessage {
@@ -852,6 +879,35 @@ impl SessionActor {
                     let _ = response.send(result);
                 }
             }
+            Control::PublishNotification {
+                origin,
+                category,
+                level,
+                text,
+                data,
+                response,
+            } => {
+                if self.phase == RuntimePhase::Closing {
+                    let _ = response.send(Err(AgentServiceError::SessionClosed(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                let message_id = MessageId::new();
+                let result = self
+                    .persist_client_event(SessionEventPayload::Notification {
+                        message_id: message_id.clone(),
+                        turn_id: self.active.as_ref().map(|active| active.id.clone()),
+                        origin,
+                        category,
+                        level,
+                        text,
+                        data,
+                    })
+                    .await
+                    .map(|()| message_id);
+                let _ = response.send(result);
+            }
             Control::RespondPermission {
                 origin: responder,
                 request_id,
@@ -1102,6 +1158,8 @@ impl SessionActor {
             message_id: MessageId::new(),
             thought_message_id: MessageId::new(),
             tools: Vec::new(),
+            absorbed_user_message: false,
+            uncommitted_pending: Vec::new(),
         });
         self.phase = RuntimePhase::Running;
         self.emit(SessionEventPayload::TurnStarted {
@@ -1180,11 +1238,18 @@ impl SessionActor {
             }
             TurnActorMessage::PersistContext { context, completed } => {
                 let previous_usage = self.usage_snapshot();
-                self.record.context = *context;
-                self.record.touch();
-                let result = self.repository.save(&self.record).await;
-                if result.is_ok() && self.usage_snapshot() != previous_usage {
-                    self.emit_usage_changed();
+                let mut updated = self.record.clone();
+                updated.context = *context;
+                updated.touch();
+                let result = self.repository.save(&updated).await;
+                if result.is_ok() {
+                    self.record = updated;
+                    self.finish_pending_checkpoint(true);
+                    if self.usage_snapshot() != previous_usage {
+                        self.emit_usage_changed();
+                    }
+                } else {
+                    self.finish_pending_checkpoint(false);
                 }
                 let _ = completed.send(result);
                 false
@@ -1279,6 +1344,57 @@ impl SessionActor {
                     })
                     .await;
                 }
+            }
+            TurnEvent::AssistantInterrupted {
+                turn_id,
+                content,
+                reasoning,
+                error_kind,
+            } => {
+                let accepted = if let Some(active) =
+                    self.active.as_mut().filter(|active| active.id == turn_id)
+                {
+                    let message_id = active.message_id.clone();
+                    let thought_message_id = active.thought_message_id.clone();
+                    active.partial_message.clear();
+                    active.partial_reasoning.clear();
+                    active.step_id = active.step_id.saturating_add(1);
+                    active.step_revision = 0;
+                    active.message_id = MessageId::new();
+                    active.thought_message_id = MessageId::new();
+                    Some((message_id, thought_message_id))
+                } else {
+                    None
+                };
+                if let Some((message_id, thought_message_id)) = accepted {
+                    self.emit_client_event(SessionEventPayload::AssistantInterrupted {
+                        message_id,
+                        thought_message_id,
+                        turn_id,
+                        content,
+                        reasoning,
+                        error_kind,
+                    })
+                    .await;
+                }
+            }
+            TurnEvent::Notification {
+                turn_id,
+                category,
+                level,
+                text,
+                data,
+            } => {
+                self.emit_client_event(SessionEventPayload::Notification {
+                    message_id: MessageId::new(),
+                    turn_id: Some(turn_id),
+                    origin: None,
+                    category,
+                    level,
+                    text,
+                    data,
+                })
+                .await;
             }
             TurnEvent::ToolChanged { turn_id, call } => {
                 if let Some(payload) = self.upsert_tool_call(&turn_id, call) {
@@ -1390,10 +1506,17 @@ impl SessionActor {
                 compaction_id,
                 trigger,
             } => {
-                self.emit_client_event(SessionEventPayload::CompactionStarted {
-                    turn_id,
-                    compaction_id,
-                    trigger,
+                self.emit_client_event(SessionEventPayload::Notification {
+                    message_id: MessageId::new(),
+                    turn_id: Some(turn_id),
+                    origin: None,
+                    category: "compaction_started".to_string(),
+                    level: NotificationLevel::Info,
+                    text: "Compacting context...".to_string(),
+                    data: serde_json::json!({
+                        "compactionId": compaction_id,
+                        "trigger": trigger,
+                    }),
                 })
                 .await;
             }
@@ -1402,10 +1525,17 @@ impl SessionActor {
                 compaction_id,
                 summary,
             } => {
-                self.emit_client_event(SessionEventPayload::CompactionCompleted {
-                    turn_id,
-                    compaction_id,
-                    summary,
+                self.emit_client_event(SessionEventPayload::Notification {
+                    message_id: MessageId::new(),
+                    turn_id: Some(turn_id),
+                    origin: None,
+                    category: "compaction_completed".to_string(),
+                    level: NotificationLevel::Success,
+                    text: "Context compacted.".to_string(),
+                    data: serde_json::json!({
+                        "compactionId": compaction_id,
+                        "summary": summary,
+                    }),
                 })
                 .await;
             }
@@ -1414,10 +1544,17 @@ impl SessionActor {
                 compaction_id,
                 error,
             } => {
-                self.emit_client_event(SessionEventPayload::CompactionFailed {
-                    turn_id,
-                    compaction_id,
-                    error,
+                self.emit_client_event(SessionEventPayload::Notification {
+                    message_id: MessageId::new(),
+                    turn_id: Some(turn_id),
+                    origin: None,
+                    category: "compaction_failed".to_string(),
+                    level: NotificationLevel::Error,
+                    text: "Context compaction failed.".to_string(),
+                    data: serde_json::json!({
+                        "compactionId": compaction_id,
+                        "error": error,
+                    }),
                 })
                 .await;
             }
@@ -1425,9 +1562,14 @@ impl SessionActor {
                 turn_id,
                 compaction_id,
             } => {
-                self.emit_client_event(SessionEventPayload::CompactionCancelled {
-                    turn_id,
-                    compaction_id,
+                self.emit_client_event(SessionEventPayload::Notification {
+                    message_id: MessageId::new(),
+                    turn_id: Some(turn_id),
+                    origin: None,
+                    category: "compaction_cancelled".to_string(),
+                    level: NotificationLevel::Warning,
+                    text: "Context compaction cancelled.".to_string(),
+                    data: serde_json::json!({"compactionId": compaction_id}),
                 })
                 .await;
             }
@@ -1443,8 +1585,7 @@ impl SessionActor {
                 self.permission.reject("turn finished");
                 self.phase = RuntimePhase::Idle;
                 let allow_pending_wake = !matches!(outcome, TurnOutcome::Cancelled);
-                let mut auto_resumed = false;
-                if self.record.info.ephemeral && !matches!(outcome, TurnOutcome::Interrupted) {
+                if self.record.info.ephemeral {
                     self.record.info.completed |= matches!(outcome, TurnOutcome::Completed);
                     self.record.info.delete_after_ms =
                         Some(current_time_ms().saturating_add(EPHEMERAL_GRACE_MS));
@@ -1458,35 +1599,17 @@ impl SessionActor {
                         );
                     }
                 }
-                match outcome {
-                    TurnOutcome::Completed => {
-                        self.auto_resumes = 0;
-                        self.emit(SessionEventPayload::TurnCompleted { turn_id })
-                    }
-                    TurnOutcome::Cancelled => {
-                        self.emit(SessionEventPayload::TurnCancelled { turn_id })
-                    }
-                    TurnOutcome::Interrupted => {
-                        self.emit(SessionEventPayload::TurnFailed {
-                            turn_id: turn_id.clone(),
-                            error: "model stream interrupted; resuming automatically".to_string(),
-                        });
-                        if self.auto_resumes < MAX_AUTO_RESUMES {
-                            self.auto_resumes += 1;
-                            // Inject the <resume> instruction only on the first retry;
-                            // subsequent retries are plain re-requests of the same
-                            // context and must not grow the prompt.
-                            let result = self
-                                .start_resume(EndpointId::new(), self.auto_resumes == 1)
-                                .await;
-                            if result.is_ok() {
-                                auto_resumed = true;
-                            }
-                        }
-                    }
-                    TurnOutcome::Failed(error) => {
-                        self.emit(SessionEventPayload::TurnFailed { turn_id, error })
-                    }
+                match &outcome {
+                    TurnOutcome::Completed => self.emit(SessionEventPayload::TurnCompleted {
+                        turn_id: turn_id.clone(),
+                    }),
+                    TurnOutcome::Cancelled => self.emit(SessionEventPayload::TurnCancelled {
+                        turn_id: turn_id.clone(),
+                    }),
+                    TurnOutcome::Failed(error) => self.emit(SessionEventPayload::TurnFailed {
+                        turn_id: turn_id.clone(),
+                        error: error.clone(),
+                    }),
                 }
                 if let Some(response) = self.closing_response.take() {
                     self.phase = RuntimePhase::Closing;
@@ -1496,9 +1619,7 @@ impl SessionActor {
                     let _ = response.send(result);
                     return true;
                 }
-                if !auto_resumed {
-                    self.process_pending_idle(allow_pending_wake).await;
-                }
+                self.process_pending_idle(allow_pending_wake).await;
             }
         }
         false
@@ -1511,7 +1632,14 @@ impl SessionActor {
         while let Some(pending) = self.pending_messages.pop_front() {
             match pending {
                 PendingMessage::User { content } => {
-                    messages.push(PendingContextMessage::User(content));
+                    if let Some(active) = self.active.as_mut() {
+                        active.absorbed_user_message = true;
+                    }
+                    let message = PendingContextMessage::User(content);
+                    if let Some(active) = self.active.as_mut() {
+                        active.uncommitted_pending.push(message.clone());
+                    }
+                    messages.push(message);
                     should_continue = true;
                 }
                 PendingMessage::Internal {
@@ -1519,12 +1647,20 @@ impl SessionActor {
                     wake,
                     response,
                 } => {
-                    messages.push(PendingContextMessage::Internal(content));
+                    let message = PendingContextMessage::Internal(content);
+                    if let Some(active) = self.active.as_mut() {
+                        active.uncommitted_pending.push(message.clone());
+                    }
+                    messages.push(message);
                     should_continue |= wake;
                     let _ = response.send(Ok(None));
                 }
                 PendingMessage::StepInternal { content } => {
-                    messages.push(PendingContextMessage::Internal(content));
+                    let message = PendingContextMessage::Internal(content);
+                    if let Some(active) = self.active.as_mut() {
+                        active.uncommitted_pending.push(message.clone());
+                    }
+                    messages.push(message);
                     should_continue = true;
                 }
             }
@@ -1532,6 +1668,25 @@ impl SessionActor {
         PendingMessageBatch {
             messages,
             should_continue,
+        }
+    }
+
+    fn finish_pending_checkpoint(&mut self, committed: bool) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        let pending = std::mem::take(&mut active.uncommitted_pending);
+        if committed {
+            return;
+        }
+        for message in pending.into_iter().rev() {
+            let pending = match message {
+                PendingContextMessage::User(content) => PendingMessage::User { content },
+                PendingContextMessage::Internal(content) => {
+                    PendingMessage::StepInternal { content }
+                }
+            };
+            self.pending_messages.push_front(pending);
         }
     }
 
@@ -1619,7 +1774,10 @@ impl SessionActor {
                 ),
                 ContextMessage::user(format!("User message:\n{source}\n\nTitle:")),
             ];
-            let result = model.complete(selection, messages, cancellation).await;
+            let result = dwo_model_client::request_with_retry(&cancellation, || {
+                model.complete(selection.clone(), messages.clone(), cancellation.clone())
+            })
+            .await;
             let _ = actor.send(TurnActorMessage::TitleGenerated {
                 original_title,
                 result,
@@ -1708,21 +1866,27 @@ impl SessionActor {
     }
 
     async fn emit_client_event(&mut self, payload: SessionEventPayload) {
-        let event = ClientTranscriptEvent::new(payload.clone());
-        match self
-            .repository
-            .append_transcript_event(&self.record.info.id, &event)
-            .await
-        {
-            Ok(()) => self.transcript.push(event),
-            Err(error) => tracing::error!(
+        if let Err(error) = self.persist_client_event(payload).await {
+            tracing::error!(
                 event = "session.transcript_persist_failed",
                 session_id = %self.record.info.id,
                 error = %format!("{error:#}"),
                 "persist client transcript event failed"
-            ),
+            );
         }
+    }
+
+    async fn persist_client_event(
+        &mut self,
+        payload: SessionEventPayload,
+    ) -> Result<(), AgentServiceError> {
+        let event = ClientTranscriptEvent::new(payload.clone());
+        self.repository
+            .append_transcript_event(&self.record.info.id, &event)
+            .await?;
+        self.transcript.push(event);
         self.emit(payload);
+        Ok(())
     }
 
     fn upsert_tool_call(
@@ -1905,6 +2069,7 @@ fn update_step_checkpoint(step: &mut Option<ActiveStepSnapshot>, payload: &Sessi
             });
         }
         SessionEventPayload::AssistantCompleted { turn_id, .. }
+        | SessionEventPayload::AssistantInterrupted { turn_id, .. }
             if step
                 .as_ref()
                 .is_some_and(|current| current.turn_id == *turn_id) =>

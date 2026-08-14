@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -14,8 +13,8 @@ use agent_client_protocol::schema::v2::{
     ConfigOptionUpdate, Content as ToolContent, ContentBlock, ContentChunk, DeleteSessionRequest,
     DeleteSessionResponse, Diff, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
     IdleStateUpdate, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, NewSessionRequest, NewSessionResponse, OtherSessionUpdate,
-    PermissionOption, PermissionOptionKind, PromptCapabilities, PromptEmbeddedContextCapabilities,
+    ListSessionsResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptCapabilities, PromptEmbeddedContextCapabilities,
     PromptImageCapabilities, PromptRequest, PromptResponse, ReplayFrom, RequestPermissionOutcome,
     RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
     RunningStateUpdate, SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
@@ -65,7 +64,6 @@ struct AcpRuntime {
     observers: Arc<Mutex<HashMap<String, Arc<SessionObserver>>>>,
     prompt_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<PromptCompletion>>>>,
     pending_cancels: PendingCancels,
-    compaction_supported: Arc<AtomicBool>,
 }
 
 type PromptCompletion = Result<StopReason, String>;
@@ -159,7 +157,6 @@ struct AcpConnection {
     protocol: AcpProtocol,
     inner: ConnectionTo<Client>,
     delivered: Arc<StdMutex<DeliveredMessages>>,
-    compaction_supported: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
@@ -178,21 +175,12 @@ struct DeliveredMessages {
 }
 
 impl AcpConnection {
-    fn new(
-        protocol: AcpProtocol,
-        inner: ConnectionTo<Client>,
-        compaction_supported: Arc<AtomicBool>,
-    ) -> Self {
+    fn new(protocol: AcpProtocol, inner: ConnectionTo<Client>) -> Self {
         Self {
             protocol,
             inner,
             delivered: Arc::new(StdMutex::new(DeliveredMessages::default())),
-            compaction_supported,
         }
-    }
-
-    fn supports_compaction(&self) -> bool {
-        self.protocol == AcpProtocol::V2 || self.compaction_supported.load(Ordering::Relaxed)
     }
 
     fn mark_manual_compaction(&self, turn_id: &str) {
@@ -286,7 +274,6 @@ where
         observers: Arc::new(Mutex::new(HashMap::new())),
         prompt_waiters: Arc::new(Mutex::new(HashMap::new())),
         pending_cancels: PendingCancels::default(),
-        compaction_supported: Arc::new(AtomicBool::new(true)),
     };
     let new_config = config_path.clone();
     let list_config = config_path.clone();
@@ -343,11 +330,7 @@ where
                         let id = value["session_id"].as_str().unwrap_or_default();
                         match session_config_options(&new_config, id).await {
                             Ok(options) => {
-                                let connection = AcpConnection::new(
-                                    AcpProtocol::V2,
-                                    cx.clone(),
-                                    Arc::new(AtomicBool::new(true)),
-                                );
+                                let connection = AcpConnection::new(AcpProtocol::V2, cx.clone());
                                 let result = responder.respond(
                                     NewSessionResponse::new(SessionId::new(id))
                                         .config_options(options),
@@ -419,11 +402,7 @@ where
                         responder: Responder<ResumeSessionResponse>,
                         cx: ConnectionTo<Client>| {
                 let runtime = resume_runtime.clone();
-                let connection = AcpConnection::new(
-                    AcpProtocol::V2,
-                    cx.clone(),
-                    Arc::new(AtomicBool::new(true)),
-                );
+                let connection = AcpConnection::new(AcpProtocol::V2, cx.clone());
                 cx.clone().spawn(async move {
                     let session_id = request.session_id.to_string();
                     match validate_resume(&runtime, &request).await {
@@ -518,11 +497,7 @@ where
                         responder: Responder<PromptResponse>,
                         cx: ConnectionTo<Client>| {
                 let runtime = prompt_runtime.clone();
-                let connection = AcpConnection::new(
-                    AcpProtocol::V2,
-                    cx.clone(),
-                    Arc::new(AtomicBool::new(true)),
-                );
+                let connection = AcpConnection::new(AcpProtocol::V2, cx.clone());
                 cx.clone().spawn(async move {
                     run_prompt(runtime, request, responder, connection).await;
                     Ok(())
@@ -535,8 +510,7 @@ where
             async move |request: SetSessionConfigOptionRequest,
                         responder: Responder<SetSessionConfigOptionResponse>,
                         cx: ConnectionTo<Client>| {
-                let connection =
-                    AcpConnection::new(AcpProtocol::V2, cx, Arc::new(AtomicBool::new(true)));
+                let connection = AcpConnection::new(AcpProtocol::V2, cx);
                 let session_id = request.session_id.to_string();
                 let config_id = request.config_id.to_string();
                 let Some(value) = request.value.as_id().map(ToString::to_string) else {
@@ -629,18 +603,6 @@ async fn run_prompt(
             return;
         }
     };
-    if command == Some(SlashCommand::Status) {
-        match load_status_snapshot(&runtime, &session_id).await {
-            Ok(snapshot) => {
-                let _ = responder.respond(PromptResponse::new());
-                send_status_message(&cx, &session_id, &snapshot);
-            }
-            Err(error) => {
-                let _ = responder.respond_with_error(internal_error(error));
-            }
-        }
-        return;
-    }
     let observer = match prepare_observer(&runtime, &session_id, false).await {
         Ok(prepared) => match activate_observer(&runtime, &session_id, &cx, prepared).await {
             Ok(observer) => observer,
@@ -654,6 +616,39 @@ async fn run_prompt(
             return;
         }
     };
+    if command == Some(SlashCommand::Status) {
+        let result = async {
+            let snapshot = load_status_snapshot(&runtime, &session_id).await?;
+            let text = crate::session_status::render_status(
+                &snapshot,
+                crate::session_status::SessionIdDisplay::Full,
+            );
+            ipc::request(
+                &runtime.config_path,
+                "session.notify",
+                json!({
+                    "session_id": session_id,
+                    "endpoint_id": observer.endpoint_id,
+                    "category": "status",
+                    "level": "info",
+                    "text": text,
+                    "data": {},
+                }),
+            )
+            .await?;
+            anyhow::Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                let _ = responder.respond(PromptResponse::new());
+            }
+            Err(error) => {
+                let _ = responder.respond_with_error(internal_error(error));
+            }
+        }
+        return;
+    }
     let request = match command {
         Some(SlashCommand::Compact) => {
             ipc::request(
@@ -702,7 +697,6 @@ async fn run_prompt(
     match request {
         Ok(value) => {
             let _ = responder.respond(PromptResponse::new());
-            send_fork_result(&cx, &session_id, &value);
             if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
                 let prompt = serde_json::to_value(prompt_blocks)
                     .unwrap_or_else(|_| Value::Array(Vec::new()));
@@ -969,6 +963,8 @@ async fn handle_session_event(
             }
         }
         "assistant_completed" => send_assistant_completed(cx, session_id, payload),
+        "assistant_interrupted" => send_assistant_interrupted(cx, session_id, payload),
+        "notification" => send_notification(cx, session_id, payload),
         "turn_started" => send_state(
             cx,
             session_id,
@@ -985,7 +981,7 @@ async fn handle_session_event(
         "compaction_started"
         | "compaction_completed"
         | "compaction_failed"
-        | "compaction_cancelled" => send_compaction_event(cx, session_id, payload),
+        | "compaction_cancelled" => send_legacy_compaction_notification(cx, session_id, payload),
         "permission_requested" => {
             send_state(
                 cx,
@@ -1351,42 +1347,6 @@ async fn load_status_snapshot(
     Ok(serde_json::from_value(value)?)
 }
 
-fn send_status_message(
-    cx: &AcpConnection,
-    session_id: &str,
-    snapshot: &dwo_agent_service::SessionSnapshot,
-) {
-    let text = crate::session_status::render_status(
-        snapshot,
-        crate::session_status::SessionIdDisplay::Full,
-    );
-    send_update(
-        cx,
-        session_id,
-        SessionUpdate::AgentMessage(
-            AgentMessage::new(format!("message-{}", Uuid::new_v4()))
-                .content(vec![ContentBlock::Text(TextContent::new(text))]),
-        ),
-    );
-    send_idle(cx, session_id, StopReason::EndTurn);
-}
-
-fn send_fork_result(cx: &AcpConnection, source_id: &str, value: &Value) {
-    let Some(forked_id) = value.get("forked_session_id").and_then(Value::as_str) else {
-        return;
-    };
-    send_update(
-        cx,
-        source_id,
-        SessionUpdate::AgentMessage(
-            AgentMessage::new(format!("message-{}", Uuid::new_v4())).content(vec![
-                ContentBlock::Text(TextContent::new(format!("Forked session {forked_id}"))),
-            ]),
-        ),
-    );
-    send_idle(cx, source_id, StopReason::EndTurn);
-}
-
 fn send_user_message(cx: &AcpConnection, session_id: &str, message_id: &str, content: &Value) {
     send_update(
         cx,
@@ -1422,11 +1382,10 @@ fn send_thought_chunk(cx: &AcpConnection, session_id: &str, message_id: &str, te
 }
 
 fn send_assistant_completed(cx: &AcpConnection, session_id: &str, payload: &Value) {
-    if cx.supports_compaction()
-        && payload
-            .get("turn_id")
-            .and_then(Value::as_str)
-            .is_some_and(|turn_id| cx.is_manual_compaction_turn(turn_id))
+    if payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .is_some_and(|turn_id| cx.is_manual_compaction_turn(turn_id))
     {
         return;
     }
@@ -1456,6 +1415,107 @@ fn send_assistant_completed(cx: &AcpConnection, session_id: &str, payload: &Valu
             ])),
         );
     }
+}
+
+fn send_assistant_interrupted(cx: &AcpConnection, session_id: &str, payload: &Value) {
+    let meta = notification_meta(
+        "interrupted_attempt",
+        "warning",
+        json!({
+            "errorKind": payload.get("error_kind").cloned().unwrap_or(Value::Null),
+        }),
+    );
+    if let (Some(message_id), Some(reasoning)) = (
+        payload.get("thought_message_id").and_then(Value::as_str),
+        payload
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty()),
+    ) {
+        let send_content = cx.should_send_completed(message_id, true);
+        if send_content || cx.protocol == AcpProtocol::V1 {
+            let content = send_content
+                .then(|| vec![ContentBlock::Text(TextContent::new(reasoning))])
+                .unwrap_or_else(|| vec![ContentBlock::Text(TextContent::new("\u{200b}"))]);
+            send_update(
+                cx,
+                session_id,
+                SessionUpdate::AgentThought(
+                    AgentThought::new(message_id.to_string())
+                        .content(content)
+                        .meta(meta.clone()),
+                ),
+            );
+        }
+    }
+    if let (Some(message_id), Some(content)) = (
+        payload.get("message_id").and_then(Value::as_str),
+        payload
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty()),
+    ) {
+        let send_content = cx.should_send_completed(message_id, false);
+        if send_content || cx.protocol == AcpProtocol::V1 {
+            let content = send_content
+                .then(|| vec![ContentBlock::Text(TextContent::new(content))])
+                .unwrap_or_else(|| vec![ContentBlock::Text(TextContent::new("\u{200b}"))]);
+            send_update(
+                cx,
+                session_id,
+                SessionUpdate::AgentMessage(
+                    AgentMessage::new(message_id.to_string())
+                        .content(content)
+                        .meta(meta),
+                ),
+            );
+        }
+    }
+}
+
+fn send_notification(cx: &AcpConnection, session_id: &str, payload: &Value) {
+    let Some(message_id) = payload.get("message_id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(text) = payload.get("text").and_then(Value::as_str) else {
+        return;
+    };
+    let category = payload
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("notification");
+    let level = payload
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("info");
+    let data = payload.get("data").cloned().unwrap_or_else(|| json!({}));
+    if category == "compaction_started"
+        && data.get("trigger").and_then(Value::as_str) == Some("manual")
+        && let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str)
+    {
+        cx.mark_manual_compaction(turn_id);
+    }
+    send_update(
+        cx,
+        session_id,
+        SessionUpdate::AgentMessage(
+            AgentMessage::new(message_id.to_string())
+                .content(vec![ContentBlock::Text(TextContent::new(text))])
+                .meta(notification_meta(category, level, data)),
+        ),
+    );
+}
+
+fn notification_meta(category: &str, level: &str, data: Value) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(
+        "dwo".to_string(),
+        json!({
+            "kind": "system_notification",
+            "category": category,
+            "level": level,
+            "data": data,
+        }),
+    )])
 }
 
 fn send_state(cx: &AcpConnection, session_id: &str, state: StateUpdate) {
@@ -1496,72 +1556,38 @@ fn usage_update(used: u64, size: u64) -> SessionUpdate {
     SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
 }
 
-fn send_compaction_event(cx: &AcpConnection, session_id: &str, payload: &Value) {
-    if !cx.supports_compaction() {
-        return;
-    }
-    let Some(update) = compaction_session_update(payload) else {
+fn send_legacy_compaction_notification(cx: &AcpConnection, session_id: &str, payload: &Value) {
+    let Some(compaction_id) = payload.get("compaction_id").and_then(Value::as_str) else {
         return;
     };
-    if payload.get("kind").and_then(Value::as_str) == Some("compaction_started")
-        && payload.get("trigger").and_then(Value::as_str) == Some("manual")
-        && let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str)
-    {
-        cx.mark_manual_compaction(turn_id);
-    }
-    match cx.protocol {
-        AcpProtocol::V1 => {
-            let Ok(update) = serde_json::to_value(update) else {
-                return;
-            };
-            let _ = cx.inner.send_notification_to(
-                Client,
-                RawSessionNotification {
-                    session_id: session_id.to_string(),
-                    update,
-                },
-            );
-        }
-        AcpProtocol::V2 => send_update(cx, session_id, update),
-    }
-}
-
-fn compaction_session_update(payload: &Value) -> Option<SessionUpdate> {
-    let compaction_id = payload.get("compaction_id").and_then(Value::as_str)?;
-    let (status, summary, error) = match payload.get("kind").and_then(Value::as_str) {
-        Some("compaction_started") => ("in_progress", None, None),
-        Some("compaction_completed") => (
-            "completed",
-            payload
-                .get("summary")
-                .and_then(Value::as_str)
-                .filter(|summary| !summary.is_empty()),
-            None,
+    let (category, level, text) = match payload.get("kind").and_then(Value::as_str) {
+        Some("compaction_started") => ("compaction_started", "info", "Compacting context..."),
+        Some("compaction_completed") => ("compaction_completed", "success", "Context compacted."),
+        Some("compaction_failed") => ("compaction_failed", "error", "Context compaction failed."),
+        Some("compaction_cancelled") => (
+            "compaction_cancelled",
+            "warning",
+            "Context compaction cancelled.",
         ),
-        Some("compaction_failed") => ("failed", None, payload.get("error").and_then(Value::as_str)),
-        Some("compaction_cancelled") => ("cancelled", None, None),
-        _ => return None,
+        _ => return,
     };
-    let mut fields = BTreeMap::from([
-        (
-            "compactionId".to_string(),
-            Value::String(compaction_id.to_string()),
-        ),
-        ("status".to_string(), Value::String(status.to_string())),
-    ]);
-    if let Some(summary) = summary {
-        fields.insert(
-            "summary".to_string(),
-            json!([{"type": "text", "text": summary}]),
-        );
-    }
-    if let Some(error) = error {
-        fields.insert("error".to_string(), Value::String(error.to_string()));
-    }
-    Some(SessionUpdate::Other(OtherSessionUpdate::new(
-        "compaction_update",
-        fields,
-    )))
+    send_notification(
+        cx,
+        session_id,
+        &json!({
+            "message_id": format!("notification-{compaction_id}-{category}"),
+            "turn_id": payload.get("turn_id").cloned().unwrap_or(Value::Null),
+            "category": category,
+            "level": level,
+            "text": text,
+            "data": {
+                "compactionId": compaction_id,
+                "trigger": payload.get("trigger").cloned().unwrap_or(Value::Null),
+                "summary": payload.get("summary").cloned().unwrap_or(Value::Null),
+                "error": payload.get("error").cloned().unwrap_or(Value::Null),
+            },
+        }),
+    );
 }
 
 fn send_tool_started(cx: &AcpConnection, session_id: &str, payload: &Value) {
@@ -1856,50 +1882,54 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
             .and_then(Value::as_u64);
         send_session_info_update(cx, session_id, title, updated_at_ms);
     }
-    let Some(transcript) = snapshot.get("transcript").and_then(Value::as_array) else {
-        return;
-    };
-    for event in transcript {
-        let Some(payload) = event.get("payload") else {
-            continue;
-        };
-        match payload.get("kind").and_then(Value::as_str) {
-            Some("user_prompt_submitted") => {
-                if let Some(message_id) = payload.get("message_id").and_then(Value::as_str) {
-                    send_user_message(cx, session_id, message_id, &payload["content"]);
+    if let Some(transcript) = snapshot.get("transcript").and_then(Value::as_array) {
+        for event in transcript {
+            let Some(payload) = event.get("payload") else {
+                continue;
+            };
+            let kind = payload.get("kind").and_then(Value::as_str);
+            match kind {
+                Some("user_prompt_submitted") => {
+                    if let Some(message_id) = payload.get("message_id").and_then(Value::as_str) {
+                        send_user_message(cx, session_id, message_id, &payload["content"]);
+                    }
                 }
-            }
-            Some("assistant_delta") => {
-                if let (Some(message_id), Some(delta)) = (
-                    payload.get("message_id").and_then(Value::as_str),
-                    payload.get("delta").and_then(Value::as_str),
-                ) {
-                    send_agent_chunk(cx, session_id, message_id, delta);
+                Some("assistant_delta") => {
+                    if let (Some(message_id), Some(delta)) = (
+                        payload.get("message_id").and_then(Value::as_str),
+                        payload.get("delta").and_then(Value::as_str),
+                    ) {
+                        send_agent_chunk(cx, session_id, message_id, delta);
+                    }
                 }
-            }
-            Some("assistant_reasoning_delta") => {
-                if let (Some(message_id), Some(delta)) = (
-                    payload.get("message_id").and_then(Value::as_str),
-                    payload.get("delta").and_then(Value::as_str),
-                ) {
-                    send_thought_chunk(cx, session_id, message_id, delta);
+                Some("assistant_reasoning_delta") => {
+                    if let (Some(message_id), Some(delta)) = (
+                        payload.get("message_id").and_then(Value::as_str),
+                        payload.get("delta").and_then(Value::as_str),
+                    ) {
+                        send_thought_chunk(cx, session_id, message_id, delta);
+                    }
                 }
+                Some("assistant_completed") => send_assistant_completed(cx, session_id, payload),
+                Some("assistant_interrupted") => {
+                    send_assistant_interrupted(cx, session_id, payload)
+                }
+                Some("notification") => send_notification(cx, session_id, payload),
+                Some("tool_started") => send_tool_started(cx, session_id, payload),
+                Some("tool_updated") => send_tool_updated(cx, session_id, payload),
+                Some("tool_completed") => send_tool_completed(cx, session_id, payload),
+                Some("terminal_opened") => send_terminal_opened(cx, session_id, payload),
+                Some("terminal_exited") => send_terminal_exited(cx, session_id, payload),
+                Some("file_read") => send_file_read(cx, session_id, payload),
+                Some("file_changed") => send_file_changed(cx, session_id, payload),
+                Some(
+                    "compaction_started"
+                    | "compaction_completed"
+                    | "compaction_failed"
+                    | "compaction_cancelled",
+                ) => send_legacy_compaction_notification(cx, session_id, payload),
+                _ => {}
             }
-            Some("assistant_completed") => send_assistant_completed(cx, session_id, payload),
-            Some("tool_started") => send_tool_started(cx, session_id, payload),
-            Some("tool_updated") => send_tool_updated(cx, session_id, payload),
-            Some("tool_completed") => send_tool_completed(cx, session_id, payload),
-            Some("terminal_opened") => send_terminal_opened(cx, session_id, payload),
-            Some("terminal_exited") => send_terminal_exited(cx, session_id, payload),
-            Some("file_read") => send_file_read(cx, session_id, payload),
-            Some("file_changed") => send_file_changed(cx, session_id, payload),
-            Some(
-                "compaction_started"
-                | "compaction_completed"
-                | "compaction_failed"
-                | "compaction_cancelled",
-            ) => send_compaction_event(cx, session_id, payload),
-            _ => {}
         }
     }
     match snapshot.get("phase").and_then(Value::as_str) {
@@ -2401,60 +2431,62 @@ mod tests {
     }
 
     #[test]
-    fn compaction_events_map_to_id_addressed_acp_updates() {
-        let started = serde_json::to_value(
-            compaction_session_update(&json!({
-                "kind": "compaction_started",
-                "compaction_id": "cmp_001"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(started["sessionUpdate"], "compaction_update");
-        assert_eq!(started["compactionId"], "cmp_001");
-        assert_eq!(started["status"], "in_progress");
-        assert!(started.get("summary").is_none());
-
-        let completed = serde_json::to_value(
-            compaction_session_update(&json!({
-                "kind": "compaction_completed",
-                "compaction_id": "cmp_001",
-                "summary": "retained context"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(completed["compactionId"], started["compactionId"]);
-        assert_eq!(completed["status"], "completed");
-        assert_eq!(completed["summary"][0]["type"], "text");
-        assert_eq!(completed["summary"][0]["text"], "retained context");
+    fn notifications_use_agent_message_metadata() {
+        let update = SessionUpdate::AgentMessage(
+            AgentMessage::new("notification-1")
+                .content(vec![ContentBlock::Text(TextContent::new(
+                    "Context compacted.",
+                ))])
+                .meta(notification_meta(
+                    "compaction_completed",
+                    "success",
+                    json!({"compactionId": "cmp_001"}),
+                )),
+        );
+        let value = serde_json::to_value(update).unwrap();
+        assert_eq!(value["sessionUpdate"], "agent_message");
+        assert_eq!(value["messageId"], "notification-1");
+        assert_eq!(value["content"][0]["text"], "Context compacted.");
+        assert_eq!(value["_meta"]["dwo"]["kind"], "system_notification");
+        assert_eq!(value["_meta"]["dwo"]["category"], "compaction_completed");
+        assert_eq!(value["_meta"]["dwo"]["level"], "success");
+        assert_eq!(value["_meta"]["dwo"]["data"]["compactionId"], "cmp_001");
     }
 
     #[test]
-    fn failed_and_cancelled_compactions_have_terminal_statuses() {
-        let failed = serde_json::to_value(
-            compaction_session_update(&json!({
-                "kind": "compaction_failed",
-                "compaction_id": "cmp_failed",
-                "error": "summary request failed"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(failed["status"], "failed");
-        assert_eq!(failed["error"], "summary request failed");
+    fn notification_metadata_survives_v1_conversion() {
+        let update = SessionUpdate::AgentMessage(
+            AgentMessage::new("notification-1")
+                .content(vec![ContentBlock::Text(TextContent::new("Retrying."))])
+                .meta(notification_meta(
+                    "model_retrying",
+                    "warning",
+                    json!({"retry": 1}),
+                )),
+        );
+        let converted = Vec::<v1::SessionUpdate>::try_from(update).unwrap();
+        let value = serde_json::to_value(&converted[0]).unwrap();
+        assert_eq!(value["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(value["_meta"]["dwo"]["category"], "model_retrying");
+        assert_eq!(value["_meta"]["dwo"]["data"]["retry"], 1);
+    }
 
-        let cancelled = serde_json::to_value(
-            compaction_session_update(&json!({
-                "kind": "compaction_cancelled",
-                "compaction_id": "cmp_cancelled"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(cancelled["status"], "cancelled");
-        assert!(cancelled.get("summary").is_none());
-        assert!(cancelled.get("error").is_none());
+    #[test]
+    fn interrupted_metadata_survives_an_empty_v1_terminal_chunk() {
+        let update = SessionUpdate::AgentMessage(
+            AgentMessage::new("partial-1")
+                .content(vec![ContentBlock::Text(TextContent::new("\u{200b}"))])
+                .meta(notification_meta(
+                    "interrupted_attempt",
+                    "warning",
+                    json!({"errorKind": "stream_interrupted"}),
+                )),
+        );
+        let converted = Vec::<v1::SessionUpdate>::try_from(update).unwrap();
+        let value = serde_json::to_value(&converted[0]).unwrap();
+        assert_eq!(value["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(value["content"]["text"], "\u{200b}");
+        assert_eq!(value["_meta"]["dwo"]["category"], "interrupted_attempt");
     }
 
     #[test]

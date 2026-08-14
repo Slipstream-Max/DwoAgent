@@ -9,6 +9,7 @@ async-trait.workspace = true
 dwo-context = { path = "../dwo-context" }
 eventsource-stream.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 indexmap.workspace = true
 reqwest.workspace = true
 serde.workspace = true

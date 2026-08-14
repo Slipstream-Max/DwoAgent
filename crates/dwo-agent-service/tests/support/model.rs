@@ -377,11 +377,9 @@ impl ModelClient for ScriptedModelGateway {
                     }
                     let _ = events.send(event);
                 }
-                result.map_err(ModelClientError::Protocol)
+                result.map_err(|body| ModelClientError::InvalidRequest { status: 400, body })
             }
-            ScriptedStep::StreamedInterrupt {
-                events: streamed,
-            } => {
+            ScriptedStep::StreamedInterrupt { events: streamed } => {
                 let mut text_chars = 0usize;
                 for event in streamed {
                     if cancellation.is_cancelled() {

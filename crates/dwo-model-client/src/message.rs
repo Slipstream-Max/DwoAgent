@@ -284,7 +284,7 @@ pub(crate) fn parse_response(payload: &Value) -> Result<ModelReply, ModelClientE
         .get("output")
         .and_then(Value::as_array)
         .cloned()
-        .ok_or_else(|| ModelClientError::protocol("missing response.output"))?;
+        .ok_or_else(|| ModelClientError::invalid_response("missing response.output"))?;
     let status = payload.get("status").and_then(Value::as_str);
     let finish_reason = match status {
         Some("incomplete") => FinishReason::Length,

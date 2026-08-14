@@ -170,7 +170,7 @@ impl ModelClient for ConfiguredModelClient {
         messages.extend(view.messages);
         let response = self.complete(selection, messages, cancellation).await?;
         if response.content.trim().is_empty() {
-            return Err(ModelClientError::protocol(
+            return Err(ModelClientError::invalid_response(
                 "summary response content must not be empty",
             ));
         }

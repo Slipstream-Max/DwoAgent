@@ -68,8 +68,6 @@ providers:
     request:
       requestTimeoutMs: 5000
       streamIdleTimeoutMs: 5000
-      maxRetries: 0
-      retryBaseDelayMs: 1
     body:
       extra_body:
         provider_flag: true
@@ -586,7 +584,10 @@ fn builtin_grok_provider_exposes_responses_models_and_reasoning() {
     assert_eq!(grok.endpoint, "https://api.x.ai/v1/responses");
 
     for (id, modes) in [
-        ("grok-4.5", &[("Low", "low"), ("Medium", "medium"), ("High", "high")][..]),
+        (
+            "grok-4.5",
+            &[("Low", "low"), ("Medium", "medium"), ("High", "high")][..],
+        ),
         (
             "grok-4.6",
             &[
@@ -738,7 +739,7 @@ models:
     let provider = &resolved.providers["deepseek"];
     assert_eq!(provider.endpoint, "https://gateway.example.com/responses");
     assert_eq!(provider.api_key_env.as_deref(), Some("CUSTOM_DEEPSEEK_KEY"));
-    assert_eq!(provider.request.max_retries, 4);
+    assert_eq!(provider.request.request_timeout_ms, 300_000);
 
     let model = &resolved.models["custom-pro"];
     assert_eq!(model.context_window_tokens, 800_000);

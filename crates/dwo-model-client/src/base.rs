@@ -1,9 +1,10 @@
 use std::collections::HashSet;
-use std::time::Duration;
 
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER,
+};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
@@ -14,7 +15,7 @@ use crate::message::{
     StreamAccumulator, parse_response, provider_input, provider_tool_event_state, provider_tools,
     stream_tool_call,
 };
-use crate::{ModelClientError, ModelReply, ModelStreamEvent, RequestPolicy};
+use crate::{ModelClientError, ModelReply, ModelStreamEvent};
 
 pub struct BaseClient {
     provider: ProviderConfig,
@@ -74,7 +75,7 @@ impl BaseClient {
         let input = provider_input(messages, model.capabilities.image_input)?;
         let tools = provider_tools(tools, &model.hosted_tools)?;
         let body = self.request_body(model, input, &tools, reasoning, true)?;
-        let response = self.send_with_retries(&body, cancellation).await?;
+        let response = self.send(&body, cancellation).await?;
         self.read_stream(response, &model.hosted_tools, events, cancellation)
             .await
     }
@@ -88,7 +89,7 @@ impl BaseClient {
     ) -> Result<ModelReply, ModelClientError> {
         let input = provider_input(messages, model.capabilities.image_input)?;
         let body = self.request_body(model, input, &[], reasoning, false)?;
-        let response = self.send_with_retries(&body, cancellation).await?;
+        let response = self.send(&body, cancellation).await?;
         let payload: Value = tokio::select! {
             _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
             payload = response.json() => payload?,
@@ -134,44 +135,33 @@ impl BaseClient {
         Ok(Value::Object(body))
     }
 
-    async fn send_with_retries(
+    async fn send(
         &self,
         body: &Value,
         cancellation: &CancellationToken,
     ) -> Result<Response, ModelClientError> {
-        let policy = self.provider.request;
-        for attempt in 0..=policy.max_retries {
-            if cancellation.is_cancelled() {
-                return Err(ModelClientError::Cancelled);
-            }
-            let request = self
-                .http
-                .post(self.endpoint.clone())
-                .headers(self.headers.clone())
-                .json(body)
-                .send();
-            let response = tokio::select! {
-                _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
-                response = request => response,
-            };
-            match response {
-                Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    if is_retryable_status(status) && attempt < policy.max_retries {
-                        sleep_before_retry(policy, attempt + 1, cancellation).await?;
-                        continue;
-                    }
-                    return Err(classify_http_error(status, &body));
-                }
-                Err(error) if is_retryable_error(&error) && attempt < policy.max_retries => {
-                    sleep_before_retry(policy, attempt + 1, cancellation).await?;
-                }
-                Err(error) => return Err(ModelClientError::Http(error)),
-            }
+        let request = self
+            .http
+            .post(self.endpoint.clone())
+            .headers(self.headers.clone())
+            .json(body)
+            .send();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
+            response = request => response?,
+        };
+        if response.status().is_success() {
+            return Ok(response);
         }
-        unreachable!("retry loop always returns")
+        let status = response.status();
+        let retry_after_ms = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|seconds| seconds.saturating_mul(1_000));
+        let body = response.text().await.unwrap_or_default();
+        Err(classify_http_error(status, &body, retry_after_ms))
     }
 
     async fn read_stream(
@@ -204,12 +194,15 @@ impl BaseClient {
                     has_tool_calls: !accumulated.output_items.is_empty(),
                 });
             };
-            let event = event.map_err(|error| ModelClientError::protocol(error.to_string()))?;
+            let event = event.map_err(|_| ModelClientError::StreamInterrupted {
+                text_chars: accumulated.content.chars().count(),
+                has_tool_calls: !accumulated.output_items.is_empty(),
+            })?;
             if event.data == "[DONE]" {
                 break;
             }
             let payload: Value = serde_json::from_str(&event.data).map_err(|error| {
-                ModelClientError::protocol(format!("invalid SSE JSON: {error}"))
+                ModelClientError::invalid_response(format!("invalid SSE JSON: {error}"))
             })?;
             match payload.get("type").and_then(Value::as_str) {
                 Some("response.output_text.delta") => {
@@ -282,7 +275,7 @@ impl BaseClient {
                     break;
                 }
                 Some("response.failed") => {
-                    return Err(ModelClientError::protocol(format!(
+                    return Err(ModelClientError::invalid_response(format!(
                         "response failed: {}",
                         payload.get("response").unwrap_or(&payload)
                     )));
@@ -339,33 +332,6 @@ fn merge_map(target: &mut Map<String, Value>, source: &Map<String, Value>) {
     }
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 425 | 429) || status.is_server_error()
-}
-
-fn is_retryable_error(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout() || error.is_request()
-}
-
-async fn sleep_before_retry(
-    policy: RequestPolicy,
-    attempt: u32,
-    cancellation: &CancellationToken,
-) -> Result<(), ModelClientError> {
-    let multiplier = 1_u32
-        .checked_shl(attempt.saturating_sub(1).min(8))
-        .unwrap_or(256);
-    let delay = policy
-        .retry_base_delay()
-        .checked_mul(multiplier)
-        .unwrap_or(Duration::from_secs(30))
-        .min(Duration::from_secs(30));
-    tokio::select! {
-        _ = cancellation.cancelled() => Err(ModelClientError::Cancelled),
-        _ = tokio::time::sleep(delay) => Ok(()),
-    }
-}
-
 fn cap_error_body(body: &str) -> String {
     const LIMIT: usize = 8_000;
     if body.len() <= LIMIT {
@@ -378,7 +344,11 @@ fn cap_error_body(body: &str) -> String {
     format!("{}...", &body[..end])
 }
 
-fn classify_http_error(status: StatusCode, body: &str) -> ModelClientError {
+fn classify_http_error(
+    status: StatusCode,
+    body: &str,
+    retry_after_ms: Option<u64>,
+) -> ModelClientError {
     let body = cap_error_body(body);
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return ModelClientError::Authentication {
@@ -387,7 +357,10 @@ fn classify_http_error(status: StatusCode, body: &str) -> ModelClientError {
         };
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return ModelClientError::RateLimited { body };
+        return ModelClientError::RateLimited {
+            body,
+            retry_after_ms,
+        };
     }
     if is_context_length_error(&body) {
         return ModelClientError::ContextLengthExceeded {
@@ -395,7 +368,7 @@ fn classify_http_error(status: StatusCode, body: &str) -> ModelClientError {
             body,
         };
     }
-    if status.is_client_error() {
+    if status.is_client_error() && !matches!(status.as_u16(), 408 | 409 | 425) {
         return ModelClientError::InvalidRequest {
             status: status.as_u16(),
             body,
@@ -404,6 +377,7 @@ fn classify_http_error(status: StatusCode, body: &str) -> ModelClientError {
     ModelClientError::ProviderStatus {
         status: status.as_u16(),
         body,
+        retry_after_ms,
     }
 }
 
@@ -426,16 +400,21 @@ mod http_error_tests {
         assert!(matches!(
             classify_http_error(
                 StatusCode::BAD_REQUEST,
-                r#"{"error":{"code":"context_length_exceeded"}}"#
+                r#"{"error":{"code":"context_length_exceeded"}}"#,
+                None,
             ),
             ModelClientError::ContextLengthExceeded { .. }
         ));
         assert!(matches!(
-            classify_http_error(StatusCode::BAD_REQUEST, "unsupported thinking parameter"),
+            classify_http_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported thinking parameter",
+                None,
+            ),
             ModelClientError::InvalidRequest { .. }
         ));
         assert!(matches!(
-            classify_http_error(StatusCode::UNAUTHORIZED, "bad key"),
+            classify_http_error(StatusCode::UNAUTHORIZED, "bad key", None),
             ModelClientError::Authentication { .. }
         ));
     }

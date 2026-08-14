@@ -29,8 +29,6 @@ headers:                            # 可选，附加到每次请求
 request:                            # 可选，超时与重试策略
   requestTimeoutMs: 300000
   streamIdleTimeoutMs: 300000
-  maxRetries: 4
-  retryBaseDelayMs: 200
 body:                               # 可选，provider 级请求体骨架
   extra_field: value
 models:                             # 必填，至少一个
@@ -60,7 +58,7 @@ models:                             # 必填，至少一个
 | `protocol` | 传输协议，当前仅 `open_ai_responses`（默认值，可省略） |
 | `endpoint` | 完整 Responses URL，必填，必须为 http/https |
 | `headers` | 附加请求头；`Authorization: Bearer <key>` 由 client 在最后注入，优先于 catalog 中的同名头 |
-| `request` | 超时与重试策略，见下表 |
+| `request` | 单次请求超时策略，见下表 |
 | `body` | provider 级请求体骨架，与模型级 `body` 深合并 |
 | `models` | `modelId -> ModelSpec` 映射，必填且非空 |
 
@@ -70,11 +68,15 @@ models:                             # 必填，至少一个
 | --- | --- | --- |
 | `requestTimeoutMs` | 300000 | 单次请求超时（毫秒），必须为正 |
 | `streamIdleTimeoutMs` | 300000 | 流式响应相邻事件的最大空闲间隔 |
-| `maxRetries` | 4 | 最大重试次数（不含首次） |
-| `retryBaseDelayMs` | 200 | 指数退避基数：`base × 2^(attempt-1)`，封顶 30 秒 |
 
-可重试：HTTP 408/409/425/429/5xx，以及连接失败、超时等网络错误。其余错误立即
-返回并按错误分类处理（见[错误分类](#错误分类)）。
+重试策略由统一 model client 固定实现，不从 provider/profile 配置：每个模型请求
+步骤最多执行首次请求加 5 次重试；任意一次成功后，下一个模型步骤重新获得完整
+预算。退避为 1、2、4、8、16 秒并增加最多 25% jitter，provider 的
+`Retry-After` 可以延长等待，单次封顶 60 秒。
+
+可重试错误包括 HTTP 408/409/425/429/5xx、连接/请求/响应体错误、超时、provider
+响应解析错误和流中断。Cancel、认证、普通 4xx、本地请求/上下文校验失败、上下文超限等永久或专用恢复错误不会进入
+通用重试；上下文超限仍由 agent loop 执行压缩恢复。
 
 ### ModelSpec 字段
 
@@ -147,12 +149,18 @@ models:                             # 必填，至少一个
 | 错误 | 触发条件 |
 | --- | --- |
 | `Authentication` | HTTP 401/403 |
-| `RateLimited` | HTTP 429（超出 `maxRetries` 后） |
+| `RateLimited` | HTTP 429（5 次重试耗尽后） |
 | `ContextLengthExceeded` | 响应体匹配上下文超限特征（如 `context_length_exceeded`、`maximum context length`），触发压缩恢复 |
 | `InvalidRequest` | 其他 4xx |
 | `ProviderStatus` | 其他状态码（如 5xx 超出重试次数） |
 | `StreamInterrupted` | 流中断或空闲超时，保留已累积文本/工具调用 |
 | `Cancelled` | 会话取消 |
+
+流式请求是单次原子尝试：只有完整读到结束事件才算成功。连接在输出中途断开时，
+已收到的 reasoning、assistant 文本和工具事件会先写入 transcript；重试仍保持原
+turn ID 和原 ACP prompt，并在下一次请求上下文中加入可见的残缺 assistant 文本。
+重试期间 session 保持 `Running`。只有成功、Cancel、永久错误或重试耗尽才结束
+turn；失败结束不会自动推进未完成计划，计划保留供用户修正后继续。
 
 ## 自定义 Provider
 

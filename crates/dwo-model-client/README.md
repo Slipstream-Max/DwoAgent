@@ -6,7 +6,7 @@ Provider-configured model transport for the rewrite.
 ConfiguredModelClient
 |- model alias registry
 `- provider id -> BaseClient
-   |- HTTP/auth/retry/cancellation
+   |- atomic HTTP/SSE request and cancellation
    |- OpenAI-compatible Responses input/output items
    |- SSE text/reasoning/function/hosted-tool assembly
    `- non-streaming response normalization
@@ -68,9 +68,9 @@ models:
 ```
 
 One provider entry produces one shared `BaseClient`, so every model using that
-provider shares its API key, endpoint, headers, HTTP pool, and retry policy.
+provider shares its API key, endpoint, headers, and HTTP pool.
 Only `baseUrl`, `apiKeyEnv`, and `apiKey` are profile-level provider settings;
-headers, retry policy, hosted tools, and provider request fields remain
+headers, timeouts, hosted tools, and provider request fields remain
 catalog-owned. Responses requests always use `max_output_tokens`.
 Catalog provider body, catalog model body, and the selected reasoning map are
 deep-merged in that order. Reasoning never changes the model output limit.
@@ -126,5 +126,11 @@ tool executor to return a per-call parse error without discarding the rest of
 the model response.
 
 HTTP/provider failures are classified into context-length, authentication,
-rate-limit, invalid-request, provider-status, transport, and protocol errors.
-The agent loop may compact and retry once only for the context-length class.
+rate-limit, invalid-request, provider-status, transport, invalid-response, and
+local protocol/validation errors.
+Every model request step gets five retries for transient failures, using
+1/2/4/8/16-second exponential backoff plus up to 25% jitter and honoring a
+longer provider `Retry-After` value. A stream attempt succeeds only after its
+terminal event; interrupted partial output is returned to the agent loop for
+transcript persistence before the same turn retries. Context-length errors use
+the separate compaction recovery path.

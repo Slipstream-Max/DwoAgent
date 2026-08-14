@@ -4,9 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
-    AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession, PromptAccepted,
-    SessionConfig, SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings,
-    SessionRecord, SessionSnapshot, SessionStatusSnapshot, SessionSubscription, TurnId,
+    AgentService, EndpointId, FsSessionRepository, LoadedAgentProfile, NewSession,
+    NotificationLevel, PromptAccepted, SessionConfig, SessionConfigUpdate, SessionEventPayload,
+    SessionId, SessionLlmSettings, SessionRecord, SessionSnapshot, SessionStatusSnapshot,
+    SessionSubscription, TurnId,
 };
 use dwo_context::MessageContent;
 use dwo_mcp::McpRuntime;
@@ -80,6 +81,17 @@ struct PromptParam {
 struct SessionCommandParam {
     session_id: String,
     endpoint_id: String,
+}
+
+#[derive(Deserialize)]
+struct NotificationParam {
+    session_id: String,
+    endpoint_id: Option<String>,
+    category: String,
+    level: NotificationLevel,
+    text: String,
+    #[serde(default)]
+    data: Value,
 }
 
 #[derive(Deserialize)]
@@ -398,6 +410,23 @@ impl Host {
         Ok(self.service.prompt(id, endpoint, content).await?)
     }
 
+    pub async fn publish_session_notification(
+        &self,
+        id: &SessionId,
+        origin: Option<EndpointId>,
+        category: String,
+        level: NotificationLevel,
+        text: String,
+        data: Value,
+    ) -> Result<dwo_agent_service::MessageId> {
+        Ok(self
+            .service
+            .load(id)
+            .await?
+            .publish_notification(origin, category, level, text, data)
+            .await?)
+    }
+
     async fn expand_prompt_directives(
         &self,
         cwd: &Path,
@@ -598,6 +627,26 @@ impl Host {
                 let id = parse_session(params)?;
                 self.prompt_directive_options(&id).await
             }
+            "session.notify" => {
+                let params: NotificationParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let origin = params
+                    .endpoint_id
+                    .map(EndpointId::parse)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?;
+                let message_id = self
+                    .publish_session_notification(
+                        &id,
+                        origin,
+                        params.category,
+                        params.level,
+                        params.text,
+                        params.data,
+                    )
+                    .await?;
+                Ok(json!({"session_id": id, "message_id": message_id}))
+            }
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
                 let snapshot = self.setup_session(params.title, params.cwd).await?;
@@ -610,10 +659,21 @@ impl Host {
                 let source_id = parse_session(params)?;
                 let snapshot = self.fork_session(&source_id).await?;
                 let id = snapshot.record.info.id;
+                let message_id = self
+                    .publish_session_notification(
+                        &source_id,
+                        None,
+                        "fork_completed".to_string(),
+                        NotificationLevel::Success,
+                        format!("Forked session {id}."),
+                        json!({"forkedSessionId": id}),
+                    )
+                    .await?;
                 Ok(json!({
                     "accepted": false,
                     "session_id": id.clone(),
                     "forked_session_id": id,
+                    "message_id": message_id,
                     "usage": snapshot.usage,
                 }))
             }
@@ -1759,6 +1819,8 @@ fn is_content_event(payload: &SessionEventPayload) -> bool {
         payload,
         SessionEventPayload::UserPromptSubmitted { .. }
             | SessionEventPayload::AssistantCompleted { .. }
+            | SessionEventPayload::AssistantInterrupted { .. }
+            | SessionEventPayload::Notification { .. }
             | SessionEventPayload::ToolStarted { .. }
             | SessionEventPayload::ToolUpdated { .. }
             | SessionEventPayload::ToolCompleted { .. }

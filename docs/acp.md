@@ -98,17 +98,25 @@ ACP 的 command input 目前只有自由文本 hint，没有参数候选列表�
 
 Slash command 仍通过普通 `session/prompt` 发送，由 Agent 识别并执行。ACP 同时声明并实现实验性原生 `session/fork`；它和 `/fork` 都返回副本 ID，但都不会切换当前 ACP session。ACP 协议自身的 `session/resume` 是重新接入已有 session、恢复 observer 和可选回放历史，不会启动模型；它与自定义 `/resume` 命令不是同一功能。
 
-## 上下文压缩回显
+## 系统通知
 
-手动 `/compact`、达到 token 阈值后的自动压缩、上下文超限恢复，以及 Agent 调用 `handoff` 触发的上下文重建，都会在 ACP 时间线中产生同一个 ID 寻址的压缩实体：
+压缩、模型重试、`/fork` 等运行时状态统一映射为 `agent_message`，并在
+`_meta.dwo` 中携带机器可读信息：`kind: "system_notification"`、`category`、
+`level` 和 `data`。这样 v1/v2 客户端即使没有专用 update schema 也能显示文本，
+支持 metadata 的客户端则可以渲染独立通知样式。通知写入 session transcript，
+因此 `session/load` 或带 replay 的 `session/resume` 会在原时间线位置恢复。
 
-1. 开始时发送 `compaction_update`，状态为 `in_progress`。
-2. 成功时复用同一个 `compactionId` 发送 `completed`，并在存在安全、用户可见的保留摘要时附带 `summary`。
-3. 失败或取消时复用同一个 ID 发送 `failed` 或 `cancelled`；失败状态包含可读的 `error`。
+压缩通知使用 `compaction_started`、`compaction_completed`、
+`compaction_failed`、`compaction_cancelled` category，并在 `data` 中携带同一个
+`compactionId`、trigger、summary 或 error。`usage_update` 仍独立报告压缩后的
+context window 使用量。旧 `compaction_update` 不再发送，也不再依赖客户端声明
+compaction capability。
 
-这些事件会写入 session transcript，因此 `session/load` 或带 replay 的 `session/resume` 可以在原来的时间线位置重建压缩边界。`usage_update` 仍独立报告压缩后的 context window 使用量。
-
-ACP v2 始终发送这些标准 update。ACP v1 仅在客户端初始化时声明 `clientCapabilities.session.compaction: {}` 后发送；未声明该能力的 v1 客户端继续接收原有的普通文本结果。
+模型流中断时，已显示的 reasoning/assistant partial 会作为带
+`interrupted_attempt` metadata 的原消息保留；随后发送 `model_retrying` 系统通知。
+重试期间 `state_update` 仍为 Running，turn ID 和 ACP prompt 不变。最多五次重试
+耗尽后才发送最终 Failed/stop reason；未完成计划暂停自动 continuation，但不会被
+清除。其他消息 channel 不展示中间 retry 通知，只在最终失败时报告原因。
 
 ## 输入与输出能力
 
@@ -118,7 +126,7 @@ ACP v2 始终发送这些标准 update。ACP v1 仅在客户端初始化时声�
 - 图片输入；最终是否接受取决于当前模型是否支持图片。
 - 文本型 embedded resource。
 - resource link，包括名称、URI、MIME type 和可用元数据。
-- reasoning、assistant message、usage、compaction lifecycle 和 session state 更新。
+- reasoning、assistant message、usage、系统通知和 session state 更新。
 - 本地与 provider 托管的 tool call/result、权限请求和取消。
 
 当前不支持：

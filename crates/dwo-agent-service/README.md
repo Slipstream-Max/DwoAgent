@@ -126,6 +126,7 @@ SessionAgent::prompt(origin, user_message)
      -> compare last turn input usage with the selected model compact trigger
      -> compact old history with the last successful model when the trigger is reached
      -> ModelClient::stream_turn
+     -> on transient model failure, persist partial output and retry the same step up to five times
      -> on ContextLengthExceeded, compact and retry that request once
      -> stream assistant deltas
      -> without tool calls, drain queued user/internal messages after the response
@@ -159,7 +160,12 @@ append-only client transcript.
 
 Only an explicitly classified `ContextLengthExceeded` response enters reactive
 recovery. Authentication, rate-limit, network, and other invalid-request
-errors do not masquerade as context errors.
+errors do not masquerade as context errors. Transient network, provider,
+protocol, and stream-interruption errors use the shared model retry policy.
+Retries keep the same turn active, absorb pending user/runtime messages before
+the next request, and preserve partial assistant content in both transcript and
+model context. A permanently failed or retry-exhausted turn pauses automatic
+plan continuation while retaining the current plan.
 
 Context usage is recomputed from system prompt, messages, reasoning, images,
 tool calls/results, and tool schemas after each checkpoint. Provider input and

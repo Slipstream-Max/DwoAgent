@@ -22,15 +22,6 @@ use super::*;
 #[serde(rename_all = "camelCase")]
 struct InitializeRequest {
     protocol_version: ProtocolVersion,
-    #[serde(default)]
-    client_capabilities: Value,
-}
-
-fn advertises_compaction(request: &InitializeRequest) -> bool {
-    request
-        .client_capabilities
-        .pointer("/session/compaction")
-        .is_some_and(Value::is_object)
 }
 
 pub(super) async fn run_with_io<R, W>(config_path: PathBuf, stdin: R, stdout: W) -> Result<()>
@@ -48,9 +39,7 @@ where
         observers: Arc::new(Mutex::new(HashMap::new())),
         prompt_waiters: Arc::new(Mutex::new(HashMap::new())),
         pending_cancels: PendingCancels::default(),
-        compaction_supported: Arc::new(AtomicBool::new(false)),
     };
-    let initialize_compaction_supported = runtime.compaction_supported.clone();
     let new_runtime = runtime.clone();
     let list_runtime = runtime.clone();
     let fork_runtime = runtime.clone();
@@ -65,11 +54,9 @@ where
     let agent = Agent
         .builder()
         .on_receive_request(
-            async move |request: InitializeRequest,
+            async move |_request: InitializeRequest,
                         responder: Responder<v1::InitializeResponse>,
                         _cx: ConnectionTo<Client>| {
-                initialize_compaction_supported
-                    .store(advertises_compaction(&request), Ordering::Relaxed);
                 let response = v2::InitializeResponse::new(
                     ProtocolVersion::V2,
                     v2::Implementation::new("dwo", env!("CARGO_PKG_VERSION")),
@@ -117,11 +104,7 @@ where
                     Ok(response) => response,
                     Err(error) => return responder.respond_with_error(internal_error(error)),
                 };
-                let connection = AcpConnection::new(
-                    AcpProtocol::V1,
-                    cx,
-                    new_runtime.compaction_supported.clone(),
-                );
+                let connection = AcpConnection::new(AcpProtocol::V1, cx);
                 let result = responder.respond(response);
                 if result.is_ok() {
                     if let Some((used, size)) = snapshot_usage(&value) {
@@ -347,7 +330,7 @@ async fn run_load(
             return;
         }
     };
-    let connection = AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
+    let connection = AcpConnection::new(AcpProtocol::V1, cx);
     if responder
         .respond(v1::LoadSessionResponse::new().config_options(options))
         .is_ok()
@@ -394,7 +377,7 @@ async fn run_resume(
             return;
         }
     };
-    let connection = AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
+    let connection = AcpConnection::new(AcpProtocol::V1, cx);
     if responder.respond(response).is_ok()
         && activate_observer(&runtime, &session_id, &connection, prepared)
             .await
@@ -433,21 +416,6 @@ async fn run_prompt(
         }
     };
     let replaces_pending_cancel = runtime.pending_cancels.consume(&session_id);
-    if command == Some(SlashCommand::Status) {
-        let connection =
-            AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
-        match load_status_snapshot(&runtime, &session_id).await {
-            Ok(snapshot) => {
-                send_status_message(&connection, &session_id, &snapshot);
-                let _ = responder.respond(v1::PromptResponse::new(v1::StopReason::EndTurn));
-            }
-            Err(error) => {
-                forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
-                let _ = responder.respond_with_error(internal_error(error));
-            }
-        }
-        return;
-    }
     let prepared = match prepare_observer(&runtime, &session_id, false).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -456,7 +424,7 @@ async fn run_prompt(
             return;
         }
     };
-    let connection = AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone());
+    let connection = AcpConnection::new(AcpProtocol::V1, cx);
     let observer = match activate_observer(&runtime, &session_id, &connection, prepared).await {
         Ok(observer) => observer,
         Err(error) => {
@@ -465,6 +433,40 @@ async fn run_prompt(
             return;
         }
     };
+    if command == Some(SlashCommand::Status) {
+        let result = async {
+            let snapshot = load_status_snapshot(&runtime, &session_id).await?;
+            let text = crate::session_status::render_status(
+                &snapshot,
+                crate::session_status::SessionIdDisplay::Full,
+            );
+            ipc::request(
+                &runtime.config_path,
+                "session.notify",
+                json!({
+                    "session_id": session_id,
+                    "endpoint_id": observer.endpoint_id,
+                    "category": "status",
+                    "level": "info",
+                    "text": text,
+                    "data": {},
+                }),
+            )
+            .await?;
+            anyhow::Ok(())
+        }
+        .await;
+        forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
+        match result {
+            Ok(()) => {
+                let _ = responder.respond(v1::PromptResponse::new(v1::StopReason::EndTurn));
+            }
+            Err(error) => {
+                let _ = responder.respond_with_error(internal_error(error));
+            }
+        }
+        return;
+    }
     let (sender, completion) = oneshot::channel();
     {
         let mut waiters = runtime.prompt_waiters.lock().await;
@@ -487,7 +489,6 @@ async fn run_prompt(
             return;
         }
     };
-    send_fork_result(&connection, &session_id, &value);
     if value.get("accepted").and_then(Value::as_bool) == Some(false) {
         runtime.prompt_waiters.lock().await.remove(&session_id);
         forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
@@ -592,7 +593,7 @@ async fn set_config_option(
         && let Some((used, size)) = snapshot_usage(&changed)
     {
         send_usage_update(
-            &AcpConnection::new(AcpProtocol::V1, cx, runtime.compaction_supported.clone()),
+            &AcpConnection::new(AcpProtocol::V1, cx),
             &session_id,
             used,
             size,
@@ -621,26 +622,4 @@ async fn delete_session(runtime: &AcpRuntime, session_id: String) -> Result<()> 
     .await?;
     runtime.observers.lock().await.remove(&session_id);
     Ok(())
-}
-
-#[cfg(test)]
-mod compaction_capability_tests {
-    use super::*;
-
-    #[test]
-    fn v1_requires_the_session_compaction_capability() {
-        let unsupported: InitializeRequest = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {"session": {}}
-        }))
-        .unwrap();
-        assert!(!advertises_compaction(&unsupported));
-
-        let supported: InitializeRequest = serde_json::from_value(json!({
-            "protocolVersion": 1,
-            "clientCapabilities": {"session": {"compaction": {}}}
-        }))
-        .unwrap();
-        assert!(advertises_compaction(&supported));
-    }
 }

@@ -44,10 +44,6 @@ pub struct RequestPolicy {
     pub request_timeout_ms: u64,
     #[serde(default = "default_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_retry_base_delay_ms")]
-    pub retry_base_delay_ms: u64,
 }
 
 impl Default for RequestPolicy {
@@ -55,8 +51,6 @@ impl Default for RequestPolicy {
         Self {
             request_timeout_ms: default_request_timeout_ms(),
             stream_idle_timeout_ms: default_stream_idle_timeout_ms(),
-            max_retries: default_max_retries(),
-            retry_base_delay_ms: default_retry_base_delay_ms(),
         }
     }
 }
@@ -68,10 +62,6 @@ impl RequestPolicy {
 
     pub(crate) fn stream_idle_timeout(self) -> Duration {
         Duration::from_millis(self.stream_idle_timeout_ms)
-    }
-
-    pub(crate) fn retry_base_delay(self) -> Duration {
-        Duration::from_millis(self.retry_base_delay_ms)
     }
 
     fn validate(self, source: &str) -> Result<(), ModelClientError> {
@@ -90,14 +80,6 @@ fn default_request_timeout_ms() -> u64 {
 
 fn default_stream_idle_timeout_ms() -> u64 {
     300_000
-}
-
-fn default_max_retries() -> u32 {
-    4
-}
-
-fn default_retry_base_delay_ms() -> u64 {
-    200
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

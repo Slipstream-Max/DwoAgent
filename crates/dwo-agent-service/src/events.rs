@@ -52,6 +52,15 @@ pub enum CompactionTrigger {
     Handoff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveStepSnapshot {
@@ -128,6 +137,24 @@ pub enum SessionEventPayload {
         content: String,
         reasoning: Option<String>,
         tool_calls: Vec<ActiveToolCall>,
+    },
+    AssistantInterrupted {
+        message_id: MessageId,
+        thought_message_id: MessageId,
+        turn_id: TurnId,
+        content: String,
+        reasoning: String,
+        error_kind: String,
+    },
+    Notification {
+        message_id: MessageId,
+        turn_id: Option<TurnId>,
+        origin: Option<EndpointId>,
+        category: String,
+        level: NotificationLevel,
+        text: String,
+        #[serde(default)]
+        data: serde_json::Value,
     },
     ToolStarted {
         turn_id: TurnId,

@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dwo_agent_service::{
-    AgentService, AgentServiceError, CompactionTrigger, ConfirmationDecision, ContentBlock,
-    ContextMessage, EndpointId, FinishReason, FsSessionRepository, MemorySessionRepository,
-    MessageContent, MessageKind, ModelLimits, ModelReply, ModelStreamEvent, ModelUsage, NewSession,
-    RuntimePhase, SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings,
-    SessionMode, SessionRepository, StreamToolCall,
+    AgentService, AgentServiceError, ConfirmationDecision, ContentBlock, ContextMessage,
+    EndpointId, FinishReason, FsSessionRepository, MemorySessionRepository, MessageContent,
+    MessageKind, ModelLimits, ModelReply, ModelStreamEvent, ModelUsage, NewSession, RuntimePhase,
+    SessionConfigUpdate, SessionEventPayload, SessionId, SessionLlmSettings, SessionMode,
+    SessionRepository, StreamToolCall,
 };
 use dwo_tools::PolicyConfig;
 use serde_json::{Value, json};
@@ -1405,20 +1405,25 @@ async fn manual_compaction_uses_the_command_turn_without_adding_it_to_model_cont
     let mut completed_compaction = None;
     loop {
         match events.recv().await.unwrap().payload {
-            SessionEventPayload::CompactionStarted {
-                turn_id,
-                compaction_id,
-                trigger,
-            } if turn_id == compact.turn_id => {
-                assert_eq!(trigger, CompactionTrigger::Manual);
-                started_compaction = Some(compaction_id);
+            SessionEventPayload::Notification {
+                turn_id: Some(turn_id),
+                category,
+                data,
+                ..
+            } if turn_id == compact.turn_id && category == "compaction_started" => {
+                assert_eq!(data["trigger"], "manual");
+                started_compaction = data["compactionId"].as_str().map(str::to_string);
             }
-            SessionEventPayload::CompactionCompleted {
-                turn_id,
-                compaction_id,
-                summary,
-            } if turn_id == compact.turn_id => {
-                completed_compaction = Some((compaction_id, summary));
+            SessionEventPayload::Notification {
+                turn_id: Some(turn_id),
+                category,
+                data,
+                ..
+            } if turn_id == compact.turn_id && category == "compaction_completed" => {
+                completed_compaction = Some((
+                    data["compactionId"].as_str().unwrap().to_string(),
+                    data["summary"].as_str().map(str::to_string),
+                ));
             }
             SessionEventPayload::AssistantCompleted {
                 turn_id, content, ..
@@ -1491,22 +1496,22 @@ async fn handoff_reports_a_completed_compaction_with_the_retained_summary() {
         .transcript
         .iter()
         .find_map(|event| match &event.payload {
-            SessionEventPayload::CompactionStarted {
-                compaction_id,
-                trigger: CompactionTrigger::Handoff,
-                ..
-            } => Some(compaction_id),
+            SessionEventPayload::Notification { category, data, .. }
+                if category == "compaction_started" && data["trigger"] == "handoff" =>
+            {
+                data["compactionId"].as_str()
+            }
             _ => None,
         });
     let completed = snapshot
         .transcript
         .iter()
         .find_map(|event| match &event.payload {
-            SessionEventPayload::CompactionCompleted {
-                compaction_id,
-                summary,
-                ..
-            } => Some((compaction_id, summary.as_deref())),
+            SessionEventPayload::Notification { category, data, .. }
+                if category == "compaction_completed" =>
+            {
+                Some((data["compactionId"].as_str()?, data["summary"].as_str()))
+            }
             _ => None,
         });
     let started = started.expect("handoff compaction should start");
@@ -1590,10 +1595,8 @@ async fn usage_trigger_filters_a_recent_tool_turn_without_calling_the_summary_mo
     assert_eq!(snapshot.record.context.compaction.count, 1);
     assert!(snapshot.transcript.iter().any(|event| matches!(
         event.payload,
-        SessionEventPayload::CompactionStarted {
-            trigger: CompactionTrigger::Automatic,
-            ..
-        }
+        SessionEventPayload::Notification { ref category, ref data, .. }
+            if category == "compaction_started" && data["trigger"] == "automatic"
     )));
     assert!(snapshot.transcript.iter().any(|event| {
         matches!(
@@ -3324,21 +3327,16 @@ async fn model_and_reasoning_changes_apply_to_the_next_model_step() {
     assert_eq!(requests[1].selection.reasoning.as_deref(), Some("high"));
 }
 
-/// Waits for a turn to finish, skipping the automatic-resume TurnFailed
-/// events that the session emits when an interrupted stream is retried.
-async fn wait_for_turn_end_after_auto_resume(
+async fn wait_for_turn_end_after_retry(
     events: &mut tokio::sync::mpsc::Receiver<dwo_agent_service::SessionEvent>,
 ) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.expect("event stream closed");
-            if let SessionEventPayload::TurnFailed { error, .. } = &event.payload {
-                assert!(
-                    error.contains("interrupted"),
-                    "unexpected turn failure: {error}"
-                );
-                continue;
-            }
+            assert!(!matches!(
+                event.payload,
+                SessionEventPayload::TurnFailed { .. }
+            ));
             if matches!(event.payload, SessionEventPayload::TurnCompleted { .. }) {
                 break;
             }
@@ -3348,13 +3346,11 @@ async fn wait_for_turn_end_after_auto_resume(
     .expect("turn did not finish")
 }
 
-#[tokio::test]
-async fn interrupted_stream_auto_resumes_the_turn() {
+#[tokio::test(start_paused = true)]
+async fn interrupted_stream_retries_inside_the_same_turn() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([
-        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta(
-            "partial ".to_string(),
-        )]),
+        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta("partial ".to_string())]),
         ScriptedStep::text("final answer"),
     ]);
     let service = AgentService::new(
@@ -3368,31 +3364,55 @@ async fn interrupted_stream_auto_resumes_the_turn() {
         .unwrap();
     let origin = EndpointId::new();
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
-    agent.prompt(origin.clone(), "hello").await.unwrap();
+    let accepted = agent.prompt(origin.clone(), "hello").await.unwrap();
 
-    wait_for_turn_end_after_auto_resume(&mut events).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().payload,
+                SessionEventPayload::Notification { ref category, .. }
+                    if category == "model_retrying"
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let retrying = agent.snapshot().await.unwrap();
+    assert_eq!(retrying.phase, RuntimePhase::Running);
+    assert_eq!(retrying.active_turn_id.as_ref(), Some(&accepted.turn_id));
+    agent
+        .prompt(origin, "include this before retry")
+        .await
+        .unwrap();
+    wait_for_turn_end_after_retry(&mut events).await;
 
     let requests = model.requests().await;
     assert_eq!(requests.len(), 2);
-    let last_message = requests[1].messages.last().unwrap();
-    assert!(
-        last_message
-            .content
-            .as_text()
-            .is_some_and(|text| text.contains("<resume>"))
-    );
+    let retry_context = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(retry_context.contains("partial "));
+    assert!(retry_context.contains("include this before retry"));
+    let snapshot = agent.snapshot().await.unwrap();
+    assert_eq!(snapshot.phase, RuntimePhase::Idle);
+    assert!(snapshot.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::AssistantInterrupted { turn_id, content, .. }
+            if turn_id == &accepted.turn_id && content == "partial "
+    )));
+    assert!(snapshot.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::Notification { turn_id: Some(turn_id), category, .. }
+            if turn_id == &accepted.turn_id && category == "model_retrying"
+    )));
 }
 
-#[tokio::test]
-async fn interrupted_stream_injects_resume_instruction_only_once() {
+#[tokio::test(start_paused = true)]
+async fn repeated_interruptions_append_partial_assistant_messages_without_resume_prompts() {
     let dir = tempfile::tempdir().unwrap();
     let model = ScriptedModelGateway::new([
-        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta(
-            "partial ".to_string(),
-        )]),
-        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta(
-            "more ".to_string(),
-        )]),
+        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta("partial ".to_string())]),
+        ScriptedStep::streamed_interrupt(vec![ModelStreamEvent::TextDelta("more ".to_string())]),
         ScriptedStep::text("done"),
     ]);
     let service = AgentService::new(
@@ -3408,28 +3428,32 @@ async fn interrupted_stream_injects_resume_instruction_only_once() {
     let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
     agent.prompt(origin.clone(), "hello").await.unwrap();
 
-    wait_for_turn_end_after_auto_resume(&mut events).await;
+    wait_for_turn_end_after_retry(&mut events).await;
 
     let requests = model.requests().await;
     assert_eq!(requests.len(), 3);
-    // The <resume> instruction is injected only on the first retry; the
-    // second retry is a plain re-request with the same context, so the
-    // prompt must not grow between retries.
-    let resume_counts = requests
+    let partials = requests
         .iter()
         .map(|request| {
             request
                 .messages
                 .iter()
-                .filter(|message| {
-                    message
-                        .content
-                        .as_text()
-                        .is_some_and(|text| text.contains("<resume>"))
-                })
-                .count()
+                .filter(|message| message.role == dwo_agent_service::MessageRole::Assistant)
+                .filter_map(|message| message.content.as_text())
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    assert_eq!(resume_counts, vec![0, 1, 1]);
-    assert_eq!(requests[1].messages.len(), requests[2].messages.len());
+    assert!(partials[0].is_empty());
+    assert_eq!(partials[1], vec!["partial "]);
+    assert_eq!(partials[2], vec!["partial ", "more "]);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.messages.iter().all(|message| {
+                message
+                    .content
+                    .as_text()
+                    .is_none_or(|text| !text.contains("<resume>"))
+            }))
+    );
 }

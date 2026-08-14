@@ -25,6 +25,10 @@ use agent_client_protocol::schema::v2::{
     TextCommandInput, TextContent, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
 };
+use agent_client_protocol::schema::v2::{
+    PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanEntryPriority,
+    PlanEntryStatus as AcpPlanEntryStatus, PlanUpdate, PlanUpdateContent,
+};
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Error as AcpError, Responder,
     on_receive_notification, on_receive_request,
@@ -33,7 +37,9 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::ValueEnum;
+use dwo_agent_service::ExecutionPlan;
 use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
+use dwo_tools::{PlanEntry, PlanEntryPriority, PlanEntryStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -122,7 +128,8 @@ struct SessionObserver {
 
 struct PreparedObserver {
     observer: Arc<SessionObserver>,
-    replay: Option<Value>,
+    snapshot: Option<Value>,
+    replay: bool,
     events: Option<tokio::sync::mpsc::Receiver<Value>>,
 }
 
@@ -803,20 +810,18 @@ async fn prepare_observer(
     let mut observers = runtime.observers.lock().await;
     if let Some(observer) = observers.get(session_id).cloned() {
         drop(observers);
-        let replay = if replay {
-            Some(json!({
-                "snapshot": ipc::request(
+        let snapshot = if replay {
+            Some(json!({"snapshot": ipc::request(
                 &runtime.config_path,
                 "session.snapshot",
                 json!({"session_id": session_id}),
-            )
-            .await?
-            }))
+            ).await?}))
         } else {
             None
         };
         return Ok(PreparedObserver {
             observer,
+            snapshot,
             replay,
             events: None,
         });
@@ -831,7 +836,8 @@ async fn prepare_observer(
 
     Ok(PreparedObserver {
         observer,
-        replay: replay.then_some(snapshot),
+        snapshot: Some(snapshot),
+        replay,
         events: Some(events),
     })
 }
@@ -886,8 +892,12 @@ async fn activate_observer(
     cx: &AcpConnection,
     mut prepared: PreparedObserver,
 ) -> Result<Arc<SessionObserver>> {
-    if let Some(snapshot) = prepared.replay.take() {
-        replay_snapshot(cx, session_id, &snapshot);
+    if let Some(snapshot) = prepared.snapshot.as_ref() {
+        if prepared.replay {
+            replay_snapshot(cx, session_id, snapshot);
+        } else if let Some(snapshot) = snapshot.get("snapshot") {
+            replay_snapshot_state(cx, session_id, snapshot);
+        }
     }
     let Some(mut events) = prepared.events.take() else {
         return Ok(prepared.observer);
@@ -934,6 +944,20 @@ async fn handle_session_event(
         return;
     };
     let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("");
+    if kind == "plan_updated" {
+        if let Some(plan) = payload.get("plan") {
+            send_plan_update(
+                cx,
+                session_id,
+                plan,
+                payload
+                    .get("cleared")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            );
+        }
+        return;
+    }
     match kind {
         "assistant_delta" => {
             if let (Some(message_id), Some(delta)) = (
@@ -1264,6 +1288,69 @@ fn send_update(cx: &AcpConnection, session_id: &str, update: SessionUpdate) {
             );
         }
     }
+}
+
+fn send_plan_update(cx: &AcpConnection, session_id: &str, plan: &Value, cleared: bool) {
+    let Ok(mut plan) = serde_json::from_value::<ExecutionPlan>(plan.clone()) else {
+        return;
+    };
+    if cleared {
+        plan.entries.clear();
+    }
+    match cx.protocol {
+        AcpProtocol::V1 => {
+            let _ = cx.inner.send_notification_to(
+                Client,
+                RawSessionNotification {
+                    session_id: session_id.to_string(),
+                    update: v1_plan_update_value(&plan),
+                },
+            );
+        }
+        AcpProtocol::V2 => send_update(cx, session_id, v2_plan_update_value(&plan)),
+    }
+}
+
+fn v1_plan_update_value(plan: &ExecutionPlan) -> Value {
+    json!({
+        "sessionUpdate":"plan",
+        "entries":plan.entries.iter().map(v1_plan_entry).collect::<Vec<_>>(),
+    })
+}
+
+fn v2_plan_update_value(plan: &ExecutionPlan) -> SessionUpdate {
+    SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
+        plan.id.as_str(),
+        plan.entries.iter().map(v2_plan_entry).collect(),
+    )))
+}
+
+fn v1_plan_entry(entry: &PlanEntry) -> Value {
+    if entry.status == PlanEntryStatus::Cancelled {
+        json!({
+            "content":format!("[cancelled] {}", entry.content),
+            "priority":entry.priority,
+            "status":"completed",
+            "_meta":{"_dwo_original_status":"cancelled"},
+        })
+    } else {
+        serde_json::to_value(entry).expect("plan entry serializes")
+    }
+}
+
+fn v2_plan_entry(entry: &PlanEntry) -> AcpPlanEntry {
+    let priority = match entry.priority {
+        PlanEntryPriority::High => AcpPlanEntryPriority::High,
+        PlanEntryPriority::Medium => AcpPlanEntryPriority::Medium,
+        PlanEntryPriority::Low => AcpPlanEntryPriority::Low,
+    };
+    let status = match entry.status {
+        PlanEntryStatus::Pending => AcpPlanEntryStatus::Pending,
+        PlanEntryStatus::InProgress => AcpPlanEntryStatus::InProgress,
+        PlanEntryStatus::Completed => AcpPlanEntryStatus::Completed,
+        PlanEntryStatus::Cancelled => AcpPlanEntryStatus::Other("cancelled".to_string()),
+    };
+    AcpPlanEntry::new(&entry.content, priority, status)
 }
 
 async fn send_available_commands(config_path: &Path, cx: &AcpConnection, session_id: &str) {
@@ -1888,6 +1975,9 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
                 continue;
             };
             let kind = payload.get("kind").and_then(Value::as_str);
+            if kind == Some("plan_updated") {
+                continue;
+            }
             match kind {
                 Some("user_prompt_submitted") => {
                     if let Some(message_id) = payload.get("message_id").and_then(Value::as_str) {
@@ -1931,6 +2021,20 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
                 _ => {}
             }
         }
+    }
+    replay_snapshot_state(cx, session_id, snapshot);
+}
+
+fn replay_snapshot_state(cx: &AcpConnection, session_id: &str, snapshot: &Value) {
+    if let Some(plan) = snapshot.pointer("/record/current_plan") {
+        send_plan_update(cx, session_id, plan, false);
+    } else {
+        send_plan_update(
+            cx,
+            session_id,
+            &json!({"id":"plan-cleared", "entries":[]}),
+            true,
+        );
     }
     match snapshot.get("phase").and_then(Value::as_str) {
         Some("running" | "cancelling") => send_state(
@@ -2428,6 +2532,34 @@ mod tests {
         assert_eq!(update["sessionUpdate"], "usage_update");
         assert_eq!(update["used"], 15);
         assert_eq!(update["size"], 200_000);
+    }
+
+    #[test]
+    fn plan_updates_serialize_for_acp_v1_and_v2() {
+        let mut plan = serde_json::from_value(json!({
+            "id":"plan-1",
+            "entries":[
+                {"content":"done", "priority":"high", "status":"completed"},
+                {"content":"old direction", "priority":"medium", "status":"cancelled"}
+            ]
+        }))
+        .unwrap();
+
+        let v1 = v1_plan_update_value(&plan);
+        assert_eq!(v1["sessionUpdate"], "plan");
+        assert_eq!(v1["entries"][1]["status"], "completed");
+        assert_eq!(v1["entries"][1]["content"], "[cancelled] old direction");
+
+        let v2 = serde_json::to_value(v2_plan_update_value(&plan)).unwrap();
+        assert_eq!(v2["sessionUpdate"], "plan_update");
+        assert_eq!(v2["plan"]["planId"], "plan-1");
+        assert_eq!(v2["plan"]["entries"][1]["status"], "cancelled");
+
+        plan.entries.clear();
+        let cleared_v1 = v1_plan_update_value(&plan);
+        let cleared_v2 = serde_json::to_value(v2_plan_update_value(&plan)).unwrap();
+        assert_eq!(cleared_v1["entries"], json!([]));
+        assert_eq!(cleared_v2["plan"]["entries"], json!([]));
     }
 
     #[test]

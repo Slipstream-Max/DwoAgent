@@ -101,6 +101,7 @@ impl ToolPolicyEngine {
                 }
             },
             ToolIntent::Handoff => Authorization::Allow,
+            ToolIntent::Plan => Authorization::Allow,
         }
     }
 

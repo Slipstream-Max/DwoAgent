@@ -136,6 +136,37 @@ impl ContextManager {
         self.extend_messages([ContextMessage::internal(kind, content)]);
     }
 
+    pub fn replace_plan_watcher(&mut self, content: Option<MessageContent>) -> bool {
+        let watcher_count = self
+            .context
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::PlanWatcher)
+            .count();
+        let already_current = match content.as_ref() {
+            Some(content) => {
+                watcher_count == 1
+                    && self.context.messages.iter().any(|message| {
+                        message.kind == MessageKind::PlanWatcher && &message.content == content
+                    })
+            }
+            None => watcher_count == 0,
+        };
+        if already_current {
+            return false;
+        }
+        self.context
+            .messages
+            .retain(|message| message.kind != MessageKind::PlanWatcher);
+        if let Some(content) = content {
+            self.context
+                .messages
+                .push(ContextMessage::internal(MessageKind::PlanWatcher, content));
+        }
+        self.recalculate_message_tokens();
+        true
+    }
+
     pub fn append_assistant(&mut self, content: impl Into<String>, tool_calls: Vec<Value>) {
         self.append_assistant_with_reasoning(content, None, tool_calls);
     }

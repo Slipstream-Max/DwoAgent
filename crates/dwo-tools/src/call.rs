@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::plan::{PlanRequest, validate_entries};
 use crate::terminal::TerminalId;
 
 const DEFAULT_YIELD_MS: u64 = 60_000;
@@ -24,6 +25,7 @@ pub enum ToolCall {
     FileEdit(FileEditArgs),
     ReadFile(ReadFileArgs),
     Handoff(HandoffArgs),
+    Plan(PlanRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,7 @@ pub enum ToolIntent {
     FileEdit,
     ReadFile,
     Handoff,
+    Plan,
 }
 
 impl ToolCall {
@@ -96,6 +99,7 @@ impl ToolCall {
             Self::FileEdit(_) => ToolIntent::FileEdit,
             Self::ReadFile(_) => ToolIntent::ReadFile,
             Self::Handoff(_) => ToolIntent::Handoff,
+            Self::Plan(_) => ToolIntent::Plan,
         }
     }
 
@@ -105,6 +109,7 @@ impl ToolCall {
             Self::FileEdit(_) => "file_edit",
             Self::ReadFile(_) => "read_file",
             Self::Handoff(_) => "handoff",
+            Self::Plan(_) => "plan",
         }
     }
 }
@@ -151,6 +156,9 @@ impl ParsedToolCall {
             "handoff" => ToolCall::Handoff(
                 parse_handoff(&arguments).map_err(|message| parse_error(&id, &name, message))?,
             ),
+            "plan" => ToolCall::Plan(
+                parse_plan(&arguments).map_err(|message| parse_error(&id, &name, message))?,
+            ),
             _ => return Err(parse_error(&id, &name, format!("Unknown tool: {name}"))),
         };
         Ok(Self {
@@ -159,6 +167,19 @@ impl ParsedToolCall {
             raw_arguments: arguments,
         })
     }
+}
+
+fn parse_plan(args: &Map<String, Value>) -> Result<PlanRequest, String> {
+    let mut request: PlanRequest = serde_json::from_value(Value::Object(args.clone()))
+        .map_err(|error| format!("Invalid plan arguments: {error}"))?;
+    match request.action {
+        crate::plan::PlanAction::Get if !request.entries.is_empty() => {
+            return Err("plan get requires an empty entries array".to_string());
+        }
+        crate::plan::PlanAction::Update => validate_entries(&mut request.entries)?,
+        _ => {}
+    }
+    Ok(request)
 }
 
 fn parse_handoff(args: &Map<String, Value>) -> Result<HandoffArgs, String> {
@@ -478,6 +499,33 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn plan_get_requires_empty_entries() {
+        let parsed = ParsedToolCall::parse(json!({
+            "id":"plan-get",
+            "name":"plan",
+            "arguments":{"action":"get", "entries":[]}
+        }))
+        .unwrap();
+        assert!(matches!(
+            parsed.call,
+            ToolCall::Plan(PlanRequest {
+                action: crate::plan::PlanAction::Get,
+                ref entries,
+            }) if entries.is_empty()
+        ));
+
+        let error = ParsedToolCall::parse(json!({
+            "id":"plan-get",
+            "name":"plan",
+            "arguments":{"action":"get", "entries":[{
+                "content":"no", "priority":"low", "status":"pending"
+            }]}
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("empty entries"));
     }
 
     #[test]

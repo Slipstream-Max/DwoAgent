@@ -5,6 +5,7 @@ pub mod atomic_file;
 mod error;
 mod events;
 mod permission;
+mod plan;
 mod profile;
 mod record;
 mod repository;
@@ -30,6 +31,7 @@ pub use events::{
     NotificationLevel, PendingPermission, RuntimePhase, SessionEvent, SessionEventPayload,
     SessionSnapshot, SessionStatusSnapshot, SessionSubscription, SessionUsageSnapshot,
 };
+pub use plan::ExecutionPlan;
 pub use profile::{AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, load_profile};
 pub use record::{
     DEFAULT_MAX_MODEL_STEPS, SessionConfig, SessionConfigUpdate, SessionId, SessionInfo,

@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::ToolEventHandler;
 use crate::call::ParsedToolCall;
 use crate::file_edit::FileEditManager;
+use crate::plan::PlanHandler;
 use crate::policy::{SessionMode, ToolPolicyEngine};
 use crate::result::ToolResult;
 use crate::terminal::TerminalManager;
@@ -40,6 +41,7 @@ pub struct ExecutionContext {
     pub confirmation: Option<ConfirmationHandler>,
     pub allow_image_input: bool,
     pub events: Option<ToolEventHandler>,
+    pub plan: Option<PlanHandler>,
 }
 
 impl ExecutionContext {
@@ -49,6 +51,7 @@ impl ExecutionContext {
             confirmation: None,
             allow_image_input: false,
             events: None,
+            plan: None,
         }
     }
 }

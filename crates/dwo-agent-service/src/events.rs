@@ -227,6 +227,11 @@ pub enum SessionEventPayload {
         turn_id: TurnId,
         compaction_id: String,
     },
+    PlanUpdated {
+        turn_id: TurnId,
+        plan: crate::ExecutionPlan,
+        cleared: bool,
+    },
     TurnCompleted {
         turn_id: TurnId,
     },

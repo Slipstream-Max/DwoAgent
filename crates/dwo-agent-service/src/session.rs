@@ -7,7 +7,7 @@ use dwo_context::{
     PendingContextMessage, PendingMessageBatch, SystemPromptBuilder,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection};
-use dwo_tools::{ConfirmationDecision, ToolManager};
+use dwo_tools::{ConfirmationDecision, PlanAction, PlanRequest, PlanResponse, ToolManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -22,6 +22,7 @@ use crate::events::{
     SessionUsageSnapshot,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
+use crate::plan::ExecutionPlan;
 use crate::record::{SessionConfig, SessionConfigUpdate, SessionRecord, title_from_user_content};
 use crate::repository::SessionRepository;
 
@@ -494,7 +495,6 @@ struct ActiveTurn {
     message_id: MessageId,
     thought_message_id: MessageId,
     tools: Vec<ActiveToolCall>,
-    absorbed_user_message: bool,
     uncommitted_pending: Vec<PendingContextMessage>,
 }
 
@@ -538,6 +538,9 @@ enum PendingMessage {
     },
     StepInternal {
         content: MessageContent,
+    },
+    PlanWatcher {
+        content: Option<MessageContent>,
     },
 }
 
@@ -1158,7 +1161,6 @@ impl SessionActor {
             message_id: MessageId::new(),
             thought_message_id: MessageId::new(),
             tools: Vec::new(),
-            absorbed_user_message: false,
             uncommitted_pending: Vec::new(),
         });
         self.phase = RuntimePhase::Running;
@@ -1259,7 +1261,91 @@ impl SessionActor {
                 let _ = completed.send(batch);
                 false
             }
+            TurnActorMessage::Plan {
+                turn_id,
+                request,
+                completed,
+            } => {
+                let result = self.handle_plan_request(&turn_id, request).await;
+                let _ = completed.send(result);
+                false
+            }
         }
+    }
+
+    async fn handle_plan_request(
+        &mut self,
+        turn_id: &TurnId,
+        request: PlanRequest,
+    ) -> Result<PlanResponse, String> {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|active| &active.id != turn_id)
+        {
+            return Err("turn is no longer active".to_string());
+        }
+        if request.action == PlanAction::Get {
+            return Ok(plan_response(
+                false,
+                false,
+                self.record
+                    .current_plan
+                    .as_ref()
+                    .map(|plan| plan.entries.clone())
+                    .unwrap_or_default(),
+            ));
+        }
+        if request.entries.is_empty() {
+            let Some(plan) = self
+                .record
+                .current_plan
+                .as_ref()
+                .map(ExecutionPlan::terminalized)
+            else {
+                return Ok(plan_response(false, false, Vec::new()));
+            };
+            return self.commit_plan(turn_id, plan, true).await;
+        }
+        if self
+            .record
+            .current_plan
+            .as_ref()
+            .is_some_and(|plan| plan.entries == request.entries)
+        {
+            return Ok(plan_response(false, false, request.entries));
+        }
+        let mut plan = self
+            .record
+            .current_plan
+            .clone()
+            .unwrap_or_else(|| ExecutionPlan::new(request.entries.clone()));
+        plan.entries = request.entries;
+        let cleared = plan.is_finished();
+        self.commit_plan(turn_id, plan, cleared).await
+    }
+
+    async fn commit_plan(
+        &mut self,
+        turn_id: &TurnId,
+        plan: ExecutionPlan,
+        cleared: bool,
+    ) -> Result<PlanResponse, String> {
+        let mut updated = self.record.clone();
+        updated.current_plan = (!cleared).then_some(plan.clone());
+        updated.touch();
+        self.repository
+            .save(&updated)
+            .await
+            .map_err(|error| format!("persist plan: {error:#}"))?;
+        self.record = updated;
+        self.emit_client_event(SessionEventPayload::PlanUpdated {
+            turn_id: turn_id.clone(),
+            plan: plan.clone(),
+            cleared,
+        })
+        .await;
+        Ok(plan_response(true, cleared, plan.entries))
     }
 
     async fn handle_turn_event(&mut self, event: TurnEvent) -> bool {
@@ -1581,10 +1667,13 @@ impl SessionActor {
                 {
                     return false;
                 }
-                self.active = None;
+                let active_kind = self.active.take().expect("active turn was checked").kind;
                 self.permission.reject("turn finished");
                 self.phase = RuntimePhase::Idle;
                 let allow_pending_wake = !matches!(outcome, TurnOutcome::Cancelled);
+                if active_kind == ActiveTurnKind::Agent {
+                    self.queue_plan_watcher();
+                }
                 if self.record.info.ephemeral {
                     self.record.info.completed |= matches!(outcome, TurnOutcome::Completed);
                     self.record.info.delete_after_ms =
@@ -1613,6 +1702,7 @@ impl SessionActor {
                 }
                 if let Some(response) = self.closing_response.take() {
                     self.phase = RuntimePhase::Closing;
+                    self.persist_pending_plan_watcher().await;
                     self.reject_pending_messages();
                     self.tools.shutdown().await;
                     let result = self.repository.save(&self.record).await.map_err(Into::into);
@@ -1632,9 +1722,6 @@ impl SessionActor {
         while let Some(pending) = self.pending_messages.pop_front() {
             match pending {
                 PendingMessage::User { content } => {
-                    if let Some(active) = self.active.as_mut() {
-                        active.absorbed_user_message = true;
-                    }
                     let message = PendingContextMessage::User(content);
                     if let Some(active) = self.active.as_mut() {
                         active.uncommitted_pending.push(message.clone());
@@ -1663,6 +1750,7 @@ impl SessionActor {
                     messages.push(message);
                     should_continue = true;
                 }
+                PendingMessage::PlanWatcher { .. } => {}
             }
         }
         PendingMessageBatch {
@@ -1721,6 +1809,16 @@ impl SessionActor {
                     }
                 }
                 PendingMessage::StepInternal { .. } => {}
+                PendingMessage::PlanWatcher { content } => {
+                    if let Err(error) = self.replace_plan_watcher_idle(content).await {
+                        tracing::error!(
+                            event = "session.plan_watcher_persist_failed",
+                            session_id = %self.record.info.id,
+                            error = %format!("{error:#}"),
+                            "persist plan watcher after turn failed"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1734,8 +1832,66 @@ impl SessionActor {
                     let _ = response.send(Err(error()));
                 }
                 PendingMessage::StepInternal { .. } => {}
+                PendingMessage::PlanWatcher { .. } => {}
             }
         }
+    }
+
+    fn queue_plan_watcher(&mut self) {
+        self.pending_messages
+            .retain(|message| !matches!(message, PendingMessage::PlanWatcher { .. }));
+        self.pending_messages
+            .push_front(PendingMessage::PlanWatcher {
+                content: self
+                    .record
+                    .current_plan
+                    .as_ref()
+                    .map(ExecutionPlan::watcher_message),
+            });
+    }
+
+    async fn persist_pending_plan_watcher(&mut self) {
+        let position = self
+            .pending_messages
+            .iter()
+            .position(|message| matches!(message, PendingMessage::PlanWatcher { .. }));
+        let Some(position) = position else {
+            return;
+        };
+        let PendingMessage::PlanWatcher { content } = self
+            .pending_messages
+            .remove(position)
+            .expect("pending plan watcher position was checked")
+        else {
+            unreachable!();
+        };
+        if let Err(error) = self.replace_plan_watcher_idle(content).await {
+            tracing::error!(
+                event = "session.plan_watcher_persist_failed",
+                session_id = %self.record.info.id,
+                error = %format!("{error:#}"),
+                "persist plan watcher during close failed"
+            );
+        }
+    }
+
+    async fn replace_plan_watcher_idle(
+        &mut self,
+        content: Option<MessageContent>,
+    ) -> Result<(), AgentServiceError> {
+        let previous_usage = self.usage_snapshot();
+        let mut context = ContextManager::new(self.record.context.clone());
+        if !context.replace_plan_watcher(content) {
+            return Ok(());
+        }
+        context.refresh_usage(self.tools.schemas());
+        self.record.context = context.into_context();
+        self.record.touch();
+        self.repository.save(&self.record).await?;
+        if self.usage_snapshot() != previous_usage {
+            self.emit_usage_changed();
+        }
+        Ok(())
     }
 
     fn handle_permission_request(&mut self, request: PermissionRequestEnvelope) {
@@ -1938,6 +2094,14 @@ impl SessionActor {
 
 fn terminal_tool_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "canceled")
+}
+
+fn plan_response(updated: bool, cleared: bool, entries: Vec<dwo_tools::PlanEntry>) -> PlanResponse {
+    PlanResponse {
+        updated,
+        cleared,
+        entries,
+    }
 }
 
 fn apply_step_delta(step: &mut Option<ActiveStepSnapshot>, payload: &SessionEventPayload) -> bool {

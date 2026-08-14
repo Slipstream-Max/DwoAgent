@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{ClientTranscriptEvent, SessionId, SessionInfo, SessionLlmSettings, SessionRecord};
+use crate::{
+    ClientTranscriptEvent, ExecutionPlan, SessionId, SessionInfo, SessionLlmSettings, SessionRecord,
+};
 
 pub const SESSION_META_FILE: &str = "session.json";
 pub const SESSION_MODEL_CONTEXT_FILE: &str = "model_context.json";
@@ -102,6 +104,8 @@ struct PersistedSessionMetadata {
     llm: SessionLlmSettings,
     #[serde(default, skip_serializing_if = "is_false")]
     auto_title_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_plan: Option<ExecutionPlan>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -114,6 +118,7 @@ impl PersistedSessionMetadata {
             info: record.info.clone(),
             llm: record.llm.clone(),
             auto_title_pending: record.auto_title_pending(),
+            current_plan: record.current_plan.clone(),
         }
     }
 }
@@ -213,6 +218,7 @@ impl FsSessionRepository {
             metadata.llm,
             context,
             metadata.auto_title_pending,
+            metadata.current_plan,
         ))
     }
 

@@ -10,6 +10,7 @@ use dwo_model_client::{
     request_with_retry, retry_info, wait_before_retry,
 };
 use dwo_tools::{ExecutionContext, ParsedToolCall, ToolEvent, ToolManager, ToolResult};
+use dwo_tools::{PlanRequest, PlanResponse};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +34,11 @@ pub(crate) enum TurnActorMessage {
     },
     TakePendingMessages {
         completed: oneshot::Sender<PendingMessageBatch>,
+    },
+    Plan {
+        turn_id: TurnId,
+        request: PlanRequest,
+        completed: oneshot::Sender<Result<PlanResponse, String>>,
     },
 }
 
@@ -347,6 +353,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             reasoning: response.reasoning,
             tool_calls: active_tool_calls
                 .iter()
+                .filter(|call| call.tool_name != "plan")
                 .chain(remote_tool_calls.iter())
                 .cloned()
                 .collect(),
@@ -396,7 +403,10 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             return TurnOutcome::Completed;
         }
 
-        for mut call in active_tool_calls {
+        for mut call in active_tool_calls
+            .into_iter()
+            .filter(|call| call.tool_name != "plan")
+        {
             call.status = "in_progress".to_string();
             turn.emit(TurnEvent::ToolChanged {
                 turn_id: turn.turn_id.clone(),
@@ -407,6 +417,24 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
         let mut execution = ExecutionContext::new(turn.config.borrow().mode);
         execution.confirmation = Some(turn.permission.confirmation_handler());
         execution.allow_image_input = model_step.allow_image_input;
+        let plan_actor = turn.actor.clone();
+        let plan_turn_id = turn.turn_id.clone();
+        execution.plan = Some(Arc::new(move |request| {
+            let actor = plan_actor.clone();
+            let turn_id = plan_turn_id.clone();
+            Box::pin(async move {
+                let (completed, wait) = oneshot::channel();
+                actor
+                    .send(TurnActorMessage::Plan {
+                        turn_id,
+                        request,
+                        completed,
+                    })
+                    .map_err(|_| "session actor stopped".to_string())?;
+                wait.await
+                    .map_err(|_| "session actor dropped plan request".to_string())?
+            })
+        }));
         let actor = turn.actor.clone();
         let telemetry_turn_id = turn.turn_id.clone();
         execution.events = Some(Arc::new(move |event| {
@@ -449,10 +477,12 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                 status = result.output.get("status").and_then(|value| value.as_str()),
                 "tool call completed"
             );
-            turn.emit(TurnEvent::ToolCompleted {
-                turn_id: turn.turn_id.clone(),
-                result: result.clone(),
-            });
+            if result.tool_name != "plan" {
+                turn.emit(TurnEvent::ToolCompleted {
+                    turn_id: turn.turn_id.clone(),
+                    result: result.clone(),
+                });
+            }
         }
         tracing::info!(
             event = "tool.batch_completed",

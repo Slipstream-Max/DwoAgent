@@ -1830,6 +1830,7 @@ fn is_content_event(payload: &SessionEventPayload) -> bool {
             | SessionEventPayload::FileChanged { .. }
             | SessionEventPayload::PermissionRequested { .. }
             | SessionEventPayload::PermissionResolved { .. }
+            | SessionEventPayload::PlanUpdated { .. }
             | SessionEventPayload::TurnCancelled { .. }
             | SessionEventPayload::TurnFailed { .. }
     )

@@ -125,6 +125,17 @@ pub(crate) async fn execute(
             "status": "completed",
             "handoff_text": args.text,
         })),
+        ToolCall::Plan(request) => {
+            let Some(handler) = &context.plan else {
+                return result_error(&id, &name, "plan handler is not available");
+            };
+            handler(request)
+                .await
+                .and_then(|response| {
+                    serde_json::to_value(response).map_err(|error| error.to_string())
+                })
+                .map_err(anyhow::Error::msg)
+        }
     };
 
     ToolResult {

@@ -287,6 +287,7 @@ pub enum MessageKind {
     Conversation,
     CompactionSummary,
     EnvWatcher,
+    PlanWatcher,
     Permission,
     Config,
     Runtime,

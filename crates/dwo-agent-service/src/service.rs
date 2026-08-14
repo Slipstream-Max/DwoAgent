@@ -280,6 +280,7 @@ impl AgentService {
         );
         record.set_parent_session_id(source.info.parent_session_id.clone());
         record.context = source.context;
+        record.current_plan = source.current_plan;
 
         let id = record.info.id.clone();
         let operation = self.session_operation(&id).await;
@@ -587,6 +588,12 @@ impl AgentService {
         )?);
         let previous_tokens = record.context.usage.current_tokens;
         let mut context = ContextManager::new(record.context.clone());
+        record_changed |= context.replace_plan_watcher(
+            record
+                .current_plan
+                .as_ref()
+                .map(crate::ExecutionPlan::watcher_message),
+        );
         let current_tokens = context.refresh_usage(tools.schemas());
         record.context = context.into_context();
         if current_tokens != previous_tokens {

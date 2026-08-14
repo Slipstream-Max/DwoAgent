@@ -135,6 +135,7 @@ SessionAgent::prompt(origin, user_message)
      -> persist the complete response/tool/message checkpoint
      -> repeat model/tool steps
   -> TurnCompleted | TurnCancelled | TurnFailed
+  -> persist the latest plan as a non-waking PlanWatcher for the next explicit turn
 ```
 
 `ModelClient` is implemented by the provider-configured HTTP client in
@@ -164,8 +165,25 @@ errors do not masquerade as context errors. Transient network, provider,
 protocol, and stream-interruption errors use the shared model retry policy.
 Retries keep the same turn active, absorb pending user/runtime messages before
 the next request, and preserve partial assistant content in both transcript and
-model context. A permanently failed or retry-exhausted turn pauses automatic
-plan continuation while retaining the current plan.
+model context. A permanently failed or retry-exhausted turn remains idle.
+
+## Execution plans
+
+Each session may persist one current `ExecutionPlan`. The model-facing `plan`
+tool supports only `get` and `update`; an empty update clears the plan, and a
+plan whose entries are all `completed` or `cancelled` is removed from current
+session state after its terminal update is published.
+
+Plans never start, resume, or queue turns. When an agent turn reaches any
+terminal outcome, the actor places the latest unfinished plan in the normal
+pending buffer as a non-waking `PlanWatcher`. The idle drain replaces the
+previous watcher in model context and persists it. A later user prompt or
+explicit `/resume` naturally includes that watcher. Reloading a session only
+restores the plan and watcher; it does not call the model. Manual compaction
+does not create a plan watcher. Context compaction carries an existing
+`PlanWatcher` separately from summary history, preserving its position before
+the next user message so later plan updates or clears cannot leave stale plan
+text inside a compaction summary.
 
 Context usage is recomputed from system prompt, messages, reasoning, images,
 tool calls/results, and tool schemas after each checkpoint. Provider input and

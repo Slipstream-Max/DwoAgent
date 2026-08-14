@@ -8,7 +8,39 @@ pub fn tool_schemas() -> Vec<Value> {
         read_file_schema(),
         file_edit_schema(),
         handoff_schema(),
+        plan_schema(),
     ]
+}
+
+pub fn plan_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "plan",
+            "description": "Read or replace the current session execution plan. This tool never starts another turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type":"string", "enum":["get", "update"]},
+                    "entries": {
+                        "type":"array",
+                        "items": {
+                            "type":"object",
+                            "properties": {
+                                "content":{"type":"string", "maxLength":100},
+                                "priority":{"type":"string", "enum":["high", "medium", "low"]},
+                                "status":{"type":"string", "enum":["pending", "in_progress", "completed", "cancelled"]}
+                            },
+                            "required":["content", "priority", "status"],
+                            "additionalProperties":false
+                        }
+                    }
+                },
+                "required":["action", "entries"],
+                "additionalProperties":false
+            }
+        }
+    })
 }
 
 pub fn handoff_schema() -> Value {
@@ -150,6 +182,16 @@ mod tests {
         let parameters = &handoff_schema()["function"]["parameters"];
         assert_eq!(parameters["required"], json!(["handoff_text"]));
         assert_eq!(parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn plan_schema_requires_action_and_entries() {
+        let parameters = &plan_schema()["function"]["parameters"];
+        assert_eq!(parameters["required"], json!(["action", "entries"]));
+        assert_eq!(
+            parameters["properties"]["entries"]["items"]["additionalProperties"],
+            false
+        );
     }
 
     #[test]

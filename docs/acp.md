@@ -115,8 +115,24 @@ compaction capability。
 模型流中断时，已显示的 reasoning/assistant partial 会作为带
 `interrupted_attempt` metadata 的原消息保留；随后发送 `model_retrying` 系统通知。
 重试期间 `state_update` 仍为 Running，turn ID 和 ACP prompt 不变。最多五次重试
-耗尽后才发送最终 Failed/stop reason；未完成计划暂停自动 continuation，但不会被
-清除。其他消息 channel 不展示中间 retry 通知，只在最终失败时报告原因。
+耗尽后才发送最终 Failed/stop reason。其他消息 channel 不展示中间 retry 通知，
+只在最终失败时报告原因。
+
+## 执行计划
+
+内置 `plan` 工具只支持读取或完整替换当前 session 的执行清单，不负责调度 turn。
+ACP adapter 会隐藏 `plan` 的普通 tool-call lifecycle，只发布计划状态：v2 使用标准
+`plan_update`；v1 使用兼容的 `sessionUpdate: "plan"`。v1 没有 `cancelled` 状态，
+因此取消项以 `completed` 发送，并在 `_meta._dwo_original_status` 保留原状态。
+计划清除时两个协议都发布空 entries；snapshot 没有当前计划时也发送空计划，确保持续
+连接和重新接入的客户端最终显示一致。
+
+agent turn 结束时，daemon 将最新未完成计划作为不唤醒 session 的 PlanWatcher 写入
+模型上下文。session 保持 Idle；只有后续用户 prompt 或显式 `/resume` 才会启动新
+turn 并携带该 watcher。Cancel、Failed、daemon shutdown 和重启都不会因为存在
+计划而自动调用模型。compaction 将 PlanWatcher 与 summary history 分开保存，避免
+旧计划被写进不可撤销的摘要。恢复 ACP session 时只从 snapshot 展示当前计划和真实
+phase。
 
 ## 输入与输出能力
 

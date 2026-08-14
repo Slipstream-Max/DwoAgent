@@ -48,11 +48,128 @@ async fn wait_for_turn_end(
     .expect("turn did not finish")
 }
 
+fn plan_step(content: &str, status: &str) -> ScriptedStep {
+    ScriptedStep::tools(
+        Vec::new(),
+        vec![json!({
+            "id":"plan-call",
+            "name":"plan",
+            "arguments":{"action":"update", "entries":[{
+                "content":content, "priority":"high", "status":status
+            }]}
+        })],
+    )
+}
+
 fn ephemeral_session(cwd: &std::path::Path) -> NewSession {
     NewSession {
         ephemeral: true,
         ..new_session(cwd, SessionMode::FullAccess)
     }
+}
+
+#[tokio::test]
+async fn unfinished_plan_waits_idle_and_reaches_only_the_next_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = ScriptedModelGateway::new([
+        plan_step("finish plan support", "in_progress"),
+        ScriptedStep::text("first turn done"),
+        ScriptedStep::text("second turn done"),
+    ]);
+    let service = AgentService::new(
+        Arc::new(MemorySessionRepository::default()),
+        model.clone(),
+        PolicyConfig::default(),
+    );
+    let agent = service
+        .create(new_session(dir.path(), SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+
+    agent.prompt(EndpointId::new(), "start").await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { .. }
+    ));
+    let snapshot = agent.snapshot().await.unwrap();
+    assert_eq!(snapshot.phase, RuntimePhase::Idle);
+    assert!(snapshot.active_turn_id.is_none());
+    assert!(snapshot.record.current_plan.is_some());
+    assert_eq!(
+        snapshot
+            .record
+            .context
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::PlanWatcher)
+            .count(),
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(model.requests().await.len(), 2);
+    assert!(!snapshot.transcript.iter().any(|event| matches!(
+        &event.payload,
+        SessionEventPayload::ToolStarted { call, .. } if call.tool_name == "plan"
+    )));
+
+    agent.prompt(EndpointId::new(), "continue").await.unwrap();
+    assert!(matches!(
+        wait_for_turn_end(&mut events).await,
+        SessionEventPayload::TurnCompleted { .. }
+    ));
+    let requests = model.requests().await;
+    assert_eq!(requests.len(), 3);
+    let next_prompt = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(next_prompt.contains("execution_plan"));
+    assert!(next_prompt.contains("finish plan support"));
+}
+
+#[tokio::test]
+async fn reloaded_plan_stays_idle_until_an_explicit_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let first_model = ScriptedModelGateway::new([
+        plan_step("survive restart", "in_progress"),
+        ScriptedStep::text("saved"),
+    ]);
+    let first = AgentService::new(
+        Arc::new(FsSessionRepository::new(&sessions).await.unwrap()),
+        first_model,
+        PolicyConfig::default(),
+    );
+    let agent = first
+        .create(new_session(&workspace, SessionMode::FullAccess))
+        .await
+        .unwrap();
+    let id = agent.id().clone();
+    let mut events = agent.attach(EndpointId::new()).await.unwrap().events;
+    agent.prompt(EndpointId::new(), "start").await.unwrap();
+    wait_for_turn_end(&mut events).await;
+    first.shutdown().await;
+
+    let second_model = ScriptedModelGateway::new([ScriptedStep::text("resumed")]);
+    let second = AgentService::new(
+        Arc::new(FsSessionRepository::new(&sessions).await.unwrap()),
+        second_model.clone(),
+        PolicyConfig::default(),
+    );
+    let loaded = second.load(&id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(second_model.requests().await.is_empty());
+    let snapshot = loaded.snapshot().await.unwrap();
+    assert_eq!(snapshot.phase, RuntimePhase::Idle);
+    assert!(snapshot.record.current_plan.is_some());
+
+    let mut events = loaded.attach(EndpointId::new()).await.unwrap().events;
+    loaded.prompt(EndpointId::new(), "continue").await.unwrap();
+    wait_for_turn_end(&mut events).await;
+    let requests = second_model.requests().await;
+    assert_eq!(requests.len(), 1);
+    let resumed = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(resumed.contains("survive restart"));
 }
 
 #[tokio::test]

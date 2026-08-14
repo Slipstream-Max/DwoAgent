@@ -121,7 +121,7 @@ CLI 的 `prompt` 用来提交任务，`watch` 用来读取最新事件。需要�
 
 ## 🧰 原生工具
 
-赤铎内置四个由 Rust runtime 直接执行的基础工具，不需要额外配置 MCP server：
+赤铎内置五个由 Rust runtime 直接执行的基础工具，不需要额外配置 MCP server：
 
 | 工具 | 用途 |
 | --- | --- |
@@ -129,6 +129,7 @@ CLI 的 `prompt` 用来提交任务，`watch` 用来读取最新事件。需要�
 | **读取 `read_file`** | 读取 UTF-8 文本或 PNG、JPEG、GIF、WebP 图片。文本每次最多返回 500 行，并通过 `cursor` 继续读取；图片只会加入支持图片输入的模型上下文。 |
 | **写入 `file_edit`** | 使用结构化 patch 新建、修改、移动或删除文件。一次调用可以按顺序表达多个相关文件变更；`confirm` 模式需要确认，`watch` 模式禁止写入。 |
 | **交接 `handoff`** | Agent 判断上下文需要重建时调用：附上交接摘要，daemon 用它压缩当前上下文，同一 turn 在新上下文中继续。始终允许，不经过权限确认。 |
+| **计划 `plan`** | 读取或替换当前 session 的执行清单。turn 结束后，未完成计划会作为 watcher 保存到模型上下文，等待下一次用户 prompt 或显式 `/resume`；计划本身不会启动、恢复或排队 turn。 |
 
 `read_file` 和 `file_edit` 使用 session 的工作目录解析相对路径。没有显式指定 `cwd` 的 session 使用自己的隔离工作区。
 

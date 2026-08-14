@@ -4,6 +4,7 @@ pub mod call;
 mod exec;
 pub mod file_edit;
 pub mod manager;
+pub mod plan;
 pub mod policy;
 pub mod prompt;
 mod read_file;
@@ -17,6 +18,10 @@ pub use call::{HandoffArgs, ParsedToolCall, ToolCall, ToolCallParseError, ToolIn
 pub use file_edit::FileEditManager;
 pub use manager::{
     ConfirmationDecision, ConfirmationHandler, ConfirmationRequest, ExecutionContext, ToolManager,
+};
+pub use plan::{
+    PlanAction, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanHandler, PlanRequest,
+    PlanResponse,
 };
 pub use policy::{Authorization, CommandRule, PolicyConfig, SessionMode, ToolPolicyEngine};
 pub use result::ToolResult;

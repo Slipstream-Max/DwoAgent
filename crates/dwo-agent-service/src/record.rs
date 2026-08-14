@@ -8,6 +8,8 @@ use dwo_tools::SessionMode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ExecutionPlan;
+
 macro_rules! string_id {
     ($name:ident, $prefix:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -59,6 +61,8 @@ pub struct SessionRecord {
     pub info: SessionInfo,
     pub llm: SessionLlmSettings,
     pub context: SessionContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_plan: Option<ExecutionPlan>,
     #[serde(default, skip_serializing_if = "is_false")]
     auto_title_pending: bool,
     #[serde(default = "default_max_model_steps")]
@@ -144,11 +148,13 @@ impl SessionRecord {
         llm: SessionLlmSettings,
         context: SessionContext,
         auto_title_pending: bool,
+        current_plan: Option<ExecutionPlan>,
     ) -> Self {
         Self {
             info,
             llm,
             context,
+            current_plan,
             auto_title_pending,
             max_model_steps: DEFAULT_MAX_MODEL_STEPS,
         }
@@ -180,6 +186,7 @@ impl SessionRecord {
             },
             llm,
             context: SessionContext::default(),
+            current_plan: None,
             auto_title_pending: false,
             max_model_steps,
         }

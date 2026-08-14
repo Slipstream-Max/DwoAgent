@@ -541,6 +541,51 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
 }
 
 #[test]
+fn compaction_preserves_plan_watcher_without_summarizing_or_reordering_it() {
+    let root = tempfile::tempdir().unwrap();
+    let builder = SystemPromptBuilder::new(None, root.path());
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+    manager.append_user("old request");
+    manager.append_assistant("old answer", Vec::new());
+    let watcher = MessageContent::text("<execution_plan>continue</execution_plan>");
+    assert!(manager.replace_plan_watcher(Some(watcher.clone())));
+    manager.append_user("new request");
+    let before_reload = manager.model_messages().to_vec();
+    assert!(!manager.replace_plan_watcher(Some(watcher.clone())));
+    assert_eq!(manager.model_messages(), before_reload);
+
+    let plan = manager.plan_compaction(&CompactionPlanner::new(1, 5_000));
+    assert!(
+        plan.view
+            .messages
+            .iter()
+            .all(|message| message.kind != MessageKind::PlanWatcher)
+    );
+    manager
+        .apply_compaction(plan, "old summary", &builder, &[])
+        .unwrap();
+
+    let messages = manager.model_messages();
+    let watcher_index = messages
+        .iter()
+        .position(|message| message.kind == MessageKind::PlanWatcher)
+        .unwrap();
+    let user_index = messages
+        .iter()
+        .position(|message| message.content.as_text() == Some("new request"))
+        .unwrap();
+    assert_eq!(messages[watcher_index].content, watcher);
+    assert!(watcher_index < user_index);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::PlanWatcher)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn historical_and_reserved_users_share_one_token_budget() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());

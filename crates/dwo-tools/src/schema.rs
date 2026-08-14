@@ -114,7 +114,7 @@ pub fn file_edit_schema() -> Value {
         "type": "function",
         "function": {
             "name": "file_edit",
-            "description": "Apply a structured patch to files.",
+            "description": "Apply a structured patch to add, replace, update, move, or delete files.",
             "parameters": {
                 "type":"object",
                 "properties":{"patch":{"type":"string"}},

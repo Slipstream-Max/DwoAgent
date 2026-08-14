@@ -8,6 +8,8 @@ const ENVIRONMENT_ID: &str = "*** Environment ID:";
 const ADD: &str = "*** Add File: ";
 const DELETE: &str = "*** Delete File: ";
 const UPDATE: &str = "*** Update File: ";
+const REPLACE: &str = "*** Replace File: ";
+const EXPECTED: &str = "*** Expected: ";
 const MOVE: &str = "*** Move to: ";
 const EOF: &str = "*** End of File";
 
@@ -24,6 +26,12 @@ pub(super) enum Hunk {
         path: PathBuf,
         move_path: Option<PathBuf>,
         chunks: Vec<UpdateChunk>,
+    },
+    Replace {
+        path: PathBuf,
+        expected: usize,
+        old: String,
+        new: String,
     },
 }
 
@@ -84,6 +92,74 @@ pub(super) fn parse_patch(patch: &str) -> Result<Vec<Hunk>> {
                 path: PathBuf::from(path),
             });
             index += 1;
+            continue;
+        }
+
+        if let Some(path) = header.strip_prefix(REPLACE) {
+            let hunk_line = index + 1;
+            index += 1;
+            let Some(expected_line) = lines.get(index) else {
+                bail!("Replace file hunk at line {hunk_line} is missing '{EXPECTED}<count>'");
+            };
+            let Some(expected) = expected_line.trim().strip_prefix(EXPECTED) else {
+                bail!("Replace file hunk at line {hunk_line} is missing '{EXPECTED}<count>'");
+            };
+            let expected = expected.trim().parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("Invalid Replace File expected count at line {}", index + 1)
+            })?;
+            if expected == 0 {
+                bail!(
+                    "Replace File expected count must be at least 1 at line {}",
+                    index + 1
+                );
+            }
+            index += 1;
+            if lines.get(index).map(|line| line.trim_end()) != Some("@@") {
+                bail!(
+                    "Expected Replace File body to start with '@@' at line {}",
+                    index + 1
+                );
+            }
+            index += 1;
+
+            let mut old_lines = Vec::new();
+            let mut new_lines = Vec::new();
+            let mut reading_new = false;
+            while index < lines.len() - 1 && !is_trimmed_header(lines[index]) {
+                let line = lines[index];
+                if let Some(content) = line.strip_prefix('-') {
+                    if reading_new {
+                        bail!(
+                            "Invalid Replace File line {}: removed lines must precede added lines",
+                            index + 1
+                        );
+                    }
+                    old_lines.push(content);
+                } else if let Some(content) = line.strip_prefix('+') {
+                    reading_new = true;
+                    new_lines.push(content);
+                } else {
+                    bail!(
+                        "Invalid Replace File line {}: expected '-' or '+'",
+                        index + 1
+                    );
+                }
+                index += 1;
+            }
+            if old_lines.is_empty() {
+                bail!("Replace file hunk for path '{path}' has no content to match");
+            }
+            let old = old_lines.join("\n");
+            let new = new_lines.join("\n");
+            if old == new {
+                bail!("Replace file hunk for path '{path}' does not change the content");
+            }
+            hunks.push(Hunk::Replace {
+                path: PathBuf::from(path),
+                expected,
+                old,
+                new,
+            });
             continue;
         }
 
@@ -223,11 +299,19 @@ fn has_boundaries(lines: &[&str]) -> bool {
 
 fn is_trimmed_header(line: &str) -> bool {
     let line = line.trim();
-    line == END || line.starts_with(ADD) || line.starts_with(DELETE) || line.starts_with(UPDATE)
+    line == END
+        || line.starts_with(ADD)
+        || line.starts_with(DELETE)
+        || line.starts_with(UPDATE)
+        || line.starts_with(REPLACE)
 }
 
 fn is_update_header(line: &str) -> bool {
-    line == END || line.starts_with(ADD) || line.starts_with(DELETE) || line.starts_with(UPDATE)
+    line == END
+        || line.starts_with(ADD)
+        || line.starts_with(DELETE)
+        || line.starts_with(UPDATE)
+        || line.starts_with(REPLACE)
 }
 
 fn ensure_last_chunk_not_empty(chunks: &[UpdateChunk], line_number: usize) -> Result<()> {
@@ -273,5 +357,46 @@ mod tests {
             parse_patch("<<'EOF'\n*** Begin Patch\n*** Add File: a\n+x\n*** End Patch\nEOF")
                 .unwrap();
         assert_eq!(hunks.len(), 1);
+    }
+
+    #[test]
+    fn parses_replace_file_with_expected_count() {
+        let hunks = parse_patch(
+            "*** Begin Patch\n*** Replace File: a.txt\n*** Expected: 2\n@@\n-old\n-line\n+new\n+line\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(
+            hunks,
+            vec![Hunk::Replace {
+                path: PathBuf::from("a.txt"),
+                expected: 2,
+                old: "old\nline".to_string(),
+                new: "new\nline".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn replace_file_requires_a_positive_expected_count() {
+        let error = parse_patch(
+            "*** Begin Patch\n*** Replace File: a.txt\n*** Expected: 0\n@@\n-old\n+new\n*** End Patch",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be at least 1"));
+    }
+
+    #[test]
+    fn update_context_that_looks_like_replace_header_remains_context() {
+        let hunks = parse_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n *** Replace File: literal text\n-old\n+new\n*** End Patch",
+        )
+        .unwrap();
+        let Hunk::Update { chunks, .. } = &hunks[0] else {
+            panic!("expected update hunk");
+        };
+        assert_eq!(
+            chunks[0].old_lines,
+            vec!["*** Replace File: literal text", "old"]
+        );
     }
 }

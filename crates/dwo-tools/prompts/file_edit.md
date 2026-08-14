@@ -1,6 +1,6 @@
 ---
 name: file_edit
-description: Apply structured patches that add, update, move, or delete UTF-8 text files.
+description: Apply structured patches that add, replace, update, move, or delete UTF-8 text files.
 ---
 
 # Use Cases
@@ -74,6 +74,22 @@ Within an update hunk:
 - Blank context lines may be completely empty or contain a single leading space. Use `+` or `-` explicitly when adding or removing a blank line.
 - `*** End of File` requires the hunk to match at the end of the file.
 
+## Replace File
+
+Replace every exact, non-overlapping occurrence of a text block in one UTF-8 file. `Expected` is required and the operation fails without writing the file unless the actual match count is identical.
+
+```text
+*** Replace File: path/to/existing.txt
+*** Expected: 3
+@@
+-old_function(
++new_function(
+```
+
+Every matched-content line starts with `-`, followed by zero or more replacement lines starting with `+`. Removed lines must precede added lines. The matched block must not be empty, `Expected` must be at least 1, and the old and new blocks must differ. Use multiple `Replace File` operations in one patch for explicit cross-file replacement; globs and regular expressions are not supported.
+
+Before using `Replace File`, inspect the current target file and determine the exact number of non-overlapping literal matches. Never guess `Expected`. For a single-line literal, prefer `rg -F -o --count-matches -- "old text" path/to/file`. For multiline content, inspect the relevant text with `read_file` or use `rg -U -F`. The count describes the file state when the operation runs, so account for earlier operations in the same patch that modify the same file; when that is difficult, issue the replacement in a later `file_edit` call.
+
 ## Move File
 
 Move an updated file by placing `*** Move to:` immediately after its update header. An existing destination is replaced.
@@ -101,10 +117,11 @@ A successful result lists each changed path and whether it was added, updated, m
 # Notes
 
 - Prefer paths relative to the session working directory.
-- Add targets replace existing files. Update and delete targets must exist.
+- Add targets replace existing files. Replace, update, and delete targets must exist.
 - Files being updated must contain valid UTF-8 text.
 - Updates follow Codex apply-patch text behavior and normally finish with a final newline.
 - Hunk matching tries exact text first, then tolerates trailing whitespace, surrounding whitespace, and common Unicode punctuation differences.
+- Replace File matching is literal and does not use Update File's fuzzy matching.
 - File operations are applied in patch order. If a later operation fails, earlier successful operations remain applied.
 - Keep related multi-file changes in one patch when they form one coherent edit.
 - Only one `file_edit` call is allowed per assistant response. Combine coherent multi-file changes into one patch; issue unrelated or follow-up patches in later responses.

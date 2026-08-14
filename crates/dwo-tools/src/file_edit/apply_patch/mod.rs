@@ -112,6 +112,37 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
                     moved_to: is_move.then_some(destination),
                 });
             }
+            Hunk::Replace {
+                path,
+                expected,
+                old,
+                new,
+            } => {
+                let path = resolve_path(cwd, &path);
+                let original = fs::read_to_string(&path).with_context(|| {
+                    format!("Failed to read file to replace {}", path.display())
+                })?;
+                let actual = original.matches(&old).count();
+                if actual != expected {
+                    bail!(
+                        "Replace File expected {expected} matches in {}, found {actual}",
+                        path.display()
+                    );
+                }
+                let updated = original.replace(&old, &new);
+                write_file(&path, updated.as_bytes())?;
+                applied_text.push(AppliedTextChange {
+                    source: path.clone(),
+                    destination: path.clone(),
+                    old: original.into_bytes(),
+                    new: updated.into_bytes(),
+                });
+                changes.push(PatchChange {
+                    path,
+                    kind: "update",
+                    moved_to: None,
+                });
+            }
         }
     }
 
@@ -384,5 +415,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = apply_patch("*** Begin Patch\n*** End Patch", dir.path()).unwrap_err();
         assert_eq!(error.to_string(), "No files were modified.");
+    }
+
+    #[test]
+    fn replace_file_replaces_every_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "old value\nkeep\nold value\n").unwrap();
+        let applied = apply_patch(
+            "*** Begin Patch\n*** Replace File: a.txt\n*** Expected: 2\n@@\n-old value\n+new value\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "new value\nkeep\nnew value\n"
+        );
+        assert_eq!(applied.changes[0].kind, "update");
+        assert!(applied.git_patch.contains("+new value"));
+    }
+
+    #[test]
+    fn replace_file_count_mismatch_does_not_write_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "old\nold\n").unwrap();
+        let error = apply_patch(
+            "*** Begin Patch\n*** Replace File: a.txt\n*** Expected: 1\n@@\n-old\n+new\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expected 1 matches"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "old\nold\n"
+        );
     }
 }

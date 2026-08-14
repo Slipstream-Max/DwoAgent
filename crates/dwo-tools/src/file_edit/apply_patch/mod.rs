@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::text_encoding::decode_text;
+
 use parser::{Hunk, UpdateChunk, parse_patch};
 use seek_sequence::seek_sequence;
 
@@ -47,9 +49,12 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
         match hunk {
             Hunk::Add { path, contents } => {
                 let path = resolve_path(cwd, &path);
-                let old = fs::read(&path).unwrap_or_default();
+                let old_bytes = fs::read(&path).unwrap_or_default();
+                let old = decode_text(&old_bytes, &path)
+                    .map(|decoded| decoded.text.into_bytes())
+                    .unwrap_or(old_bytes);
+                write_text_file(&path, &contents)?;
                 let new = contents.into_bytes();
-                write_file(&path, &new)?;
                 applied_text.push(AppliedTextChange {
                     source: path.clone(),
                     destination: path.clone(),
@@ -64,7 +69,10 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
             }
             Hunk::Delete { path } => {
                 let path = resolve_path(cwd, &path);
-                let old = fs::read(&path).unwrap_or_default();
+                let old_bytes = fs::read(&path).unwrap_or_default();
+                let old = decode_text(&old_bytes, &path)
+                    .map(|decoded| decoded.text.into_bytes())
+                    .unwrap_or(old_bytes);
                 fs::remove_file(&path)
                     .with_context(|| format!("Failed to delete file {}", path.display()))?;
                 applied_text.push(AppliedTextChange {
@@ -90,11 +98,12 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
                     .as_ref()
                     .map(|path| resolve_path(cwd, path))
                     .unwrap_or_else(|| source.clone());
-                let original = fs::read_to_string(&source).with_context(|| {
+                let original_bytes = fs::read(&source).with_context(|| {
                     format!("Failed to read file to update {}", source.display())
                 })?;
+                let original = decode_text(&original_bytes, &source)?.text;
                 let updated = derive_new_contents(&original, &source, &chunks)?;
-                write_file(&destination, updated.as_bytes())?;
+                write_text_file(&destination, &updated)?;
                 if is_move {
                     fs::remove_file(&source).with_context(|| {
                         format!("Failed to remove original {}", source.display())
@@ -119,9 +128,10 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
                 new,
             } => {
                 let path = resolve_path(cwd, &path);
-                let original = fs::read_to_string(&path).with_context(|| {
+                let original_bytes = fs::read(&path).with_context(|| {
                     format!("Failed to read file to replace {}", path.display())
                 })?;
+                let original = decode_text(&original_bytes, &path)?.text;
                 let actual = original.matches(&old).count();
                 if actual != expected {
                     bail!(
@@ -130,7 +140,7 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
                     );
                 }
                 let updated = original.replace(&old, &new);
-                write_file(&path, updated.as_bytes())?;
+                write_text_file(&path, &updated)?;
                 applied_text.push(AppliedTextChange {
                     source: path.clone(),
                     destination: path.clone(),
@@ -256,12 +266,13 @@ fn git_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_text_file(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create parent directory {}", parent.display()))?;
     }
-    fs::write(path, bytes).with_context(|| format!("Failed to write file {}", path.display()))
+    fs::write(path, text.as_bytes())
+        .with_context(|| format!("Failed to write file {}", path.display()))
 }
 
 fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
@@ -276,6 +287,12 @@ fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn read_written_text(path: impl AsRef<Path>) -> String {
+        let bytes = fs::read(path).unwrap();
+        assert!(!bytes.starts_with(b"\xef\xbb\xbf"));
+        String::from_utf8(bytes).unwrap()
+    }
+
     #[test]
     fn add_overwrites_existing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -285,10 +302,7 @@ mod tests {
             dir.path(),
         )
         .unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "new\n"
-        );
+        assert_eq!(read_written_text(dir.path().join("a.txt")), "new\n");
     }
 
     #[test]
@@ -303,8 +317,24 @@ mod tests {
         .unwrap();
         assert!(!dir.path().join("source.txt").exists());
         assert_eq!(
-            fs::read_to_string(dir.path().join("destination.txt")).unwrap(),
+            read_written_text(dir.path().join("destination.txt")),
             "new\n"
+        );
+    }
+
+    #[test]
+    fn move_decodes_gbk_and_writes_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("source.txt"), b"\xd6\xd0\xce\xc4\n").unwrap();
+        apply_patch(
+            "*** Begin Patch\n*** Update File: source.txt\n*** Move to: destination.txt\n@@\n-中文\n+已移动\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap();
+        assert!(!dir.path().join("source.txt").exists());
+        assert_eq!(
+            read_written_text(dir.path().join("destination.txt")),
+            "已移动\n"
         );
     }
 
@@ -318,7 +348,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            read_written_text(dir.path().join("a.txt")),
             "one\ntwo\nthree\n"
         );
     }
@@ -332,10 +362,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("Failed to read file to update"));
-        assert_eq!(
-            fs::read_to_string(dir.path().join("created.txt")).unwrap(),
-            "hello\n"
-        );
+        assert_eq!(read_written_text(dir.path().join("created.txt")), "hello\n");
     }
 
     #[test]
@@ -347,10 +374,7 @@ mod tests {
             dir.path(),
         )
         .unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "ONE\nTWO\n"
-        );
+        assert_eq!(read_written_text(dir.path().join("a.txt")), "ONE\nTWO\n");
     }
 
     #[test]
@@ -362,10 +386,7 @@ mod tests {
             dir.path(),
         )
         .unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "new\n"
-        );
+        assert_eq!(read_written_text(dir.path().join("a.txt")), "new\n");
     }
 
     #[test]
@@ -378,7 +399,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            read_written_text(dir.path().join("a.txt")),
             "one\nTWO\nthree\nFOUR\n"
         );
     }
@@ -404,10 +425,7 @@ mod tests {
             dir.path(),
         )
         .unwrap();
-        assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "updated\n"
-        );
+        assert_eq!(read_written_text(dir.path().join("a.txt")), "updated\n");
     }
 
     #[test]
@@ -427,7 +445,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            read_written_text(dir.path().join("a.txt")),
             "new value\nkeep\nnew value\n"
         );
         assert_eq!(applied.changes[0].kind, "update");
@@ -448,5 +466,33 @@ mod tests {
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "old\nold\n"
         );
+    }
+
+    #[test]
+    fn update_decodes_gbk_and_writes_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.txt"),
+            b"\xd6\xd0\xce\xc4\xc4\xda\xc8\xdd\n",
+        )
+        .unwrap();
+        apply_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-中文内容\n+中文已更新\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(read_written_text(dir.path().join("a.txt")), "中文已更新\n");
+    }
+
+    #[test]
+    fn replace_decodes_windows_1252_and_writes_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"caf\xe9 caf\xe9").unwrap();
+        apply_patch(
+            "*** Begin Patch\n*** Replace File: a.txt\n*** Expected: 2\n@@\n-café\n+cafe\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(read_written_text(dir.path().join("a.txt")), "cafe cafe");
     }
 }

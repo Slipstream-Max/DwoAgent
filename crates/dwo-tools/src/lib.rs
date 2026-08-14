@@ -11,6 +11,7 @@ pub mod result;
 pub mod schema;
 mod telemetry;
 pub mod terminal;
+mod text_encoding;
 
 pub use call::{HandoffArgs, ParsedToolCall, ToolCall, ToolCallParseError, ToolIntent};
 pub use file_edit::FileEditManager;

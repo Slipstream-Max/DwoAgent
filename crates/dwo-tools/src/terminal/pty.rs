@@ -76,6 +76,7 @@ impl PtyProcess {
 
 fn shell_command(command: &str) -> (String, Vec<String>) {
     if cfg!(windows) {
+        let utf8 = "$utf8=New-Object System.Text.UTF8Encoding $false;[Console]::InputEncoding=$utf8;[Console]::OutputEncoding=$utf8;$global:OutputEncoding=$utf8;";
         (
             "powershell.exe".to_string(),
             vec![
@@ -84,7 +85,7 @@ fn shell_command(command: &str) -> (String, Vec<String>) {
                 "-ExecutionPolicy".to_string(),
                 "Bypass".to_string(),
                 "-Command".to_string(),
-                format!("chcp 65001 >$null;$ProgressPreference='SilentlyContinue';{command}"),
+                format!("chcp 65001 >$null;{utf8}$ProgressPreference='SilentlyContinue';{command}"),
             ],
         )
     } else {

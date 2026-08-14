@@ -8,9 +8,11 @@ rust-version.workspace = true
 diffy.workspace = true
 anyhow.workspace = true
 base64 = "0.22"
+chardetng = "1.0"
 dunce = "1.0"
 dwo-context = { path = "../dwo-context" }
 dwo-pty = { path = "../dwo-pty" }
+encoding_rs = "0.8"
 futures.workspace = true
 regex.workspace = true
 serde.workspace = true

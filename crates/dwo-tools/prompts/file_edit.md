@@ -118,7 +118,8 @@ A successful result lists each changed path and whether it was added, updated, m
 
 - Prefer paths relative to the session working directory.
 - Add targets replace existing files. Replace, update, and delete targets must exist.
-- Files being updated must contain valid UTF-8 text.
+- Existing text is decoded from a Unicode BOM, strict UTF-8, or a detected legacy encoding such as GBK or Windows-1252 before Update or Replace matching.
+- Every file written by Add, Update, Replace, or Move is encoded as UTF-8 without a BOM.
 - Updates follow Codex apply-patch text behavior and normally finish with a final newline.
 - Hunk matching tries exact text first, then tolerates trailing whitespace, surrounding whitespace, and common Unicode punctuation differences.
 - Replace File matching is literal and does not use Update File's fuzzy matching.

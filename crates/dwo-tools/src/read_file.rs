@@ -5,7 +5,10 @@ use base64::Engine;
 use dwo_context::{ContentBlock, MessageContent};
 use serde_json::{Map, Value, json};
 
-use crate::call::{DEFAULT_READ_FILE_LINES, ReadFileArgs};
+use crate::{
+    call::{DEFAULT_READ_FILE_LINES, ReadFileArgs},
+    text_encoding::decode_text,
+};
 
 const MAX_TEXT_OUTPUT_BYTES: usize = 20_000;
 
@@ -46,10 +49,15 @@ pub(crate) async fn execute(
         });
     }
 
-    let text = String::from_utf8(bytes)
-        .with_context(|| format!("{} is not UTF-8 text or a supported image", path.display()))?;
+    let decoded = decode_text(&bytes, &path)?;
+    let mut output = text_page(&decoded.text, args.cursor, args.line_count, args.offset)?;
+    if let Some(encoding) = decoded.encoding
+        && let Some(output) = output.as_object_mut()
+    {
+        output.insert("encoding".to_string(), json!(encoding));
+    }
     Ok(ReadFileOutput {
-        output: text_page(&text, args.cursor, args.line_count, args.offset)?,
+        output,
         model_context: Vec::new(),
     })
 }
@@ -346,5 +354,54 @@ mod tests {
         .err()
         .expect("image offset should fail");
         assert!(error.to_string().contains("offset is only valid"));
+    }
+
+    #[tokio::test]
+    async fn reads_gbk_text_with_decoded_content_and_encoding() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("gbk.txt"),
+            b"\xd6\xd0\xce\xc4\xc4\xda\xc8\xdd\r\n\xb5\xda\xb6\xfe\xd0\xd0",
+        )
+        .unwrap();
+        let output = execute(
+            ReadFileArgs {
+                path: PathBuf::from("gbk.txt"),
+                cursor: 2,
+                line_count: 1,
+                offset: 0,
+            },
+            directory.path(),
+            false,
+        )
+        .await
+        .unwrap()
+        .output;
+        assert_eq!(output["content"], "第二行");
+        assert_eq!(output["encoding"], "GBK");
+    }
+
+    #[test]
+    fn decodes_windows_1252_text() {
+        let decoded = decode_text(b"caf\xe9 \x96 r\xe9sum\xe9", Path::new("ansi.txt")).unwrap();
+        assert_eq!(decoded.text, "café – résumé");
+        assert_eq!(decoded.encoding, Some("windows-1252"));
+    }
+
+    #[test]
+    fn decodes_utf16_bom_and_reports_the_encoding() {
+        let decoded = decode_text(
+            b"\xff\xfe-N\x87e\x0d\x00\x0a\x00L\x88",
+            Path::new("utf16.txt"),
+        )
+        .unwrap();
+        assert_eq!(decoded.text, "中文\r\n行");
+        assert_eq!(decoded.encoding, Some("UTF-16LE"));
+    }
+
+    #[test]
+    fn rejects_nul_containing_non_bom_binary() {
+        let error = decode_text(b"text\0binary", Path::new("data.bin")).unwrap_err();
+        assert!(error.to_string().contains("not recognized text"));
     }
 }

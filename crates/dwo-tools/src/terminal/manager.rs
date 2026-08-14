@@ -497,6 +497,22 @@ mod tests {
         assert!(!second.output.contains("first"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_terminal_initializes_every_encoding_as_utf8() {
+        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        let snapshot = manager
+            .run(
+                "Write-Output (([Console]::InputEncoding.WebName, [Console]::OutputEncoding.WebName, $OutputEncoding.WebName) -join '|'); Write-Output '中文🙂'".to_string(),
+                5_000,
+                120_000,
+            )
+            .await
+            .unwrap();
+        assert!(snapshot.output.contains("utf-8|utf-8|utf-8"));
+        assert!(snapshot.output.contains("中文🙂"));
+    }
+
     #[tokio::test]
     async fn pty_input_reaches_the_process() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();

@@ -67,18 +67,6 @@ fn responses_are_stored_item_first_and_provider_private_items_are_trimmed_on_swi
 }
 
 #[test]
-fn legacy_aggregated_response_schema_is_rejected() {
-    let error = serde_json::from_value::<ContextMessage>(json!({
-        "role": "assistant",
-        "content": [],
-        "response_items": [{"type": "message", "role": "assistant", "content": []}]
-    }))
-    .unwrap_err();
-
-    assert!(error.to_string().contains("unknown field `response_items`"));
-}
-
-#[test]
 fn selection_normalization_permanently_removes_unsupported_images() {
     let mut manager = ContextManager::new(SessionContext {
         messages: vec![

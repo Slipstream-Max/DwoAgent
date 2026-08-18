@@ -18,8 +18,6 @@ The rewrite profile has one strict `profile.yaml` and fixed resource paths:
 ```
 
 ```yaml
-name: coder
-description: coding agent
 policyMode: confirm
 model:
   defaultModelName: deepseek-v4-pro

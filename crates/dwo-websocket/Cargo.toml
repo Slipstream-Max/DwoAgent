@@ -1,0 +1,23 @@
+[package]
+name = "dwo-websocket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+dwo-acp = { path = "../dwo-acp" }
+dwo-host = { path = "../dwo-host" }
+dwo-protocol = { path = "../dwo-protocol" }
+serde_json.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

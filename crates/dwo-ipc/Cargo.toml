@@ -1,0 +1,21 @@
+[package]
+name = "dwo-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dwo-host = { path = "../dwo-host" }
+dwo-protocol = { path = "../dwo-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }

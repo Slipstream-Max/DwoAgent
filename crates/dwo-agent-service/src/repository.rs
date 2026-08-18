@@ -99,6 +99,7 @@ impl SessionRepository for MemorySessionRepository {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedSessionMetadata {
     info: SessionInfo,
     llm: SessionLlmSettings,
@@ -421,7 +422,6 @@ mod tests {
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
             SessionLlmSettings::default(),
-            crate::record::DEFAULT_MAX_MODEL_STEPS,
         );
         record.info.created_at_ms = 1_768_521_600_000;
         record.context.usage.current_tokens = 321;
@@ -448,6 +448,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(session_dir.join(SESSION_META_FILE)).unwrap())
                 .unwrap();
         assert!(metadata.get("context").is_none());
+        assert!(metadata.get("max_model_steps").is_none());
         let model_context: serde_json::Value = serde_json::from_slice(
             &std::fs::read(session_dir.join(SESSION_MODEL_CONTEXT_FILE)).unwrap(),
         )
@@ -520,7 +521,6 @@ mod tests {
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
             SessionLlmSettings::default(),
-            crate::record::DEFAULT_MAX_MODEL_STEPS,
         );
         repository.save(&record).await.unwrap();
         repository
@@ -563,7 +563,6 @@ mod tests {
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
             SessionLlmSettings::default(),
-            crate::record::DEFAULT_MAX_MODEL_STEPS,
         );
         repository.save(&record).await.unwrap();
         let path = repository

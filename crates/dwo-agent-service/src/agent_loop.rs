@@ -125,6 +125,7 @@ pub(crate) struct RunTurn {
     pub model: Arc<dyn ModelClient>,
     pub tools: Arc<ToolManager>,
     pub config: watch::Receiver<SessionConfig>,
+    pub max_model_steps: usize,
     pub permission: PermissionRequester,
     pub cancellation: CancellationToken,
     pub actor: mpsc::UnboundedSender<TurnActorMessage>,
@@ -284,7 +285,7 @@ async fn manual_compaction_inner(turn: &mut RunTurn) -> TurnOutcome {
 }
 
 async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
-    let max_model_steps = turn.config.borrow().max_model_steps;
+    let max_model_steps = turn.max_model_steps;
     let mut step = 0usize;
     loop {
         if max_model_steps > 0 && step >= max_model_steps {

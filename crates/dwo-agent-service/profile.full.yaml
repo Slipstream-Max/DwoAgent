@@ -5,9 +5,6 @@
 #   resource/skills/*/SKILL.md   optional
 #   resource/mcp/mcp.json        optional
 
-name: coder
-description: coding agent
-
 # full_access | confirm | watch
 policyMode: confirm
 
@@ -98,11 +95,13 @@ channels:
     # Download inbound attachments and submit structured resources.
     mediaInput: true
 
-  websocket:
-    # ACP over WebSocket listens on all interfaces at /acp. A persistent
-    # access token is generated under channels/websocket/secret.yaml.
-    enabled: false
-    port: 8765
+
+# Remote ACP and management RPC. Tokens are generated under
+# runtime/websocket/secret.yaml and never belong in profile.yaml.
+websocket:
+  enabled: false
+  bind: 127.0.0.1
+  port: 8787
 
 # The daemon watches this section and reschedules valid changes automatically.
 # Cron uses the standard five fields: minute hour day-of-month month weekday.

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -36,7 +37,6 @@ pub struct NewSession {
     pub cwd: PathBuf,
     pub mode: SessionMode,
     pub llm: SessionLlmSettings,
-    pub max_model_steps: usize,
     pub ephemeral: bool,
 }
 
@@ -47,6 +47,7 @@ pub struct AgentService {
     file_edit: Arc<FileEditManager>,
     profile_root: Option<PathBuf>,
     external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
+    max_model_steps: Arc<AtomicUsize>,
     loaded: Mutex<LoadedSessionRegistry>,
     operations: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
@@ -147,7 +148,13 @@ impl AgentService {
         model: Arc<dyn ModelClient>,
         policy: PolicyConfig,
     ) -> Self {
-        Self::build(repository, model, policy, None)
+        Self::build(
+            repository,
+            model,
+            policy,
+            None,
+            crate::DEFAULT_MAX_MODEL_STEPS,
+        )
     }
 
     pub fn with_profile_root(
@@ -158,7 +165,13 @@ impl AgentService {
     ) -> Result<Self, AgentServiceError> {
         let profile_root =
             std::fs::canonicalize(profile_root.into()).map_err(anyhow::Error::from)?;
-        Ok(Self::build(repository, model, policy, Some(profile_root)))
+        Ok(Self::build(
+            repository,
+            model,
+            policy,
+            Some(profile_root),
+            crate::DEFAULT_MAX_MODEL_STEPS,
+        ))
     }
 
     pub fn from_profile(
@@ -168,7 +181,13 @@ impl AgentService {
     ) -> Result<Self, AgentServiceError> {
         let model = ConfiguredModelClient::from_resolved(profile.models)
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
-        let service = Self::build(repository, model, policy, Some(profile.root));
+        let service = Self::build(
+            repository,
+            model,
+            policy,
+            Some(profile.root),
+            profile.config.max_model_steps,
+        );
         service.replace_external_skill_dirs(profile.external_skill_dirs);
         Ok(service)
     }
@@ -178,6 +197,7 @@ impl AgentService {
         model: Arc<dyn ModelClient>,
         policy: PolicyConfig,
         profile_root: Option<PathBuf>,
+        max_model_steps: usize,
     ) -> Self {
         Self {
             repository,
@@ -186,6 +206,7 @@ impl AgentService {
             file_edit: Arc::new(FileEditManager::new()),
             profile_root,
             external_skill_dirs: Arc::new(RwLock::new(Vec::new())),
+            max_model_steps: Arc::new(AtomicUsize::new(max_model_steps)),
             loaded: Mutex::new(LoadedSessionRegistry::default()),
             operations: Mutex::new(HashMap::new()),
         }
@@ -200,6 +221,15 @@ impl AgentService {
             .external_skill_dirs
             .write()
             .expect("external skill dirs lock poisoned") = dirs;
+    }
+
+    pub fn replace_max_model_steps(&self, max_model_steps: usize) {
+        self.max_model_steps
+            .store(max_model_steps, Ordering::Release);
+    }
+
+    pub fn max_model_steps(&self) -> usize {
+        self.max_model_steps.load(Ordering::Acquire)
     }
 
     pub fn skill_snapshots(&self, cwd: &Path) -> Result<Vec<SkillSnapshot>, PromptBuildError> {
@@ -240,7 +270,6 @@ impl AgentService {
             cwd,
             new_session.mode,
             new_session.llm,
-            new_session.max_model_steps,
         );
         record.set_parent_session_id(new_session.parent_session_id);
         record.set_automation_job(new_session.automation_job);
@@ -276,7 +305,6 @@ impl AgentService {
             source.info.cwd.clone(),
             source.info.mode,
             source.llm.clone(),
-            source.config().max_model_steps,
         );
         record.set_parent_session_id(source.info.parent_session_id.clone());
         record.context = source.context;
@@ -616,6 +644,7 @@ impl AgentService {
             self.model.clone(),
             tools,
             prompt_builder,
+            self.max_model_steps.clone(),
         );
         loaded.agents.insert(record.info.id, agent.clone());
         Ok(agent)

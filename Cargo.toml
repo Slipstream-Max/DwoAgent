@@ -1,14 +1,28 @@
 [workspace]
 members = [
     "crates/dwo-agent",
+    "crates/dwo-acp",
     "crates/dwo-context",
     "crates/dwo-model-client",
     "crates/dwo-mcp",
     "crates/dwo-agent-service",
+    "crates/dwo-command",
+    "crates/dwo-channels",
+    "crates/dwo-cli",
+    "crates/dwo-host",
+    "crates/dwo-ipc",
+    "crates/dwo-protocol",
     "crates/dwo-pty",
     "crates/dwo-tools",
+    "crates/dwo-websocket",
 ]
 resolver = "2"
+
+# Keep test artifacts small while preserving incremental compilation. This only
+# affects the test profile; development and release builds keep their defaults.
+[profile.test]
+debug = 0
+incremental = true
 
 [workspace.package]
 version = "0.1.0"

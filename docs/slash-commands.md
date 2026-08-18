@@ -12,7 +12,7 @@
 | `/model` `/reasoning` `/policy` | — | ✅ | 消息渠道专用（修改 session 配置） |
 | `/allow` `/deny` | — | ✅ | 消息渠道专用（处理权限请求） |
 
-> WebSocket channel 不走消息渠道命令，直接使用 ACP，因此只有第一、二行的命令可用。
+> WebSocket ACP transport 不走消息渠道命令，因此只有 ACP 宣告的命令可用。
 
 ## Prompt directives
 
@@ -94,4 +94,3 @@ daemon 只替换名称与当前有效 catalog 精确匹配的 directive；未知
 - **ACP**：只在宣告的命令列表内识别（`/compact` `/resume` `/fork` `/status` `/plan` + 动态 `skill <name>` / `mcp <name>`），列表外的以 `/` 开头的文本报 not recognized。
 
 所以消息 channel 里输入单独 `/skill`（没有名称）或近似拼写 `/skills`、`/mcpx`，都会落入命令解析并报错——directive 需要完整的精确名称。
-

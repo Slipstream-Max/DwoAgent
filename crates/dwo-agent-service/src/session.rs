@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dwo_context::{
     ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind,
@@ -107,6 +108,7 @@ impl SessionAgent {
         model: Arc<dyn ModelClient>,
         tools: Arc<ToolManager>,
         prompt_builder: SystemPromptBuilder,
+        max_model_steps: Arc<AtomicUsize>,
     ) -> Arc<Self> {
         let id = record.info.id.clone();
         let (control_tx, control_rx) = mpsc::channel(128);
@@ -121,6 +123,7 @@ impl SessionAgent {
             model,
             tools,
             prompt_builder,
+            max_model_steps,
             controls: control_rx,
             turn_tx,
             turn_messages: turn_rx,
@@ -525,6 +528,7 @@ struct SessionActor {
     pending_messages: VecDeque<PendingMessage>,
     closing_response: Option<oneshot::Sender<Result<(), AgentServiceError>>>,
     title_cancellation: Option<CancellationToken>,
+    max_model_steps: Arc<AtomicUsize>,
 }
 
 enum PendingMessage {
@@ -1180,6 +1184,7 @@ impl SessionActor {
             model: self.model.clone(),
             tools: self.tools.clone(),
             config: self.config_tx.subscribe(),
+            max_model_steps: self.max_model_steps.load(Ordering::Acquire),
             permission,
             cancellation,
             actor: self.turn_tx.clone(),

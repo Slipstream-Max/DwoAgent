@@ -1,6 +1,6 @@
 # Profile 配置指南
 
-Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默认目录是 `~/.dwoagent/`，入口文件是 `profile.yaml`。
+单一 Host 配置保存赤铎的模型、提示词、skills、MCP 和运行数据。默认目录是 `~/.dwoagent/`，入口文件是 `profile.yaml`；这里没有可选择的多 profile 身份。
 
 安装和启动见 [README](https://github.com/Slipstream-Max/DwoAgent/blob/main/README.md)，channel 部署见 [Channel 部署与使用](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/channels.md)，定时任务见 [Automation 使用指南](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/automation.md)，CLI 参数见 [命令参考](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/commands.md)。
 
@@ -29,6 +29,8 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 |  |  `- client_transcript.jsonl
 |  |- workspaces/<session-id>/
 |  |- attachments/<channel>/YYYY/MM/DD/<session-id>/
+|  `- websocket/
+|     `- secret.yaml
 |- logs/
 `- channels/
    |- weixin/
@@ -43,8 +45,6 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
    |- qq/
    |  |- runtime.yaml
    |  `- secret.yaml
-   `- websocket/
-      `- secret.yaml
 ```
 
 | 路径 | 是否手动编辑 | 内容 |
@@ -63,8 +63,6 @@ Profile 保存赤铎的配置、提示词、skills、MCP 和运行数据。默�
 下面的配置包含所有顶层部分：
 
 ```yaml
-name: coder
-description: coding agent
 policyMode: confirm
 maxModelSteps: 100
 externalSkillsDirs: []
@@ -102,9 +100,11 @@ channels:
     replayTurns: 5
     outputMode: final
     mediaInput: true
-  websocket:
-    enabled: false
-    port: 8765
+
+websocket:
+  enabled: false
+  bind: 127.0.0.1
+  port: 8787
 
 automation:
   enabled: false
@@ -129,7 +129,7 @@ Profile 使用严格 schema，未知字段会报错。旧的 `agent.yaml`、prof
 
 Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份配置，不需要重启。无效或写入中的配置不会覆盖当前运行态，修正文件后会在下一次检查自动生效。
 
-- `name`、`description` 和模型选项会立即反映到 `profile-list`、ACP 和后续配置查询。
+- 模型选项会立即反映到 ACP 和后续配置查询。
 - provider、模型地址、凭据、能力和限制从已有 session 的下一次模型请求起生效。删除已有 session 正在使用的模型 alias 会使该 session 的后续请求报配置错误，直到切换到有效模型。
 - `policyMode`、默认模型和 `maxModelSteps` 是创建新 session、subsession 或 automation session 时使用的默认值，不会改写已有 session 自己的配置。
 - `channels` 变化会重新构造 channel manager，并短暂停止和重启已连接且仍启用的 channel。
@@ -142,8 +142,6 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 
 | 字段 | 必需 | 说明 |
 | --- | --- | --- |
-| `name` | 是 | Profile 名称，不能为空。 |
-| `description` | 是 | Profile 说明，不能为空。 |
 | `policyMode` | 是 | 新 session 的默认权限：`full_access`、`confirm` 或 `watch`。 |
 | `maxModelSteps` | 否 | 单回合 agent 循环的最大模型步数：`0`（无限）或 `5`–`200`，默认 `100`。 |
 | `logging` | 否 | Daemon 文件日志级别和保留天数。 |
@@ -284,7 +282,6 @@ Channels 配置 adapter 是否启动，以及回放、凭据环境变量、代�
 | Telegram | `enabled`、`replayTurns`、`outputMode`、`botTokenEnv`、`tgProxy`、`mediaInput` |
 | 飞书/Lark | `enabled`、`replayTurns`、`outputMode`、`appIdEnv`、`appSecretEnv`、`platform`、`mediaInput` |
 | QQ Bot | `enabled`、`replayTurns`、`outputMode`、`mediaInput` |
-| WebSocket | `enabled`、`port` |
 
 ### Channel 字段
 
@@ -300,11 +297,21 @@ Channels 配置 adapter 是否启动，以及回放、凭据环境变量、代�
 | 飞书/Lark | `appIdEnv`、`appSecretEnv` | 非空环境变量名 | 企业自建应用凭据所在的环境变量。 |
 | 飞书/Lark | `platform` | `feishu` 或 `lark` | 选择国内飞书或海外 Lark 的 API 地址。 |
 | QQ Bot | 无凭据字段 | 通过二维码绑定 | 运行 `dwo channel qq bind` 后写入 `channels/qq/secret.yaml`，仅支持单用户 C2C 私聊。 |
-| WebSocket | `port` | 默认 `8765`，必须大于 `0` | ACP WebSocket 监听端口，固定路径为 `/acp`。 |
 
 `replayTurns` 最大为 10。Token、App ID 和 App Secret 从环境变量读取。QQ Bot 通过 `dwo channel qq bind` 扫码绑定，不在 `profile.yaml` 中填写凭据。
 
-WebSocket 固定监听 `0.0.0.0:<port>`，ACP 路径固定为 `/acp`。访问 token 自动生成并保存到 `channels/websocket/secret.yaml`，不需要写入 profile。
+## WebSocket Transport
+
+`websocket` 是独立顶层配置，不属于 `channels`：
+
+```yaml
+websocket:
+  enabled: false
+  bind: 127.0.0.1
+  port: 8787
+```
+
+`bind` 必须是 IP 地址，`port` 必须大于 0。`/acp` 提供 ACP v2，`/dwo` 提供 Management RPC。两枚访问 token 自动生成并保存到 `runtime/websocket/secret.yaml`，不写入 profile。
 
 绑定命令、开放平台设置和 slash commands 见 [Channel 部署与使用](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/channels.md)。
 

@@ -1,0 +1,13 @@
+[package]
+name = "dwo-command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dwo-agent-service = { path = "../dwo-agent-service" }
+dwo-context = { path = "../dwo-context" }
+dwo-tools = { path = "../dwo-tools" }
+

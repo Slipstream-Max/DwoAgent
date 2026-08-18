@@ -106,6 +106,9 @@ impl McpConfig {
             .ok_or_else(|| Error::InvalidConfig("missing object mcpServers".into()))?;
         let mut servers = BTreeMap::new();
         for (name, value) in raw {
+            if value.get("enabled").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
             servers.insert(
                 name.clone(),
                 parse_server(name, value, base_dir, &environment)?,

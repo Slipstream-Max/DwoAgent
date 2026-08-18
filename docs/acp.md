@@ -63,15 +63,15 @@ macOS/Linux: /home/<user>/.dwoagent/bin/dwo
 网页可以通过 WebSocket 使用完全相同的 ACP 协议：
 
 ```yaml
-channels:
-  websocket:
-    enabled: true
-    port: 8765
+websocket:
+  enabled: true
+  bind: 127.0.0.1
+  port: 8787
 ```
 
-服务地址固定为 `ws://<host>:8765/acp?token=<token>`。运行 `dwo channel websocket token` 查看 token。每条 ACP JSON-RPC 消息使用一个 WebSocket text frame，方法、通知、能力和 stdio ACP 相同。WebSocket adapter 当前固定使用 ACP v2。
+服务地址为 `ws://<bind>:8787/acp?token=<acp-token>`。运行 `dwo websocket token` 查看 token。每条 ACP JSON-RPC 消息使用一个 WebSocket text frame，方法、通知、能力和 stdio ACP 相同。WebSocket adapter 固定使用 ACP v2。
 
-服务监听所有网卡。局域网连接需要放行防火墙端口；公网必须通过 TLS 反向代理使用 `wss://`。
+默认只监听 `127.0.0.1`。局域网使用时显式修改 `bind` 并放行防火墙端口；公网必须通过 TLS 反向代理使用 `wss://`。
 
 ## Session 工作方式
 
@@ -176,6 +176,6 @@ Session policy 有三种：
 ## 排查
 
 1. `dwo daemon status`：确认 daemon 可连接。
-2. `dwo profile-list`：确认模型和默认配置可解析。
+2. `dwo config-show`：确认模型和默认配置可解析。
 3. 检查客户端启动的命令是否为安装后的 `dwo ... acp`。
 4. 查看 `~/.dwoagent/logs/` 中的 daemon 日志。

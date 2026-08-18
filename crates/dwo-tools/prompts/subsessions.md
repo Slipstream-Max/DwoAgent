@@ -12,6 +12,6 @@ Use a child session when a bounded task can run independently or needs a separat
 - Inspect recent child content: `dwo session watch SESSION_ID`. It returns the latest three content events and a `next_cursor`; pass `--cursor NEXT_CURSOR` to read later events. Use `--limit N` to change the page size. `watch` reads content and is not the source of current running state.
 - Cancel the active turn: `dwo session cancel SESSION_ID`.
 - Delete an unneeded child and its transcript: `dwo session delete SESSION_ID`. Only delete when the session and its history are no longer needed.
-- Inspect available profile policy, models, reasoning modes, description, and session count: `dwo profile-list`.
+- Inspect the Host default policy, models, reasoning modes, limits, and session count: `dwo config-show`.
 
 When a child turn finishes, its final result is delivered automatically as an internal `<subsession_result>` message, not as a user prompt. If you are idle, that message starts a turn immediately. If you are running, it is buffered and inserted after the current model response or tool-call batch. Do not busy-poll a child solely to detect completion.

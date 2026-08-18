@@ -24,7 +24,7 @@ daemon 启动 host 时会并发初始化 `resource/mcp/mcp.json` 中的全部 MC
 本节用于查询具体命令和参数。父子 session、继承规则与结果回传流程见 [Subsessions 使用指南](subsessions.md)。
 
 ```text
-dwo profile-list
+dwo config-show
 dwo session list [--all]
 dwo session status <session-id> [--json]
 dwo session delete <session-id>
@@ -37,9 +37,9 @@ dwo session deny <session-id> <permission-id>
 
 agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 或 `--from` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session；带 `--from` 时复制指定直接子 session 的 context 和 transcript，再把 prompt 发给副本。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此默认创建根 session。
 
-`--from` 和 `--to` 严格互斥。`--title` 可用于新建或重命名 fork；`--cwd` 只用于全新 session，和 `--to` 或 `--from` 同时使用会被拒绝。来源必须处于 idle，fork 会保留来源的 cwd、父子关系和配置。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `profile-list` 中列出的有效组合。继续或 fork session 时，policy/model/reasoning 更新会在提交新 prompt 前写入目标配置。
+`--from` 和 `--to` 严格互斥。`--title` 可用于新建或重命名 fork；`--cwd` 只用于全新 session，和 `--to` 或 `--from` 同时使用会被拒绝。来源必须处于 idle，fork 会保留来源的 cwd、父子关系和配置。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `config-show` 中列出的有效组合。继续或 fork session 时，policy/model/reasoning 更新会在提交新 prompt 前写入目标配置。
 
-`session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 profile 中的全部 session。输出包含总数、运行状态、模型、更新时间和标题。`session status` 显示单个 session 的配置、usage、active turn 和最后一条最终回答；回答会折叠空白并限制在 100 个字符内。完整内容继续使用 `session watch`。`profile-list` 输出 profile 描述、默认 policy、可用 model/reasoning、默认 model 和 session 总数。
+`session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 Host 中的全部 session。输出包含总数、运行状态、模型、更新时间和标题。`session status` 显示单个 session 的配置、usage、active turn 和最后一条最终回答；回答会折叠空白并限制在 100 个字符内。完整内容继续使用 `session watch`。`config-show` 输出默认 policy、可用 model/reasoning、默认 model、全局 `maxModelSteps` 和 session 总数。
 
 `session watch` 默认返回最近 3 个内容事件及 `next_cursor`，不会建立持续广播。传入 `--cursor <next_cursor>` 可读取之后的事件，`--limit` 范围为 1 到 100。普通 CLI 输出使用适合终端阅读的 YAML 风格文本。
 
@@ -100,9 +100,9 @@ dwo channel qq bind
 dwo channel qq unbind
 dwo channel qq send-message <message>
 dwo channel qq send-file <path>
-dwo channel websocket status
-dwo channel websocket token
-dwo channel websocket reset-token
+dwo websocket status
+dwo websocket token
+dwo websocket reset-token
 ```
 
 `weixin bind` 在终端显示 QR 登录流程。`telegram bind` 从 `botTokenEnv` 读取 BotFather token，终端显示一次性 `/bind <code>`；在 bot 私聊中发送后，daemon 把该 user/chat 写入 `channels/telegram/secret.yaml`。`feishu bind` 从 `appIdEnv`/`appSecretEnv` 读取企业自建应用凭据，临时建立长连接并等待同样的私聊命令，随后只把 `open_id/chat_id` 写入 `channels/feishu/secret.yaml`。`qq bind` 只使用 QQ 官方二维码绑定，并要求扫码结果带有单用户 `userOpenid`。QQ 扫码返回的 AppID/AppSecret 保存在受限权限的 `channels/qq/secret.yaml`。
@@ -111,7 +111,7 @@ Telegram 使用 long polling，不需要 webhook 或公网地址。`tgProxy` 是
 
 Feishu/Lark 使用 `openlark` WebSocket 长连接，也不需要 webhook 或公网地址。`platform: feishu` 对应国内开放平台，`platform: lark` 对应海外开放平台。应用必须启用机器人、以长连接订阅 `im.message.receive_v1`，并开通接收消息、以应用身份发送消息、获取和上传消息资源的权限。入站 text、image、file 均可触发 prompt；image/file 下载到 `runtime/attachments/feishu/YYYY/MM/DD/<session-id>/`。输出使用 plain text。
 
-`websocket` 在 `0.0.0.0:<port>/acp` 提供完整 ACP 协议。token 自动保存到 `channels/websocket/secret.yaml`；`token` 显示连接凭据，`reset-token` 使旧 token 失效并断开已有连接。
+独立 WebSocket transport 在配置的 `<bind>:<port>` 上提供 `/acp` 和 `/dwo`。token 自动保存到 `runtime/websocket/secret.yaml`；`token` 显示两条路径各自的连接凭据，`reset-token` 使旧 token 失效并断开已有连接。
 
 不同 channel 可以 `/use` 同一个全局 session，也会在各自的 `runtime.yaml` 中保持当前选择。绑定、解绑或重绑某个 channel 只重启该 channel，不影响其他 channel。
 

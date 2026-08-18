@@ -1,12 +1,10 @@
 # Channel 部署与使用
 
-赤铎可以把同一个 daemon 接到微信、Telegram、飞书/Lark、QQ Bot 私聊和 ACP WebSocket。所有入口共享全局 session、模型、工具、MCP 和持久化数据。
+赤铎可以把同一个 daemon 接到微信、Telegram、飞书/Lark 和 QQ Bot 私聊。所有入口共享全局 session、模型、工具、MCP 和持久化数据。远程 ACP 和管理客户端使用独立的 WebSocket transport，见本文末尾。
 
-四个消息 channel 只接受已绑定用户的私聊；WebSocket 使用独立 token 鉴权。修改 `profile.yaml` 后重启 daemon，使 adapter 按新配置启动：
+四个消息 channel 只接受已绑定用户的私聊。修改 `profile.yaml` 后 Host watcher 会校验并热应用 adapter 配置：
 
 ```text
-dwo daemon stop
-dwo daemon start
 dwo channel list
 ```
 
@@ -41,9 +39,6 @@ channels:
     replayTurns: 5
     outputMode: final
     mediaInput: true
-  websocket:
-    enabled: false
-    port: 8765
 ```
 
 `replayTurns` 最大为 10，控制 `/use` session 时回放多少个最近 turn。`outputMode` 支持 `final` 和 `full`：前者只发送最终回答，后者按顺序发送 thinking、tool-call 和每个阶段的回答；微信固定使用 `final`。`mediaInput` 控制是否接收平台图片和文件。
@@ -131,42 +126,42 @@ $env:FEISHU_APP_SECRET = "xxx"
 
 `channels/feishu/secret.yaml` 只保存绑定的 `open_id` 和 `chat_id`，不会保存 App ID 或 App Secret。
 
-## ACP WebSocket
+## WebSocket Transport
 
-WebSocket channel 把现有 ACP 协议开放给网页客户端。它不使用 slash commands，也没有绑定用户或当前 session；每个连接都是独立的 ACP client。
+WebSocket transport 把 ACP v2 和 Dwo Management RPC 开放给远程客户端。它不是 Channel，不使用 slash commands，也没有绑定用户或当前 session。
 
 ```yaml
-channels:
-  websocket:
-    enabled: true
-    port: 8765
+websocket:
+  enabled: true
+  bind: 127.0.0.1
+  port: 8787
 ```
 
-重启 daemon 后，服务固定监听 `0.0.0.0:8765`，路径固定为 `/acp`。首次启用时会生成 256-bit token，并保存到 `channels/websocket/secret.yaml`。
+Host 会热启动或重绑 listener。`/acp` 使用 ACP v2，`/dwo` 使用 Management RPC；首次启用时生成两枚独立 256-bit token，并保存到 `runtime/websocket/secret.yaml`。
 
 查看状态和 token：
 
 ```text
-dwo channel websocket status
-dwo channel websocket token
-dwo channel websocket reset-token
+dwo websocket status
+dwo websocket token
+dwo websocket reset-token
 ```
 
 网页连接示例：
 
 ```js
 const ws = new WebSocket(
-  "ws://192.168.1.20:8765/acp?token=" + encodeURIComponent(token)
+  "ws://192.168.1.20:8787/acp?token=" + encodeURIComponent(acpToken)
 );
 ```
 
-一条 ACP JSON-RPC 消息对应一个 WebSocket text frame。Binary frame 会被拒绝。重置 token 会立即断开已有连接，旧 token 随即失效。
+一条 ACP 或 Dwo RPC JSON 消息对应一个 WebSocket text frame。Binary frame 会被拒绝。两条路径使用不同 token；重置 token 会立即断开已有连接，旧 token 随即失效。
 
 局域网使用前需要在系统防火墙中放行对应 TCP 端口。公网不要直接暴露明文 `ws://`；应通过 Caddy、Nginx 或其他反向代理提供 TLS，并使用 `wss://`。query token 可能进入代理访问日志，代理应避免记录完整 query string。
 
 ## Slash Commands
 
-四个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。WebSocket 直接使用 ACP；ACP client 会收到 Agent 宣告的 `/compact`、`/resume`、`/fork` 和 `/plan`。所有命令的完整说明见 [Slash Commands 使用指南](slash-commands.md)，这里只保留消息渠道特有细节。
+四个消息 channel 使用同一个命令定义，因此参数校验和 `/help` 内容一致。远程 ACP client 会收到 Agent 宣告的 `/compact`、`/resume`、`/fork` 和 `/plan`。所有命令的完整说明见 [Slash Commands 使用指南](slash-commands.md)，这里只保留消息渠道特有细节。
 
 `/skill` 和 `/mcp` 是进入模型的 prompt directive，不是本地 session 控制命令。它们可以出现在正文任意位置，同一条消息可以重复或混合使用，例如：
 
@@ -209,7 +204,7 @@ Agent 只应在用户明确要求主动发送消息或文件时调用这些命�
 
 ```text
 dwo channel list
-dwo channel <weixin|telegram|feishu|qq|websocket> status
+dwo channel <weixin|telegram|feishu|qq> status
 ```
 
 `connected` 表示持久化绑定有效；Telegram 还要求 token 环境变量可读取，飞书/Lark 还要求 App ID/Secret 环境变量可读取。QQ 的 AppID/AppSecret 由二维码绑定写入私有 secret 文件。它不代表实时网络健康。排查顺序：

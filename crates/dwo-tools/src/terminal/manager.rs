@@ -384,10 +384,7 @@ mod tests {
         assert_eq!(snapshot.status, "running");
 
         let terminal_id = snapshot.terminal_id.clone();
-        let input = manager
-            .input(&terminal_id, "x", 3_000)
-            .await
-            .unwrap();
+        let input = manager.input(&terminal_id, "x", 3_000).await.unwrap();
         assert!(
             input.output.contains("GOT:'x'"),
             "interactive input lost: {:?}",

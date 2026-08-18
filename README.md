@@ -150,7 +150,7 @@ args: [acp, --protocol, v2]
 
 ### Channels：从聊天应用连接
 
-赤铎目前支持微信、Telegram、飞书/Lark、QQ Bot 私聊和 ACP WebSocket。启用 channel 后重启 daemon；消息 channel 再完成绑定：
+赤铎目前支持微信、Telegram、飞书/Lark 和 QQ Bot 私聊。消息 channel 启用后完成绑定：
 
 ```text
 dwo channel weixin bind       # 终端扫码
@@ -160,6 +160,8 @@ dwo channel qq bind           # QQ 官方二维码
 ```
 
 Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不需要公网 webhook。环境变量、开放平台权限和完整部署步骤见 [Channel 部署与使用](docs/channels.md)。
+
+远程客户端通过独立 WebSocket transport 使用 `/acp` 和 `/dwo`，它不属于 Channel。运行 `dwo websocket token` 查看两条路径各自的凭据。
 
 普通文本直接作为 prompt 发送；在 `confirm` 模式下回复 `/allow` 或 `/deny` 即可处理权限请求。
 
@@ -216,7 +218,7 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
 - `ModelClient`：模型接口，可以使用 profile 创建默认 client，也可以接入自定义实现。
 - `SessionSubscription`：先返回完整 snapshot，再持续接收广播事件。
 
-`dwo-agent` crate 在 core 外面加上 daemon、IPC、CLI、ACP、channels、MCP 和 automation。只需要 Agent 能力时，可以直接依赖 core；需要完整个人 Agent 时，运行 `dwo` daemon 即可。
+`dwo-agent` 只负责组装进程和启动 daemon。长期状态与应用 API 在 `dwo-host`，本地 IPC、远程 WebSocket、ACP、CLI 和消息渠道分别由独立 crate 实现。只需要 session/agent loop 时可以直接依赖 `dwo-agent-service`；需要完整 Host 时依赖 `dwo-host`，或直接运行 `dwo` daemon。
 
 System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource/prompts/AGENTS.md`，skills 和 MCP 也使用独立目录。做新的 agent step、上下文策略、工具策略或客户端时，可以从对应 crate 开始修改，不需要先拆开一个完整的 Web 产品。
 
@@ -236,6 +238,9 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | [Automation 使用指南](docs/automation.md) | Cron、时区、新建/固定 session 和无人值守行为 |
 | [CLI 命令参考](docs/commands.md) | daemon、session、MCP、channel、automation 命令 |
 | [Profile 配置指南](docs/profile.md) | 完整 profile.yaml、资源目录、模型、MCP 与运行数据 |
+| [Dwo Management RPC](docs/management-api.md) | 管理方法、事件和本地/远程传输契约 |
+| [dwo-protocol API](crates/dwo-protocol/README.md) | RPC envelope、错误、能力发现和方法注册表 |
+| [dwo-host API](crates/dwo-host/README.md) | Host 生命周期、Session API、事件和二开边界 |
 
 ## 🛠️ 开发
 
@@ -244,4 +249,9 @@ cargo fmt --all
 cargo test --workspace
 ```
 
-工作区按功能拆成几个 crate：`dwo-agent` 包含 daemon、CLI 和 adapters，`dwo-agent-service` 包含 session actor 和 agent loop，`dwo-context`、`dwo-model-client`、`dwo-mcp`、`dwo-tools` 与 `dwo-pty` 分别处理上下文、模型、MCP、工具和终端。
+The workspace test profile disables debug information to reduce build artifacts
+while keeping incremental compilation enabled. On Windows ARM64, run Cargo from
+the Visual Studio Developer PowerShell so native dependencies can find the C
+toolchain.
+
+工作区按运行边界拆分：`dwo-agent` 是 binary composition root，`dwo-host` 持有长期状态和应用 API，`dwo-ipc`、`dwo-websocket`、`dwo-acp`、`dwo-cli`、`dwo-channels` 是适配层，`dwo-protocol` 保存共享线协议，`dwo-command` 保存共享命令语义。`dwo-agent-service`、`dwo-context`、`dwo-model-client`、`dwo-mcp`、`dwo-tools` 与 `dwo-pty` 组成执行核心。

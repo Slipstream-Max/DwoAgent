@@ -9,8 +9,6 @@ fn daemon_startup_failure_is_written_as_jsonl() {
     std::fs::write(
         &config_path,
         r#"
-name: ""
-description: invalid profile used to test logging
 policyMode: confirm
 logging:
   level: info

@@ -6,32 +6,22 @@ ACP processes connect to that daemon over local IPC instead of creating their
 own `AgentService`.
 
 ```text
-src/
-  main.rs              process entry point
-  cli/mod.rs           command parsing and client-side command handlers
-  host/mod.rs          daemon composition root and RPC dispatch
-  local/
-    ipc.rs             local IPC server, request client, and event subscription
-    ipc_schema.rs      ACP-facing IPC envelopes and session DTOs
-    acp_stdio.rs       newline-delimited stdio JSON-RPC transport
-    acp.rs             ACP v1/v2 adapter backed only by local IPC
-  channels/
-    manager.rs         channel login, configuration, state, and secrets
-    hub.rs             running channel adapter lifecycle
-    command.rs         shared slash command definition and parsing
-    bridge.rs          session selection, prompt routing, observers, and replay
-    render.rs          channel-neutral session event rendering
-    attachments.rs     shared inbound attachment storage and resource links
-    weixin.rs          Weixin SDK, media, context tokens, and message limits
-    telegram.rs        Telegram polling, binding enforcement, media, and sends
-    feishu.rs          Feishu/Lark WebSocket, binding, resources, and sends
+crates/dwo-agent/       binary composition entry point
+crates/dwo-cli/         commands, install, rendering, composition callback
+crates/dwo-host/        long-running state owner and management APIs
+crates/dwo-ipc/         local named-pipe/Unix-socket transport
+crates/dwo-websocket/   remote /acp and /dwo transport
+crates/dwo-acp/         ACP v1/v2 adapters and Zed stdio shim
+crates/dwo-channels/    message platform adapters
+crates/dwo-command/     shared slash-command behavior
+crates/dwo-protocol/    Dwo RPC envelopes and method registry
 ```
 
 Only `dwo serve` constructs the `Host` and its `AgentService`. CLI and ACP
 commands are local clients; channel runtimes live inside the daemon and call
 the shared service directly. Platform adapters normalize inbound messages and
-perform final network sends. `SessionBridge` owns the shared command and
-session behavior, while rendering remains independent from channel SDK types.
+perform final network sends. Channel adapters share command and session
+behavior without owning Host state.
 
 ```text
 dwo install [--start]
@@ -39,7 +29,7 @@ dwo uninstall [--purge]
 dwo serve
 dwo daemon start|stop|status
 
-dwo profile-list
+dwo config-show
 dwo session list [--all]
 dwo session status <id> [--json]
 dwo session delete <id>
@@ -65,9 +55,9 @@ dwo channel feishu bind
 dwo channel feishu unbind
 dwo channel feishu send-message <message>
 dwo channel feishu send-file <path>
-dwo channel websocket status
-dwo channel websocket token
-dwo channel websocket reset-token
+dwo websocket status
+dwo websocket token
+dwo websocket reset-token
 dwo mcp list
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
@@ -140,7 +130,7 @@ channels/telegram/runtime.yaml
 channels/telegram/secret.yaml
 channels/feishu/runtime.yaml
 channels/feishu/secret.yaml
-channels/websocket/secret.yaml
+runtime/websocket/secret.yaml
 ```
 
 Weixin user settings live in `profile.yaml` and are validated before the host

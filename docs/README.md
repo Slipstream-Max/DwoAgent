@@ -21,9 +21,13 @@
 | [Automation 使用指南](automation.md) | 配置 cron、时区、新建/固定 session 和无人值守任务 |
 | [Model Client 与 Provider Catalog](model-client.md) | 添加/覆盖模型 provider、理解请求构造与重试策略 |
 | [Profile 配置指南](profile.md) | 修改模型、权限、资源、MCP、channel 和持久化目录 |
+| [Dwo Management RPC](management-api.md) | 管理方法、事件 cursor、路由和错误契约 |
+| [dwo-protocol API](../crates/dwo-protocol/README.md) | Rust 协议类型、envelope、capabilities 和方法注册表 |
+| [dwo-host API](../crates/dwo-host/README.md) | Host 生命周期、直接 Session API、管理调用和事件订阅 |
+| [Flutter/Dart binding](../bindings/dart/README.md) | Flutter 管理面板复用 Dwo RPC 的客户端契约 |
 
 ## 推荐阅读顺序
 
 - 首次部署：README -> Profile 配置 -> ACP 或 Channels。
 - 日常操作：CLI 命令参考 + 对应入口指南；需要拆分任务时阅读 Subsessions 使用指南。
-- 排查状态：先运行 `dwo daemon status`、`dwo profile-list` 和 `dwo channel <name> status`，再检查 `~/.dwoagent/logs/`。
+- 排查状态：先运行 `dwo daemon status`、`dwo config-show` 和 `dwo channel <name> status`，再检查 `~/.dwoagent/logs/`。

@@ -12,8 +12,6 @@ use crate::record::DEFAULT_MAX_MODEL_STEPS;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentProfileConfig {
-    pub name: String,
-    pub description: String,
     pub policy_mode: SessionMode,
     #[serde(default = "default_max_model_steps")]
     pub max_model_steps: usize,
@@ -25,7 +23,38 @@ pub struct AgentProfileConfig {
     #[serde(default)]
     pub channels: BTreeMap<String, serde_yaml::Value>,
     #[serde(default)]
+    pub websocket: WebsocketConfig,
+    #[serde(default)]
     pub automation: serde_yaml::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebsocketConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_websocket_bind")]
+    pub bind: String,
+    #[serde(default = "default_websocket_port")]
+    pub port: u16,
+}
+
+impl Default for WebsocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_websocket_bind(),
+            port: default_websocket_port(),
+        }
+    }
+}
+
+fn default_websocket_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_websocket_port() -> u16 {
+    8787
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,8 +166,6 @@ impl AgentProfileConfig {
     }
 
     pub fn validate(&self) -> Result<(), AgentServiceError> {
-        validate_text(&self.name, "name")?;
-        validate_text(&self.description, "description")?;
         if !(1..=365).contains(&self.logging.retention_days) {
             return Err(AgentServiceError::InvalidConfig(
                 "logging.retentionDays must be between 1 and 365".to_string(),
@@ -149,6 +176,9 @@ impl AgentProfileConfig {
                 "maxModelSteps must be 0 (unlimited) or between 5 and 200".to_string(),
             ));
         }
+        self.websocket
+            .validate()
+            .map_err(AgentServiceError::InvalidConfig)?;
         self.model
             .validate()
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))
@@ -163,30 +193,14 @@ impl AgentProfileConfig {
     }
 }
 
-fn validate_text(value: &str, field: &str) -> Result<(), AgentServiceError> {
-    if value.trim().is_empty() {
-        return Err(AgentServiceError::InvalidConfig(format!(
-            "{field} must not be empty"
-        )));
-    }
-    if value != value.trim() {
-        return Err(AgentServiceError::InvalidConfig(format!(
-            "{field} must not contain surrounding whitespace"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn profile_has_no_tool_switches_and_keeps_provider_credentials_shared() {
+    fn profile_resolves_one_provider_for_multiple_models() {
         let profile = AgentProfileConfig::from_yaml(
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 channels:
   weixin:
@@ -210,7 +224,6 @@ model:
         )
         .unwrap();
 
-        assert_eq!(profile.name, "coder");
         assert_eq!(profile.policy_mode, SessionMode::Confirm);
         assert_eq!(profile.logging, LoggingConfig::default());
         assert!(profile.channels.contains_key("weixin"));
@@ -227,8 +240,6 @@ model:
     fn profile_parses_logging_configuration() {
         let profile = AgentProfileConfig::from_yaml(
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 logging:
   level: debug
@@ -254,8 +265,6 @@ model:
     fn profile_rejects_invalid_log_retention() {
         let error = AgentProfileConfig::from_yaml(
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 logging:
   retentionDays: 0
@@ -279,8 +288,6 @@ model:
     fn profile_max_model_steps_defaults_and_accepts_bounds() {
         let default = AgentProfileConfig::from_yaml(
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 model:
   defaultModelName: chat
@@ -299,8 +306,6 @@ model:
         for value in [0, 5, 200] {
             let profile = AgentProfileConfig::from_yaml(&format!(
                 r#"
-name: coder
-description: coding agent
 policyMode: confirm
 maxModelSteps: {value}
 model:
@@ -324,8 +329,6 @@ model:
         for value in [4, 201] {
             let error = AgentProfileConfig::from_yaml(&format!(
                 r#"
-name: coder
-description: coding agent
 policyMode: confirm
 maxModelSteps: {value}
 model:
@@ -345,13 +348,22 @@ model:
     }
 
     #[test]
-    fn profile_rejects_removed_tool_switches() {
-        let error = AgentProfileConfig::from_yaml(
-            r#"
-name: coder
-description: coding agent
+    fn profile_reports_invalid_websocket_fields() {
+        for (websocket, expected) in [
+            (
+                "enabled: true\n  bind: localhost\n  port: 8787",
+                "websocket.bind must be an IP address",
+            ),
+            (
+                "enabled: true\n  bind: 127.0.0.1\n  port: 0",
+                "websocket.port must be greater than 0",
+            ),
+        ] {
+            let error = AgentProfileConfig::from_yaml(&format!(
+                r#"
 policyMode: confirm
-tools: {}
+websocket:
+  {websocket}
 model:
   defaultModelName: chat
   providers:
@@ -361,19 +373,17 @@ model:
     - modelName: chat
       provider: local
       modelId: chat
-"#,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("unknown field `tools`"));
+"#
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
     fn profile_rejects_provider_transport_configuration() {
         let error = AgentProfileConfig::from_yaml(
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 model:
   defaultModelName: chat
@@ -405,8 +415,6 @@ model:
         std::fs::write(
             root.path().join("profile.yaml"),
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 model:
   defaultModelName: deepseek-v4-pro
@@ -423,7 +431,6 @@ model:
 
         let loaded = load_profile(root.path()).unwrap();
         assert!(loaded.root.is_absolute());
-        assert_eq!(loaded.config.name, "coder");
         assert_eq!(loaded.models.default_model_name, "deepseek-v4-pro");
     }
 
@@ -459,8 +466,6 @@ models:
         std::fs::write(
             root.path().join("profile.yaml"),
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 model:
   defaultModelName: custom
@@ -497,8 +502,6 @@ model:
         std::fs::write(
             root.path().join("profile.yaml"),
             r#"
-name: coder
-description: coding agent
 policyMode: confirm
 externalSkillsDirs:
   - C:/Users/example/shared-skills
@@ -526,5 +529,17 @@ model:
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         assert!(loaded.external_skill_dirs[1].starts_with(&canonical_root));
         assert!(loaded.external_skill_dirs[1].ends_with("team-skills"));
+    }
+}
+
+impl WebsocketConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.port == 0 {
+            return Err("websocket.port must be greater than 0".to_string());
+        }
+        self.bind
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "websocket.bind must be an IP address".to_string())?;
+        Ok(())
     }
 }

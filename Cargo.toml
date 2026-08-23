@@ -12,6 +12,7 @@ members = [
     "crates/dwo-host",
     "crates/dwo-ipc",
     "crates/dwo-protocol",
+    "crates/dwo-project",
     "crates/dwo-pty",
     "crates/dwo-tools",
     "crates/dwo-websocket",

@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use dwo_context::{
-    CompactionView, ContextManager, ContextMessage, PromptBuildError, SkillSnapshot,
+    CompactionView, ContextManager, ContextMessage, PromptBuildError, RuleSource, SkillSnapshot,
     SystemPromptBuilder,
 };
 use dwo_model_client::{
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::AgentServiceError;
 use crate::events::{
     ClientTranscriptEvent, RuntimePhase, SessionEventPayload, SessionStatusSnapshot,
-    SessionUsageSnapshot,
+    SessionUsageSnapshot, TerminalTurnStatus,
 };
 use crate::profile::LoadedAgentProfile;
 use crate::record::{
@@ -35,6 +35,7 @@ pub struct NewSession {
     pub title: Option<String>,
     pub automation_job: Option<String>,
     pub cwd: PathBuf,
+    pub rule_sources: Vec<RuleSource>,
     pub mode: SessionMode,
     pub llm: SessionLlmSettings,
     pub ephemeral: bool,
@@ -237,7 +238,8 @@ impl AgentService {
     }
 
     pub fn skill_snapshots(&self, cwd: &Path) -> Result<Vec<SkillSnapshot>, PromptBuildError> {
-        self.prompt_builder(cwd.to_path_buf()).scan_skills()
+        self.prompt_builder(cwd.to_path_buf(), Vec::new())
+            .scan_skills()
     }
 
     pub fn replace_models(&self, config: ModelClientConfig) -> Result<(), AgentServiceError> {
@@ -264,7 +266,7 @@ impl AgentService {
             .filter(|title| !title.is_empty());
         let automatic_title = explicit_title.is_none();
         let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
-        let prompt_builder = self.prompt_builder(cwd.clone());
+        let prompt_builder = self.prompt_builder(cwd.clone(), new_session.rule_sources);
         let context = ContextManager::initialize(&prompt_builder)
             .map_err(anyhow::Error::from)?
             .into_context();
@@ -403,8 +405,12 @@ impl AgentService {
         for record in records {
             if let Some(agent) = loaded.get(&record.info.id) {
                 let snapshot = agent.snapshot().await?;
+                let (last_turn_status, last_turn_finished_at_ms) =
+                    last_terminal_turn(&snapshot.transcript);
                 statuses.push(SessionStatusSnapshot {
                     last_answer: last_answer_preview(&snapshot.transcript),
+                    last_turn_status,
+                    last_turn_finished_at_ms,
                     record: snapshot.record,
                     usage: snapshot.usage,
                     phase: snapshot.phase,
@@ -412,6 +418,7 @@ impl AgentService {
                 });
             } else {
                 let transcript = self.repository.load_transcript(&record.info.id).await?;
+                let (last_turn_status, last_turn_finished_at_ms) = last_terminal_turn(&transcript);
                 let used = record.context.usage.current_tokens;
                 let size = self
                     .model
@@ -420,6 +427,8 @@ impl AgentService {
                     .unwrap_or(used);
                 statuses.push(SessionStatusSnapshot {
                     last_answer: last_answer_preview(&transcript),
+                    last_turn_status,
+                    last_turn_finished_at_ms,
                     record,
                     usage: SessionUsageSnapshot { used, size },
                     phase: RuntimePhase::Idle,
@@ -604,7 +613,8 @@ impl AgentService {
             }
         }
         let transcript = self.repository.load_transcript(&record.info.id).await?;
-        let prompt_builder = self.prompt_builder(record.info.cwd.clone());
+        let prompt_builder =
+            self.prompt_builder(record.info.cwd.clone(), record.context.rule_sources.clone());
         let mut record_changed = repair_empty_title(&mut record, &transcript);
         if !record.context.system_prompt.is_initialized() {
             record.context = ContextManager::initialize(&prompt_builder)
@@ -654,8 +664,9 @@ impl AgentService {
         Ok(agent)
     }
 
-    fn prompt_builder(&self, cwd: PathBuf) -> SystemPromptBuilder {
+    fn prompt_builder(&self, cwd: PathBuf, rule_sources: Vec<RuleSource>) -> SystemPromptBuilder {
         SystemPromptBuilder::new(self.profile_root.clone(), cwd)
+            .with_rule_sources(rule_sources)
             .with_external_skill_dirs(self.external_skill_dirs.clone())
             .with_tool_prompt(dwo_tools::prompt::tools())
             .with_subsession_prompt(dwo_tools::prompt::SUBSESSIONS)
@@ -717,6 +728,24 @@ fn last_answer_preview(transcript: &[ClientTranscriptEvent]) -> Option<String> {
     })
 }
 
+fn last_terminal_turn(
+    transcript: &[ClientTranscriptEvent],
+) -> (Option<TerminalTurnStatus>, Option<u64>) {
+    transcript
+        .iter()
+        .rev()
+        .find_map(|event| {
+            let status = match &event.payload {
+                SessionEventPayload::TurnCompleted { .. } => TerminalTurnStatus::Completed,
+                SessionEventPayload::TurnFailed { .. } => TerminalTurnStatus::Failed,
+                SessionEventPayload::TurnCancelled { .. } => TerminalTurnStatus::Cancelled,
+                _ => return None,
+            };
+            Some((Some(status), Some(event.recorded_at_ms)))
+        })
+        .unwrap_or((None, None))
+}
+
 #[cfg(test)]
 mod status_tests {
     use super::*;
@@ -738,5 +767,27 @@ mod status_tests {
         assert_eq!(preview.chars().count(), 100);
         assert!(preview.starts_with("answer "));
         assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn last_terminal_turn_reports_status_and_recorded_time() {
+        let turn_id = TurnId::new();
+        let transcript = vec![
+            ClientTranscriptEvent {
+                recorded_at_ms: 10,
+                payload: SessionEventPayload::TurnFailed {
+                    turn_id: turn_id.clone(),
+                    error: "failed".to_string(),
+                },
+            },
+            ClientTranscriptEvent {
+                recorded_at_ms: 20,
+                payload: SessionEventPayload::TurnCompleted { turn_id },
+            },
+        ];
+        assert_eq!(
+            last_terminal_turn(&transcript),
+            (Some(TerminalTurnStatus::Completed), Some(20))
+        );
     }
 }

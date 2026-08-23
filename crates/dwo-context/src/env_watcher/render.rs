@@ -19,8 +19,9 @@ pub(super) fn render(change: &EnvChange) -> String {
                     .iter()
                     .map(|rule| {
                         format!(
-                            "source: {}\n{}",
+                            "source: {}\npwd: {}\n{}",
                             xml_escape(&rule.path.display().to_string()),
+                            xml_escape(&rule.pwd.display().to_string()),
                             xml_escape(&rule.content)
                         )
                     })
@@ -28,7 +29,7 @@ pub(super) fn render(change: &EnvChange) -> String {
                     .join("\n\n")
             };
             format!(
-                "The AGENTS.md rules changed. Replace the previous rules from the fixed profile and session-cwd sources with:\n\n{current}"
+                "The AGENTS.md rules changed. Replace the previous rules from the configured sources with:\n\n{current}"
             )
         }
         EnvChange::Skills { skills } => format!(

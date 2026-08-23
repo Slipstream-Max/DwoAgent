@@ -55,8 +55,31 @@ impl Host {
         Ok(self.create_session(title, cwd).await?.snapshot().await?)
     }
 
+    pub async fn setup_project_session(
+        &self,
+        title: Option<String>,
+        project_id: &str,
+        topic_id: Option<&str>,
+    ) -> Result<SessionSnapshot> {
+        let project = self.projects.get(project_id)?;
+        let topic_id = topic_id.unwrap_or(&project.board.uncategorized_topic_id);
+        Ok(self
+            .create_project_session(title, project_id, topic_id)
+            .await?
+            .snapshot()
+            .await?)
+    }
+
     pub async fn fork_session(&self, source_id: &SessionId) -> Result<SessionSnapshot> {
-        Ok(self.service.fork(source_id, None).await?.snapshot().await?)
+        let snapshot = self.service.fork(source_id, None).await?.snapshot().await?;
+        if let Some((project, topic)) = self.projects.locate_session(source_id.as_str()) {
+            self.projects.assign_session(
+                &project.id,
+                &topic.id,
+                snapshot.record.info.id.to_string(),
+            )?;
+        }
+        Ok(snapshot)
     }
 
     pub async fn subscribe_session(

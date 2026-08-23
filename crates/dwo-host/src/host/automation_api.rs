@@ -179,6 +179,16 @@ impl Host {
     ) -> Result<Value> {
         anyhow::ensure!(all ^ job.is_some(), "specify a job or --all");
         let event_job = job.clone();
+        let removed_jobs = if all {
+            self.automation
+                .list()
+                .await
+                .into_iter()
+                .map(|status| status.job.name)
+                .collect::<Vec<_>>()
+        } else {
+            job.iter().cloned().collect::<Vec<_>>()
+        };
         self.mutate_automation_config(|config| {
             if all {
                 config.jobs.clear();
@@ -196,6 +206,9 @@ impl Host {
         self.automation
             .remove_job_state(job.as_deref(), all)
             .await?;
+        for job in &removed_jobs {
+            self.projects.unassign_task_everywhere(job)?;
+        }
         self.events
             .publish(
                 "automation.changed",

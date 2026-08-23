@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::compaction::{CompactionPlan, CompactionPlanner};
 use crate::env_watcher::{DynamicEnvironmentSnapshot, EnvWatcherState};
-use crate::prompt::{PromptBuildError, SystemPromptBlock, SystemPromptBuilder};
+use crate::prompt::{PromptBuildError, RuleSource, SystemPromptBlock, SystemPromptBuilder};
 use crate::{
     ContextMessage, MessageContent, MessageKind, ToolResultRecord, estimate_message_tokens,
     estimate_tool_tokens,
@@ -39,6 +39,8 @@ pub struct SessionContext {
     pub compaction: CompactionState,
     #[serde(default)]
     pub env_watcher: EnvWatcherState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_sources: Vec<RuleSource>,
 }
 
 impl SessionContext {
@@ -100,9 +102,9 @@ impl ContextManager {
     }
 
     pub fn initialize(builder: &SystemPromptBuilder) -> Result<Self, PromptBuildError> {
-        Ok(Self::new(SessionContext::with_system_prompt(
-            builder.build_initial()?,
-        )))
+        let mut context = SessionContext::with_system_prompt(builder.build_initial()?);
+        context.rule_sources = builder.rule_sources().to_vec();
+        Ok(Self::new(context))
     }
 
     pub fn context(&self) -> &SessionContext {

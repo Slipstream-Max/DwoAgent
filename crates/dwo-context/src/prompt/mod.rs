@@ -5,8 +5,8 @@ mod mcp;
 mod skills;
 
 pub use builder::{
-    AgentProfilePaths, PromptBuildError, PromptSnapshot, RuleSnapshot, SystemPromptBlock,
-    SystemPromptBuilder,
+    AgentProfilePaths, PromptBuildError, PromptSnapshot, RuleSnapshot, RuleSource,
+    SystemPromptBlock, SystemPromptBuilder,
 };
 pub use channel::ChannelCapabilitySnapshot;
 pub use environment::EnvironmentSnapshot;

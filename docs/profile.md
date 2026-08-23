@@ -27,7 +27,10 @@
 |  |  |- session.json
 |  |  |- model_context.json
 |  |  `- client_transcript.jsonl
-|  |- workspaces/<session-id>/
+|  |- projects/<project-id>/
+|  |  |- project.json
+|  |  |- workspace/
+|  |  `- topics/<topic-id>/{overview.md,AGENTS.md}
 |  |- attachments/<channel>/YYYY/MM/DD/<session-id>/
 |  `- websocket/
 |     `- secret.yaml
@@ -338,11 +341,12 @@ automation:
 | `resource/prompts/AGENTS.md` | 可选 profile 级规则。 |
 | `<session-cwd>/AGENTS.md` | 当前工作目录规则。 |
 | `<session-cwd>/.agents/AGENTS.md` | 项目级规则。 |
+| `runtime/projects/<project-id>/topics/<topic-id>/AGENTS.md` | 看板 Topic 的 Knowledge；以 `Project.pwd` 作为规则 pwd。 |
 | `resource/skills/<name>/SKILL.md` | Profile 内可用的 skill。 |
 | `<session-cwd>/.agents/skills/<name>/SKILL.md` | 项目级 skill，与 profile 同名时项目级生效。 |
 | `externalSkillsDirs` 指定的目录 | 外部 skill；同名时优先级为 profile < 外部 < 项目。 |
 
-Daemon 会监听这些固定资源、session 初始工作目录、`.agents/` 和 `externalSkillsDirs` 中的规则与技能变化，并在 agent loop 的边界通知现有 session。
+Daemon 会监听这些固定资源、session 初始工作目录、Topic RuleSource、`.agents/` 和 `externalSkillsDirs` 中的规则与技能变化，并在 agent loop 的边界通知现有 session。每份 AGENTS 规则同时向模型提供来源路径和适用的 pwd。
 
 ## MCP
 
@@ -394,7 +398,7 @@ dwo mcp auth <server> [--logout]
 
 上下文压缩会重建 `model_context.json`，不会删除 `client_transcript.jsonl`。
 
-没有显式 cwd 的 session 使用 `runtime/workspaces/<session-id>/`。删除这种 session 时，对应自动 workspace 会一起删除。手动指定的工作目录不会被删除。
+Session 由 Host 放入 Project：Project 可以使用显式 pwd，也可以使用 `runtime/projects/<project-id>/workspace/`。workspace 属于 Project，不属于 Session；删除 Session 不删除 Project workspace。Topic 归属由 `project.json` 中的 `sessionIds` 保存，不写入 Session metadata。
 
 ## Channel 数据
 

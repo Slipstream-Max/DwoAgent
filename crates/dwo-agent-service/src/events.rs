@@ -279,6 +279,16 @@ pub struct SessionStatusSnapshot {
     pub phase: RuntimePhase,
     pub active_turn_id: Option<TurnId>,
     pub last_answer: Option<String>,
+    pub last_turn_status: Option<TerminalTurnStatus>,
+    pub last_turn_finished_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalTurnStatus {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 pub struct SessionSubscription {

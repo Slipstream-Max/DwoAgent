@@ -28,7 +28,30 @@ Flutter/Dart 的 transport-neutral binding 位于 `bindings/dart/lib/dwo_rpc.dar
 现有 WebSocket 连接上接收 replay 和 live event。默认不传 `event` 时发送全部管理事件；
 传入事件名后，IPC/WebSocket 会同时过滤 replay 和 live。当前事件包括 `config.changed`、
 `config.apply_failed`、`mcp.status`、`automation.changed` 和 `automation.run`；事件只由
-Host 发布，客户端断开不会停止 Host。当前事件还包括 `channel.status` 和 `skill.changed`。
+Host 发布，客户端断开不会停止 Host。当前事件还包括 `channel.status`、`skill.changed` 和
+`project.changed`。
+
+## Project 与看板
+
+Project 拥有 `pwd` 和 Board；Topic 保存 `sessionIds`、`taskIds` 与 `labelIds`。Session 和
+Automation Job 不保存 `topicId`。完整数据关系、默认未分类话题和文件布局见
+[Project 与看板](project-board.md)。
+
+| 方法 | 用途 |
+| --- | --- |
+| `project.list/get/create/update` | Project 查询、创建和改名 |
+| `project.board` | 获取 Sections、Topics 和 Labels |
+| `project.section.create/update/delete/reorder` | 分区 CRUD 和排序 |
+| `project.topic.get/create/update/delete/move/reorder` | Topic 管理；`get` 聚合 Session/Task 状态 |
+| `project.topic.overview.get/set` | 读写概述与计划 Markdown |
+| `project.topic.agents.get/set` | 读写 Knowledge `AGENTS.md` |
+| `project.topic.session.assign/unassign` | Session 归类或移回未分类 Topic |
+| `project.topic.task.create/assign/unassign` | 创建、关联或取消归类 Automation Job |
+| `project.label.create/update/delete/assign/unassign` | Board 标签管理 |
+
+`session.new` 可传 `project_id` 与可选 `topic_id`；指定 Project 时不能再传 `cwd`。省略
+`topic_id` 使用该 Project 的未分类话题。省略 `project_id` 时 Host 根据 `cwd` 创建 Project，
+没有 `cwd` 则创建 Project workspace。看板变更发布 `project.changed`。
 
 ## Host 配置与模型
 
@@ -129,3 +152,7 @@ ACP token 不能访问 `/dwo`，Management token 不能访问 `/acp`。token 保
 Dwo RPC 保留 Session 查询和管理方法。ACP 的 `session.watch` 首先返回一致的 snapshot，
 随后推送 `session.event`；事件包含单调递增的 `seq`。管理事件使用 `event.read` 和独立
 cursor。客户端连接关闭不会 cancel 已接受 turn、Automation run 或 Host。
+
+`session.status-list` 和 `session.status` 还返回 `lastTurnStatus` 与
+`lastTurnFinishedAtMs`。Desktop Inbox 直接按这些 Session 事实筛选和排序，不需要 Inbox
+repository 或单独的后端 API。

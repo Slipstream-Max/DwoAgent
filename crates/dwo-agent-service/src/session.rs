@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dwo_context::{
     ContentBlock, ContextManager, ContextMessage, MessageContent, MessageKind,
-    PendingContextMessage, PendingMessageBatch, SystemPromptBuilder,
+    PendingContextMessage, PendingMessageBatch, RuleSource, SystemPromptBuilder,
 };
 use dwo_model_client::{ModelClient, ModelReply, ModelSelection};
 use dwo_tools::{ConfirmationDecision, PlanAction, PlanRequest, PlanResponse, ToolManager};
@@ -348,6 +348,17 @@ impl SessionAgent {
             .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub async fn set_rule_sources(
+        &self,
+        sources: Vec<RuleSource>,
+    ) -> Result<(), AgentServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(Control::SetRuleSources { sources, response })
+            .await?;
+        wait.await
+            .map_err(|_| AgentServiceError::SessionClosed(self.id.clone()))?
+    }
+
     pub(crate) async fn keep(&self) -> Result<bool, AgentServiceError> {
         let (response, wait) = oneshot::channel();
         self.send(Control::Keep { response }).await?;
@@ -458,6 +469,10 @@ enum Control {
     },
     SetConfig {
         update: SessionConfigUpdate,
+        response: oneshot::Sender<Result<(), AgentServiceError>>,
+    },
+    SetRuleSources {
+        sources: Vec<RuleSource>,
         response: oneshot::Sender<Result<(), AgentServiceError>>,
     },
     Keep {
@@ -839,6 +854,41 @@ impl SessionActor {
                     if model_changed {
                         self.emit_usage_changed();
                     }
+                }
+                let _ = response.send(result);
+            }
+            Control::SetRuleSources { sources, response } => {
+                if self.phase != RuntimePhase::Idle {
+                    let _ = response.send(Err(AgentServiceError::SessionBusy(
+                        self.record.info.id.clone(),
+                    )));
+                    return false;
+                }
+                let builder = self
+                    .prompt_builder
+                    .clone()
+                    .with_rule_sources(sources.clone());
+                let mut context = ContextManager::new(self.record.context.clone());
+                let result = context
+                    .refresh_environment(&builder)
+                    .map_err(anyhow::Error::from)
+                    .map_err(AgentServiceError::from);
+                if let Err(error) = result {
+                    let _ = response.send(Err(error));
+                    return false;
+                }
+                let mut updated = self.record.clone();
+                updated.context = context.into_context();
+                updated.context.rule_sources = sources;
+                updated.touch();
+                let result = self
+                    .repository
+                    .save(&updated)
+                    .await
+                    .map_err(AgentServiceError::from);
+                if result.is_ok() {
+                    self.record = updated;
+                    self.prompt_builder = builder;
                 }
                 let _ = response.send(result);
             }

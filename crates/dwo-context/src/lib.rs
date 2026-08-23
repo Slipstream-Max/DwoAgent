@@ -22,7 +22,7 @@ pub use message::{
 };
 pub use prompt::{
     AgentProfilePaths, ChannelCapabilitySnapshot, EnvironmentSnapshot, McpSnapshot,
-    PromptBuildError, PromptSnapshot, RuleSnapshot, SkillSnapshot, SystemPromptBlock,
+    PromptBuildError, PromptSnapshot, RuleSnapshot, RuleSource, SkillSnapshot, SystemPromptBlock,
     SystemPromptBuilder,
 };
 pub use token::{

@@ -206,7 +206,7 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
                          +------------------+
 ```
 
-所有入口共享 session，每个 channel 会单独保存当前选择的 session。没有显式 `cwd` 的 session 使用 `runtime/workspaces/<session-id>/`；完整 transcript 与当前模型上下文分别持久化，模型压缩不会删除 transcript。
+所有入口共享 session，每个 channel 会单独保存当前选择的 session。Host 先创建拥有 `pwd` 的 Project；没有显式目录时使用 `runtime/projects/<project-id>/workspace/`。看板 Topic 保存 Session 和自动任务的归属，完整 transcript 与当前模型上下文仍分别持久化，模型压缩不会删除 transcript。
 
 ## 🔌 Core 嵌入
 
@@ -233,6 +233,7 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | [文档索引](docs/README.md) | 按首次使用、日常操作和深入理解组织的阅读入口 |
 | [ACP 使用指南](docs/acp.md) | ACP 启动、session、权限、内容类型与限制 |
 | [Channel 部署与使用](docs/channels.md) | 微信、Telegram、飞书/Lark、QQ Bot 部署和 slash commands |
+| [Project 与看板](docs/project-board.md) | Project workspace、分区、话题、标签及 Session/Task 关系 |
 | [Slash Commands 使用指南](docs/slash-commands.md) | 所有 `/` 命令的用途、示例与入口对照 |
 | [Subsessions 使用指南](docs/subsessions.md) | 父子 session、配置继承、结果回传和常用命令 |
 | [Automation 使用指南](docs/automation.md) | Cron、时区、新建/固定 session 和无人值守行为 |

@@ -529,6 +529,41 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
 }
 
 #[test]
+fn prompt_uses_and_watches_extra_rules_with_their_pwd() {
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("profile");
+    let cwd = root.path().join("workspace");
+    let topic_rules = root.path().join("runtime/topics/topic-1/AGENTS.md");
+    std::fs::create_dir_all(&cwd).unwrap();
+    write(
+        &profile.join("resource/prompts/System.md"),
+        "Profile system prompt",
+    );
+    write(&topic_rules, "topic rule v1");
+
+    let builder = SystemPromptBuilder::new(Some(profile), cwd.clone()).with_rule_sources(vec![
+        dwo_context::RuleSource::new(topic_rules.clone(), cwd.clone()),
+    ]);
+    let mut manager = ContextManager::initialize(&builder).unwrap();
+    let prompt = manager.system_prompt();
+    assert!(prompt.contains("topic rule v1"));
+    assert!(prompt.contains("AGENTS.md"));
+    let canonical_cwd = std::fs::canonicalize(&cwd).unwrap();
+    assert!(prompt.contains(&canonical_cwd.to_string_lossy().to_string()));
+
+    write(&topic_rules, "topic rule v2");
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
+    let watcher = manager.model_messages().last().unwrap();
+    assert_eq!(watcher.kind, MessageKind::EnvWatcher);
+    assert!(watcher.content.contains("topic rule v2"));
+    assert!(
+        watcher
+            .content
+            .contains(&canonical_cwd.to_string_lossy().to_string())
+    );
+}
+
+#[test]
 fn compaction_preserves_plan_watcher_without_summarizing_or_reordering_it() {
     let root = tempfile::tempdir().unwrap();
     let builder = SystemPromptBuilder::new(None, root.path());

@@ -38,8 +38,25 @@ impl AgentProfilePaths {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleSource {
+    pub path: PathBuf,
+    pub pwd: PathBuf,
+}
+
+impl RuleSource {
+    pub fn new(path: impl Into<PathBuf>, pwd: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            pwd: pwd.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleSnapshot {
     pub path: PathBuf,
+    #[serde(default)]
+    pub pwd: PathBuf,
     pub content: String,
 }
 
@@ -83,6 +100,7 @@ impl SystemPromptBlock {
 pub struct SystemPromptBuilder {
     profile: Option<AgentProfilePaths>,
     cwd: PathBuf,
+    rule_sources: Vec<RuleSource>,
     external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
     tool_prompt: Option<String>,
     subsession_prompt: Option<String>,
@@ -95,6 +113,7 @@ impl SystemPromptBuilder {
         Self {
             profile: profile_root.map(AgentProfilePaths::new),
             cwd: cwd.into(),
+            rule_sources: Vec::new(),
             external_skill_dirs: Arc::new(RwLock::new(Vec::new())),
             tool_prompt: None,
             subsession_prompt: None,
@@ -111,6 +130,15 @@ impl SystemPromptBuilder {
     pub fn with_external_skill_dirs(mut self, dirs: Arc<RwLock<Vec<PathBuf>>>) -> Self {
         self.external_skill_dirs = dirs;
         self
+    }
+
+    pub fn with_rule_sources(mut self, sources: Vec<RuleSource>) -> Self {
+        self.rule_sources = sources;
+        self
+    }
+
+    pub fn rule_sources(&self) -> &[RuleSource] {
+        &self.rule_sources
     }
 
     pub fn with_subsession_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -192,6 +220,7 @@ impl SystemPromptBuilder {
         {
             rules.push(RuleSnapshot {
                 path: resolve_or_original(&profile.agents_rules),
+                pwd: resolve_or_original(&profile.root),
                 content,
             });
         }
@@ -199,6 +228,7 @@ impl SystemPromptBuilder {
         if let Some(content) = read_optional_nonempty(&cwd_rules)? {
             rules.push(RuleSnapshot {
                 path: resolve_or_original(&cwd_rules),
+                pwd: resolve_or_original(&self.cwd),
                 content,
             });
         }
@@ -206,8 +236,24 @@ impl SystemPromptBuilder {
         if let Some(content) = read_optional_nonempty(&project_rules)? {
             rules.push(RuleSnapshot {
                 path: resolve_or_original(&project_rules),
+                pwd: resolve_or_original(&self.cwd),
                 content,
             });
+        }
+        for source in &self.rule_sources {
+            if let Some(content) = read_optional_nonempty(&source.path)? {
+                let path = resolve_or_original(&source.path);
+                if let Some(existing) = rules.iter_mut().find(|rule| rule.path == path) {
+                    existing.pwd = resolve_or_original(&source.pwd);
+                    existing.content = content;
+                } else {
+                    rules.push(RuleSnapshot {
+                        path,
+                        pwd: resolve_or_original(&source.pwd),
+                        content,
+                    });
+                }
+            }
         }
         Ok(rules)
     }
@@ -273,7 +319,14 @@ fn render_prompt(
         let rules = snapshot
             .rules
             .iter()
-            .map(|rule| format!("source: {}\n{}", rule.path.display(), rule.content))
+            .map(|rule| {
+                format!(
+                    "source: {}\npwd: {}\n{}",
+                    rule.path.display(),
+                    rule.pwd.display(),
+                    rule.content
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
         blocks.push(xml_block("rules", &rules));

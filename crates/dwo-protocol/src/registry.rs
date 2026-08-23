@@ -111,6 +111,119 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     query("session.options", MethodRoute::Acp),
     command("session.permission", MethodRoute::Acp, None),
     subscription("session.watch", MethodRoute::Acp),
+    query("project.list", MethodRoute::Dwo),
+    query("project.get", MethodRoute::Dwo),
+    query("project.board", MethodRoute::Dwo),
+    command("project.create", MethodRoute::Dwo, Some("project.changed")),
+    command("project.update", MethodRoute::Dwo, Some("project.changed")),
+    command(
+        "project.section.create",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.section.update",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.section.delete",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.section.reorder",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    query("project.topic.get", MethodRoute::Dwo),
+    command(
+        "project.topic.create",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.update",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.delete",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.move",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.reorder",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    query("project.topic.overview.get", MethodRoute::Dwo),
+    command(
+        "project.topic.overview.set",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    query("project.topic.agents.get", MethodRoute::Dwo),
+    command(
+        "project.topic.agents.set",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.session.assign",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.session.unassign",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.task.assign",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.task.unassign",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.topic.task.create",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.label.create",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.label.update",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.label.delete",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.label.assign",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.label.unassign",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
     query("automation.list", MethodRoute::Dwo),
     query("automation.status", MethodRoute::Dwo),
     command(
@@ -257,6 +370,7 @@ pub const EVENTS: &[&str] = &[
     "channel.status",
     "websocket.status",
     "skill.changed",
+    "project.changed",
 ];
 
 const CHANNEL_KINDS: &[&str] = &["weixin", "telegram", "feishu", "qq"];

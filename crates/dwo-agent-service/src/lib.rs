@@ -15,7 +15,7 @@ mod session;
 pub use dwo_context::{
     CompactionPlan, CompactionPlanner, CompactionState, CompactionView, ContentAnnotations,
     ContentAudienceRole, ContentBlock, ContextManager, ContextMessage, EmbeddedResourceContents,
-    EnvChange, MessageContent, MessageKind, MessageRole, SessionContext, SessionUsage,
+    EnvChange, MessageContent, MessageKind, MessageRole, RuleSource, SessionContext, SessionUsage,
     SystemPromptBlock, SystemPromptBuilder, TurnId,
 };
 pub use dwo_model_client::{
@@ -31,6 +31,7 @@ pub use events::{
     ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, CompactionTrigger, FileChange,
     NotificationLevel, PendingPermission, RuntimePhase, SessionEvent, SessionEventPayload,
     SessionSnapshot, SessionStatusSnapshot, SessionSubscription, SessionUsageSnapshot,
+    TerminalTurnStatus,
 };
 pub use plan::ExecutionPlan;
 pub use profile::{

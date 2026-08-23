@@ -8,9 +8,10 @@ use chrono::{DateTime, Local, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 use dwo_agent_service::{
-    AgentService, AgentServiceError, EndpointId, NewSession, SessionAgent, SessionEventPayload,
-    SessionId, SessionLlmSettings, SessionSubscription, TurnId,
+    AgentService, AgentServiceError, EndpointId, NewSession, RuleSource, SessionAgent,
+    SessionEventPayload, SessionId, SessionLlmSettings, SessionSubscription, TurnId,
 };
+use dwo_project::ProjectService;
 use dwo_tools::{ConfirmationDecision, SessionMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -159,6 +160,7 @@ struct AutomationDefaults {
 
 pub struct AutomationRuntime {
     service: Arc<AgentService>,
+    projects: Arc<ProjectService>,
     profile_root: PathBuf,
     history_path: PathBuf,
     defaults: Mutex<AutomationDefaults>,
@@ -171,6 +173,7 @@ pub struct AutomationRuntime {
 impl AutomationRuntime {
     pub fn new(
         service: Arc<AgentService>,
+        projects: Arc<ProjectService>,
         profile_root: PathBuf,
         config: AutomationConfig,
         default_model: String,
@@ -196,6 +199,7 @@ impl AutomationRuntime {
         }
         Ok(Arc::new(Self {
             service,
+            projects,
             history_path,
             profile_root,
             defaults: Mutex::new(AutomationDefaults {
@@ -509,6 +513,7 @@ impl AutomationRuntime {
                 self.service.load(&id).await?
             }
         };
+        self.bind_session_to_job_topic(job, &agent).await?;
         Ok(agent)
     }
 
@@ -561,11 +566,26 @@ impl AutomationRuntime {
         cwd: &Path,
         title: &Option<String>,
     ) -> Result<Arc<SessionAgent>> {
-        let cwd = if cwd.is_absolute() {
+        let configured_cwd = if cwd.is_absolute() {
             cwd.to_path_buf()
         } else {
             self.profile_root.join(cwd)
         };
+        let topic = self.projects.locate_task(&job.name);
+        let (cwd, rule_sources) = topic.as_ref().map_or_else(
+            || (configured_cwd, Vec::new()),
+            |(project, topic)| {
+                (
+                    project.pwd.clone(),
+                    vec![RuleSource::new(
+                        self.projects
+                            .agents_path(&project.id, &topic.id)
+                            .expect("located topic has an AGENTS path"),
+                        project.pwd.clone(),
+                    )],
+                )
+            },
+        );
         let defaults = self.defaults.lock().await.clone();
         let model = job.model.clone().unwrap_or_else(|| defaults.model.clone());
         let reasoning = job.reasoning.clone().or_else(|| {
@@ -585,6 +605,7 @@ impl AutomationRuntime {
                         .unwrap_or_else(|| format!("automation/{}", job.name)),
                 ),
                 cwd,
+                rule_sources,
                 mode: job.policy.unwrap_or(defaults.mode),
                 llm: SessionLlmSettings::new(model, reasoning),
                 automation_job: matches!(
@@ -598,6 +619,31 @@ impl AutomationRuntime {
                 ephemeral: false,
             })
             .await?)
+    }
+
+    async fn bind_session_to_job_topic(
+        &self,
+        job: &AutomationJob,
+        agent: &SessionAgent,
+    ) -> Result<()> {
+        let Some((project, topic)) = self.projects.locate_task(&job.name) else {
+            return Ok(());
+        };
+        let snapshot = agent.snapshot().await?;
+        anyhow::ensure!(
+            snapshot.record.info.cwd == project.pwd,
+            "automation session cwd does not match the topic project pwd"
+        );
+        let source = RuleSource::new(
+            self.projects.agents_path(&project.id, &topic.id)?,
+            project.pwd,
+        );
+        if snapshot.record.context.rule_sources != [source.clone()] {
+            agent.set_rule_sources(vec![source]).await?;
+        }
+        self.projects
+            .assign_session(&project.id, &topic.id, agent.id().to_string())?;
+        Ok(())
     }
 
     async fn once_session(
@@ -1106,6 +1152,7 @@ jobs:
         let build_runtime = || {
             AutomationRuntime::new(
                 service.clone(),
+                Arc::new(ProjectService::open(root.path().join("runtime/projects")).unwrap()),
                 root.path().to_path_buf(),
                 AutomationConfig {
                     enabled: false,

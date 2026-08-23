@@ -21,10 +21,13 @@ ContextManager
 `- mcp.json
 ```
 
-Rules also include the `AGENTS.md` at the session's initial `cwd`. Only the
-profile and initial-cwd rule paths are watched. Changes to system prompt,
-rules, skills, MCP config, or environment append `EnvWatcher` messages at
-model-step boundaries. They do not mutate the existing system prompt.
+Rules also include `AGENTS.md` files at the session's initial `cwd` and any
+persisted extra `RuleSource`, such as a Board Topic's Knowledge file. Every
+rule snapshot carries the source file path, the `pwd` where its instructions
+apply, and its content. All configured rule paths are watched. Changes to the
+system prompt, rules, skills, MCP config, or environment append `EnvWatcher`
+messages at model-step boundaries. They do not mutate the existing system
+prompt.
 
 Responses output is stored item-first. Reasoning, assistant messages, local
 function calls, and hosted calls occupy separate ordered history entries rather

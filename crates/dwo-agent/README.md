@@ -118,7 +118,11 @@ runtime/sessions/YYYY/MM/DD/<session-id>/
   session.json
   model_context.json
   client_transcript.jsonl
-runtime/workspaces/<session-id>/
+runtime/projects/<project-id>/
+  project.json
+  workspace/
+  topics/<topic-id>/overview.md
+  topics/<topic-id>/AGENTS.md
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
 runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
@@ -203,8 +207,9 @@ image/file messages are downloaded under the selected session's dated channel
 attachment directory and submitted as a structured resource link containing
 the local path, MIME type, name, and size. A media-only message is a valid
 prompt. Telegram and Feishu send model output as plain text without markdown
-rewriting. Sessions created without an explicit cwd use
-`runtime/workspaces/<session-id>` instead of the daemon process cwd.
+rewriting. Host-created sessions belong to a Project. Projects created without
+an explicit cwd use `runtime/projects/<project-id>/workspace`; the workspace is
+not owned or deleted by an individual Session.
 
 Channel slash commands are declared as one clap-derived command enum shared by
 platform adapters. Parsing, argument validation, and `/help` descriptions

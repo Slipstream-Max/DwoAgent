@@ -10,8 +10,9 @@ use dwo_agent_service::{
     NotificationLevel, SessionConfig, SessionConfigUpdate, SessionEventPayload, SessionId,
     SessionLlmSettings, SessionRecord, SessionSubscription, TurnId,
 };
-use dwo_context::MessageContent;
+use dwo_context::{MessageContent, RuleSource};
 use dwo_mcp::McpRuntime;
+use dwo_project::{CreateProject, Project, ProjectService};
 use dwo_tools::{ConfirmationDecision, PolicyConfig, SessionMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +29,7 @@ pub mod events;
 pub(crate) mod management_api;
 mod mcp_api;
 mod model_api;
+mod project_api;
 mod prompt_api;
 mod session_api;
 mod skill_api;
@@ -42,6 +44,7 @@ pub struct Host {
     pub channel_gateway: Arc<ChannelGateway>,
     pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
+    projects: Arc<ProjectService>,
     channels: RwLock<Arc<ChannelManager>>,
     profile_root: PathBuf,
     config_manager: ConfigManager,
@@ -75,6 +78,8 @@ struct SessionIdParam {
 struct NewSessionParam {
     title: Option<String>,
     cwd: Option<PathBuf>,
+    project_id: Option<String>,
+    topic_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -296,8 +301,10 @@ impl Host {
             PolicyConfig::default(),
         )?);
         let shutdown = CancellationToken::new();
+        let projects = Arc::new(ProjectService::open(profile_root.join("runtime/projects"))?);
         let automation = AutomationRuntime::new(
             service.clone(),
+            projects.clone(),
             profile_root.clone(),
             automation_config,
             default_model.clone(),
@@ -310,6 +317,7 @@ impl Host {
             channel_gateway: Arc::new(ChannelGateway::new()),
             mcp,
             automation,
+            projects,
             channels: RwLock::new(channels),
             profile_root: profile_root.clone(),
             config_manager,
@@ -353,10 +361,14 @@ impl Host {
         );
         for id in ephemeral {
             let _ = delete_session_resources(&self.service, &self.profile_root, &id).await;
+            let _ = self.projects.unassign_session_everywhere(id.as_str());
         }
     }
 
     pub async fn handle_method(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
+        if method.starts_with("project.") {
+            return self.dispatch_project(method, params).await;
+        }
         if method.starts_with("websocket.") {
             return self.dispatch_websocket(method, params).await;
         }
@@ -459,7 +471,21 @@ impl Host {
             }
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
-                let snapshot = self.setup_session(params.title, params.cwd).await?;
+                anyhow::ensure!(
+                    params.project_id.is_none() || params.cwd.is_none(),
+                    "cwd cannot be supplied with project_id"
+                );
+                let snapshot = if let Some(project_id) = params.project_id {
+                    self.setup_project_session(
+                        params.title,
+                        &project_id,
+                        params.topic_id.as_deref(),
+                    )
+                    .await?
+                } else {
+                    anyhow::ensure!(params.topic_id.is_none(), "topic_id requires project_id");
+                    self.setup_session(params.title, params.cwd).await?
+                };
                 Ok(json!({
                     "session_id": snapshot.record.info.id,
                     "usage": snapshot.usage,
@@ -1068,48 +1094,100 @@ impl Host {
         title: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<Arc<dwo_agent_service::SessionAgent>> {
-        let (default_model, default_reasoning, default_mode) = self.defaults();
-        let session_id = SessionId::new();
-        let uses_generated_workspace = cwd.is_none();
-        let cwd = match cwd {
+        let project = self.create_session_project(title.clone(), cwd)?;
+        self.create_project_session(title, &project.id, &project.board.uncategorized_topic_id)
+            .await
+    }
+
+    fn create_session_project(
+        &self,
+        title: Option<String>,
+        cwd: Option<PathBuf>,
+    ) -> Result<Project> {
+        let pwd = match cwd {
             Some(cwd) if cwd.is_absolute() => cwd,
             Some(cwd) => self.profile_root.join(cwd),
-            None => {
-                let workspace = self
-                    .profile_root
-                    .join("runtime")
-                    .join("workspaces")
-                    .join(session_id.as_str());
-                tokio::fs::create_dir_all(&workspace)
-                    .await
-                    .with_context(|| format!("create default workspace {}", workspace.display()))?;
-                workspace
-            }
+            None => PathBuf::new(),
         };
-        let cleanup_path = uses_generated_workspace.then(|| cwd.clone());
+        let project_name = title
+            .clone()
+            .or_else(|| {
+                pwd.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "Untitled Project".to_string());
+        Ok(self.projects.create(CreateProject {
+            name: project_name,
+            pwd: (!pwd.as_os_str().is_empty()).then_some(pwd),
+        })?)
+    }
+
+    pub async fn create_project_session(
+        &self,
+        title: Option<String>,
+        project_id: &str,
+        topic_id: &str,
+    ) -> Result<Arc<dwo_agent_service::SessionAgent>> {
+        let (default_model, default_reasoning, default_mode) = self.defaults();
+        self.create_project_session_with(
+            title,
+            project_id,
+            topic_id,
+            None,
+            default_mode,
+            SessionLlmSettings::new(default_model, default_reasoning),
+            false,
+        )
+        .await
+    }
+
+    async fn create_project_session_with(
+        &self,
+        title: Option<String>,
+        project_id: &str,
+        topic_id: &str,
+        parent_session_id: Option<SessionId>,
+        mode: SessionMode,
+        llm: SessionLlmSettings,
+        ephemeral: bool,
+    ) -> Result<Arc<dwo_agent_service::SessionAgent>> {
+        let project = self.projects.get(project_id)?;
+        anyhow::ensure!(
+            project
+                .board
+                .topics
+                .iter()
+                .any(|topic| topic.id == topic_id),
+            "topic not found in project: {topic_id}"
+        );
+        let agents_path = self.projects.agents_path(project_id, topic_id)?;
+        let session_id = SessionId::new();
         let created = self
             .service
             .create(NewSession {
-                id: Some(session_id),
-                parent_session_id: None,
+                id: Some(session_id.clone()),
+                parent_session_id,
                 title,
                 automation_job: None,
-                cwd,
-                mode: default_mode,
-                ephemeral: false,
-                llm: SessionLlmSettings::new(default_model, default_reasoning),
+                cwd: project.pwd.clone(),
+                rule_sources: vec![RuleSource::new(agents_path, project.pwd)],
+                mode,
+                ephemeral,
+                llm,
             })
             .await;
         match created {
-            Ok(session) => Ok(session),
-            Err(error) => {
-                if let Some(path) = cleanup_path
-                    && path.is_dir()
+            Ok(session) => {
+                if let Err(error) =
+                    self.projects
+                        .assign_session(project_id, topic_id, session_id.to_string())
                 {
-                    let _ = tokio::fs::remove_dir_all(path).await;
+                    let _ = self.service.delete(&session_id).await;
+                    return Err(error.into());
                 }
-                Err(error.into())
+                Ok(session)
             }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1195,6 +1273,10 @@ impl Host {
                 let _ = self.service.delete(&id).await;
                 return Err(error.into());
             }
+            if let Some((project, topic)) = self.projects.locate_session(source_id.as_str()) {
+                self.projects
+                    .assign_session(&project.id, &topic.id, agent.id().to_string())?;
+            }
             return Ok((agent, parent_id));
         }
 
@@ -1223,49 +1305,37 @@ impl Host {
                     .then(|| default_reasoning.clone())
                     .flatten()
             });
-        let session_id = SessionId::new();
         let requested_cwd = params
             .cwd
             .clone()
             .or_else(|| caller_record.as_ref().map(|record| record.info.cwd.clone()));
-        let uses_generated_workspace = requested_cwd.is_none();
-        let cwd = match requested_cwd {
-            Some(cwd) if cwd.is_absolute() => cwd,
-            Some(cwd) => self.profile_root.join(cwd),
+        let inherited_topic = if params.cwd.is_none() {
+            caller
+                .as_ref()
+                .and_then(|id| self.projects.locate_session(id.as_str()))
+        } else {
+            None
+        };
+        let (project, topic_id) = match inherited_topic {
+            Some((project, topic)) => (project, topic.id),
             None => {
-                let workspace = self
-                    .profile_root
-                    .join("runtime/workspaces")
-                    .join(session_id.as_str());
-                tokio::fs::create_dir_all(&workspace).await?;
-                workspace
+                let project = self.create_session_project(params.title.clone(), requested_cwd)?;
+                let topic_id = project.board.uncategorized_topic_id.clone();
+                (project, topic_id)
             }
         };
-        let cleanup_path = uses_generated_workspace.then(|| cwd.clone());
-        let created = self
-            .service
-            .create(NewSession {
-                id: Some(session_id),
-                parent_session_id: caller.clone(),
-                title: params.title.clone(),
-                automation_job: None,
-                cwd,
+        let agent = self
+            .create_project_session_with(
+                params.title.clone(),
+                &project.id,
+                &topic_id,
+                caller.clone(),
                 mode,
-                llm: SessionLlmSettings::new(model, reasoning),
-                ephemeral: params.ephemeral,
-            })
-            .await;
-        match created {
-            Ok(agent) => Ok((agent, caller)),
-            Err(error) => {
-                if let Some(path) = cleanup_path
-                    && path.is_dir()
-                {
-                    let _ = tokio::fs::remove_dir_all(path).await;
-                }
-                Err(error.into())
-            }
-        }
+                SessionLlmSettings::new(model, reasoning),
+                params.ephemeral,
+            )
+            .await?;
+        Ok((agent, caller))
     }
 
     fn spawn_result_delivery(
@@ -1292,6 +1362,7 @@ impl Host {
     ) {
         let service = self.service.clone();
         let profile_root = self.profile_root.clone();
+        let projects = self.projects.clone();
         tokio::spawn(async move {
             while let Some(event) = subscription.events.recv().await {
                 let terminal = match event.payload {
@@ -1315,7 +1386,7 @@ impl Host {
                     else {
                         continue;
                     };
-                    spawn_ephemeral_expiry(service, profile_root, child_id, deadline);
+                    spawn_ephemeral_expiry(service, projects, profile_root, child_id, deadline);
                     break;
                 }
             }
@@ -1331,6 +1402,7 @@ impl Host {
         for (id, deadline) in schedule {
             spawn_ephemeral_expiry(
                 self.service.clone(),
+                self.projects.clone(),
                 self.profile_root.clone(),
                 id,
                 deadline,
@@ -1339,7 +1411,9 @@ impl Host {
     }
 
     pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
-        delete_session_resources(&self.service, &self.profile_root, id).await
+        delete_session_resources(&self.service, &self.profile_root, id).await?;
+        self.projects.unassign_session_everywhere(id.as_str())?;
+        Ok(())
     }
 
     pub fn profile_root_path(&self) -> &Path {
@@ -1657,6 +1731,7 @@ const EPHEMERAL_GRACE_MS: u64 = 5 * 60 * 1000;
 
 fn spawn_ephemeral_expiry(
     service: Arc<AgentService>,
+    projects: Arc<ProjectService>,
     profile_root: PathBuf,
     id: SessionId,
     deadline: u64,
@@ -1668,23 +1743,15 @@ fn spawn_ephemeral_expiry(
             return;
         };
         let _ = cleanup_deleted_session_resources(&profile_root, &id, &record).await;
+        let _ = projects.unassign_session_everywhere(id.as_str());
     });
 }
 
 async fn cleanup_deleted_session_resources(
     profile_root: &Path,
     id: &SessionId,
-    record: &SessionRecord,
+    _record: &SessionRecord,
 ) -> Result<()> {
-    let generated_workspace = profile_root
-        .join("runtime")
-        .join("workspaces")
-        .join(id.as_str());
-    let resolved_generated_workspace =
-        std::fs::canonicalize(&generated_workspace).unwrap_or_else(|_| generated_workspace.clone());
-    if record.info.cwd == resolved_generated_workspace && generated_workspace.is_dir() {
-        tokio::fs::remove_dir_all(&generated_workspace).await?;
-    }
     for channel in ["weixin", "telegram", "feishu"] {
         remove_session_attachment_dirs(
             &profile_root.join("runtime/attachments").join(channel),
@@ -2011,6 +2078,208 @@ model:
                 .unwrap()
                 .iter()
                 .any(|method| method == "skill.install")
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_board_composes_topics_sessions_labels_and_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let host = Host::load(&config).await.unwrap();
+
+        let project = host
+            .handle_method("project.create", json!({"name": "Demo", "pwd": workspace}))
+            .await
+            .unwrap();
+        let project_id = project["id"].as_str().unwrap();
+        let section_id = project["board"]["uncategorizedSectionId"].as_str().unwrap();
+        let topic = host
+            .handle_method(
+                "project.topic.create",
+                json!({
+                    "project_id": project_id,
+                    "section_id": section_id,
+                    "title": "Project API"
+                }),
+            )
+            .await
+            .unwrap();
+        let topic_id = topic["id"].as_str().unwrap();
+        host.handle_method(
+            "project.topic.agents.set",
+            json!({
+                "project_id": project_id,
+                "topic_id": topic_id,
+                "content": "Keep changes inside the project API."
+            }),
+        )
+        .await
+        .unwrap();
+        let label = host
+            .handle_method(
+                "project.label.create",
+                json!({
+                    "project_id": project_id,
+                    "name": "Backend",
+                    "color": "#388E3C"
+                }),
+            )
+            .await
+            .unwrap();
+        host.handle_method(
+            "project.label.assign",
+            json!({
+                "project_id": project_id,
+                "topic_id": topic_id,
+                "label_id": label["id"]
+            }),
+        )
+        .await
+        .unwrap();
+        let created = host
+            .handle_method(
+                "session.new",
+                json!({"project_id": project_id, "topic_id": topic_id}),
+            )
+            .await
+            .unwrap();
+        let session_id = created["session_id"].as_str().unwrap();
+
+        let detail = host
+            .handle_method(
+                "project.topic.get",
+                json!({"project_id": project_id, "topic_id": topic_id}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail["sessions"][0]["record"]["info"]["id"], session_id);
+        assert_eq!(detail["labels"][0]["name"], "Backend");
+        let snapshot = host
+            .service
+            .load(&SessionId::parse(session_id.to_string()).unwrap())
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert!(
+            snapshot
+                .record
+                .context
+                .system_prompt
+                .content
+                .contains("Keep changes inside the project API.")
+        );
+        assert_eq!(snapshot.record.context.rule_sources.len(), 1);
+        assert_eq!(
+            snapshot.record.context.rule_sources[0].pwd,
+            std::fs::canonicalize(workspace).unwrap()
+        );
+        let second = host
+            .handle_method(
+                "project.topic.create",
+                json!({
+                    "project_id": project_id,
+                    "section_id": section_id,
+                    "title": "Review"
+                }),
+            )
+            .await
+            .unwrap();
+        let second_id = second["id"].as_str().unwrap();
+        host.handle_method(
+            "project.topic.agents.set",
+            json!({
+                "project_id": project_id,
+                "topic_id": second_id,
+                "content": "Review the completed implementation."
+            }),
+        )
+        .await
+        .unwrap();
+        host.handle_method(
+            "project.topic.session.assign",
+            json!({
+                "project_id": project_id,
+                "topic_id": second_id,
+                "session_id": session_id
+            }),
+        )
+        .await
+        .unwrap();
+        let moved = host
+            .service
+            .load(&SessionId::parse(session_id.to_string()).unwrap())
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert!(moved.record.context.messages.iter().any(|message| {
+            message.kind == dwo_context::MessageKind::EnvWatcher
+                && message
+                    .content
+                    .contains("Review the completed implementation.")
+        }));
+        assert!(
+            host.projects
+                .get(project_id)
+                .unwrap()
+                .board
+                .topics
+                .iter()
+                .find(|topic| topic.id == topic_id)
+                .unwrap()
+                .session_ids
+                .is_empty()
+        );
+        host.handle_method(
+            "project.topic.task.create",
+            json!({
+                "project_id": project_id,
+                "topic_id": second_id,
+                "job": {
+                    "name": "topic-review",
+                    "enabled": true,
+                    "schedule": {"cron": "0 9 * * *", "timezone": "Asia/Shanghai"},
+                    "session": {"mode": "new", "behavior": "every_time", "cwd": "."},
+                    "prompt": "Review now"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let run = host
+            .handle_method(
+                "automation.run",
+                json!({"job": "topic-review", "caller_session_id": null}),
+            )
+            .await
+            .unwrap();
+        let automation_session_id = run["sessionId"].as_str().unwrap();
+        let (_, automation_topic) = host
+            .projects
+            .locate_session(automation_session_id)
+            .expect("topic automation session is assigned to its topic");
+        assert_eq!(automation_topic.id, second_id);
+        let automation_snapshot = host
+            .service
+            .load(&SessionId::parse(automation_session_id.to_string()).unwrap())
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert!(
+            automation_snapshot
+                .record
+                .context
+                .system_prompt
+                .content
+                .contains("Review the completed implementation.")
         );
         host.shutdown().await;
     }
@@ -2488,7 +2757,7 @@ automation:
     }
 
     #[tokio::test]
-    async fn sessions_use_runtime_workspaces_unless_cwd_is_explicit() {
+    async fn sessions_use_project_workspaces_and_topic_rule_sources() {
         let profile = tempfile::tempdir().unwrap();
         let config = write_test_profile(profile.path());
         let host = Host::load(&config).await.unwrap();
@@ -2503,17 +2772,28 @@ automation:
             .record
             .info
             .cwd;
+        let (generated_project, generated_topic) = host
+            .projects
+            .locate_session(generated_id.as_str())
+            .expect("generated session belongs to the uncategorized topic");
+        assert_eq!(generated_cwd, generated_project.pwd);
         assert_eq!(
-            generated_cwd,
-            std::fs::canonicalize(
-                profile
-                    .path()
-                    .join("runtime/workspaces")
-                    .join(generated_id.as_str())
-            )
-            .unwrap()
+            generated_topic.id,
+            generated_project.board.uncategorized_topic_id
         );
         assert!(generated_cwd.is_dir());
+        let snapshot = generated.snapshot().await.unwrap();
+        assert_eq!(snapshot.record.context.rule_sources.len(), 1);
+        assert_eq!(
+            snapshot.record.context.rule_sources[0].pwd,
+            generated_project.pwd
+        );
+        assert_eq!(
+            snapshot.record.context.rule_sources[0].path,
+            host.projects
+                .agents_path(&generated_project.id, &generated_topic.id)
+                .unwrap()
+        );
 
         let explicit = profile.path().join("projects/demo");
         std::fs::create_dir_all(&explicit).unwrap();
@@ -2544,7 +2824,15 @@ automation:
         }
 
         host.delete_session(&generated_id).await.unwrap();
-        assert!(!generated_cwd.exists());
+        assert!(
+            generated_cwd.exists(),
+            "the workspace belongs to Project, not Session"
+        );
+        assert!(
+            host.projects
+                .locate_session(generated_id.as_str())
+                .is_none()
+        );
         assert!(
             !profile
                 .path()

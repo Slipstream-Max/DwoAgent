@@ -17,6 +17,7 @@ dwo-command = { path = "../dwo-command" }
 dwo-context = { path = "../dwo-context" }
 dwo-mcp = { path = "../dwo-mcp" }
 dwo-protocol = { path = "../dwo-protocol" }
+dwo-project = { path = "../dwo-project" }
 dwo-tools = { path = "../dwo-tools" }
 getrandom.workspace = true
 serde.workspace = true
@@ -31,4 +32,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-

@@ -1,7 +1,7 @@
 # dwo-host API
 
 `dwo-host` 是 DwoAgent 的长期运行应用层。一个 `Host` 拥有唯一的 AgentService、Session
-repository、有效配置、MCP runtime、Channel runtime、Automation scheduler、事件历史和
+repository、ProjectService、有效配置、MCP runtime、Channel runtime、Automation scheduler、事件历史和
 shutdown 边界。IPC、WebSocket、ACP shim、CLI 和 Flutter 都是它外面的适配器。
 
 二开有两种接入方式：
@@ -81,8 +81,10 @@ let accepted = host
 | `list_session_statuses(all, caller)` | 带运行状态的列表 |
 | `session_status(id)` | 单个 Session 的状态摘要 |
 | `session_snapshot(id)` | 一致的当前快照 |
-| `setup_session(title, cwd)` | 按 Host 默认配置建立根 Session；无 cwd 时创建 runtime workspace |
-| `create_session(title, cwd)` | 建立 Session 并返回 `Arc<SessionAgent>` |
+| `setup_session(title, cwd)` | 建立 Project 和未分类根 Session；无 cwd 时创建 Project workspace |
+| `setup_project_session(title, project, topic)` | 在已有 Project/Topic 中建立 Session |
+| `create_session(title, cwd)` | 建立 Project 与 Session，并返回 `Arc<SessionAgent>` |
+| `create_project_session(title, project, topic)` | 在已有 Project/Topic 中建立 SessionAgent |
 | `fork_session(source)` | 从 idle Session 复制 context/transcript |
 | `subscribe_session(id, endpoint, cursor)` | 先取得快照/回放，再接收 live Session 事件 |
 | `prompt_session(id, endpoint, content)` | 展开有效 Skill/MCP directive 后提交 prompt |
@@ -93,7 +95,7 @@ let accepted = host
 | `resolve_session_permission(...)` | 回答待处理的工具权限请求 |
 | `publish_session_notification(...)` | 向 Session 写入结构化 Host/adapter 通知 |
 | `close_session(id)` | 关闭已加载 actor，不删除持久记录 |
-| `delete_session(id)` | 关闭并删除 Session 记录及生成的 workspace |
+| `delete_session(id)` | 关闭并删除 Session 记录，同时清理 Topic 引用；不删除 Project workspace |
 | `watch(session_id, endpoint_id, cursor)` | 面向字符串 transport 参数的订阅便捷方法 |
 
 `SessionSubscription` 提供的 snapshot/checkpoint 与 live event 是恢复边界。自定义客户端应保存
@@ -132,7 +134,7 @@ transport 在调用 Host 前仍必须：
 4. 把 `anyhow::Error` 转成 `RpcError`，保证一次请求只有 result 或 error；
 5. 单独实现 `event.subscribe` 的长连接发送循环。
 
-Model、Provider、Prompt、Rule、Skill、MCP、Automation 和 Channel 的具体管理实现目前是
+Project、Model、Provider、Prompt、Rule、Skill、MCP、Automation 和 Channel 的具体管理实现目前是
 Host 内部 API。crate 外二开应通过 `handle_request` 使用这些域；不要绕过 ConfigManager
 直接写内存状态。这样人工编辑、API 修改、原子校验、watcher 和运行事件才保持一致。
 

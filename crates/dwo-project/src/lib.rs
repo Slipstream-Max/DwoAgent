@@ -156,11 +156,40 @@ impl ProjectService {
 
     pub fn create(&self, input: CreateProject) -> Result<Project> {
         let name = nonempty("project name", input.name)?;
+        let pwd = input.pwd.as_deref().map(canonical_directory).transpose()?;
+        let mut projects = self.projects.write().expect("project lock poisoned");
+        if let Some(pwd) = &pwd
+            && projects.iter().any(|project| &project.pwd == pwd)
+        {
+            return Err(ProjectError::Invalid(format!(
+                "a project already uses pwd: {}",
+                pwd.display()
+            )));
+        }
+        self.create_locked(&mut projects, name, pwd)
+    }
+
+    pub fn get_or_create_by_pwd(&self, name: String, pwd: &Path) -> Result<Project> {
+        let name = nonempty("project name", name)?;
+        let pwd = canonical_directory(pwd)?;
+        let mut projects = self.projects.write().expect("project lock poisoned");
+        if let Some(project) = projects.iter().find(|project| project.pwd == pwd) {
+            return Ok(project.clone());
+        }
+        self.create_locked(&mut projects, name, Some(pwd))
+    }
+
+    fn create_locked(
+        &self,
+        projects: &mut Vec<Project>,
+        name: String,
+        pwd: Option<PathBuf>,
+    ) -> Result<Project> {
         let id = new_id("project");
         let project_dir = self.project_dir(&id);
         create_dir_all(&project_dir)?;
-        let pwd = match input.pwd {
-            Some(pwd) => canonical_directory(&pwd)?,
+        let pwd = match pwd {
+            Some(pwd) => pwd,
             None => {
                 let workspace = project_dir.join("workspace");
                 create_dir_all(&workspace)?;
@@ -198,10 +227,7 @@ impl ProjectService {
         };
         self.create_topic_files(&project.id, &topic_id)?;
         self.persist(&project)?;
-        self.projects
-            .write()
-            .expect("project lock poisoned")
-            .push(project.clone());
+        projects.push(project.clone());
         Ok(project)
     }
 
@@ -1103,5 +1129,41 @@ mod tests {
             find_topic(&project, &second.id).unwrap().session_ids,
             ["session-1"]
         );
+    }
+
+    #[test]
+    fn get_or_create_by_pwd_is_atomic_and_explicit_duplicates_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let service =
+            std::sync::Arc::new(ProjectService::open(root.path().join("projects")).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads = (0..8)
+            .map(|index| {
+                let service = service.clone();
+                let barrier = barrier.clone();
+                let workspace = workspace.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    service
+                        .get_or_create_by_pwd(format!("Project {index}"), &workspace)
+                        .unwrap()
+                        .id
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(service.list().len(), 1);
+
+        let duplicate = service.create(CreateProject {
+            name: "Duplicate".to_string(),
+            pwd: Some(workspace),
+        });
+        assert!(matches!(duplicate, Err(ProjectError::Invalid(_))));
     }
 }

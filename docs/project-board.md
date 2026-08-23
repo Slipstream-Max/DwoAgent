@@ -23,7 +23,9 @@ Topic
 
 关系只由 Topic 保存：Session 不含 `topicId`，Automation Job 也不含 `topicId`。Host 根据 Topic 中的 ID 向 AgentService 和 Automation 查询详情。
 
-每个 Project 创建时都有一个“未分类”分区和话题。调用 `session.new` 时可以省略 `topic_id`，Host 会使用该 Project 的未分类话题；完全省略 `project_id` 时，Host 先根据 `cwd` 创建 Project，没有 `cwd` 则生成 Project workspace。
+每个 Project 创建时都有一个“未分类”分区和话题。调用 `session.new` 时可以省略 `topic_id`，Host 会使用该 Project 的未分类话题；完全省略 `project_id` 时，Host 按 canonical cwd 查找已有 Project，找不到才创建，没有 `cwd` 则生成 Project workspace。显式 `project.create` 不允许两个 Project 使用同一个 canonical pwd。
+
+ACP 的标准 `new_session` 只有 cwd，没有 Project/Topic 字段。ACP adapter 只需把 cwd 转发给 `session.new`；上述 Host 解析会复用对应 Project，并把新 Session 放入未分类话题。ACP fork 继续继承源 Session 的 Topic。
 
 ## 持久化
 

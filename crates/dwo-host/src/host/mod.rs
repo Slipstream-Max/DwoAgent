@@ -1094,32 +1094,35 @@ impl Host {
         title: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<Arc<dwo_agent_service::SessionAgent>> {
-        let project = self.create_session_project(title.clone(), cwd)?;
+        let project = self.resolve_or_create_session_project(title.clone(), cwd)?;
         self.create_project_session(title, &project.id, &project.board.uncategorized_topic_id)
             .await
     }
 
-    fn create_session_project(
+    fn resolve_or_create_session_project(
         &self,
         title: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<Project> {
-        let pwd = match cwd {
-            Some(cwd) if cwd.is_absolute() => cwd,
-            Some(cwd) => self.profile_root.join(cwd),
-            None => PathBuf::new(),
+        let Some(pwd) = cwd.map(|cwd| {
+            if cwd.is_absolute() {
+                cwd
+            } else {
+                self.profile_root.join(cwd)
+            }
+        }) else {
+            return Ok(self.projects.create(CreateProject {
+                name: title.unwrap_or_else(|| "Untitled Project".to_string()),
+                pwd: None,
+            })?);
         };
         let project_name = title
-            .clone()
             .or_else(|| {
                 pwd.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
             })
             .unwrap_or_else(|| "Untitled Project".to_string());
-        Ok(self.projects.create(CreateProject {
-            name: project_name,
-            pwd: (!pwd.as_os_str().is_empty()).then_some(pwd),
-        })?)
+        Ok(self.projects.get_or_create_by_pwd(project_name, &pwd)?)
     }
 
     pub async fn create_project_session(
@@ -1319,7 +1322,8 @@ impl Host {
         let (project, topic_id) = match inherited_topic {
             Some((project, topic)) => (project, topic.id),
             None => {
-                let project = self.create_session_project(params.title.clone(), requested_cwd)?;
+                let project =
+                    self.resolve_or_create_session_project(params.title.clone(), requested_cwd)?;
                 let topic_id = project.board.uncategorized_topic_id.clone();
                 (project, topic_id)
             }
@@ -2811,6 +2815,23 @@ automation:
             .info
             .cwd;
         assert_eq!(custom_cwd, std::fs::canonicalize(&explicit).unwrap());
+        let second_custom = host
+            .create_session(
+                Some("second".to_string()),
+                Some(PathBuf::from("projects/demo")),
+            )
+            .await
+            .unwrap();
+        let (custom_project, custom_topic) =
+            host.projects.locate_session(custom_id.as_str()).unwrap();
+        let (second_project, second_topic) = host
+            .projects
+            .locate_session(second_custom.id().as_str())
+            .unwrap();
+        assert_eq!(custom_project.id, second_project.id);
+        assert_eq!(custom_topic.id, second_topic.id);
+        assert_eq!(second_topic.session_ids.len(), 2);
+        assert_eq!(host.projects.list().len(), 2);
 
         for date in ["2026/07/15", "2026/07/16"] {
             let attachment = profile
@@ -2841,6 +2862,7 @@ automation:
                 .exists()
         );
         host.delete_session(&custom_id).await.unwrap();
+        host.delete_session(second_custom.id()).await.unwrap();
         assert!(explicit.is_dir(), "an explicit cwd must never be deleted");
 
         host.shutdown.cancel();

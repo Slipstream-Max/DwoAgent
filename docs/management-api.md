@@ -50,8 +50,9 @@ Automation Job 不保存 `topicId`。完整数据关系、默认未分类话题�
 | `project.label.create/update/delete/assign/unassign` | Board 标签管理 |
 
 `session.new` 可传 `project_id` 与可选 `topic_id`；指定 Project 时不能再传 `cwd`。省略
-`topic_id` 使用该 Project 的未分类话题。省略 `project_id` 时 Host 根据 `cwd` 创建 Project，
-没有 `cwd` 则创建 Project workspace。看板变更发布 `project.changed`。
+`topic_id` 使用该 Project 的未分类话题。省略 `project_id` 时 Host 按 canonical cwd 查找或
+创建 Project，没有 `cwd` 则创建 Project workspace。ACP new-session 因而可以只传 cwd；
+重复使用同一 cwd 会复用 Project。看板变更发布 `project.changed`。
 
 ## Host 配置与模型
 

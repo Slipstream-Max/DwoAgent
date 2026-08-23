@@ -12,10 +12,10 @@
 
 ## 自动压缩与 `/compact`
 
-自动压缩在 `profile.yaml` 的 `compactThreshold` 达到时触发，阈值公式：
+自动压缩在 `profile.yaml` 的 `model.compactionTriggerRatio` 达到时触发，阈值公式：
 
 ```text
-(contextWindowTokens - maxOutputTokens) * compactThreshold
+(contextWindowTokens - maxOutputTokens) * compactionTriggerRatio
 ```
 
 压缩会保留约 20K 最新 token 的“保留区”（必要时在 turn 中间切断，保留当前用户问题），更早的历史由模型生成摘要。`/compact` 只是把同一流程提前到任意时刻手动执行。配置细节见 [Profile 配置指南](profile.md)。
@@ -47,4 +47,3 @@
 | 适用场景 | 当前任务线太长，精简后继续 | 边界清晰、适合独立/并行处理的任务 |
 
 需要拆分并行任务时用 [Subsessions](subsessions.md)；需要精简当前上下文、继续同一任务时用 `handoff`。
-

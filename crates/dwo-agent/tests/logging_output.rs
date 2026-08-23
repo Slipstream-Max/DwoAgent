@@ -14,14 +14,10 @@ logging:
   level: info
   retentionDays: 3
 model:
-  defaultModelName: test
+  default:
+    model: deepseek/deepseek-v4-pro
   providers:
-    local:
-      type: local
-  models:
-    - modelName: test
-      provider: local
-      modelId: test
+    deepseek:
 "#,
     )
     .unwrap();

@@ -59,28 +59,20 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn catalog(endpoint: &str) -> String {
-    format!(
-        r#"
-providers:
-  local:
-    endpoint: {endpoint}
-    request:
-      requestTimeoutMs: 5000
-      streamIdleTimeoutMs: 5000
-    body:
-      extra_body:
-        provider_flag: true
+fn catalog() -> &'static str {
+    r#"
+families:
+  test:
     models:
       test-model:
         contextWindowTokens: 100000
         maxOutputTokens: 4096
-        compactThreshold: 0.8
         capabilities:
           imageInput: true
           toolCalls: true
         hostedTools:
-          - type: web_search
+          webSearch:
+            type: web_search
         reasoning:
           Low:
             reasoning:
@@ -89,20 +81,30 @@ providers:
               thinking:
                 type: enabled
 "#
-    )
 }
 
-fn agent() -> &'static str {
-    r#"
-defaultModelName: chat
+fn agent(endpoint: &str) -> String {
+    format!(
+        r#"
+default:
+  model: local/test-model
+  reasoning: Low
+compactionTriggerRatio: 0.8
 providers:
   local:
-    type: local
-models:
-  - modelName: chat
-    provider: local
-    modelId: test-model
+    baseUrl: {endpoint}
+    request:
+      requestTimeoutMs: 5000
+      streamIdleTimeoutMs: 5000
+    extraBody:
+      extra_body:
+        provider_flag: true
+    models:
+      Chat:
+        modelId: test-model
+        profile: test/test-model
 "#
+    )
 }
 
 #[tokio::test]
@@ -132,14 +134,14 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
     );
     let (endpoint, request_rx) = one_response_server(response).await;
-    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
-    let limits = client.model_limits("chat").unwrap();
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
+    let limits = client.model_limits("local/test-model").unwrap();
     assert_eq!(limits.context_window_tokens, 100_000);
     assert_eq!(limits.max_output_tokens, 4_096);
     assert_eq!(limits.max_input_tokens, 95_904);
     assert_eq!(limits.compact_trigger_tokens, 76_723);
-    assert_eq!(client.default_model_name(), "chat");
-    assert!(client.supports_image_input("chat").unwrap());
+    assert_eq!(client.default_model(), "local/test-model");
+    assert!(client.supports_image_input("local/test-model").unwrap());
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let messages = vec![
         ContextMessage::system("system prompt"),
@@ -153,7 +155,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     let reply = client
         .stream_turn(
             ModelSelection {
-                model: "chat".to_string(),
+                model: "local/test-model".to_string(),
                 reasoning: Some("Low".to_string()),
             },
             &messages,
@@ -242,13 +244,13 @@ async fn streamed_function_call_waits_for_complete_output_item_without_arguments
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
     );
     let (endpoint, _request_rx) = one_response_server(response).await;
-    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let reply = client
         .stream_turn(
             ModelSelection {
-                model: "chat".to_string(),
+                model: "local/test-model".to_string(),
                 reasoning: None,
             },
             &[
@@ -284,11 +286,11 @@ async fn summary_uses_non_streaming_request_without_tools() {
         body.len()
     );
     let (endpoint, request_rx) = one_response_server(response).await;
-    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
     let reply = client
         .summarize(
             ModelSelection {
-                model: "chat".to_string(),
+                model: "local/test-model".to_string(),
                 reasoning: None,
             },
             CompactionView {
@@ -325,11 +327,11 @@ async fn completion_uses_non_streaming_request_without_tools() {
         body.len()
     );
     let (endpoint, request_rx) = one_response_server(response).await;
-    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
     let reply = client
         .complete(
             ModelSelection {
-                model: "chat".to_string(),
+                model: "local/test-model".to_string(),
                 reasoning: None,
             },
             vec![
@@ -368,11 +370,11 @@ async fn responses_always_uses_max_output_tokens() {
         body.len()
     );
     let (endpoint, request_rx) = one_response_server(response).await;
-    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
     client
         .complete(
             ModelSelection {
-                model: "chat".to_string(),
+                model: "local/test-model".to_string(),
                 reasoning: None,
             },
             vec![
@@ -400,7 +402,7 @@ async fn cancellation_interrupts_an_in_flight_request() {
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
     let client =
-        ConfiguredModelClient::from_yaml(&catalog(&format!("http://{address}")), agent()).unwrap();
+        ConfiguredModelClient::from_yaml(catalog(), &agent(&format!("http://{address}"))).unwrap();
     let cancellation = CancellationToken::new();
     let cancel = cancellation.clone();
     tokio::spawn(async move {
@@ -415,7 +417,7 @@ async fn cancellation_interrupts_an_in_flight_request() {
     let error = client
         .stream_turn(
             ModelSelection {
-                model: "chat".to_string(),
+                model: "local/test-model".to_string(),
                 reasoning: None,
             },
             &messages,
@@ -429,16 +431,15 @@ async fn cancellation_interrupts_an_in_flight_request() {
 }
 
 #[test]
-fn config_rejects_reserved_body_overrides() {
+fn config_rejects_reserved_extra_body_overrides() {
     let invalid = r#"
-providers:
+families:
   local:
-    endpoint: http://localhost:1/responses
     models:
       test:
         contextWindowTokens: 100000
         maxOutputTokens: 4096
-        body:
+        extraBody:
           input: []
 "#;
     let error = ModelCatalog::from_yaml(invalid).unwrap_err();
@@ -446,326 +447,222 @@ providers:
 }
 
 #[test]
-fn builtin_catalog_resolves_two_models_through_one_shared_provider() {
+fn official_provider_expands_the_complete_family() {
     let catalog = ModelCatalog::builtin().unwrap();
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelName: deepseek-v4-pro
+default:
+  model: deepseek/deepseek-v4-pro
+  reasoning: High
+compactionTriggerRatio: 0.5
 providers:
   deepseek:
-    type: deepseek
-models:
-  - modelName: deepseek-v4-pro
-    provider: deepseek
-    modelId: deepseek-v4-pro
-  - modelName: deepseek-v4-flash
-    provider: deepseek
-    modelId: deepseek-v4-flash
+    apiKeyEnv: DEEPSEEK_API_KEY
 "#,
     )
     .unwrap();
     let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
 
     assert_eq!(resolved.providers.len(), 1);
+    assert_eq!(
+        resolved.providers["deepseek"].base_url,
+        "https://api.deepseek.com"
+    );
     assert_eq!(resolved.models.len(), 2);
-    let model = &resolved.models["deepseek-v4-pro"];
-    assert_eq!(model.context_window_tokens, 1_000_000);
-    assert_eq!(model.max_output_tokens, 384_000);
+    assert_eq!(resolved.default_model, "deepseek/deepseek-v4-pro");
+    assert_eq!(resolved.default_reasoning.as_deref(), Some("High"));
+    let model = &resolved.models["deepseek/deepseek-v4-pro"];
+    assert_eq!(model.model_name, "deepseek-v4-pro");
     assert_eq!(model.max_input_tokens().unwrap(), 616_000);
+    assert_eq!(model.compaction_trigger_ratio, 0.5);
+}
+
+#[test]
+fn custom_provider_maps_display_names_and_multiple_families() {
+    let catalog = ModelCatalog::builtin().unwrap();
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: newapi/ds-v4-pro
+providers:
+  newapi:
+    baseUrl: https://gateway.example.com/v1
+    apiKeyEnv: NEW_API_KEY
+    models:
+      "5.6 Terra":
+        modelId: gpt-5.6-terra
+        profile: openai/gpt-5.6-terra
+      "Grok 4.6":
+        modelId: grok-4.6
+        profile: grok/grok-4.6
+      "DeepSeek V4 Pro":
+        modelId: ds-v4-pro
+        profile: deepseek/deepseek-v4-pro
+"#,
+    )
+    .unwrap();
+    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
+
+    assert_eq!(resolved.providers.len(), 1);
+    assert_eq!(resolved.models.len(), 3);
+    assert_eq!(
+        resolved.models["newapi/ds-v4-pro"].model_name,
+        "DeepSeek V4 Pro"
+    );
+    assert_eq!(resolved.models["newapi/ds-v4-pro"].model_id, "ds-v4-pro");
+    assert_eq!(
+        resolved.models["newapi/gpt-5.6-terra"].context_owner_id(),
+        "newapi/openai"
+    );
+    assert_eq!(
+        resolved.models["newapi/grok-4.6"].context_owner_id(),
+        "newapi/grok"
+    );
 
     let client = ConfiguredModelClient::new(&catalog, &agent).unwrap();
-    let limits = client.model_limits("deepseek-v4-pro").unwrap();
-    assert_eq!(limits.max_input_tokens, 616_000);
-    assert_eq!(limits.compact_trigger_tokens, 308_000);
-    client
-        .validate_selection(&ModelSelection {
-            model: "deepseek-v4-flash".to_string(),
-            reasoning: Some("High".to_string()),
-        })
-        .unwrap();
+    assert_eq!(
+        client.context_owner_id("newapi/gpt-5.6-terra").unwrap(),
+        "newapi/openai"
+    );
+    assert_eq!(
+        client.context_owner_id("newapi/grok-4.6").unwrap(),
+        "newapi/grok"
+    );
+    assert_eq!(client.provider_id("newapi/grok-4.6").unwrap(), "newapi");
 }
 
 #[test]
-fn resolved_models_and_reasoning_preserve_config_order() {
-    let catalog = ModelCatalog::from_yaml(
+fn explicit_official_models_form_an_allowlist_and_infer_profiles() {
+    let catalog = ModelCatalog::builtin().unwrap();
+    let agent = AgentModelConfig::from_yaml(
         r#"
+default:
+  model: openai/gpt-5.6-terra
 providers:
-  local:
-    endpoint: https://example.com/v1/responses
+  openai:
+    baseUrl: https://compatible.example.com/v1
     models:
-      test-model:
-        contextWindowTokens: 100000
-        maxOutputTokens: 4096
-        reasoning:
-          max:
-            reasoning:
-              effort: max
-          auto: {}
-          nonthink:
-            reasoning:
-              effort: none
-"#,
-    )
-    .unwrap();
-    let agent = AgentModelConfig::from_yaml(
-        r#"
-defaultModelName: model-z
-providers:
-  local:
-    type: local
-models:
-  - modelName: model-z
-    provider: local
-    modelId: test-model
-  - modelName: model-a
-    provider: local
-    modelId: test-model
+      "5.6 Terra":
+        modelId: gpt-5.6-terra
+        hostedTools: []
 "#,
     )
     .unwrap();
     let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
 
-    let model_ids: Vec<&str> = resolved.models.keys().map(String::as_str).collect();
-    assert_eq!(model_ids, ["model-z", "model-a"]);
-
-    let reasoning: Vec<&str> = resolved.models["model-z"]
-        .reasoning
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(reasoning, ["max", "auto", "nonthink"]);
+    assert_eq!(resolved.models.len(), 1);
+    let model = &resolved.models["openai/gpt-5.6-terra"];
+    assert_eq!(model.model_name, "5.6 Terra");
+    assert!(model.hosted_tools.is_empty());
+    assert_eq!(
+        resolved.providers["openai"].base_url,
+        "https://compatible.example.com/v1"
+    );
 }
 
 #[test]
-fn builtin_openai_provider_exposes_verified_model_capabilities() {
-    let catalog = ModelCatalog::builtin().unwrap();
-    let openai = &catalog.providers["openai"];
-    assert_eq!(openai.endpoint, "https://api.openai.com/v1/responses");
-
-    for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4"] {
-        let model = &openai.models[id];
-        assert_eq!(model.context_window_tokens, 1_050_000, "{id}");
-        assert_eq!(model.max_output_tokens, 128_000, "{id}");
-        assert!(model.capabilities.image_input, "{id}");
-        assert!(model.capabilities.tool_calls, "{id}");
-        assert_eq!(model.default_reasoning_mode, "Medium", "{id}");
-        for (mode, effort) in [
-            ("Low", "low"),
-            ("Medium", "medium"),
-            ("High", "high"),
-            ("XHigh", "xhigh"),
-        ] {
-            assert_eq!(model.reasoning[mode]["reasoning"]["effort"], effort, "{id}");
-        }
-    }
-
-    for id in ["gpt-5.6-sol", "gpt-5.6-terra"] {
-        for (mode, effort) in [
-            ("Low", "low"),
-            ("Medium", "medium"),
-            ("High", "high"),
-            ("XHigh", "xhigh"),
-            ("Max", "max"),
-        ] {
-            let reasoning = &openai.models[id].reasoning[mode]["reasoning"];
-            assert_eq!(reasoning["effort"], effort, "{id}/{effort}");
-            assert_eq!(reasoning["summary"], "auto", "{id}/{effort}");
-        }
-    }
-    for id in ["gpt-5.5", "gpt-5.4"] {
-        assert!(!openai.models[id].reasoning.contains_key("Max"), "{id}");
-    }
-}
-
-#[test]
-fn builtin_grok_provider_exposes_responses_models_and_reasoning() {
-    let catalog = ModelCatalog::builtin().unwrap();
-    let grok = &catalog.providers["grok"];
-    assert_eq!(grok.endpoint, "https://api.x.ai/v1/responses");
-
-    for (id, modes) in [
-        (
-            "grok-4.5",
-            &[("Low", "low"), ("Medium", "medium"), ("High", "high")][..],
-        ),
-        (
-            "grok-4.6",
-            &[
-                ("Low", "low"),
-                ("Medium", "medium"),
-                ("High", "high"),
-                ("XHigh", "xhigh"),
-            ][..],
-        ),
+fn custom_provider_requires_base_url_models_and_profiles() {
+    for source in [
+        r#"
+default:
+  model: custom/test
+providers:
+  custom:
+    models:
+      Test:
+        modelId: test
+        profile: openai/gpt-5.6-terra
+"#,
+        r#"
+default:
+  model: custom/test
+providers:
+  custom:
+    baseUrl: https://example.com/v1
+"#,
+        r#"
+default:
+  model: custom/test
+providers:
+  custom:
+    baseUrl: https://example.com/v1
+    models:
+      Test:
+        modelId: test
+"#,
     ] {
-        let model = &grok.models[id];
-        assert_eq!(model.context_window_tokens, 500_000, "{id}");
-        assert_eq!(model.max_output_tokens, 128_000, "{id}");
-        assert!(model.capabilities.image_input, "{id}");
-        assert!(model.capabilities.tool_calls, "{id}");
-        assert_eq!(
-            model.hosted_tools,
-            [json!({"type":"web_search"}), json!({"type":"x_search"})],
-            "{id}"
-        );
-        assert_eq!(model.default_reasoning_mode, "High", "{id}");
-        for (mode, effort) in modes {
-            let reasoning = &model.reasoning[*mode]["reasoning"];
-            assert_eq!(reasoning["effort"], *effort, "{id}/{mode}");
-            assert_eq!(reasoning["summary"], "auto", "{id}/{mode}");
-        }
+        let agent = AgentModelConfig::from_yaml(source).unwrap();
+        assert!(ModelClientConfig::resolve(&ModelCatalog::builtin().unwrap(), &agent).is_err());
     }
 }
 
 #[test]
-fn openai_provider_instance_only_overrides_endpoint_and_credentials() {
-    let catalog = ModelCatalog::builtin().unwrap();
+fn duplicate_upstream_model_ids_are_rejected() {
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelName: gpt-5.6-terra
+default:
+  model: custom/same
 providers:
-  relay:
-    type: openai
-    baseUrl: https://relay.example.com/v1/responses
-    apiKeyEnv: RELAY_API_KEY
-models:
-  - modelName: gpt-5.6-terra
-    provider: relay
-    modelId: gpt-5.6-terra
+  custom:
+    baseUrl: https://example.com/v1
+    models:
+      First:
+        modelId: same
+        profile: openai/gpt-5.6-terra
+      Second:
+        modelId: same
+        profile: grok/grok-4.6
 "#,
     )
     .unwrap();
-    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
-
-    let provider = &resolved.providers["relay"];
-    assert_eq!(provider.endpoint, "https://relay.example.com/v1/responses");
-    assert_eq!(provider.api_key_env.as_deref(), Some("RELAY_API_KEY"));
-    let model = &resolved.models["gpt-5.6-terra"];
-    assert!(model.capabilities.image_input);
-    assert_eq!(model.default_reasoning_mode, "Medium");
+    let error = ModelClientConfig::resolve(&ModelCatalog::builtin().unwrap(), &agent).unwrap_err();
+    assert!(error.to_string().contains("duplicate modelId same"));
 }
 
 #[test]
-fn custom_provider_directory_adds_one_provider_per_yaml_file() {
+fn custom_model_directory_adds_a_family() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
-        directory.path().join("newapi.yaml"),
+        directory.path().join("minimax.yaml"),
         r#"
-protocol: open_ai_responses
-endpoint: https://gateway.example.com/v1/responses
 models:
-  chat:
-    contextWindowTokens: 100000
-    maxOutputTokens: 4096
+  minimax-m2.5:
+    contextWindowTokens: 200000
+    maxOutputTokens: 32000
     capabilities:
-      imageInput: true
       toolCalls: true
-    defaultReasoningMode: medium
+    defaultReasoningMode: High
     reasoning:
-      medium:
+      High:
         reasoning:
-          effort: medium
+          effort: high
 "#,
     )
     .unwrap();
 
     let mut catalog = ModelCatalog::builtin().unwrap();
-    catalog.merge_provider_directory(directory.path()).unwrap();
-    assert!(catalog.providers.contains_key("newapi"));
+    catalog.merge_model_directory(directory.path()).unwrap();
+    assert!(catalog.families.contains_key("minimax"));
 
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelName: chat
+default:
+  model: gateway/minimax-m2.5
 providers:
-  relay:
-    type: newapi
-models:
-  - modelName: chat
-    provider: relay
-    modelId: chat
+  gateway:
+    baseUrl: https://gateway.example.com/v1
+    models:
+      "MiniMax M2.5":
+        modelId: minimax-m2.5
+        profile: minimax/minimax-m2.5
 "#,
     )
     .unwrap();
     let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
     assert_eq!(
-        resolved.providers["relay"].endpoint,
-        "https://gateway.example.com/v1/responses"
+        resolved.models["gateway/minimax-m2.5"].model_name,
+        "MiniMax M2.5"
     );
-}
-
-#[test]
-fn custom_provider_directory_rejects_builtin_name_collisions() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(
-        directory.path().join("openai.yaml"),
-        "endpoint: https://example.com/v1/responses\nmodels: {}\n",
-    )
-    .unwrap();
-    let error = ModelCatalog::builtin()
-        .unwrap()
-        .merge_provider_directory(directory.path())
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("conflicts with a built-in provider")
-    );
-}
-
-#[test]
-fn profile_overrides_only_base_url_credentials_and_model_limits() {
-    let catalog = ModelCatalog::builtin().unwrap();
-    let agent = AgentModelConfig::from_yaml(
-        r#"
-defaultModelName: custom-pro
-providers:
-  deepseek:
-    type: deepseek
-    baseUrl: https://gateway.example.com/responses
-    apiKeyEnv: CUSTOM_DEEPSEEK_KEY
-models:
-  - modelName: custom-pro
-    provider: deepseek
-    modelId: deepseek-v4-pro
-    contextWindowTokens: 800000
-    maxOutputTokens: 200000
-    compactThreshold: 0.6
-    defaultReasoningMode: Max
-"#,
-    )
-    .unwrap();
-    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
-
-    let provider = &resolved.providers["deepseek"];
-    assert_eq!(provider.endpoint, "https://gateway.example.com/responses");
-    assert_eq!(provider.api_key_env.as_deref(), Some("CUSTOM_DEEPSEEK_KEY"));
-    assert_eq!(provider.request.request_timeout_ms, 300_000);
-
-    let model = &resolved.models["custom-pro"];
-    assert_eq!(model.context_window_tokens, 800_000);
-    assert_eq!(model.max_output_tokens, 200_000);
-    assert_eq!(model.max_input_tokens().unwrap(), 600_000);
-    assert_eq!(model.compact_threshold, 0.6);
-    assert_eq!(model.default_reasoning_mode, "Max");
-}
-
-#[test]
-fn reasoning_cannot_override_the_model_output_limit() {
-    let invalid = r#"
-providers:
-  local:
-    endpoint: http://localhost:1/responses
-    models:
-      test:
-        contextWindowTokens: 100000
-        maxOutputTokens: 4096
-        reasoning:
-          high:
-            max_tokens: 99999
-"#;
-
-    let error = ModelCatalog::from_yaml(invalid).unwrap_err();
-    assert!(error.to_string().contains("reserved field max_tokens"));
 }
 
 #[tokio::test]
@@ -782,7 +679,7 @@ async fn interrupted_stream_reports_stream_interrupted_error() {
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
     );
     let (endpoint, _request_rx) = one_response_server(response).await;
-    let client = ConfiguredModelClient::from_yaml(&catalog(&endpoint), agent()).unwrap();
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let messages = vec![
         ContextMessage::system("system"),
@@ -792,7 +689,7 @@ async fn interrupted_stream_reports_stream_interrupted_error() {
     let error = client
         .stream_turn(
             ModelSelection {
-                model: "chat".to_string(),
+                model: "local/test-model".to_string(),
                 reasoning: None,
             },
             &messages,

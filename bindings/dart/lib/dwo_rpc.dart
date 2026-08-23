@@ -317,14 +317,62 @@ final class DwoRpcClient {
 
   Future<JsonObject> models() => call('model.list');
 
-  Future<JsonObject> setDefaultModel(String name, {String? requestId}) =>
-      call('model.set_default', params: {'name': name}, requestId: requestId);
+  Future<JsonObject> setDefaultModel(
+    String model, {
+    String? reasoning,
+    String? requestId,
+  }) =>
+      call(
+        'model.set_default',
+        params: {'model': model, if (reasoning != null) 'reasoning': reasoning},
+        requestId: requestId,
+      );
 
-  Future<JsonObject> upsertModel(JsonObject model, {String? requestId}) =>
-      call('model.upsert', params: {'model': model}, requestId: requestId);
+  Future<JsonObject> upsertModel(
+    String provider,
+    String name,
+    JsonObject model, {
+    String? requestId,
+  }) =>
+      call(
+        'model.upsert',
+        params: {'provider': provider, 'name': name, 'model': model},
+        requestId: requestId,
+      );
 
-  Future<JsonObject> removeModel(String name, {String? requestId}) =>
-      call('model.remove', params: {'name': name}, requestId: requestId);
+  Future<JsonObject> removeModel(
+    String provider,
+    String modelId, {
+    String? requestId,
+  }) =>
+      call(
+        'model.remove',
+        params: {'provider': provider, 'modelId': modelId},
+        requestId: requestId,
+      );
+
+  Future<JsonObject> modelCatalog() => call('model.catalog.list');
+
+  Future<JsonObject> upsertModelFamily(
+    String family,
+    JsonObject spec, {
+    String? requestId,
+  }) =>
+      call(
+        'model.catalog.upsert',
+        params: {'family': family, 'spec': spec},
+        requestId: requestId,
+      );
+
+  Future<JsonObject> removeModelFamily(
+    String family, {
+    String? requestId,
+  }) =>
+      call(
+        'model.catalog.remove',
+        params: {'family': family},
+        requestId: requestId,
+      );
 
   Future<JsonObject> providers() => call('provider.list');
 

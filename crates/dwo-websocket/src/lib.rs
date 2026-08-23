@@ -418,14 +418,10 @@ websocket:
   bind: 127.0.0.1
   port: {port}
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: deepseek/deepseek-v4-pro
   providers:
     deepseek:
-      type: deepseek
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
 "#
             ),
         )

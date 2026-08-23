@@ -1223,7 +1223,7 @@ fn build_session_config_options(snapshot: SessionOptions) -> Result<Vec<SessionC
         };
         provider_options[index].push(SessionConfigSelectOption::new(
             option.id.clone(),
-            option.id.clone(),
+            option.name.clone(),
         ));
     }
     let model_options: SessionConfigSelectOptions = if provider_order.len() > 1 {
@@ -2536,6 +2536,7 @@ mod tests {
             },
             models: vec![ipc_schema::SessionModelOption {
                 id: "deepseek-v4-flash".to_string(),
+                name: "DeepSeek V4 Flash".to_string(),
                 provider: "deepseek".to_string(),
                 reasoning: vec!["Low".to_string(), "High".to_string(), "Max".to_string()],
                 default_reasoning: "High".to_string(),
@@ -2569,12 +2570,14 @@ mod tests {
             models: vec![
                 ipc_schema::SessionModelOption {
                     id: "deepseek-v4-flash".to_string(),
+                    name: "DeepSeek V4 Flash".to_string(),
                     provider: "deepseek".to_string(),
                     reasoning: vec!["high".to_string(), "max".to_string()],
                     default_reasoning: "high".to_string(),
                 },
                 ipc_schema::SessionModelOption {
                     id: "qwen3.8-max".to_string(),
+                    name: "Qwen 3.8 Max".to_string(),
                     provider: "tokenrhythm".to_string(),
                     reasoning: vec!["high".to_string()],
                     default_reasoning: "high".to_string(),

@@ -1,4 +1,4 @@
-# Dwo Management RPC 契约
+# Dwo Management RPC v3 契约
 
 管理协议使用 JSON-RPC 2.0 envelope。IPC 请求必须声明 `route: "dwo"`；远程客户端连接
 `/dwo?token=<management-token>` 后发送同样的 envelope。聊天仍走 ACP v2，不通过本文件中的
@@ -25,7 +25,8 @@ Flutter/Dart 的 transport-neutral binding 位于 `bindings/dart/lib/dwo_rpc.dar
 `session.watch` 不属于 Dwo 管理入口。
 
 管理事件可通过 `event.read` 按 cursor 读取，或使用 `event.subscribe` 在专用 IPC 连接/
-现有 WebSocket 连接上接收 replay 和 live event。当前事件包括 `config.changed`、
+现有 WebSocket 连接上接收 replay 和 live event。默认不传 `event` 时发送全部管理事件；
+传入事件名后，IPC/WebSocket 会同时过滤 replay 和 live。当前事件包括 `config.changed`、
 `config.apply_failed`、`mcp.status`、`automation.changed` 和 `automation.run`；事件只由
 Host 发布，客户端断开不会停止 Host。当前事件还包括 `channel.status` 和 `skill.changed`。
 
@@ -36,14 +37,16 @@ Host 发布，客户端断开不会停止 Host。当前事件还包括 `channel.
 | `config.snapshot` | Host 配置摘要、默认模型、模型选项、全局 `maxModelSteps` |
 | `config.update` | 修改 logging、external skill dirs、全局 `maxModelSteps` |
 | `model.list` | 模型、Provider 和默认模型配置；credential 已脱敏 |
-| `model.set_default` | 修改 Host 默认模型 |
-| `model.upsert` / `model.remove` | 新增、替换或删除模型 alias |
+| `model.set_default` | 以 `{model: "provider/modelId", reasoning?}` 修改 Host 默认选择 |
+| `model.upsert` | 以 `{provider, name, model}` 新增或替换 Provider 内的显示名模型映射 |
+| `model.remove` | 以 `{provider, modelId}` 删除显式模型映射 |
 | `provider.list` | Provider 配置与 credential 是否存在，不回显 key |
 | `provider.upsert` / `provider.remove` | 新增、替换或删除 Provider |
-| `provider.catalog.list` | 查看内置和 `resource/providers/*.yaml` Provider 类型 |
-| `provider.catalog.upsert` / `provider.catalog.remove` | 校验后写入或删除自定义 Provider 类型 |
+| `model.catalog.list` | 查看内置和 `resource/models/*.yaml` Model List family |
+| `model.catalog.upsert` / `model.catalog.remove` | 校验后写入或删除 Model List family 扩展 |
 
-Model/Provider 写入会先解析和验证完整 Host 配置，成功后原子替换 `profile.yaml`，再让
+Model/Provider 写入会先合并完整 Model List 并解析整个 Host 配置，成功后原子替换
+`profile.yaml`，再让
 AgentService、Automation 和 Channel runtime 一次性应用。`maxModelSteps` 只存在于 Host，
 每个 turn 启动时读取，不进入 Session metadata。
 

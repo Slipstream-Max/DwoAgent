@@ -123,7 +123,7 @@ fn handle_http_request(
         "Hello from mock LLM with a long response to inflate tokens."
     };
 
-    // Report high token usage: with compactThreshold=0.0001 and
+    // Report high token usage: with compactionTriggerRatio=0.0001 and
     // context_window=1024000, trigger = 102 tokens. Report 120.
     let usage = json!({"prompt_tokens": 80, "completion_tokens": 40, "total_tokens": 120});
 
@@ -182,15 +182,17 @@ maxRunningTurn: 5
 policyMode: full_access
 sessionStoreDir: .sessions
 model:
-  defaultModelId: mock-model
-  models:
-    - modelName: mock-model
-      provider: deepseek
-      modelId: deepseek-v4-pro
+  default:
+    model: mock/deepseek-v4-pro
+  compactionTriggerRatio: 0.0001
+  providers:
+    mock:
       apiKey: test-key
-      apiBase: http://127.0.0.1:{llm_port}/v1
-      defaultReasoningMode: auto
-      compactThreshold: 0.0001
+      baseUrl: http://127.0.0.1:{llm_port}/v1
+      models:
+        mock-model:
+          modelId: deepseek-v4-pro
+          profile: deepseek/deepseek-v4-pro
 "
         ),
     )

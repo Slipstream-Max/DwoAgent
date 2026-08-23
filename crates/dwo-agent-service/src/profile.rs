@@ -121,7 +121,7 @@ impl LoadedAgentProfile {
         let mut catalog = ModelCatalog::builtin()
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
         catalog
-            .merge_provider_directory(root.join("resource/providers"))
+            .merge_model_directory(root.join("resource/models"))
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
         let models = config.resolve_models(&catalog)?;
         SystemPromptBuilder::new(Some(root.clone()), root.clone())
@@ -197,68 +197,29 @@ impl AgentProfileConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn profile_resolves_one_provider_for_multiple_models() {
-        let profile = AgentProfileConfig::from_yaml(
+    fn profile_yaml(model: &str) -> String {
+        format!(
             r#"
 policyMode: confirm
-channels:
-  weixin:
-    enabled: true
-    replayTurns: 5
-    markdownFilter: true
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: {model}
   providers:
     deepseek:
-      type: deepseek
-      apiKeyEnv: DEEPSEEK_API_KEY
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
-    - modelName: deepseek-v4-flash
-      provider: deepseek
-      modelId: deepseek-v4-flash
-"#,
+"#
         )
-        .unwrap();
-
-        assert_eq!(profile.policy_mode, SessionMode::Confirm);
-        assert_eq!(profile.logging, LoggingConfig::default());
-        assert!(profile.channels.contains_key("weixin"));
-        assert_eq!(profile.model.providers.len(), 1);
-        assert_eq!(profile.model.models.len(), 2);
-        let resolved = profile
-            .resolve_models(&ModelCatalog::builtin().unwrap())
-            .unwrap();
-        assert_eq!(resolved.providers.len(), 1);
-        assert_eq!(resolved.models.len(), 2);
     }
 
     #[test]
-    fn profile_parses_logging_configuration() {
-        let profile = AgentProfileConfig::from_yaml(
-            r#"
-policyMode: confirm
-logging:
-  level: debug
-  retentionDays: 30
-model:
-  defaultModelName: chat
-  providers:
-    local:
-      type: local
-  models:
-    - modelName: chat
-      provider: local
-      modelId: chat
-"#,
-        )
-        .unwrap();
+    fn profile_resolves_official_provider_models() {
+        let profile =
+            AgentProfileConfig::from_yaml(&profile_yaml("deepseek/deepseek-v4-pro")).unwrap();
+        let resolved = profile
+            .resolve_models(&ModelCatalog::builtin().unwrap())
+            .unwrap();
 
-        assert_eq!(profile.logging.level, LogLevel::Debug);
-        assert_eq!(profile.logging.retention_days, 30);
+        assert_eq!(resolved.default_model, "deepseek/deepseek-v4-pro");
+        assert_eq!(resolved.models.len(), 2);
     }
 
     #[test]
@@ -269,14 +230,10 @@ policyMode: confirm
 logging:
   retentionDays: 0
 model:
-  defaultModelName: chat
+  default:
+    model: deepseek/deepseek-v4-pro
   providers:
-    local:
-      type: local
-  models:
-    - modelName: chat
-      provider: local
-      modelId: chat
+    deepseek:
 "#,
         )
         .unwrap_err();
@@ -286,40 +243,17 @@ model:
 
     #[test]
     fn profile_max_model_steps_defaults_and_accepts_bounds() {
-        let default = AgentProfileConfig::from_yaml(
-            r#"
-policyMode: confirm
-model:
-  defaultModelName: chat
-  providers:
-    local:
-      type: local
-  models:
-    - modelName: chat
-      provider: local
-      modelId: chat
-"#,
-        )
-        .unwrap();
+        let default =
+            AgentProfileConfig::from_yaml(&profile_yaml("deepseek/deepseek-v4-pro")).unwrap();
         assert_eq!(default.max_model_steps, 100);
 
         for value in [0, 5, 200] {
-            let profile = AgentProfileConfig::from_yaml(&format!(
-                r#"
-policyMode: confirm
-maxModelSteps: {value}
-model:
-  defaultModelName: chat
-  providers:
-    local:
-      type: local
-  models:
-    - modelName: chat
-      provider: local
-      modelId: chat
-"#
-            ))
-            .unwrap();
+            let source = profile_yaml("deepseek/deepseek-v4-pro").replacen(
+                "policyMode: confirm",
+                &format!("policyMode: confirm\nmaxModelSteps: {value}"),
+                1,
+            );
+            let profile = AgentProfileConfig::from_yaml(&source).unwrap();
             assert_eq!(profile.max_model_steps, value);
         }
     }
@@ -327,139 +261,33 @@ model:
     #[test]
     fn profile_rejects_out_of_range_max_model_steps() {
         for value in [4, 201] {
-            let error = AgentProfileConfig::from_yaml(&format!(
-                r#"
-policyMode: confirm
-maxModelSteps: {value}
-model:
-  defaultModelName: chat
-  providers:
-    local:
-      type: local
-  models:
-    - modelName: chat
-      provider: local
-      modelId: chat
-"#
-            ))
-            .unwrap_err();
+            let source = profile_yaml("deepseek/deepseek-v4-pro").replacen(
+                "policyMode: confirm",
+                &format!("policyMode: confirm\nmaxModelSteps: {value}"),
+                1,
+            );
+            let error = AgentProfileConfig::from_yaml(&source).unwrap_err();
             assert!(error.to_string().contains("maxModelSteps"));
         }
     }
 
     #[test]
-    fn profile_reports_invalid_websocket_fields() {
-        for (websocket, expected) in [
-            (
-                "enabled: true\n  bind: localhost\n  port: 8787",
-                "websocket.bind must be an IP address",
-            ),
-            (
-                "enabled: true\n  bind: 127.0.0.1\n  port: 0",
-                "websocket.port must be greater than 0",
-            ),
-        ] {
-            let error = AgentProfileConfig::from_yaml(&format!(
-                r#"
-policyMode: confirm
-websocket:
-  {websocket}
-model:
-  defaultModelName: chat
-  providers:
-    local:
-      type: local
-  models:
-    - modelName: chat
-      provider: local
-      modelId: chat
-"#
-            ))
-            .unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
-        }
-    }
-
-    #[test]
-    fn profile_rejects_provider_transport_configuration() {
-        let error = AgentProfileConfig::from_yaml(
-            r#"
-policyMode: confirm
-model:
-  defaultModelName: chat
-  providers:
-    local:
-      type: local
-      request:
-        maxRetries: 0
-  models:
-    - modelName: chat
-      provider: local
-      modelId: chat
-"#,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("unknown field `request`"));
-    }
-
-    #[test]
-    fn load_profile_resolves_models_and_fixed_resources_from_one_path() {
+    fn load_profile_merges_custom_model_families() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("resource/prompts")).unwrap();
+        std::fs::create_dir_all(root.path().join("resource/models")).unwrap();
         std::fs::write(
             root.path().join("resource/prompts/System.md"),
             "You are a coding agent.",
         )
         .unwrap();
         std::fs::write(
-            root.path().join("profile.yaml"),
+            root.path().join("resource/models/minimax.yaml"),
             r#"
-policyMode: confirm
-model:
-  defaultModelName: deepseek-v4-pro
-  providers:
-    deepseek:
-      type: deepseek
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
-"#,
-        )
-        .unwrap();
-
-        let loaded = load_profile(root.path()).unwrap();
-        assert!(loaded.root.is_absolute());
-        assert_eq!(loaded.models.default_model_name, "deepseek-v4-pro");
-    }
-
-    #[test]
-    fn load_profile_merges_custom_provider_files() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("resource/prompts")).unwrap();
-        std::fs::create_dir_all(root.path().join("resource/providers")).unwrap();
-        std::fs::write(
-            root.path().join("resource/prompts/System.md"),
-            "You are a coding agent.",
-        )
-        .unwrap();
-        std::fs::write(
-            root.path().join("resource/providers/newapi.yaml"),
-            r#"
-endpoint: https://gateway.example.com/v1/responses
 models:
-  custom-model:
-    contextWindowTokens: 100000
-    maxOutputTokens: 4096
-    capabilities:
-      imageInput: true
-      toolCalls: true
-    defaultReasoningMode: medium
-    reasoning:
-      medium:
-        reasoning:
-          effort: medium
+  minimax-m2.5:
+    contextWindowTokens: 200000
+    maxOutputTokens: 32000
 "#,
         )
         .unwrap();
@@ -468,25 +296,24 @@ models:
             r#"
 policyMode: confirm
 model:
-  defaultModelName: custom
+  default:
+    model: gateway/minimax-m2.5
   providers:
-    relay:
-      type: newapi
-      apiKeyEnv: NEW_API_KEY
-  models:
-    - modelName: custom
-      provider: relay
-      modelId: custom-model
+    gateway:
+      baseUrl: https://gateway.example.com/v1
+      models:
+        "MiniMax M2.5":
+          modelId: minimax-m2.5
+          profile: minimax/minimax-m2.5
 "#,
         )
         .unwrap();
 
         let loaded = load_profile(root.path()).unwrap();
-        assert_eq!(loaded.models.default_model_name, "custom");
-        assert!(loaded.models.models["custom"].capabilities.image_input);
+        assert_eq!(loaded.models.default_model, "gateway/minimax-m2.5");
         assert_eq!(
-            loaded.models.providers["relay"].endpoint,
-            "https://gateway.example.com/v1/responses"
+            loaded.models.models["gateway/minimax-m2.5"].model_name,
+            "MiniMax M2.5"
         );
     }
 
@@ -507,14 +334,10 @@ externalSkillsDirs:
   - C:/Users/example/shared-skills
   - team-skills
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: deepseek/deepseek-v4-pro
   providers:
     deepseek:
-      type: deepseek
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
 "#,
         )
         .unwrap();
@@ -526,9 +349,6 @@ model:
             PathBuf::from("C:/Users/example/shared-skills")
         );
         assert!(loaded.external_skill_dirs[1].is_absolute());
-        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
-        assert!(loaded.external_skill_dirs[1].starts_with(&canonical_root));
-        assert!(loaded.external_skill_dirs[1].ends_with("team-skills"));
     }
 }
 

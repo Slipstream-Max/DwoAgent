@@ -731,7 +731,7 @@ fn normalize_context_for_step(turn: &mut RunTurn, step: &ModelStep) -> anyhow::R
             .usage
             .last_model
             .as_deref()
-            .map(|model| turn.model.provider_id(model))
+            .map(|model| turn.model.context_owner_id(model))
             .transpose()?
     } else {
         None
@@ -940,7 +940,7 @@ fn current_selection(turn: &RunTurn) -> ModelSelection {
 fn current_model_step(turn: &RunTurn) -> Result<ModelStep, dwo_model_client::ModelClientError> {
     let selection = current_selection(turn);
     Ok(ModelStep {
-        provider: turn.model.provider_id(&selection.model)?,
+        provider: turn.model.context_owner_id(&selection.model)?,
         allow_image_input: turn.model.supports_image_input(&selection.model)?,
         selection,
     })

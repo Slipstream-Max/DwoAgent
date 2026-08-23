@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ModelConfig, ProviderConfig, ProviderProtocol};
+use crate::config::{ModelConfig, ProviderConfig};
 use crate::message::{
     StreamAccumulator, parse_response, provider_input, provider_tool_event_state, provider_tools,
     stream_tool_call,
@@ -26,10 +26,7 @@ pub struct BaseClient {
 
 impl BaseClient {
     pub fn new(provider: ProviderConfig) -> Result<Self, ModelClientError> {
-        if provider.protocol != ProviderProtocol::OpenAiResponses {
-            return Err(ModelClientError::config("unsupported provider protocol"));
-        }
-        let endpoint = provider.endpoint()?;
+        let endpoint = provider.responses_endpoint()?;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         for (name, value) in &provider.headers {
@@ -105,8 +102,8 @@ impl BaseClient {
         reasoning: Option<&str>,
         stream: bool,
     ) -> Result<Value, ModelClientError> {
-        let mut body = self.provider.body.clone();
-        merge_map(&mut body, &model.body);
+        let mut body = self.provider.extra_body.clone();
+        merge_map(&mut body, &model.extra_body);
         if let Some(temperature) = model.temperature {
             body.insert("temperature".to_string(), json!(temperature));
         }

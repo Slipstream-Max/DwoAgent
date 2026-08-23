@@ -1,136 +1,52 @@
 # dwo-model-client
 
-Provider-configured model transport for the rewrite.
+OpenAI Responses model transport with separate connection and model-profile identities.
 
 ```text
 ConfiguredModelClient
-|- model alias registry
-`- provider id -> BaseClient
-   |- atomic HTTP/SSE request and cancellation
-   |- OpenAI-compatible Responses input/output items
-   |- SSE text/reasoning/function/hosted-tool assembly
-   `- non-streaming response normalization
+|- provider id -> BaseClient (URL, key, headers, timeouts, HTTP pool)
+`- provider/modelId -> ModelConfig (family profile, limits, capabilities, reasoning)
 ```
 
-The public model boundary exposes model limits, image capability, and the model
-operations:
-
-```text
-model_limits(model_alias) -> context/output/input limits + compact trigger
-provider_id(model_alias) -> configured provider-instance id
-supports_image_input(model_alias) -> bool
-stream_turn(selection, messages, tools, event_sender, cancellation) -> ModelReply
-summarize(selection, compaction_view, cancellation)                  -> SummaryReply
-```
-
-User turns always request streaming output and may include tool schemas.
-Compaction summaries always use a non-streaming request and never include
-tools. Both paths resolve the session's model alias through the same model and
-provider configuration.
-
-The session runtime consults `supports_image_input` before accepting an image
-prompt. A model switch normalizes stored context immediately, permanently
-removing unsupported images. Provider message shaping still validates the
-capability as a final boundary check.
-
-The model context is one canonical item-first sequence. Each native Responses
-output item is persisted as its own ordered context entry and replayed verbatim.
-Reasoning and hosted-tool calls are owned by the configured provider instance;
-switching provider instances removes those private items while retaining
-visible messages and local function call/output pairs.
-
-## Configuration
-
-The built-in catalog is assembled from one file per provider under
-`resources/providers/`. Each file owns one provider's transport policy,
-headers, request fields, model capabilities, limits, and reasoning request
-parameters. The profile selects provider/model entries, supplies credentials,
-and may override a complete provider URL or model limits.
+The transport is fixed to OpenAI Responses. Provider configuration has no protocol or type.
+One provider can expose models from multiple families while sharing one `BaseClient`.
 
 ```yaml
-defaultModelName: deepseek-v4-pro
-providers:
-  deepseek:
-    type: deepseek
-    baseUrl: null
-    apiKeyEnv: DEEPSEEK_API_KEY
-models:
-  - modelName: deepseek-v4-pro
-    provider: deepseek
-    modelId: deepseek-v4-pro
-    contextWindowTokens: 1000000
-    maxOutputTokens: 384000
-    compactThreshold: 0.5
-    defaultReasoningMode: High
-  - modelName: deepseek-v4-flash
-    provider: deepseek
-    modelId: deepseek-v4-flash
-```
-
-One provider entry produces one shared `BaseClient`, so every model using that
-provider shares its API key, endpoint, headers, and HTTP pool.
-Only `baseUrl`, `apiKeyEnv`, and `apiKey` are profile-level provider settings;
-headers, timeouts, hosted tools, and provider request fields remain
-catalog-owned. Responses requests always use `max_output_tokens`.
-Catalog provider body, catalog model body, and the selected reasoning map are
-deep-merged in that order. Reasoning never changes the model output limit.
-
-The built-in `openai` preset uses the Responses transport. A NewAPI-compatible
-gateway can inherit it by overriding the complete endpoint:
-
-```yaml
-defaultModelName: gpt-5.6-terra
+default:
+  model: newapi/ds-v4-pro
+  reasoning: High
+compactionTriggerRatio: 0.8
 providers:
   newapi:
-    type: openai
-    baseUrl: https://gateway.example.com/v1/responses
+    baseUrl: https://gateway.example.com/v1
     apiKeyEnv: NEW_API_KEY
-models:
-  - modelName: gpt-5.6-terra
-    provider: newapi
-    modelId: gpt-5.6-terra
+    models:
+      "5.6 Terra":
+        modelId: gpt-5.6-terra
+        profile: openai/gpt-5.6-terra
+      "DeepSeek V4 Pro":
+        modelId: ds-v4-pro
+        profile: deepseek/deepseek-v4-pro
 ```
 
-Each catalog model may declare `hostedTools`. DeepSeek uses `web_search`; the
-OpenAI/NewAPI preset uses `web_search_preview`. Local function schemas are
-flattened to the Responses function-tool shape and appended to those hosted
-tools at request time.
+The map key is the display name. `modelId` is sent upstream and forms the stable selection
+`provider/modelId`. `profile` selects model metadata from the built-in catalog or
+`resource/models/<family>.yaml`.
 
-Only `function_call` items enter the local tool executor. Hosted calls such as
-`web_search_call` are retained in native output items and emitted as completed
-remote tool events. When a provider includes results on the item, the same
-event exposes them as the remote tool output.
+Official family names provide their base URL and full model list, so direct configuration only
+needs credentials:
 
-Profiles may add provider types as individual files under
-`resource/providers/`. The filename stem becomes the provider type, so
-`resource/providers/newapi.yaml` is selected with `type: newapi`. Each file has
-the same shape as a built-in provider file and contains one provider only.
-Custom provider names may not replace built-in names.
-
-The model input budget is derived rather than configured separately:
-
-```text
-max input = context window - max output
-compact trigger = max input * compact threshold
+```yaml
+default:
+  model: deepseek/deepseek-v4-pro
+providers:
+  deepseek:
+    apiKeyEnv: DEEPSEEK_API_KEY
 ```
 
-Context usage is estimated from the complete model request, including messages,
-tool calls, tool results, and tool schemas. Provider response usage is optional
-transport metadata and is not used for session context accounting.
-Transport-owned fields (`model`, `input`, `instructions`, `tools`, `stream`,
-and `max_output_tokens`) cannot be overridden by configuration.
+Provider-native reasoning and hosted-tool items are owned by `provider/family`, not just the
+connection. Switching families behind one gateway removes incompatible native items while
+retaining visible messages and local function call/results.
 
-Provider response structure errors fail the model step. Malformed individual
-tool arguments remain a raw string in the normalized tool call, allowing the
-tool executor to return a per-call parse error without discarding the rest of
-the model response.
-
-HTTP/provider failures are classified into context-length, authentication,
-rate-limit, invalid-request, provider-status, transport, invalid-response, and
-local protocol/validation errors.
-Every model request step gets five retries for transient failures, using
-1/2/4/8/16-second exponential backoff plus up to 25% jitter and honoring a
-longer provider `Retry-After` value. A stream attempt succeeds only after its
-terminal event; interrupted partial output is returned to the agent loop for
-transcript persistence before the same turn retries. Context-length errors use
-the separate compaction recovery path.
+See [docs/model-client.md](../../docs/model-client.md) for the complete schema, merge rules,
+request construction, retry behavior, and custom Model List format.

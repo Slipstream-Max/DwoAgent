@@ -88,6 +88,10 @@ impl ModelClient for ReloadableModelClient {
         self.current().provider_id(model)
     }
 
+    fn context_owner_id(&self, model: &str) -> Result<String, ModelClientError> {
+        self.current().context_owner_id(model)
+    }
+
     fn supports_image_input(&self, model: &str) -> Result<bool, ModelClientError> {
         self.current().supports_image_input(model)
     }

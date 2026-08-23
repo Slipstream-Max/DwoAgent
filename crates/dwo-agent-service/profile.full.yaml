@@ -134,37 +134,17 @@ automation:
       prompt: Continue the scheduled task.
 
 model:
-  # Must match one models[*].modelName.
-  defaultModelName: deepseek-v4-pro
+  # Stable provider/modelId selection. Reasoning is optional.
+  default:
+    model: deepseek/deepseek-v4-pro
+    reasoning: High
 
-  # Provider instances select a catalog provider and provide credentials.
-  # Transport policy, headers and request fields stay in the model catalog.
+  # Agent context policy, shared by every configured model.
+  compactionTriggerRatio: 0.5
+
+  # An official family name supplies its base URL and complete model list.
   providers:
     deepseek:
-      # Provider type from dwo-model-client/resources/providers/*.yaml.
-      type: deepseek
-
-      # Optional complete Responses URL override.
-      # The catalog endpoint is used when omitted.
-      baseUrl: null
-
       # apiKey takes precedence over apiKeyEnv. Prefer apiKeyEnv.
       apiKeyEnv: DEEPSEEK_API_KEY
       apiKey: null
-
-  # Session-visible model aliases. Optional values override the selected
-  # catalog model. Reasoning request parameters and capabilities stay catalog-owned.
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
-
-      # Optional model-level overrides.
-      contextWindowTokens: 1000000
-      maxOutputTokens: 384000
-      compactThreshold: 0.5
-      defaultReasoningMode: High
-
-    - modelName: deepseek-v4-flash
-      provider: deepseek
-      modelId: deepseek-v4-flash

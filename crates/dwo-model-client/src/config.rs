@@ -9,13 +9,13 @@ use serde_json::{Map, Value};
 
 use crate::ModelClientError;
 
-const BUILTIN_PROVIDER_YAMLS: &[(&str, &str)] = &[
+const BUILTIN_MODEL_YAMLS: &[(&str, &str)] = &[
     (
         "deepseek",
-        include_str!("../resources/providers/deepseek.yaml"),
+        include_str!("../resources/models/deepseek.yaml"),
     ),
-    ("grok", include_str!("../resources/providers/grok.yaml")),
-    ("openai", include_str!("../resources/providers/openai.yaml")),
+    ("grok", include_str!("../resources/models/grok.yaml")),
+    ("openai", include_str!("../resources/models/openai.yaml")),
 ];
 const RESERVED_BODY_FIELDS: &[&str] = &[
     "model",
@@ -29,13 +29,6 @@ const RESERVED_BODY_FIELDS: &[&str] = &[
     "max_completion_tokens",
     "max_output_tokens",
 ];
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderProtocol {
-    #[default]
-    OpenAiResponses,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -85,21 +78,19 @@ fn default_stream_idle_timeout_ms() -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelCatalog {
-    pub providers: BTreeMap<String, ProviderSpec>,
+    pub families: BTreeMap<String, ModelFamilySpec>,
 }
 
 impl ModelCatalog {
     pub fn builtin() -> Result<Self, ModelClientError> {
-        let mut providers = BTreeMap::new();
-        for (provider_type, source) in BUILTIN_PROVIDER_YAMLS {
-            let provider: ProviderSpec = serde_yaml::from_str(source).map_err(|error| {
-                ModelClientError::config(format!(
-                    "parse built-in provider {provider_type}: {error}"
-                ))
+        let mut families = BTreeMap::new();
+        for (family, source) in BUILTIN_MODEL_YAMLS {
+            let spec: ModelFamilySpec = serde_yaml::from_str(source).map_err(|error| {
+                ModelClientError::config(format!("parse built-in model family {family}: {error}"))
             })?;
-            providers.insert((*provider_type).to_string(), provider);
+            families.insert((*family).to_string(), spec);
         }
-        let catalog = Self { providers };
+        let catalog = Self { families };
         catalog.validate()?;
         Ok(catalog)
     }
@@ -111,7 +102,7 @@ impl ModelCatalog {
         Ok(catalog)
     }
 
-    pub fn merge_provider_directory(
+    pub fn merge_model_directory(
         &mut self,
         directory: impl AsRef<Path>,
     ) -> Result<(), ModelClientError> {
@@ -121,16 +112,16 @@ impl ModelCatalog {
         }
         if !directory.is_dir() {
             return Err(ModelClientError::config(format!(
-                "provider catalog path is not a directory: {}",
+                "model catalog path is not a directory: {}",
                 directory.display()
             )));
         }
 
         let mut paths = std::fs::read_dir(directory)
-            .map_err(|error| ModelClientError::config(format!("read provider catalog: {error}")))?
+            .map_err(|error| ModelClientError::config(format!("read model catalog: {error}")))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ModelClientError::config(format!("read provider catalog: {error}")))?;
+            .map_err(|error| ModelClientError::config(format!("read model catalog: {error}")))?;
         paths.sort();
 
         for path in paths {
@@ -142,61 +133,56 @@ impl ModelCatalog {
             {
                 continue;
             }
-            let provider_type = path
+            let family = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .ok_or_else(|| {
                     ModelClientError::config(format!(
-                        "provider catalog filename is not valid UTF-8: {}",
+                        "model catalog filename is not valid UTF-8: {}",
                         path.display()
                     ))
                 })?
                 .to_string();
-            validate_identifier(&provider_type, "provider type")?;
-            if self.providers.contains_key(&provider_type) {
-                return Err(ModelClientError::config(format!(
-                    "provider type {provider_type} from {} conflicts with a built-in provider",
-                    path.display()
-                )));
-            }
+            validate_identifier(&family, "model family")?;
             let source = std::fs::read_to_string(&path).map_err(|error| {
-                ModelClientError::config(format!(
-                    "read provider catalog {}: {error}",
-                    path.display()
-                ))
+                ModelClientError::config(format!("read model catalog {}: {error}", path.display()))
             })?;
-            let provider: ProviderSpec = serde_yaml::from_str(&source).map_err(|error| {
-                ModelClientError::config(format!(
-                    "parse provider catalog {}: {error}",
-                    path.display()
-                ))
+            let spec: ModelFamilySpec = serde_yaml::from_str(&source).map_err(|error| {
+                ModelClientError::config(format!("parse model catalog {}: {error}", path.display()))
             })?;
-            provider.validate(&provider_type)?;
-            self.providers.insert(provider_type, provider);
+            self.merge_family(family, spec)?;
         }
 
         self.validate()
     }
 
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, ModelClientError> {
-        let source = std::fs::read_to_string(path.as_ref()).map_err(|error| {
-            ModelClientError::config(format!(
-                "read model catalog {}: {error}",
-                path.as_ref().display()
-            ))
-        })?;
-        Self::from_yaml(&source)
+    pub fn merge_family(
+        &mut self,
+        family: String,
+        spec: ModelFamilySpec,
+    ) -> Result<(), ModelClientError> {
+        validate_identifier(&family, "model family")?;
+        spec.validate(&family)?;
+        if let Some(existing) = self.families.get_mut(&family) {
+            if spec.base_url.is_some() {
+                existing.base_url = spec.base_url;
+            }
+            existing.models.extend(spec.models);
+        } else {
+            self.families.insert(family, spec);
+        }
+        self.validate()
     }
 
     pub fn validate(&self) -> Result<(), ModelClientError> {
-        if self.providers.is_empty() {
+        if self.families.is_empty() {
             return Err(ModelClientError::config(
-                "model catalog providers must not be empty",
+                "model catalog families must not be empty",
             ));
         }
-        for (provider_type, provider) in &self.providers {
-            validate_identifier(provider_type, "provider type")?;
-            provider.validate(provider_type)?;
+        for (family, spec) in &self.families {
+            validate_identifier(family, "model family")?;
+            spec.validate(family)?;
         }
         Ok(())
     }
@@ -204,36 +190,25 @@ impl ModelCatalog {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProviderSpec {
+pub struct ModelFamilySpec {
     #[serde(default)]
-    pub protocol: ProviderProtocol,
-    pub endpoint: String,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    #[serde(default)]
-    pub request: RequestPolicy,
-    #[serde(default)]
-    pub body: Map<String, Value>,
+    pub base_url: Option<String>,
     pub models: BTreeMap<String, ModelSpec>,
 }
 
-impl ProviderSpec {
-    fn validate(&self, provider_type: &str) -> Result<(), ModelClientError> {
-        validate_endpoint(
-            &self.endpoint,
-            &format!("provider type {provider_type} endpoint"),
-        )?;
-        self.request
-            .validate(&format!("provider type {provider_type} request"))?;
-        validate_body(&self.body, &format!("provider type {provider_type} body"))?;
+impl ModelFamilySpec {
+    fn validate(&self, family: &str) -> Result<(), ModelClientError> {
+        if let Some(base_url) = &self.base_url {
+            validate_base_url(base_url, &format!("model family {family} baseUrl"))?;
+        }
         if self.models.is_empty() {
             return Err(ModelClientError::config(format!(
-                "provider type {provider_type} models must not be empty"
+                "model family {family} models must not be empty"
             )));
         }
         for (model_id, model) in &self.models {
-            validate_identifier(model_id, "provider model id")?;
-            model.validate(provider_type, model_id)?;
+            validate_identifier(model_id, "catalog model id")?;
+            model.validate(family, model_id)?;
         }
         Ok(())
     }
@@ -244,16 +219,14 @@ impl ProviderSpec {
 pub struct ModelSpec {
     pub context_window_tokens: u64,
     pub max_output_tokens: u32,
-    #[serde(default = "default_compact_threshold")]
-    pub compact_threshold: f64,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
     pub top_p: Option<f64>,
     #[serde(default)]
-    pub body: Map<String, Value>,
+    pub extra_body: Map<String, Value>,
     #[serde(default)]
-    pub hosted_tools: Vec<Value>,
+    pub hosted_tools: IndexMap<String, Value>,
     #[serde(default)]
     pub reasoning: IndexMap<String, Map<String, Value>>,
     #[serde(default = "default_reasoning_mode")]
@@ -263,12 +236,19 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    fn validate(&self, provider_type: &str, model_id: &str) -> Result<(), ModelClientError> {
-        let source = format!("model catalog {provider_type}/{model_id}");
+    fn validate(&self, family: &str, model_id: &str) -> Result<(), ModelClientError> {
+        let source = format!("model catalog {family}/{model_id}");
         let _ =
             available_input_tokens(self.context_window_tokens, self.max_output_tokens, &source)?;
-        validate_compact_threshold(self.compact_threshold, &source)?;
-        validate_body(&self.body, &format!("{source} body"))?;
+        validate_body(&self.extra_body, &format!("{source} extraBody"))?;
+        for (name, tool) in &self.hosted_tools {
+            validate_identifier(name, &format!("{source} hosted tool name"))?;
+            if !tool.is_object() {
+                return Err(ModelClientError::config(format!(
+                    "{source} hostedTools.{name} must be an object"
+                )));
+            }
+        }
         validate_reasoning(&self.reasoning, &self.default_reasoning_mode, &source)
     }
 }
@@ -282,20 +262,29 @@ pub struct ModelCapabilities {
     pub tool_calls: bool,
 }
 
-fn default_compact_threshold() -> f64 {
+fn default_reasoning_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_compaction_trigger_ratio() -> f64 {
     0.8
 }
 
-fn default_reasoning_mode() -> String {
-    "auto".to_string()
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DefaultModelConfig {
+    pub model: String,
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentModelConfig {
-    pub default_model_name: String,
-    pub providers: BTreeMap<String, AgentProviderConfig>,
-    pub models: Vec<AgentModelEntry>,
+    pub default: DefaultModelConfig,
+    #[serde(default = "default_compaction_trigger_ratio")]
+    pub compaction_trigger_ratio: f64,
+    pub providers: IndexMap<String, AgentProviderConfig>,
 }
 
 impl AgentModelConfig {
@@ -307,108 +296,150 @@ impl AgentModelConfig {
     }
 
     pub fn validate(&self) -> Result<(), ModelClientError> {
-        validate_identifier(&self.default_model_name, "defaultModelName")?;
+        let (default_provider, default_model_id) = split_model_ref(&self.default.model)?;
+        if let Some(reasoning) = &self.default.reasoning {
+            validate_identifier(reasoning, "model.default.reasoning")?;
+        }
+        validate_compaction_trigger_ratio(self.compaction_trigger_ratio)?;
         if self.providers.is_empty() {
             return Err(ModelClientError::config(
-                "agent model providers must not be empty",
+                "model.providers must not be empty",
             ));
         }
         for (provider_id, provider) in &self.providers {
             validate_identifier(provider_id, "provider id")?;
             provider.validate(provider_id)?;
         }
-        if self.models.is_empty() {
-            return Err(ModelClientError::config(
-                "agent model models must not be empty",
-            ));
-        }
-        let mut aliases = HashSet::new();
-        for model in &self.models {
-            model.validate(&self.providers)?;
-            if !aliases.insert(model.model_name.as_str()) {
-                return Err(ModelClientError::config(format!(
-                    "duplicate modelName: {}",
-                    model.model_name
-                )));
-            }
-        }
-        if !aliases.contains(self.default_model_name.as_str()) {
+        if !self.providers.contains_key(default_provider) {
             return Err(ModelClientError::config(format!(
-                "defaultModelName {} is not listed in models",
-                self.default_model_name
+                "model.default.model references unknown provider {default_provider}"
             )));
         }
-        Ok(())
+        validate_identifier(default_model_id, "default model id")
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentProviderConfig {
-    #[serde(rename = "type")]
-    pub provider_type: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub request: RequestPolicy,
+    #[serde(default)]
+    pub extra_body: Map<String, Value>,
+    #[serde(default)]
+    pub models: Option<IndexMap<String, AgentModelEntry>>,
 }
 
 impl AgentProviderConfig {
     fn validate(&self, provider_id: &str) -> Result<(), ModelClientError> {
-        validate_identifier(&self.provider_type, "provider type")?;
         if let Some(base_url) = &self.base_url {
-            validate_endpoint(base_url, &format!("provider {provider_id} baseUrl"))?;
+            validate_base_url(base_url, &format!("provider {provider_id} baseUrl"))?;
         }
         validate_optional_string(
             &self.api_key_env,
             &format!("provider {provider_id} apiKeyEnv"),
         )?;
-        validate_optional_string(&self.api_key, &format!("provider {provider_id} apiKey"))
+        validate_optional_string(&self.api_key, &format!("provider {provider_id} apiKey"))?;
+        self.request
+            .validate(&format!("provider {provider_id} request"))?;
+        validate_body(
+            &self.extra_body,
+            &format!("provider {provider_id} extraBody"),
+        )?;
+        if self.models.as_ref().is_some_and(IndexMap::is_empty) {
+            return Err(ModelClientError::config(format!(
+                "provider {provider_id} models must not be empty when configured"
+            )));
+        }
+        if let Some(models) = &self.models {
+            for (model_name, model) in models {
+                validate_identifier(model_name, "model display name")?;
+                model.validate(provider_id, model_name)?;
+            }
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentModelEntry {
-    pub model_name: String,
-    pub provider: String,
-    pub model_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
     #[serde(default)]
     pub context_window_tokens: Option<u64>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
-    pub compact_threshold: Option<f64>,
-    #[serde(default)]
     pub default_reasoning_mode: Option<String>,
+    #[serde(default)]
+    pub capabilities: Option<ModelCapabilities>,
+    #[serde(default)]
+    pub reasoning: Option<IndexMap<String, Map<String, Value>>>,
+    #[serde(default)]
+    pub hosted_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub extra_body: Map<String, Value>,
 }
 
 impl AgentModelEntry {
-    fn validate(
-        &self,
-        providers: &BTreeMap<String, AgentProviderConfig>,
-    ) -> Result<(), ModelClientError> {
-        validate_identifier(&self.model_name, "modelName")?;
-        validate_identifier(&self.provider, "model provider")?;
-        validate_identifier(&self.model_id, "modelId")?;
-        if !providers.contains_key(&self.provider) {
-            return Err(ModelClientError::config(format!(
-                "model {} references unknown provider {}",
-                self.model_name, self.provider
-            )));
+    fn validate(&self, provider_id: &str, model_name: &str) -> Result<(), ModelClientError> {
+        if let Some(model_id) = &self.model_id {
+            validate_identifier(model_id, "modelId")?;
         }
-        if let Some(default_mode) = &self.default_reasoning_mode {
-            validate_identifier(default_mode, "defaultReasoningMode")?;
+        if let Some(profile) = &self.profile {
+            split_model_ref(profile).map_err(|_| {
+                ModelClientError::config(format!(
+                    "provider {provider_id} model {model_name} profile must be family/modelId"
+                ))
+            })?;
         }
-        Ok(())
+        if let Some(mode) = &self.default_reasoning_mode {
+            validate_identifier(mode, "defaultReasoningMode")?;
+        }
+        if let Some(reasoning) = &self.reasoning {
+            for (mode, body) in reasoning {
+                validate_identifier(mode, "reasoning mode")?;
+                validate_body(body, &format!("reasoning.{mode}"))?;
+            }
+        }
+        if let Some(hosted_tools) = &self.hosted_tools {
+            let mut unique = HashSet::new();
+            for name in hosted_tools {
+                validate_identifier(name, "hosted tool name")?;
+                if !unique.insert(name) {
+                    return Err(ModelClientError::config(format!(
+                        "provider {provider_id} model {model_name} repeats hosted tool {name}"
+                    )));
+                }
+            }
+        }
+        validate_body(&self.extra_body, &format!("model {model_name} extraBody"))
+    }
+
+    pub fn effective_model_id<'a>(&'a self, model_name: &'a str) -> &'a str {
+        self.model_id.as_deref().unwrap_or(model_name)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelClientConfig {
-    pub default_model_name: String,
+    pub default_model: String,
+    pub default_reasoning: Option<String>,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub models: IndexMap<String, ModelConfig>,
 }
@@ -422,67 +453,117 @@ impl ModelClientConfig {
         agent.validate()?;
 
         let mut providers = BTreeMap::new();
+        let mut models = IndexMap::new();
         for (provider_id, agent_provider) in &agent.providers {
-            let spec = catalog
-                .providers
-                .get(&agent_provider.provider_type)
+            let official_family = catalog.families.get(provider_id);
+            let base_url = agent_provider
+                .base_url
+                .clone()
+                .or_else(|| official_family.and_then(|family| family.base_url.clone()))
                 .ok_or_else(|| {
                     ModelClientError::config(format!(
-                        "provider {provider_id} references unknown type {}",
-                        agent_provider.provider_type
+                        "custom provider {provider_id} must configure baseUrl"
                     ))
                 })?;
             let provider = ProviderConfig {
-                protocol: spec.protocol,
-                endpoint: agent_provider
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| spec.endpoint.clone()),
+                base_url,
                 api_key_env: agent_provider.api_key_env.clone(),
                 api_key: agent_provider.api_key.clone(),
-                headers: spec.headers.clone(),
-                request: spec.request,
-                body: spec.body.clone(),
+                headers: agent_provider.headers.clone(),
+                request: agent_provider.request,
+                extra_body: agent_provider.extra_body.clone(),
             };
             provider.validate(provider_id)?;
             providers.insert(provider_id.clone(), provider);
+
+            match &agent_provider.models {
+                None => {
+                    let family = official_family.ok_or_else(|| {
+                        ModelClientError::config(format!(
+                            "custom provider {provider_id} must configure models"
+                        ))
+                    })?;
+                    for (model_id, spec) in &family.models {
+                        let id = model_ref(provider_id, model_id);
+                        models.insert(
+                            id,
+                            resolved_model(
+                                provider_id,
+                                provider_id,
+                                model_id,
+                                model_id,
+                                spec,
+                                None,
+                                agent.compaction_trigger_ratio,
+                                &providers,
+                            )?,
+                        );
+                    }
+                }
+                Some(entries) => {
+                    let mut provider_model_ids = HashSet::new();
+                    for (model_name, entry) in entries {
+                        let model_id = entry.effective_model_id(model_name);
+                        if !provider_model_ids.insert(model_id) {
+                            return Err(ModelClientError::config(format!(
+                                "provider {provider_id} has duplicate modelId {model_id}"
+                            )));
+                        }
+                        let (family, profile_model_id) = match &entry.profile {
+                            Some(profile) => split_model_ref(profile)?,
+                            None if official_family.is_some() => (provider_id.as_str(), model_id),
+                            None => {
+                                return Err(ModelClientError::config(format!(
+                                    "custom provider {provider_id} model {model_name} must configure profile"
+                                )));
+                            }
+                        };
+                        let spec = catalog
+                            .families
+                            .get(family)
+                            .and_then(|family| family.models.get(profile_model_id))
+                            .ok_or_else(|| {
+                                ModelClientError::config(format!(
+                                    "provider {provider_id} model {model_name} references unknown profile {family}/{profile_model_id}"
+                                ))
+                            })?;
+                        let id = model_ref(provider_id, model_id);
+                        models.insert(
+                            id,
+                            resolved_model(
+                                provider_id,
+                                family,
+                                model_name,
+                                model_id,
+                                spec,
+                                Some(entry),
+                                agent.compaction_trigger_ratio,
+                                &providers,
+                            )?,
+                        );
+                    }
+                }
+            }
         }
 
-        let mut models = IndexMap::new();
-        for entry in &agent.models {
-            let agent_provider = &agent.providers[&entry.provider];
-            let provider_spec = &catalog.providers[&agent_provider.provider_type];
-            let spec = provider_spec.models.get(&entry.model_id).ok_or_else(|| {
-                ModelClientError::config(format!(
-                    "model {} references unknown catalog model {}/{}",
-                    entry.model_name, agent_provider.provider_type, entry.model_id
-                ))
-            })?;
-            let model = ModelConfig {
-                provider: entry.provider.clone(),
-                model_id: entry.model_id.clone(),
-                context_window_tokens: entry
-                    .context_window_tokens
-                    .unwrap_or(spec.context_window_tokens),
-                max_output_tokens: entry.max_output_tokens.unwrap_or(spec.max_output_tokens),
-                compact_threshold: entry.compact_threshold.unwrap_or(spec.compact_threshold),
-                temperature: spec.temperature,
-                top_p: spec.top_p,
-                body: spec.body.clone(),
-                hosted_tools: spec.hosted_tools.clone(),
-                reasoning: spec.reasoning.clone(),
-                default_reasoning_mode: entry
-                    .default_reasoning_mode
-                    .clone()
-                    .unwrap_or_else(|| spec.default_reasoning_mode.clone()),
-                capabilities: spec.capabilities,
-            };
-            model.validate(&entry.model_name, &providers)?;
-            models.insert(entry.model_name.clone(), model);
+        let default_model = agent.default.model.clone();
+        let default_config = models.get(&default_model).ok_or_else(|| {
+            ModelClientError::config(format!(
+                "model.default.model references unavailable model {default_model}"
+            ))
+        })?;
+        if let Some(reasoning) = &agent.default.reasoning
+            && reasoning != "auto"
+            && !default_config.reasoning.contains_key(reasoning)
+        {
+            return Err(ModelClientError::config(format!(
+                "default model {default_model} does not configure reasoning mode {reasoning}"
+            )));
         }
 
         Ok(Self {
-            default_model_name: agent.default_model_name.clone(),
+            default_model,
+            default_reasoning: agent.default.reasoning.clone(),
             providers,
             models,
         })
@@ -491,20 +572,19 @@ impl ModelClientConfig {
 
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
-    pub protocol: ProviderProtocol,
-    pub endpoint: String,
+    pub base_url: String,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
     pub headers: BTreeMap<String, String>,
     pub request: RequestPolicy,
-    pub body: Map<String, Value>,
+    pub extra_body: Map<String, Value>,
 }
 
 impl ProviderConfig {
     fn validate(&self, id: &str) -> Result<(), ModelClientError> {
-        validate_endpoint(&self.endpoint, &format!("provider {id} endpoint"))?;
+        validate_base_url(&self.base_url, &format!("provider {id} baseUrl"))?;
         self.request.validate(&format!("provider {id} request"))?;
-        validate_body(&self.body, &format!("provider {id} body"))
+        validate_body(&self.extra_body, &format!("provider {id} extraBody"))
     }
 
     pub(crate) fn resolve_api_key(&self) -> Result<Option<String>, ModelClientError> {
@@ -531,22 +611,25 @@ impl ProviderConfig {
             .ok_or_else(|| ModelClientError::MissingApiKey(name.to_string()))
     }
 
-    pub(crate) fn endpoint(&self) -> Result<Url, ModelClientError> {
-        Url::parse(self.endpoint.trim())
-            .map_err(|error| ModelClientError::config(error.to_string()))
+    pub(crate) fn responses_endpoint(&self) -> Result<Url, ModelClientError> {
+        let mut base = self.base_url.trim().trim_end_matches('/').to_string();
+        base.push_str("/responses");
+        Url::parse(&base).map_err(|error| ModelClientError::config(error.to_string()))
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub provider: String,
+    pub family: String,
+    pub model_name: String,
     pub model_id: String,
     pub context_window_tokens: u64,
     pub max_output_tokens: u32,
-    pub compact_threshold: f64,
+    pub compaction_trigger_ratio: f64,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
-    pub body: Map<String, Value>,
+    pub extra_body: Map<String, Value>,
     pub hosted_tools: Vec<Value>,
     pub reasoning: IndexMap<String, Map<String, Value>>,
     pub default_reasoning_mode: String,
@@ -556,23 +639,23 @@ pub struct ModelConfig {
 impl ModelConfig {
     fn validate(
         &self,
-        alias: &str,
+        id: &str,
         providers: &BTreeMap<String, ProviderConfig>,
     ) -> Result<(), ModelClientError> {
         if !providers.contains_key(&self.provider) {
             return Err(ModelClientError::config(format!(
-                "model {alias} references unknown provider {}",
+                "model {id} references unknown provider {}",
                 self.provider
             )));
         }
         validate_identifier(&self.model_id, "modelId")?;
         let _ = self.max_input_tokens()?;
-        validate_compact_threshold(self.compact_threshold, &format!("model {alias}"))?;
-        validate_body(&self.body, &format!("model {alias} body"))?;
+        validate_compaction_trigger_ratio(self.compaction_trigger_ratio)?;
+        validate_body(&self.extra_body, &format!("model {id} extraBody"))?;
         validate_reasoning(
             &self.reasoning,
             &self.default_reasoning_mode,
-            &format!("model {alias}"),
+            &format!("model {id}"),
         )
     }
 
@@ -582,6 +665,95 @@ impl ModelConfig {
             self.max_output_tokens,
             &format!("model {}", self.model_id),
         )
+    }
+
+    pub fn context_owner_id(&self) -> String {
+        format!("{}/{}", self.provider, self.family)
+    }
+}
+
+fn resolved_model(
+    provider_id: &str,
+    family: &str,
+    model_name: &str,
+    model_id: &str,
+    spec: &ModelSpec,
+    entry: Option<&AgentModelEntry>,
+    compaction_trigger_ratio: f64,
+    providers: &BTreeMap<String, ProviderConfig>,
+) -> Result<ModelConfig, ModelClientError> {
+    let hosted_tools = match entry.and_then(|entry| entry.hosted_tools.as_ref()) {
+        Some(names) => names
+            .iter()
+            .map(|name| {
+                spec.hosted_tools.get(name).cloned().ok_or_else(|| {
+                    ModelClientError::config(format!(
+                        "model {provider_id}/{model_id} selects unknown hosted tool {name}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => spec.hosted_tools.values().cloned().collect(),
+    };
+    let reasoning = entry
+        .and_then(|entry| entry.reasoning.clone())
+        .unwrap_or_else(|| spec.reasoning.clone());
+    let default_reasoning_mode = entry
+        .and_then(|entry| entry.default_reasoning_mode.clone())
+        .unwrap_or_else(|| spec.default_reasoning_mode.clone());
+    let mut extra_body = spec.extra_body.clone();
+    if let Some(entry) = entry {
+        merge_map(&mut extra_body, &entry.extra_body);
+    }
+    let model = ModelConfig {
+        provider: provider_id.to_string(),
+        family: family.to_string(),
+        model_name: model_name.to_string(),
+        model_id: model_id.to_string(),
+        context_window_tokens: entry
+            .and_then(|entry| entry.context_window_tokens)
+            .unwrap_or(spec.context_window_tokens),
+        max_output_tokens: entry
+            .and_then(|entry| entry.max_output_tokens)
+            .unwrap_or(spec.max_output_tokens),
+        compaction_trigger_ratio,
+        temperature: entry
+            .and_then(|entry| entry.temperature)
+            .or(spec.temperature),
+        top_p: entry.and_then(|entry| entry.top_p).or(spec.top_p),
+        extra_body,
+        hosted_tools,
+        reasoning,
+        default_reasoning_mode,
+        capabilities: entry
+            .and_then(|entry| entry.capabilities)
+            .unwrap_or(spec.capabilities),
+    };
+    model.validate(&model_ref(provider_id, model_id), providers)?;
+    Ok(model)
+}
+
+fn model_ref(provider: &str, model_id: &str) -> String {
+    format!("{provider}/{model_id}")
+}
+
+fn split_model_ref(value: &str) -> Result<(&str, &str), ModelClientError> {
+    let (provider, model_id) = value.split_once('/').ok_or_else(|| {
+        ModelClientError::config(format!("model reference {value} must be provider/modelId"))
+    })?;
+    validate_identifier(provider, "model reference provider")?;
+    validate_identifier(model_id, "model reference modelId")?;
+    Ok((provider, model_id))
+}
+
+fn merge_map(target: &mut Map<String, Value>, source: &Map<String, Value>) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(Value::Object(target)), Value::Object(source)) => merge_map(target, source),
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -628,16 +800,16 @@ fn validate_reasoning(
     Ok(())
 }
 
-fn validate_compact_threshold(value: f64, source: &str) -> Result<(), ModelClientError> {
+fn validate_compaction_trigger_ratio(value: f64) -> Result<(), ModelClientError> {
     if !value.is_finite() || value <= 0.0 || value > 1.0 {
-        return Err(ModelClientError::config(format!(
-            "{source} compactThreshold must be in (0, 1]"
-        )));
+        return Err(ModelClientError::config(
+            "model.compactionTriggerRatio must be in (0, 1]",
+        ));
     }
     Ok(())
 }
 
-fn validate_endpoint(value: &str, source: &str) -> Result<(), ModelClientError> {
+fn validate_base_url(value: &str, source: &str) -> Result<(), ModelClientError> {
     let value = value.trim();
     if value.is_empty() {
         return Err(ModelClientError::config(format!(
@@ -649,6 +821,11 @@ fn validate_endpoint(value: &str, source: &str) -> Result<(), ModelClientError> 
     if !matches!(url.scheme(), "http" | "https") {
         return Err(ModelClientError::config(format!(
             "{source} must use http or https"
+        )));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ModelClientError::config(format!(
+            "{source} must not contain a query or fragment"
         )));
     }
     Ok(())

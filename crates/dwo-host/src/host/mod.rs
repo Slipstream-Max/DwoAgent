@@ -236,6 +236,7 @@ pub(crate) struct ConfigUpdateParam {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionModelOption {
     id: String,
+    name: String,
     provider: String,
     reasoning: Vec<String>,
     default_reasoning: String,
@@ -253,6 +254,7 @@ struct SessionOptionSnapshot {
 pub(crate) struct ConfigSnapshot {
     policy: SessionMode,
     default_model: String,
+    default_reasoning: Option<String>,
     models: Vec<SessionModelOption>,
     max_model_steps: usize,
     session_count: usize,
@@ -267,7 +269,8 @@ impl Host {
         tracing::info!(event = "mcp.synchronized", "MCP configuration synchronized");
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let source = config_manager.fingerprint()?;
-        let default_model = profile.models.default_model_name.clone();
+        let default_model = profile.models.default_model.clone();
+        let default_reasoning = profile.models.default_reasoning.clone();
         let default_mode = profile.config.policy_mode;
         let profile_config = profile.config.clone();
         let model_options = profile
@@ -276,6 +279,7 @@ impl Host {
             .iter()
             .map(|(id, model)| SessionModelOption {
                 id: id.clone(),
+                name: model.model_name.clone(),
                 provider: model.provider.clone(),
                 reasoning: model.reasoning.keys().cloned().collect(),
                 default_reasoning: model.default_reasoning_mode.clone(),
@@ -297,6 +301,7 @@ impl Host {
             profile_root.clone(),
             automation_config,
             default_model.clone(),
+            default_reasoning,
             default_mode,
             shutdown.clone(),
         )?;
@@ -862,8 +867,8 @@ impl Host {
     }
 
     async fn dispatch_model(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
-        if method.starts_with("provider.catalog.") {
-            return self.dispatch_provider_catalog(method, params).await;
+        if method.starts_with("model.catalog.") {
+            return self.dispatch_model_catalog(method, params).await;
         }
         let mut parts = method.split('.');
         let domain = parts.next().unwrap_or_default();
@@ -876,25 +881,38 @@ impl Host {
             ("model", "list") => self.model_list(),
             ("provider", "list") => self.provider_list(),
             ("model", "set_default") => {
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("model name is required")?
-                    .to_string();
-                self.model_set_default(name).await
+                let default: dwo_agent_service::DefaultModelConfig =
+                    serde_json::from_value(params)?;
+                self.model_set_default(default).await
             }
             ("model", "upsert") => {
-                let entry: dwo_agent_service::AgentModelEntry =
-                    serde_json::from_value(params.get("model").cloned().unwrap_or(params))?;
-                self.model_upsert(entry).await
-            }
-            ("model", "remove") => {
+                let entry: dwo_agent_service::AgentModelEntry = serde_json::from_value(
+                    params.get("model").cloned().context("model is required")?,
+                )?;
+                let provider = params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .context("provider is required")?
+                    .to_string();
                 let name = params
                     .get("name")
                     .and_then(Value::as_str)
-                    .context("model name is required")?
+                    .context("model display name is required")?
                     .to_string();
-                self.model_remove(name).await
+                self.model_upsert(provider, name, entry).await
+            }
+            ("model", "remove") => {
+                let provider = params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .context("provider is required")?
+                    .to_string();
+                let model_id = params
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .context("modelId is required")?
+                    .to_string();
+                self.model_remove(provider, model_id).await
             }
             ("provider", "upsert") => {
                 let provider: dwo_agent_service::AgentProviderConfig = serde_json::from_value(
@@ -919,37 +937,37 @@ impl Host {
         }
     }
 
-    async fn dispatch_provider_catalog(
+    async fn dispatch_model_catalog(
         self: &Arc<Self>,
         method: &str,
         params: Value,
     ) -> Result<Value> {
         match method {
-            "provider.catalog.list" => self.provider_catalog_list(),
-            "provider.catalog.upsert" => {
-                let name = params
-                    .get("name")
+            "model.catalog.list" => self.model_catalog_list(),
+            "model.catalog.upsert" => {
+                let family = params
+                    .get("family")
                     .and_then(Value::as_str)
-                    .context("provider catalog name is required")?
+                    .context("model family is required")?
                     .to_string();
-                validate_resource_name(&name)?;
-                let provider: dwo_agent_service::ProviderSpec = serde_json::from_value(
+                validate_resource_name(&family)?;
+                let spec: dwo_agent_service::ModelFamilySpec = serde_json::from_value(
                     params
-                        .get("provider")
+                        .get("spec")
                         .cloned()
-                        .context("provider catalog is required")?,
+                        .context("model family spec is required")?,
                 )?;
-                self.provider_catalog_upsert(name, provider).await
+                self.model_catalog_upsert(family, spec).await
             }
-            "provider.catalog.remove" => {
-                let name = params
-                    .get("name")
+            "model.catalog.remove" => {
+                let family = params
+                    .get("family")
                     .and_then(Value::as_str)
-                    .context("provider catalog name is required")?
+                    .context("model family is required")?
                     .to_string();
-                self.provider_catalog_remove(name).await
+                self.model_catalog_remove(family).await
             }
-            _ => anyhow::bail!("unknown provider catalog method: {method}"),
+            _ => anyhow::bail!("unknown model catalog method: {method}"),
         }
     }
 
@@ -1050,7 +1068,7 @@ impl Host {
         title: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<Arc<dwo_agent_service::SessionAgent>> {
-        let (default_model, default_mode) = self.defaults();
+        let (default_model, default_reasoning, default_mode) = self.defaults();
         let session_id = SessionId::new();
         let uses_generated_workspace = cwd.is_none();
         let cwd = match cwd {
@@ -1079,7 +1097,7 @@ impl Host {
                 cwd,
                 mode: default_mode,
                 ephemeral: false,
-                llm: SessionLlmSettings::new(default_model, None),
+                llm: SessionLlmSettings::new(default_model, default_reasoning),
             })
             .await;
         match created {
@@ -1104,7 +1122,7 @@ impl Host {
             params.session_id.is_none() || params.from_session_id.is_none(),
             "--from cannot be used with --to"
         );
-        let (default_model, default_mode) = self.defaults();
+        let (default_model, default_reasoning, default_mode) = self.defaults();
         let records = self.service.list().await?;
         let caller_record = caller
             .as_ref()
@@ -1192,11 +1210,19 @@ impl Host {
                 .as_ref()
                 .map_or_else(|| default_model.clone(), |record| record.llm.model.clone())
         });
-        let reasoning = params.reasoning.clone().or_else(|| {
-            caller_record
-                .as_ref()
-                .and_then(|record| record.llm.reasoning.clone())
-        });
+        let reasoning = params
+            .reasoning
+            .clone()
+            .or_else(|| {
+                caller_record
+                    .as_ref()
+                    .and_then(|record| record.llm.reasoning.clone())
+            })
+            .or_else(|| {
+                (caller_record.is_none() && params.model.is_none())
+                    .then(|| default_reasoning.clone())
+                    .flatten()
+            });
         let session_id = SessionId::new();
         let requested_cwd = params
             .cwd
@@ -1327,10 +1353,11 @@ impl Host {
             .clone()
     }
 
-    fn defaults(&self) -> (String, SessionMode) {
+    fn defaults(&self) -> (String, Option<String>, SessionMode) {
         let profile = self.profile.read().expect("profile lock poisoned");
         (
-            profile.config.model.default_model_name.clone(),
+            profile.config.model.default.model.clone(),
+            profile.config.model.default.reasoning.clone(),
             profile.config.policy_mode,
         )
     }
@@ -1397,12 +1424,14 @@ impl Host {
             .iter()
             .map(|(id, model)| SessionModelOption {
                 id: id.clone(),
+                name: model.model_name.clone(),
                 provider: model.provider.clone(),
                 reasoning: model.reasoning.keys().cloned().collect(),
                 default_reasoning: model.default_reasoning_mode.clone(),
             })
             .collect();
-        let default_model = loaded.models.default_model_name.clone();
+        let default_model = loaded.models.default_model.clone();
+        let default_reasoning = loaded.models.default_reasoning.clone();
         let default_mode = loaded.config.policy_mode;
 
         self.service.replace_models(loaded.models)?;
@@ -1411,7 +1440,12 @@ impl Host {
         self.service
             .replace_external_skill_dirs(loaded.external_skill_dirs);
         self.automation
-            .apply_profile(automation_config, default_model, default_mode)
+            .apply_profile(
+                automation_config,
+                default_model,
+                default_reasoning,
+                default_mode,
+            )
             .await?;
         crate::logging::reload(&loaded.config.logging)?;
 
@@ -1767,27 +1801,6 @@ fn redacted_mcp_config(document: &Value) -> Value {
     json!({"servers": servers})
 }
 
-fn redacted_provider_catalog(catalog: &dwo_agent_service::ModelCatalog) -> Result<Value> {
-    let mut value = serde_json::to_value(catalog)?;
-    if let Some(providers) = value.get_mut("providers").and_then(Value::as_object_mut) {
-        for provider in providers.values_mut() {
-            if let Some(object) = provider.as_object_mut() {
-                let headers_configured = object
-                    .get("headers")
-                    .and_then(Value::as_object)
-                    .is_some_and(|headers| !headers.is_empty());
-                object.remove("headers");
-                object.remove("body");
-                object.insert(
-                    "headersConfigured".to_string(),
-                    Value::Bool(headers_configured),
-                );
-            }
-        }
-    }
-    Ok(value)
-}
-
 fn parse_session(params: Value) -> Result<SessionId> {
     let params: SessionIdParam = serde_json::from_value(params)?;
     SessionId::parse(params.session_id).map_err(anyhow::Error::msg)
@@ -1964,14 +1977,10 @@ mod tests {
             &config,
             r#"policyMode: confirm
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: deepseek/deepseek-v4-pro
   providers:
     deepseek:
-      type: deepseek
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
 "#,
         )
         .unwrap();
@@ -1986,7 +1995,7 @@ model:
             .handle_method("dwo.capabilities", json!({}))
             .await
             .unwrap();
-        assert_eq!(capabilities["protocolVersion"], 2);
+        assert_eq!(capabilities["protocolVersion"], 3);
         assert_eq!(capabilities["route"], "dwo");
         assert_eq!(capabilities["eventCursor"], true);
         assert!(
@@ -2141,17 +2150,10 @@ logging:
   level: debug
   retentionDays: 7
 model:
-  defaultModelName: backup
+  default:
+    model: deepseek/deepseek-v4-flash
   providers:
     deepseek:
-      type: deepseek
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
-    - modelName: backup
-      provider: deepseek
-      modelId: deepseek-v4-pro
 websocket:
   enabled: false
   bind: 127.0.0.1
@@ -2169,11 +2171,13 @@ automation:
             .await
             .unwrap();
         assert_eq!(snapshot["policy"], "watch");
-        assert_eq!(snapshot["defaultModel"], "backup");
+        assert_eq!(snapshot["defaultModel"], "deepseek/deepseek-v4-flash");
         assert_eq!(snapshot["models"].as_array().unwrap().len(), 2);
         assert!(host.channels().list().await.unwrap().is_empty());
         existing
-            .set_config(SessionConfigUpdate::Model("backup".to_string()))
+            .set_config(SessionConfigUpdate::Model(
+                "deepseek/deepseek-v4-flash".to_string(),
+            ))
             .await
             .unwrap();
 
@@ -2185,7 +2189,7 @@ automation:
             .snapshot
             .record;
         assert_eq!(record.info.mode, SessionMode::Watch);
-        assert_eq!(record.llm.model, "backup");
+        assert_eq!(record.llm.model, "deepseek/deepseek-v4-flash");
         assert_eq!(host.service.max_model_steps(), 17);
 
         let invalid = std::fs::read_to_string(&config).unwrap().replacen(
@@ -2199,7 +2203,7 @@ automation:
             .handle_method("config.snapshot", json!({}))
             .await
             .unwrap();
-        assert_eq!(snapshot["defaultModel"], "backup");
+        assert_eq!(snapshot["defaultModel"], "deepseek/deepseek-v4-flash");
 
         host.shutdown().await;
     }
@@ -2310,7 +2314,19 @@ automation:
 
         host.handle_method(
             "provider.upsert",
-            json!({"name": "private", "provider": {"type": "deepseek", "apiKey": "secret"}}),
+            json!({
+                "name": "private",
+                "provider": {
+                    "baseUrl": "https://private.example.com/v1",
+                    "apiKey": "secret",
+                    "models": {
+                        "Private GPT": {
+                            "modelId": "private-gpt",
+                            "profile": "openai/gpt-5.6-terra"
+                        }
+                    }
+                }
+            }),
         )
         .await
         .unwrap();
@@ -2320,6 +2336,61 @@ automation:
             .unwrap();
         assert_eq!(providers["private"]["apiKeyConfigured"], true);
         assert!(providers["private"].get("apiKey").is_none());
+
+        host.handle_method(
+            "model.upsert",
+            json!({
+                "provider": "private",
+                "name": "Private Grok",
+                "model": {
+                    "modelId": "private-grok",
+                    "profile": "grok/grok-4.6"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        host.handle_method(
+            "model.set_default",
+            json!({"model": "private/private-grok", "reasoning": "High"}),
+        )
+        .await
+        .unwrap();
+        let session = host
+            .create_session(Some("model default".to_string()), None)
+            .await
+            .unwrap();
+        let record = session.snapshot().await.unwrap().record;
+        assert_eq!(record.llm.model, "private/private-grok");
+        assert_eq!(record.llm.reasoning.as_deref(), Some("High"));
+
+        host.handle_method(
+            "model.catalog.upsert",
+            json!({
+                "family": "minimax",
+                "spec": {
+                    "models": {
+                        "minimax-m2.5": {
+                            "contextWindowTokens": 200000,
+                            "maxOutputTokens": 32000
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let catalog = host
+            .handle_method("model.catalog.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog["families"]["minimax"]["models"]["minimax-m2.5"]["maxOutputTokens"],
+            32000
+        );
+        host.handle_method("model.catalog.remove", json!({"family": "minimax"}))
+            .await
+            .unwrap();
 
         host.handle_method(
             "mcp.install",

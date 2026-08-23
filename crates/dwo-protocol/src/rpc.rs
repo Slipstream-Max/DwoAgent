@@ -265,6 +265,7 @@ impl SessionMode {
 #[serde(rename_all = "camelCase")]
 pub struct SessionModelOption {
     pub id: String,
+    pub name: String,
     pub provider: String,
     pub reasoning: Vec<String>,
     pub default_reasoning: String,

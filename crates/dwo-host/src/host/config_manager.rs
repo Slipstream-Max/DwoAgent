@@ -54,6 +54,9 @@ impl ConfigManager {
         let mut config = AgentProfileConfig::load(&self.root)?;
         update(&mut config)?;
         config.validate()?;
+        let mut catalog = dwo_agent_service::ModelCatalog::builtin()?;
+        catalog.merge_model_directory(self.root.join("resource/models"))?;
+        config.resolve_models(&catalog)?;
         let source = serde_yaml::to_string(&config)?;
         dwo_agent_service::atomic_file::write(&self.path, source.into_bytes()).await?;
         Ok(config)

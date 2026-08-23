@@ -412,22 +412,20 @@ maxRunningTurn: 5
 policyMode: full_access
 sessionStoreDir: .sessions
 model:
-  defaultModelId: mock-model
-  models:
-    - modelName: mock-model
-      provider: deepseek
-      modelId: deepseek-v4-pro
+  default:
+    model: mock/deepseek-v4-pro
+  compactionTriggerRatio: 0.8
+  providers:
+    mock:
       apiKey: test-key-not-real
-      apiBase: http://127.0.0.1:{llm_port}/v1
-      defaultReasoningMode: auto
-      compactThreshold: 0.8
-    - modelName: mock-flash
-      provider: deepseek
-      modelId: deepseek-v4-flash
-      apiKey: test-key-not-real
-      apiBase: http://127.0.0.1:{llm_port}/v1
-      defaultReasoningMode: auto
-      compactThreshold: 0.8
+      baseUrl: http://127.0.0.1:{llm_port}/v1
+      models:
+        mock-model:
+          modelId: deepseek-v4-pro
+          profile: deepseek/deepseek-v4-pro
+        mock-flash:
+          modelId: deepseek-v4-flash
+          profile: deepseek/deepseek-v4-flash
 "
         ),
     )

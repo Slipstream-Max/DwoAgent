@@ -19,10 +19,11 @@ pub use dwo_context::{
     SystemPromptBlock, SystemPromptBuilder, TurnId,
 };
 pub use dwo_model_client::{
-    AgentModelConfig, AgentModelEntry, AgentProviderConfig, ConfiguredModelClient, FinishReason,
-    ModelCapabilities, ModelCatalog, ModelClient, ModelClientConfig, ModelClientError, ModelConfig,
-    ModelLimits, ModelReply, ModelSelection, ModelSpec, ModelStreamEvent, ModelUsage,
-    ProviderConfig, ProviderProtocol, ProviderSpec, RequestPolicy, StreamToolCall, SummaryReply,
+    AgentModelConfig, AgentModelEntry, AgentProviderConfig, ConfiguredModelClient,
+    DefaultModelConfig, FinishReason, ModelCapabilities, ModelCatalog, ModelClient,
+    ModelClientConfig, ModelClientError, ModelConfig, ModelFamilySpec, ModelLimits, ModelReply,
+    ModelSelection, ModelSpec, ModelStreamEvent, ModelUsage, ProviderConfig, RequestPolicy,
+    StreamToolCall, SummaryReply,
 };
 pub use dwo_tools::{ConfirmationDecision, ConfirmationRequest, SessionMode};
 pub use error::AgentServiceError;

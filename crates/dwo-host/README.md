@@ -157,7 +157,8 @@ while let Ok(event) = live.recv().await {
 - 单次 replay limit 会收紧到 1–200；
 - live broadcast capacity 为 256；
 - cursor 早于现存历史时 `EventReadResult.truncated` 为 `true`；
-- 可通过 event 名称过滤 replay，live receiver 仍会收到所有 HostEvent。
+- 直接调用 `Host::subscribe_events` 时，`event` 只过滤 replay，返回的 live receiver 仍会收到所有 HostEvent；
+- IPC/WebSocket 的 `event.subscribe` transport 会把同一个 `event` 过滤同时应用到 replay 和 live；不传过滤器时发送全部 HostEvent。
 
 `HostEvent` 包含单调递增的 `seq`、事件名 `event` 和 JSON `params`。稳定事件名由
 `dwo_protocol::capabilities().events` 公布。

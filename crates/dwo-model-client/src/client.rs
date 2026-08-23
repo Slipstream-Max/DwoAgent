@@ -44,8 +44,12 @@ impl ConfiguredModelClient {
         )
     }
 
-    pub fn default_model_name(&self) -> &str {
-        &self.config.default_model_name
+    pub fn default_model(&self) -> &str {
+        &self.config.default_model
+    }
+
+    pub fn default_reasoning(&self) -> Option<&str> {
+        self.config.default_reasoning.as_deref()
     }
 
     fn resolve(&self, alias: &str) -> Result<(&BaseClient, &crate::ModelConfig), ModelClientError> {
@@ -70,7 +74,7 @@ impl ModelClient for ConfiguredModelClient {
             context_window_tokens: model.context_window_tokens,
             max_output_tokens: model.max_output_tokens,
             max_input_tokens,
-            compact_trigger_tokens: ((max_input_tokens as f64) * model.compact_threshold)
+            compact_trigger_tokens: ((max_input_tokens as f64) * model.compaction_trigger_ratio)
                 .floor()
                 .max(1.0) as u64,
         })
@@ -82,6 +86,10 @@ impl ModelClient for ConfiguredModelClient {
 
     fn provider_id(&self, model: &str) -> Result<String, ModelClientError> {
         Ok(self.resolve(model)?.1.provider.clone())
+    }
+
+    fn context_owner_id(&self, model: &str) -> Result<String, ModelClientError> {
+        Ok(self.resolve(model)?.1.context_owner_id())
     }
 
     fn reasoning_modes(&self, model: &str) -> Result<Vec<String>, ModelClientError> {

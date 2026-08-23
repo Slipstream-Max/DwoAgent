@@ -1,0 +1,42 @@
+baseUrl: https://api.x.ai/v1
+models:
+  grok-4.5:
+    contextWindowTokens: 500000
+    maxOutputTokens: 128000
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    hostedTools:
+      webSearch:
+        type: web_search
+      xSearch:
+        type: x_search
+    defaultReasoningMode: High
+    reasoning:
+      Low:
+        reasoning: {effort: low, summary: auto}
+      Medium:
+        reasoning: {effort: medium, summary: auto}
+      High:
+        reasoning: {effort: high, summary: auto}
+  grok-4.6:
+    contextWindowTokens: 500000
+    maxOutputTokens: 128000
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    hostedTools:
+      webSearch:
+        type: web_search
+      xSearch:
+        type: x_search
+    defaultReasoningMode: High
+    reasoning:
+      Low:
+        reasoning: {effort: low, summary: auto}
+      Medium:
+        reasoning: {effort: medium, summary: auto}
+      High:
+        reasoning: {effort: high, summary: auto}
+      XHigh:
+        reasoning: {effort: xhigh, summary: auto}

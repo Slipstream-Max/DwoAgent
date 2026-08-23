@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -8,7 +7,7 @@ use super::Host;
 
 impl Host {
     pub(crate) fn model_list(&self) -> Result<Value> {
-        redacted_model_config(
+        super::redacted_model_config(
             &self
                 .profile
                 .read()
@@ -18,59 +17,112 @@ impl Host {
         )
     }
 
-    pub(crate) async fn model_set_default(self: &Arc<Self>, name: String) -> Result<Value> {
+    pub(crate) async fn model_set_default(
+        self: &Arc<Self>,
+        default: dwo_agent_service::DefaultModelConfig,
+    ) -> Result<Value> {
         self.config_manager
             .update(|profile| {
-                profile.model.default_model_name = name.clone();
+                profile.model.default = default.clone();
                 Ok(())
             })
             .await?;
         self.reload_profile_if_changed().await?;
-        Ok(json!({"defaultModelName": name}))
+        Ok(json!({"default": default}))
     }
 
     pub(crate) async fn model_upsert(
         self: &Arc<Self>,
+        provider_name: String,
+        model_name: String,
         entry: dwo_agent_service::AgentModelEntry,
     ) -> Result<Value> {
-        let name = entry.model_name.clone();
+        let mut catalog = dwo_agent_service::ModelCatalog::builtin()?;
+        catalog.merge_model_directory(self.profile_root.join("resource/models"))?;
         self.config_manager
             .update(|profile| {
-                if let Some(existing) = profile
+                let provider = profile
                     .model
-                    .models
-                    .iter_mut()
-                    .find(|item| item.model_name == name)
-                {
-                    *existing = entry.clone();
-                } else {
-                    profile.model.models.push(entry.clone());
+                    .providers
+                    .get_mut(&provider_name)
+                    .ok_or_else(|| anyhow::anyhow!("provider not found: {provider_name}"))?;
+                if provider.models.is_none() {
+                    let family = catalog.families.get(&provider_name).ok_or_else(|| {
+                        anyhow::anyhow!("provider {provider_name} has no implicit model family")
+                    })?;
+                    provider.models = Some(
+                        family
+                            .models
+                            .keys()
+                            .map(|id| {
+                                (
+                                    id.clone(),
+                                    dwo_agent_service::AgentModelEntry {
+                                        model_id: None,
+                                        profile: None,
+                                        context_window_tokens: None,
+                                        max_output_tokens: None,
+                                        default_reasoning_mode: None,
+                                        capabilities: None,
+                                        reasoning: None,
+                                        hosted_tools: None,
+                                        temperature: None,
+                                        top_p: None,
+                                        extra_body: serde_json::Map::new(),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    );
                 }
+                let models = provider.models.as_mut().expect("models materialized");
+                let model_id = entry.effective_model_id(&model_name).to_string();
+                models.retain(|name, model| {
+                    name == &model_name || model.effective_model_id(name) != model_id
+                });
+                models.insert(model_name.clone(), entry.clone());
                 Ok(())
             })
             .await?;
         self.reload_profile_if_changed().await?;
-        Ok(json!({"model": name, "updated": true}))
+        Ok(json!({
+            "provider": provider_name,
+            "modelName": model_name,
+            "updated": true
+        }))
     }
 
-    pub(crate) async fn model_remove(self: &Arc<Self>, name: String) -> Result<Value> {
+    pub(crate) async fn model_remove(
+        self: &Arc<Self>,
+        provider_name: String,
+        model_id: String,
+    ) -> Result<Value> {
+        let stable_id = format!("{provider_name}/{model_id}");
         self.config_manager
             .update(|profile| {
-                let previous = profile.model.models.len();
-                profile.model.models.retain(|item| item.model_name != name);
                 anyhow::ensure!(
-                    profile.model.models.len() != previous,
-                    "model not found: {name}"
-                );
-                anyhow::ensure!(
-                    profile.model.default_model_name != name,
+                    profile.model.default.model != stable_id,
                     "cannot remove the default model"
                 );
+                let provider = profile
+                    .model
+                    .providers
+                    .get_mut(&provider_name)
+                    .ok_or_else(|| anyhow::anyhow!("provider not found: {provider_name}"))?;
+                let models = provider.models.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "provider {provider_name} uses its implicit model list; configure models before removing one"
+                    )
+                })?;
+                let previous = models.len();
+                models.retain(|name, model| model.effective_model_id(name) != model_id);
+                anyhow::ensure!(models.len() != previous, "model not found: {stable_id}");
+                anyhow::ensure!(!models.is_empty(), "provider models must not be empty");
                 Ok(())
             })
             .await?;
         self.reload_profile_if_changed().await?;
-        Ok(json!({"model": name, "removed": true}))
+        Ok(json!({"model": stable_id, "removed": true}))
     }
 
     pub(crate) fn provider_list(&self) -> Result<Value> {
@@ -103,10 +155,13 @@ impl Host {
         self.config_manager
             .update(|profile| {
                 anyhow::ensure!(
-                    profile.model.providers.remove(&name).is_some(),
+                    !profile.model.default.model.starts_with(&format!("{name}/")),
+                    "cannot remove the default model provider"
+                );
+                anyhow::ensure!(
+                    profile.model.providers.shift_remove(&name).is_some(),
                     "provider not found: {name}"
                 );
-                profile.model.models.retain(|item| item.provider != name);
                 Ok(())
             })
             .await?;
@@ -114,66 +169,75 @@ impl Host {
         Ok(json!({"provider": name, "removed": true}))
     }
 
-    pub(crate) fn provider_catalog_list(&self) -> Result<Value> {
-        let directory = self.profile_root.join("resource/providers");
+    pub(crate) fn model_catalog_list(&self) -> Result<Value> {
         let mut catalog = dwo_agent_service::ModelCatalog::builtin()?;
-        catalog.merge_provider_directory(&directory)?;
-        super::redacted_provider_catalog(&catalog)
+        catalog.merge_model_directory(self.profile_root.join("resource/models"))?;
+        Ok(serde_json::to_value(catalog)?)
     }
 
-    pub(crate) async fn provider_catalog_upsert(
+    pub(crate) async fn model_catalog_upsert(
         self: &Arc<Self>,
-        name: String,
-        provider: dwo_agent_service::ProviderSpec,
+        family: String,
+        spec: dwo_agent_service::ModelFamilySpec,
     ) -> Result<Value> {
-        super::validate_resource_name(&name)?;
-        let builtin = dwo_agent_service::ModelCatalog::builtin()?;
-        anyhow::ensure!(
-            !builtin.providers.contains_key(&name),
-            "built-in provider catalog cannot be replaced: {name}"
-        );
-        dwo_agent_service::ModelCatalog {
-            providers: BTreeMap::from([(name.clone(), provider.clone())]),
-        }
-        .validate()?;
+        super::validate_resource_name(&family)?;
+        let mut catalog = dwo_agent_service::ModelCatalog::builtin()?;
+        catalog.merge_model_directory(self.profile_root.join("resource/models"))?;
+        catalog.merge_family(family.clone(), spec.clone())?;
+        self.profile
+            .read()
+            .expect("profile lock poisoned")
+            .config
+            .resolve_models(&catalog)?;
 
         let path = self
             .profile_root
-            .join("resource/providers")
-            .join(format!("{name}.yaml"));
+            .join("resource/models")
+            .join(format!("{family}.yaml"));
         self.config_manager
             .write_resource(
                 &path,
-                serde_yaml::to_string(&provider)?.into_bytes(),
+                serde_yaml::to_string(&spec)?.into_bytes(),
                 |_| Ok(()),
             )
             .await?;
         self.reload_profile(true).await?;
-        Ok(json!({"providerType": name, "updated": true}))
+        Ok(json!({"family": family, "updated": true}))
     }
 
-    pub(crate) async fn provider_catalog_remove(self: &Arc<Self>, name: String) -> Result<Value> {
-        super::validate_resource_name(&name)?;
-        let in_use = self
-            .profile
-            .read()
-            .expect("profile lock poisoned")
-            .config
-            .model
-            .providers
-            .values()
-            .any(|provider| provider.provider_type == name);
-        anyhow::ensure!(!in_use, "provider catalog is in use: {name}");
+    pub(crate) async fn model_catalog_remove(self: &Arc<Self>, family: String) -> Result<Value> {
+        super::validate_resource_name(&family)?;
+        let builtin = dwo_agent_service::ModelCatalog::builtin()?;
+        if !builtin.families.contains_key(&family) {
+            let in_use = self
+                .profile
+                .read()
+                .expect("profile lock poisoned")
+                .config
+                .model
+                .providers
+                .iter()
+                .any(|(provider_name, provider)| {
+                    (provider_name == &family && provider.models.is_none())
+                        || provider.models.as_ref().is_some_and(|models| {
+                            models.values().any(|model| {
+                                model.profile.as_deref().is_some_and(|profile| {
+                                    profile.starts_with(&format!("{family}/"))
+                                })
+                            })
+                        })
+                });
+            anyhow::ensure!(!in_use, "model family is in use: {family}");
+        }
 
         let path = self
             .profile_root
-            .join("resource/providers")
-            .join(format!("{name}.yaml"));
+            .join("resource/models")
+            .join(format!("{family}.yaml"));
         let removed = self.config_manager.remove_resource_file(&path).await?;
-        Ok(json!({"providerType": name, "removed": removed}))
+        if removed {
+            self.reload_profile(true).await?;
+        }
+        Ok(json!({"family": family, "removed": removed}))
     }
-}
-
-fn redacted_model_config(config: &dwo_agent_service::AgentModelConfig) -> Result<Value> {
-    super::redacted_model_config(config)
 }

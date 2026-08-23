@@ -4,11 +4,12 @@ use super::{ConfigSnapshot, ConfigUpdateParam, Host};
 
 impl Host {
     pub(crate) fn config_snapshot(&self, session_count: usize) -> ConfigSnapshot {
-        let (policy, default_model, models, max_model_steps) = {
+        let (policy, default_model, default_reasoning, models, max_model_steps) = {
             let profile = self.profile.read().expect("profile lock poisoned");
             (
                 profile.config.policy_mode,
-                profile.config.model.default_model_name.clone(),
+                profile.config.model.default.model.clone(),
+                profile.config.model.default.reasoning.clone(),
                 profile.model_options.clone(),
                 profile.config.max_model_steps,
             )
@@ -16,6 +17,7 @@ impl Host {
         ConfigSnapshot {
             policy,
             default_model,
+            default_reasoning,
             models,
             max_model_steps,
             session_count,

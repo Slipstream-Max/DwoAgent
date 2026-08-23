@@ -120,6 +120,11 @@ pub trait ModelClient: Send + Sync {
         Ok("default".to_string())
     }
 
+    /// Stable response-compatibility identity for provider-native context items.
+    fn context_owner_id(&self, model: &str) -> Result<String, ModelClientError> {
+        self.provider_id(model)
+    }
+
     fn supports_image_input(&self, _model: &str) -> Result<bool, ModelClientError> {
         Ok(false)
     }

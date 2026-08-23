@@ -11,8 +11,8 @@ mod types;
 pub use base::BaseClient;
 pub use client::ConfiguredModelClient;
 pub use config::{
-    AgentModelConfig, AgentModelEntry, AgentProviderConfig, ModelCapabilities, ModelCatalog,
-    ModelClientConfig, ModelConfig, ModelSpec, ProviderConfig, ProviderProtocol, ProviderSpec,
+    AgentModelConfig, AgentModelEntry, AgentProviderConfig, DefaultModelConfig, ModelCapabilities,
+    ModelCatalog, ModelClientConfig, ModelConfig, ModelFamilySpec, ModelSpec, ProviderConfig,
     RequestPolicy,
 };
 pub use error::ModelClientError;

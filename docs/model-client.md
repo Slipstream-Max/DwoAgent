@@ -1,185 +1,187 @@
-# Model Client 与 Provider Catalog
+# Model Client、Provider 与 Model List
 
-赤铎的模型接入分两层：**provider catalog** 定义传输端点、请求行为和模型规格；
-**profile 的 `model` 段**声明使用哪些 provider 实例和模型 alias。两者在 daemon
-启动或 profile 热加载时合并解析为运行时配置，由统一的 client 按
-OpenAI Responses 协议发送请求。
+Model Client 固定使用 OpenAI Responses API。配置中没有 `protocol`，也没有 Provider
+继承或 Provider type。运行时分成三个独立概念：
 
-## 分层结构
+| 概念 | 负责内容 |
+| --- | --- |
+| Profile model 配置 | 默认模型、默认 reasoning、压缩策略和已启用 Provider |
+| Provider | `baseUrl`、凭据、headers、超时和该端点的模型映射 |
+| Model List | 模型限制、能力、reasoning 请求参数和 hosted tools |
 
-| 层 | 位置 | 内容 |
-| --- | --- | --- |
-| Provider catalog | 内置：`dwo-model-client/resources/providers/<type>.yaml`（编译进二进制）；自定义：profile 根目录 `resource/providers/<type>.yaml` | `endpoint`、`headers`、重试策略、请求体骨架、模型规格 |
-| Profile model 段 | `profile.yaml` 的 `model.providers` / `model.models` | provider instance（`type` + 凭据 + 可选 `baseUrl` 覆盖）、模型 alias |
-| 运行时配置 | 由 `ModelCatalog` + `AgentModelConfig` resolve 生成 | endpoint、Authorization、超时/重试、每个模型的 token 上限与能力 |
-| 传输 client | `dwo-model-client` 的 `BaseClient` | 统一 `open_ai_responses` 协议（Responses API + SSE 流式） |
+每个 Provider 创建一个共享 `BaseClient`。同一中转站下的 GPT、Grok 和 DeepSeek
+共享地址、凭据、HTTP pool，但分别从自己的 Model List profile 继承模型能力。
 
-配置示例见 [Profile 配置指南](profile.md#model)。
-
-## Catalog 文件格式
-
-每个文件只定义一个 provider，文件名（不含扩展名）即 `type`。字段均使用
-camelCase，未知字段会报错。
+## Profile schema
 
 ```yaml
-protocol: open_ai_responses        # 当前唯一取值，可省略
-endpoint: https://api.example.com/v1/responses   # 必填，http/https
-headers:                            # 可选，附加到每次请求
-  x-custom: value
-request:                            # 可选，超时与重试策略
-  requestTimeoutMs: 300000
-  streamIdleTimeoutMs: 300000
-body:                               # 可选，provider 级请求体骨架
-  extra_field: value
-models:                             # 必填，至少一个
-  my-model:
-    contextWindowTokens: 200000     # 必填
-    maxOutputTokens: 32000          # 必填
-    compactThreshold: 0.8           # 默认 0.8，取值 (0, 1]
-    temperature: 0.7                # 可选
-    topP: 1.0                       # 可选
-    body:                           # 可选，模型级请求体覆盖
-      extra_field: value
-    hostedTools:                    # 可选，provider 托管的服务端工具
-      - type: web_search
-    defaultReasoningMode: medium    # 默认 auto
-    reasoning:                      # 可选，mode -> 请求体覆盖
-      low: {reasoning: {effort: low}}
-      medium: {reasoning: {effort: medium}}
-    capabilities:                   # 默认均为 false
-      imageInput: false
-      toolCalls: true
+model:
+  default:
+    # 稳定身份始终是 provider/modelId，不使用显示名称。
+    model: newapi/ds-v4-pro
+    reasoning: High # 可选
+
+  # Agent 上下文策略，不属于模型能力。
+  compactionTriggerRatio: 0.8
+
+  providers:
+    newapi:
+      baseUrl: https://gateway.example.com/v1
+      apiKeyEnv: NEW_API_KEY
+      apiKey: null
+
+      headers:
+        X-Client-Name: dwoagent
+
+      request:
+        requestTimeoutMs: 300000
+        streamIdleTimeoutMs: 300000
+
+      extraBody: {}
+
+      models:
+        # Map key 是客户端显示名称。
+        "5.6 Terra":
+          # modelId 是请求 body 中的 model，也是 session/default 的稳定 ID。
+          modelId: gpt-5.6-terra
+          profile: openai/gpt-5.6-terra
+
+        "Grok 4.6":
+          modelId: grok-4.6
+          profile: grok/grok-4.6
+          hostedTools: [webSearch, xSearch]
+
+        "DeepSeek V4 Pro":
+          modelId: ds-v4-pro
+          profile: deepseek/deepseek-v4-pro
 ```
 
-### ProviderSpec 字段
+模型部署可以覆盖 `contextWindowTokens`、`maxOutputTokens`、
+`defaultReasoningMode`、`capabilities`、`reasoning`、`hostedTools`、
+`temperature`、`topP` 和 `extraBody`。`modelId` 省略时使用外层显示名称。
 
-| 字段 | 说明 |
-| --- | --- |
-| `protocol` | 传输协议，当前仅 `open_ai_responses`（默认值，可省略） |
-| `endpoint` | 完整 Responses URL，必填，必须为 http/https |
-| `headers` | 附加请求头；`Authorization: Bearer <key>` 由 client 在最后注入，优先于 catalog 中的同名头 |
-| `request` | 单次请求超时策略，见下表 |
-| `body` | provider 级请求体骨架，与模型级 `body` 深合并 |
-| `models` | `modelId -> ModelSpec` 映射，必填且非空 |
+同一 Provider 下解析后的 `modelId` 必须唯一。外层显示名称可以修改，不影响已有
+session；改变 `modelId` 会改变稳定身份。
 
-### request 策略
+## 官方 Provider 简写
 
-| 字段 | 默认 | 说明 |
-| --- | --- | --- |
-| `requestTimeoutMs` | 300000 | 单次请求超时（毫秒），必须为正 |
-| `streamIdleTimeoutMs` | 300000 | 流式响应相邻事件的最大空闲间隔 |
+`openai`、`grok`、`deepseek` 等名称命中内置 Model List family。省略 `baseUrl` 和
+`models` 时，自动使用 family 的官方地址并启用它的全部模型：
 
-重试策略由统一 model client 固定实现，不从 provider/profile 配置：每个模型请求
-步骤最多执行首次请求加 5 次重试；任意一次成功后，下一个模型步骤重新获得完整
-预算。退避为 1、2、4、8、16 秒并增加最多 25% jitter，provider 的
-`Retry-After` 可以延长等待，单次封顶 60 秒。
+```yaml
+model:
+  default:
+    model: deepseek/deepseek-v4-pro
+    reasoning: High
+  providers:
+    deepseek:
+      apiKeyEnv: DEEPSEEK_API_KEY
+```
 
-可重试错误包括 HTTP 408/409/425/429/5xx、连接/请求/响应体错误、超时、provider
-响应解析错误和流中断。Cancel、认证、普通 4xx、本地请求/上下文校验失败、上下文超限等永久或专用恢复错误不会进入
-通用重试；上下文超限仍由 agent loop 执行压缩恢复。
+可以设置 `baseUrl` 覆盖官方地址而不重复模型列表：
 
-### ModelSpec 字段
+```yaml
+providers:
+  openai:
+    baseUrl: https://compatible.example.com/v1
+    apiKeyEnv: CUSTOM_API_KEY
+```
 
-| 字段 | 默认 | 说明 |
-| --- | --- | --- |
-| `contextWindowTokens` | — | 必填，上下文窗口（token） |
-| `maxOutputTokens` | — | 必填，最大输出（token） |
-| `compactThreshold` | 0.8 | 触发上下文压缩的比例，取值 (0, 1] |
-| `temperature` / `topP` | 无 | 设置后写入请求体 |
-| `body` | 无 | 模型级请求体覆盖，与 provider `body` 深合并 |
-| `hostedTools` | 空 | 服务端托管工具声明，请求时与本地 function tools 合并 |
-| `reasoning` | 空 | `mode -> body 覆盖` 的有序映射，mode 名为任意标识符 |
-| `defaultReasoningMode` | `auto` | 新 session 默认 reasoning mode；非 `auto` 时必须存在于 `reasoning` |
-| `capabilities.imageInput` | false | 模型是否接受图片输入 |
-| `capabilities.toolCalls` | false | 模型是否支持工具调用；工具非空而该值为 false 时请求报错 |
+官方 Provider 显式配置 `models` 时，它成为 allowlist，只启用列出的模型；`profile`
+省略时按 `providerName/modelId` 推导。
 
-校验规则：
+自定义 Provider 必须配置 `baseUrl` 和非空 `models`，每个模型必须配置 `profile`。
 
-- `contextWindowTokens > 0`、`maxOutputTokens > 0`，且必须留出输入空间
-  （`contextWindowTokens > maxOutputTokens`）；
-- `compactThreshold` 必须在 (0, 1]；
-- 任何 `body`（provider 级、模型级、reasoning 覆盖）都不得覆盖保留字段：
-  `model`、`input`、`instructions`、`previous_response_id`、`tools`、`stream`、
-  `stream_options`、`max_tokens`、`max_completion_tokens`、`max_output_tokens`。
+`baseUrl` 是 API root。Client 固定请求 `POST {baseUrl}/responses`，不要在配置中附加
+`/responses`。
 
-## 内置 Provider
+## Model List
 
-内置 catalog 按 provider 分文件维护在
-`dwo-model-client/resources/providers/`，编译进二进制，改动需重新编译。
+内置文件位于 `dwo-model-client/resources/models/<family>.yaml`。用户扩展位于 profile
+根目录的 `resource/models/<family>.yaml`。文件名构成 profile 引用的 family；用户文件
+与同名内置 family 合并，同 ID 模型由用户定义覆盖。
 
-| type | endpoint | 模型 | 能力 |
-| --- | --- | --- | --- |
-| `openai` | `https://api.openai.com/v1/responses` | `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.5`、`gpt-5.4`（1,050,000 ctx / 128,000 输出） | imageInput、toolCalls；hosted `web_search`；reasoning Low/Medium/High/XHigh/Max，默认 Medium |
-| `deepseek` | `https://api.deepseek.com/responses` | `deepseek-v4-pro`、`deepseek-v4-flash`（1,000,000 ctx / 384,000 输出） | toolCalls（无图片输入）；hosted `web_search`；reasoning Auto/Off/Low/High/Max，默认 High |
-| `grok` | `https://api.x.ai/v1/responses` | `grok-4.5`、`grok-4.6`（500,000 ctx / 128,000 输出） | imageInput、toolCalls；hosted `web_search` + `x_search`；reasoning Low/Medium/High/XHigh，默认 High |
+```yaml
+# resource/models/minimax.yaml
+baseUrl: https://api.minimax.example/v1 # 可选，仅用于同名官方 Provider 简写
 
-## Profile 侧的 Provider instance
+models:
+  minimax-m2.5:
+    contextWindowTokens: 200000
+    maxOutputTokens: 32000
 
-`model.providers` 中的每个实例引用 catalog 中的 `type`，并可选覆盖地址和凭据：
+    capabilities:
+      imageInput: false
+      toolCalls: true
 
-| 字段 | 说明 |
-| --- | --- |
-| `type` | catalog 中的 provider 类型，必填 |
-| `baseUrl` | 可选，覆盖 catalog `endpoint`（OpenAI-compatible 网关可继承 `openai` 只改 URL） |
-| `apiKeyEnv` | API key 环境变量名；变量缺失或为空时报 `MissingApiKey` |
-| `apiKey` | 直接填写 key，优先于 `apiKeyEnv` |
+    hostedTools:
+      webSearch:
+        type: web_search
 
-`headers`、`request` 策略和 `body` 骨架只来自 catalog，profile 不覆盖。
-`model.models` 中的 alias 通过 `modelId` 指向 catalog 模型，可覆盖
-`contextWindowTokens`、`maxOutputTokens`、`compactThreshold`、
-`defaultReasoningMode`；`temperature`/`topP`/`hostedTools`/`reasoning`/
-`capabilities` 只来自 catalog。
+    defaultReasoningMode: High
+    reasoning:
+      Off:
+        reasoning:
+          effort: none
+      High:
+        reasoning:
+          effort: high
+
+    temperature: null
+    topP: null
+    extraBody: {}
+```
+
+引用为 `minimax/minimax-m2.5`。Model List 不保存凭据、Provider 实例、显示名称或
+`compactionTriggerRatio`。
+
+## Hosted tools
+
+Model List 的 `hostedTools` 是名称到 Responses 原生工具对象的映射。部署模型省略
+`hostedTools` 时启用 profile 中的全部 hosted tools；配置名称列表时只启用选中项；
+配置 `[]` 时全部关闭。DWO 本地 function tools 不在这里配置，只要求
+`capabilities.toolCalls: true`。
+
+## 上下文身份
+
+运行时维护两个独立身份：
+
+```text
+connection id     = newapi
+context owner id  = newapi/grok
+```
+
+连接 ID 用于复用 URL、Key 和 HTTP pool。上下文 owner 使用 `provider/family`，用于标记
+Responses 原生 reasoning 和 hosted-tool item。同一中转站从 GPT 切到 Grok 时会清除
+不兼容的原生 item；同一中转站同 family 模型切换时保留兼容 item。可见消息和本地
+function call/result 不受影响。
 
 ## 请求构造
 
-每次请求的 body 按以下顺序合并：
+请求 body 按以下顺序合并：
 
-1. provider `body` 骨架；
-2. 模型级 `body`（同键均为 object 时递归深合并，否则覆盖）；
-3. `temperature`、`top_p`（catalog 中设置了才写入）；
-4. `max_output_tokens`；
-5. reasoning mode 覆盖：mode 为本次调用传入值或模型
-   `defaultReasoningMode`；`auto` 表示不附加覆盖，否则深合并
-   `reasoning[mode]` 对应的 body（mode 未配置则报配置错误）；
-6. `model` = modelId、`input` = 消息数组；
-7. `tools`（非空时）、`stream`。
+1. Provider `extraBody`；
+2. Model List `extraBody`；
+3. 部署模型 `extraBody`；
+4. temperature、top_p、max_output_tokens；
+5. 选中 reasoning mode 的请求参数；
+6. 固定的 model、input、tools 和 stream。
 
-## 错误分类
+`model`、`input`、`tools`、`stream` 和 token limit 等 transport-owned 字段禁止通过
+`extraBody` 覆盖。
 
-| 错误 | 触发条件 |
-| --- | --- |
-| `Authentication` | HTTP 401/403 |
-| `RateLimited` | HTTP 429（5 次重试耗尽后） |
-| `ContextLengthExceeded` | 响应体匹配上下文超限特征（如 `context_length_exceeded`、`maximum context length`），触发压缩恢复 |
-| `InvalidRequest` | 其他 4xx |
-| `ProviderStatus` | 其他状态码（如 5xx 超出重试次数） |
-| `StreamInterrupted` | 流中断或空闲超时，保留已累积文本/工具调用 |
-| `Cancelled` | 会话取消 |
+模型输入上限和自动压缩触发点为：
 
-流式请求是单次原子尝试：只有完整读到结束事件才算成功。连接在输出中途断开时，
-已收到的 reasoning、assistant 文本和工具事件会先写入 transcript；重试仍保持原
-turn ID 和原 ACP prompt，并在下一次请求上下文中加入可见的残缺 assistant 文本。
-重试期间 session 保持 `Running`。只有成功、Cancel、永久错误或重试耗尽才结束
-turn；失败结束不会自动推进未完成计划，计划保留供用户修正后继续。
+```text
+max input = contextWindowTokens - maxOutputTokens
+compact trigger = max input * model.compactionTriggerRatio
+```
 
-## 自定义 Provider
+Token 估算包括 system prompt、消息、reasoning、图片、本地/远端工具 call/result 和
+tool schemas。不额外预留固定 token。
 
-自定义文件放在 profile 根目录的 `resource/providers/<type>.yaml`，文件名（不含
-扩展名）就是 `type`。文件内容只定义一个 provider，不含顶层 `providers` map；
-格式见[Catalog 文件格式](#catalog-文件格式)。
+## 错误与重试
 
-最短步骤（第三方接口兼容 OpenAI Responses 时）：
-
-1. 在 `resource/providers/<type>.yaml` 定义 `endpoint` 和 `models`；
-2. 在 `profile.yaml` 的 `model.providers` 中增加 instance，`type` 指向该文件名；
-3. 在 `model.models` 中增加 model alias，并设置 `modelId`；
-4. 通过 `apiKeyEnv` 指定密钥环境变量。
-
-约束：
-
-- 自定义文件名不能与内置 type（`openai`、`deepseek`、`grok`）冲突；需要修改
-  内置定义时应使用新文件名，再在 profile instance 中引用；
-- 无效文件会使整次 profile reload 失败，daemon 保留上一份有效配置；
-- 配置式 catalog 的 transport 固定为 `open_ai_responses`。若 provider 使用完全
-  不同的协议，需要在 Rust 中实现 `ModelClient`，再通过 `AgentService` 注入
-  自定义 client，不能仅靠 profile YAML 动态加载任意协议。
+HTTP 401/403、429、上下文超限、其他 4xx、Provider 状态、transport、无效响应、流中断
+和取消保持独立错误分类。瞬态失败使用 1/2/4/8/16 秒指数退避和 jitter；中途断流会先
+持久化可见的部分输出，再在同一 turn 重试。上下文超限走独立的 compaction recovery。

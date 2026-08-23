@@ -82,7 +82,7 @@ assert!(is_side_effect_method("model.set_default"));
 
 let spec = method_spec("channel.telegram.status").unwrap();
 let advertised = capabilities();
-assert_eq!(advertised.protocol_version, 2);
+assert_eq!(advertised.protocol_version, 3);
 ```
 
 `channel.<kind>.*` 只匹配当前允许的 `weixin`、`telegram`、`feishu` 和 `qq`，未知 kind

@@ -15,8 +15,8 @@
 |  |- prompts/
 |  |  |- System.md
 |  |  `- AGENTS.md
-|  |- providers/
-|  |  `- <provider-type>.yaml
+|  |- models/
+|  |  `- <family>.yaml
 |  |- skills/
 |  |  `- <skill>/SKILL.md
 |  `- mcp/
@@ -51,7 +51,7 @@
 | --- | --- | --- |
 | `profile.yaml` | 是 | 模型、默认权限、channels 和 automation。 |
 | `resource/prompts/` | 是 | System prompt 和 profile 级规则。 |
-| `resource/providers/` | 是 | 每个文件定义一个自定义模型 provider type。 |
+| `resource/models/` | 是 | 扩展或覆盖可引用的 Model List family。 |
 | `resource/skills/` | 是 | 本地 skill。 |
 | `resource/mcp/mcp.json` | 是 | MCP server 配置。 |
 | `runtime/` | 通常不需要 | Session、附件和 OAuth。 |
@@ -112,15 +112,13 @@ automation:
   jobs: []
 
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: deepseek/deepseek-v4-pro
+    reasoning: High
+  compactionTriggerRatio: 0.8
   providers:
     deepseek:
-      type: deepseek
       apiKeyEnv: DEEPSEEK_API_KEY
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
 ```
 
 Profile 使用严格 schema，未知字段会报错。旧的 `agent.yaml`、profile 级 `tools` 开关和额外 provider transport 配置不受支持。
@@ -130,7 +128,7 @@ Profile 使用严格 schema，未知字段会报错。旧的 `agent.yaml`、prof
 Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份配置，不需要重启。无效或写入中的配置不会覆盖当前运行态，修正文件后会在下一次检查自动生效。
 
 - 模型选项会立即反映到 ACP 和后续配置查询。
-- provider、模型地址、凭据、能力和限制从已有 session 的下一次模型请求起生效。删除已有 session 正在使用的模型 alias 会使该 session 的后续请求报配置错误，直到切换到有效模型。
+- provider、模型地址、凭据、能力和限制从已有 session 的下一次模型请求起生效。删除已有 session 正在使用的稳定模型 ID 会使该 session 的后续请求报配置错误，直到切换到有效模型。
 - `policyMode`、默认模型和 `maxModelSteps` 是创建新 session、subsession 或 automation session 时使用的默认值，不会改写已有 session 自己的配置。
 - `channels` 变化会重新构造 channel manager，并短暂停止和重启已连接且仍启用的 channel。
 - `externalSkillsDirs` 变化会立即更新所有 session（含已有 session）可用的技能目录。
@@ -148,7 +146,7 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 | `externalSkillsDirs` | 否 | 额外 skills 目录列表，可挂载他人的 skill；相对路径相对 profile 根目录解析。 |
 | `channels` | 否 | 微信、Telegram、飞书/Lark 和 QQ Bot adapter。 |
 | `automation` | 否 | Cron 定时任务。 |
-| `model` | 是 | Provider、模型 alias 和默认模型。 |
+| `model` | 是 | Provider、模型部署和默认模型。 |
 
 ## 权限模式
 
@@ -180,97 +178,82 @@ DWO_LOG=dwo_agent_service=debug,dwo_mcp=trace
 
 ## Model
 
+最小官方配置：
+
 ```yaml
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: deepseek/deepseek-v4-pro
+    reasoning: High
+  compactionTriggerRatio: 0.8
   providers:
     deepseek:
-      type: deepseek
-      baseUrl: null
       apiKeyEnv: DEEPSEEK_API_KEY
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
-      contextWindowTokens: 1000000
-      maxOutputTokens: 384000
-      compactThreshold: 0.5
-      defaultReasoningMode: high
 ```
 
-### Provider
+`default.model` 使用稳定的 `provider/modelId`。Provider 名称命中内置 family 且省略
+`models` 时，使用官方地址并启用 family 的全部模型；`baseUrl` 可选覆盖官方地址。
+`default.reasoning` 省略时使用 Model List 中模型的 `defaultReasoningMode`。
 
-| 字段 | 说明 |
-| --- | --- |
-| `type` | 内置 model catalog 中的 provider 类型。 |
-| `baseUrl` | 可选 API 地址覆盖。 |
-| `apiKeyEnv` | API key 环境变量名。 |
-| `apiKey` | 可直接填写 key，使用环境变量更方便管理。 |
-
-请求 headers、retry、request body 和模型 capabilities 来自内置 catalog。Profile 可以覆盖 provider 地址和凭据。
-
-Provider catalog 文件的完整格式、内置 provider 清单、请求构造、重试策略与错误分类
-见 [Model Client 与 Provider Catalog](model-client.md)。
-
-内置 catalog 按 provider 分文件维护在
-`dwo-model-client/resources/providers/`。OpenAI-compatible 网关可以继承
-`openai`，只覆盖完整的 Responses URL：
+第三方中转站显式声明地址和模型映射：
 
 ```yaml
 model:
-  defaultModelName: gpt-5.6-terra
+  default:
+    model: newapi/ds-v4-pro
+    reasoning: High
+  compactionTriggerRatio: 0.8
   providers:
     newapi:
-      type: openai
-      baseUrl: https://gateway.example.com/v1/responses
+      baseUrl: https://gateway.example.com/v1
       apiKeyEnv: NEW_API_KEY
-  models:
-    - modelName: gpt-5.6-terra
-      provider: newapi
-      modelId: gpt-5.6-terra
+      headers: {}
+      request:
+        requestTimeoutMs: 300000
+        streamIdleTimeoutMs: 300000
+      extraBody: {}
+      models:
+        "5.6 Terra":
+          modelId: gpt-5.6-terra
+          profile: openai/gpt-5.6-terra
+        "Grok 4.6":
+          modelId: grok-4.6
+          profile: grok/grok-4.6
+        "DeepSeek V4 Pro":
+          modelId: ds-v4-pro
+          profile: deepseek/deepseek-v4-pro
 ```
 
-`openai` 与 `deepseek` 都使用 Responses transport，并统一发送
-`input`、`max_output_tokens` 和 Responses SSE 事件。Provider catalog 可以通过
-模型级 `hostedTools` 声明服务端工具；本地 function tools 会在请求时与其合并。
+外层 map key 是显示名称；`modelId` 是请求参数和 session 稳定身份；`profile` 是
+`family/catalogModelId`，提供上下文长度、最大输出、reasoning、能力和 hosted tools。
+自定义 Provider 必须配置 `baseUrl`、非空 `models` 和每个模型的 `profile`。
+`baseUrl` 是 API root，Client 请求 `{baseUrl}/responses`。
 
-用户自定义 provider 放在 profile 根目录的 `resource/providers/<type>.yaml`，
-文件名（不含扩展名）就是 `type`。完整文件格式、内置 provider 清单、请求构造、
-重试策略与添加步骤见 [Model Client 与 Provider Catalog](model-client.md)。
+部署模型可以覆盖 `contextWindowTokens`、`maxOutputTokens`、
+`defaultReasoningMode`、`capabilities`、`reasoning`、`hostedTools`、
+`temperature`、`topP` 和 `extraBody`。显式 `models` 是 allowlist。
 
-### Responses 上下文与 provider 切换
+用户可在 `resource/models/<family>.yaml` 添加 Model List。文件与同名内置 family
+合并，同 ID 定义由用户文件覆盖。完整格式见
+[Model Client、Provider 与 Model List](model-client.md)。
 
-Responses 返回的不是一整块 assistant message。赤铎会按原始顺序保存 reasoning、assistant message、本地 `function_call`/output 和 provider 托管的 tool call。下一次请求仍按这个顺序回放，不会把它们重新揉成一条消息；压缩和 usage 估算也使用同一套结构。
-
-其中 reasoning 和托管工具调用可能包含只对当前 provider instance 有效的状态，因此带有 provider 归属。切换 provider instance 时，daemon 会在下一次模型请求前永久移除这些私有项，同时保留用户与 assistant 可见消息，以及本地工具的 call/result。只在同一个 provider 下切换模型不会触发这项清理。
-
-这里改变的是 `model_context.json`，不是 `client_transcript.jsonl`。客户端回放仍能看到完整的 reasoning、远端工具事件和原始消息。类似地，切换到纯文本模型时，图片只会从模型上下文移除，transcript 仍保留原始输入。
-
-### Model Alias
-
-| 字段 | 说明 |
-| --- | --- |
-| `modelName` | 在 CLI、ACP 和 channel 中使用的模型名称。 |
-| `provider` | 指向 `providers` 中的实例。 |
-| `modelId` | 指向该 provider 类型内置 catalog 中的模型。 |
-| `contextWindowTokens` | 可选 context window 覆盖。 |
-| `maxOutputTokens` | 可选最大输出覆盖。 |
-| `compactThreshold` | 触发上下文压缩的比例。 |
-| `defaultReasoningMode` | 新 session 默认 reasoning mode。 |
-
-`defaultModelName` 必须匹配一个 `models[].modelName`。
-
-Context token 由 daemon 根据 system prompt、消息、reasoning、图片、tool call/result 和 tool schema 估算。压缩阈值为：
+Context token 根据 system prompt、消息、reasoning、图片、tool call/result 和 tool schema
+估算。压缩触发点为：
 
 ```text
-(contextWindowTokens - maxOutputTokens) * compactThreshold
+(contextWindowTokens - maxOutputTokens) * compactionTriggerRatio
 ```
 
-### 图片模型切换
+不额外预留固定 token。压缩比例属于 Agent profile，不写进 Model List。
 
-从图片模型切换到纯文本模型时，daemon 会先用当前或最近成功的图片模型生成文字摘要。摘要成功后再保存目标模型和无图 context。摘要失败时，原模型和 context 保持不变。
+### Responses 上下文与模型切换
 
-完整 transcript 仍会保留原图。切回图片模型后，已经从 model context 压缩掉的图片不会自动恢复，需要重新附图。
+Responses 原生 reasoning 和 hosted-tool item 使用 `provider/family` 作为兼容域。
+同一中转站从 GPT 切换到 Grok 会清理这些不兼容原生项；同一中转站同 family 模型共享
+兼容域。用户/assistant 可见消息和本地 function call/result 始终保留。
+
+切换到不支持图片的模型时，图片会从 `model_context.json` 移除；完整输入仍保留在
+`client_transcript.jsonl`。
 
 ## Channels
 

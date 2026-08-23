@@ -153,6 +153,7 @@ struct AutomationExecution {
 #[derive(Clone)]
 struct AutomationDefaults {
     model: String,
+    reasoning: Option<String>,
     mode: SessionMode,
 }
 
@@ -173,6 +174,7 @@ impl AutomationRuntime {
         profile_root: PathBuf,
         config: AutomationConfig,
         default_model: String,
+        default_reasoning: Option<String>,
         default_mode: SessionMode,
         shutdown: CancellationToken,
     ) -> Result<Arc<Self>> {
@@ -198,6 +200,7 @@ impl AutomationRuntime {
             profile_root,
             defaults: Mutex::new(AutomationDefaults {
                 model: default_model,
+                reasoning: default_reasoning,
                 mode: default_mode,
             }),
             shutdown,
@@ -362,6 +365,7 @@ impl AutomationRuntime {
         &self,
         config: AutomationConfig,
         default_model: String,
+        default_reasoning: Option<String>,
         default_mode: SessionMode,
     ) -> Result<()> {
         validate_config(&config)?;
@@ -372,6 +376,7 @@ impl AutomationRuntime {
         drop(state);
         *self.defaults.lock().await = AutomationDefaults {
             model: default_model,
+            reasoning: default_reasoning,
             mode: default_mode,
         };
         Ok(())
@@ -562,6 +567,13 @@ impl AutomationRuntime {
             self.profile_root.join(cwd)
         };
         let defaults = self.defaults.lock().await.clone();
+        let model = job.model.clone().unwrap_or_else(|| defaults.model.clone());
+        let reasoning = job.reasoning.clone().or_else(|| {
+            job.model
+                .is_none()
+                .then(|| defaults.reasoning.clone())
+                .flatten()
+        });
         Ok(self
             .service
             .create(NewSession {
@@ -574,10 +586,7 @@ impl AutomationRuntime {
                 ),
                 cwd,
                 mode: job.policy.unwrap_or(defaults.mode),
-                llm: SessionLlmSettings::new(
-                    job.model.clone().unwrap_or(defaults.model),
-                    job.reasoning.clone(),
-                ),
+                llm: SessionLlmSettings::new(model, reasoning),
                 automation_job: matches!(
                     &job.session,
                     AutomationSession::New {
@@ -1104,6 +1113,7 @@ jobs:
                     jobs: vec![job.clone()],
                 },
                 "test-model".to_string(),
+                None,
                 SessionMode::Watch,
                 CancellationToken::new(),
             )

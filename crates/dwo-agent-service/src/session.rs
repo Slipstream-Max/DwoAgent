@@ -1213,13 +1213,13 @@ impl SessionActor {
     ) -> Result<(), AgentServiceError> {
         let provider = self
             .model
-            .provider_id(&record.llm.model)
+            .context_owner_id(&record.llm.model)
             .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
         let previous_provider = match record.context.provider.clone() {
             Some(provider) => provider,
             None => self
                 .model
-                .provider_id(previous_model)
+                .context_owner_id(previous_model)
                 .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?,
         };
         let allow_image_input = self

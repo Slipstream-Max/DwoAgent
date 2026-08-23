@@ -8,9 +8,9 @@ use tokio_util::sync::CancellationToken;
 fn grok_client_with_hosted_tool(tool: &str) -> std::sync::Arc<ConfiguredModelClient> {
     let catalog = format!(
         r#"
-providers:
+families:
   grok:
-    endpoint: https://api.kkrich.ltd/v1/responses
+    baseUrl: https://api.kkrich.ltd/v1
     models:
       grok-4.5:
         contextWindowTokens: 500000
@@ -19,7 +19,8 @@ providers:
           imageInput: true
           toolCalls: true
         hostedTools:
-          - type: {tool}
+          selected:
+            type: {tool}
         defaultReasoningMode: High
         reasoning:
           High:
@@ -32,7 +33,8 @@ providers:
           imageInput: true
           toolCalls: true
         hostedTools:
-          - type: {tool}
+          selected:
+            type: {tool}
         defaultReasoningMode: High
         reasoning:
           High:
@@ -41,18 +43,11 @@ providers:
 "#
     );
     let agent = r#"
-defaultModelName: grok-4.6
+default:
+  model: grok/grok-4.6
 providers:
   grok:
-    type: grok
     apiKeyEnv: GROK_API_KEY
-models:
-  - modelName: grok-4.5
-    provider: grok
-    modelId: grok-4.5
-  - modelName: grok-4.6
-    provider: grok
-    modelId: grok-4.6
 "#;
     ConfiguredModelClient::from_yaml(&catalog, agent).unwrap()
 }
@@ -115,15 +110,11 @@ async fn stream_with_reasoning(
 async fn deepseek_responses_supports_hosted_search_and_local_function_round_trip() {
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelName: deepseek-v4-flash
+default:
+  model: deepseek/deepseek-v4-flash
 providers:
   deepseek:
-    type: deepseek
     apiKeyEnv: DEEPSEEK_API_KEY
-models:
-  - modelName: deepseek-v4-flash
-    provider: deepseek
-    modelId: deepseek-v4-flash
 "#,
     )
     .unwrap();
@@ -131,7 +122,7 @@ models:
 
     let searched = stream(
         &client,
-        "deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash",
         &[
             ContextMessage::system("Use the hosted web search tool when explicitly requested."),
             ContextMessage::user(
@@ -167,7 +158,7 @@ models:
         ContextMessage::system("You must call lookup_code for code lookup requests."),
         ContextMessage::user("Use lookup_code to get the code for alpha."),
     ];
-    let called = stream(&client, "deepseek-v4-flash", &messages, &tools).await;
+    let called = stream(&client, "deepseek/deepseek-v4-flash", &messages, &tools).await;
     assert_eq!(called.tool_calls.len(), 1);
     let call_id = called.tool_calls[0]["id"].as_str().unwrap().to_string();
     let mut context = ContextManager::new(SessionContext {
@@ -182,7 +173,7 @@ models:
         model_context: Vec::new(),
     });
     messages = context.into_context().messages;
-    let completed = stream(&client, "deepseek-v4-flash", &messages, &tools).await;
+    let completed = stream(&client, "deepseek/deepseek-v4-flash", &messages, &tools).await;
     assert!(completed.content.contains("A-17"));
 }
 
@@ -191,23 +182,22 @@ models:
 async fn newapi_responses_supports_hosted_web_search() {
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelName: gpt-5.6-sol
+default:
+  model: newapi/gpt-5.6-sol
 providers:
   newapi:
-    type: openai
-    baseUrl: https://api.kkrich.ltd/v1/responses
+    baseUrl: https://api.kkrich.ltd/v1
     apiKeyEnv: NEW_API_KEY
-models:
-  - modelName: gpt-5.6-sol
-    provider: newapi
-    modelId: gpt-5.6-sol
+    models:
+      gpt-5.6-sol:
+        profile: openai/gpt-5.6-sol
 "#,
     )
     .unwrap();
     let client = ConfiguredModelClient::new(&ModelCatalog::builtin().unwrap(), &agent).unwrap();
     let reply = stream(
         &client,
-        "gpt-5.6-sol",
+        "newapi/gpt-5.6-sol",
         &[
             ContextMessage::system("Use web search when explicitly requested."),
             ContextMessage::user(
@@ -231,18 +221,11 @@ models:
 async fn grok_responses_support_reasoning_search_and_function_calls() {
     let agent = AgentModelConfig::from_yaml(
         r#"
-defaultModelName: grok-4.6
+default:
+  model: grok/grok-4.6
 providers:
   grok:
-    type: grok
     apiKeyEnv: GROK_API_KEY
-models:
-  - modelName: grok-4.5
-    provider: grok
-    modelId: grok-4.5
-  - modelName: grok-4.6
-    provider: grok
-    modelId: grok-4.6
 "#,
     )
     .unwrap();
@@ -250,7 +233,7 @@ models:
     let web_client = grok_client_with_hosted_tool("web_search");
     let x_client = grok_client_with_hosted_tool("x_search");
 
-    for model in ["grok-4.5", "grok-4.6"] {
+    for model in ["grok/grok-4.5", "grok/grok-4.6"] {
         for reasoning in ["Low", "Medium", "High", "XHigh"] {
             let reply = stream_with_reasoning(
                 &client,

@@ -1,51 +1,42 @@
-protocol: open_ai_responses
-endpoint: https://api.deepseek.com/responses
+baseUrl: https://api.deepseek.com
 models:
   deepseek-v4-pro:
     contextWindowTokens: 1000000
     maxOutputTokens: 384000
-    compactThreshold: 0.5
     capabilities:
       imageInput: false
       toolCalls: true
     hostedTools:
-      - type: web_search
+      webSearch:
+        type: web_search
     defaultReasoningMode: High
     reasoning:
       Auto: {}
       Off:
-        reasoning:
-          effort: none
+        reasoning: {effort: none}
       Low:
-        reasoning:
-          effort: low
+        reasoning: {effort: low}
       High:
-        reasoning:
-          effort: high
+        reasoning: {effort: high}
       Max:
-        reasoning:
-          effort: max
+        reasoning: {effort: max}
   deepseek-v4-flash:
     contextWindowTokens: 1000000
     maxOutputTokens: 384000
-    compactThreshold: 0.5
     capabilities:
       imageInput: false
       toolCalls: true
     hostedTools:
-      - type: web_search
+      webSearch:
+        type: web_search
     defaultReasoningMode: High
     reasoning:
       Auto: {}
       Off:
-        reasoning:
-          effort: none
+        reasoning: {effort: none}
       Low:
-        reasoning:
-          effort: low
+        reasoning: {effort: low}
       High:
-        reasoning:
-          effort: high
+        reasoning: {effort: high}
       Max:
-        reasoning:
-          effort: max
+        reasoning: {effort: max}

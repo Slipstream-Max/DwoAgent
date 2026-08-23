@@ -1005,15 +1005,11 @@ automation:
   timeoutSeconds: 900
   jobs: []
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: deepseek/deepseek-v4-pro
   providers:
     deepseek:
-      type: deepseek
       apiKeyEnv: DEEPSEEK_API_KEY
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
 "#;
 
 #[cfg(test)]

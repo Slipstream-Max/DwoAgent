@@ -13,6 +13,7 @@ The rewrite profile has one strict `profile.yaml` and fixed resource paths:
 `- resource/
    |- prompts/System.md
    |- prompts/AGENTS.md
+   |- models/<family>.yaml
    |- skills/<skill>/SKILL.md
    `- mcp.json
 ```
@@ -20,23 +21,19 @@ The rewrite profile has one strict `profile.yaml` and fixed resource paths:
 ```yaml
 policyMode: confirm
 model:
-  defaultModelName: deepseek-v4-pro
+  default:
+    model: deepseek/deepseek-v4-pro
+    reasoning: High
+  compactionTriggerRatio: 0.5
   providers:
     deepseek:
-      type: deepseek
-      baseUrl: null
       apiKeyEnv: DEEPSEEK_API_KEY
-  models:
-    - modelName: deepseek-v4-pro
-      provider: deepseek
-      modelId: deepseek-v4-pro
-      compactThreshold: 0.5
 ```
 
-There are no tool switches. Provider credentials and an optional complete
-`baseUrl` override are declared once per provider instance. Model entries may
-override context/output limits, compact threshold, and default reasoning mode;
-transport settings and reasoning request parameters remain catalog-owned.
+There are no tool switches or provider protocols. Official family names supply
+their URL and complete model list. Custom providers declare one API root and a
+display-name map whose entries select an upstream `modelId` and Model List
+`profile`. User Model Lists live under `resource/models/`.
 
 `load_profile(path)` canonicalizes one profile root, loads `profile.yaml`,
 resolves it against the built-in model catalog, and validates the fixed prompt
@@ -186,8 +183,8 @@ text inside a compaction summary.
 Context usage is recomputed from system prompt, messages, reasoning, images,
 tool calls/results, and tool schemas after each checkpoint. Provider input and
 output usage is optional transport metadata and is not accumulated. The model
-trigger uses `contextWindowTokens - maxOutputTokens`, multiplied by
-`compactThreshold`; changing models immediately publishes the estimate against
+trigger uses `contextWindowTokens - maxOutputTokens`, multiplied by the profile
+`compactionTriggerRatio`; changing models immediately publishes the estimate against
 the target model's context-window size.
 
 ## Observation and control

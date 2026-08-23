@@ -165,14 +165,14 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     command("model.upsert", MethodRoute::Dwo, Some("config.changed")),
     command("model.remove", MethodRoute::Dwo, Some("config.changed")),
     query("provider.list", MethodRoute::Dwo),
-    query("provider.catalog.list", MethodRoute::Dwo),
+    query("model.catalog.list", MethodRoute::Dwo),
     command(
-        "provider.catalog.upsert",
+        "model.catalog.upsert",
         MethodRoute::Dwo,
         Some("config.changed"),
     ),
     command(
-        "provider.catalog.remove",
+        "model.catalog.remove",
         MethodRoute::Dwo,
         Some("config.changed"),
     ),
@@ -295,7 +295,7 @@ pub fn capabilities() -> ManagementCapabilities {
         .copied()
         .collect::<Vec<_>>();
     ManagementCapabilities {
-        protocol_version: 2,
+        protocol_version: 3,
         route: "dwo",
         request_ids: true,
         structured_errors: true,

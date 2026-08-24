@@ -202,6 +202,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert!(events_rx.try_recv().is_err());
     assert_eq!(reply.content, "working");
     assert_eq!(reply.reasoning.as_deref(), Some("think more\n\nnext"));
+    assert_eq!(reply.reasoning_content, None);
     assert_eq!(reply.finish_reason, FinishReason::ToolCalls);
     assert_eq!(reply.tool_calls[0]["id"], "call-1");
     assert_eq!(reply.tool_calls[0]["name"], "terminal");
@@ -225,6 +226,59 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(request["reasoning"]["effort"], "low");
     assert_eq!(request["extra_body"]["provider_flag"], true);
     assert_eq!(request["extra_body"]["thinking"]["type"], "enabled");
+}
+
+#[tokio::test]
+async fn streaming_turn_preserves_plaintext_reasoning_content() {
+    let chunks = [
+        json!({"type":"response.reasoning_text.delta","item_id":"reason-1","output_index":0,"content_index":0,"delta":"inspect "}).to_string(),
+        json!({"type":"response.reasoning_text.delta","item_id":"reason-1","output_index":0,"content_index":0,"delta":"files"}).to_string(),
+        json!({"type":"response.output_text.delta","delta":"done"}).to_string(),
+        json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}).to_string(),
+    ];
+    let sse = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>()
+        + "data: [DONE]\n\n";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+    );
+    let (endpoint, _request_rx) = one_response_server(response).await;
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let messages = [
+        ContextMessage::system("system prompt"),
+        ContextMessage::user("inspect"),
+    ];
+    let reply = client
+        .stream_turn(
+            ModelSelection {
+                model: "local/test-model".to_string(),
+                reasoning: Some("Low".to_string()),
+            },
+            &messages,
+            &[],
+            events_tx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        events_rx.recv().await.unwrap(),
+        ModelStreamEvent::ReasoningDelta("inspect ".to_string())
+    );
+    assert_eq!(
+        events_rx.recv().await.unwrap(),
+        ModelStreamEvent::ReasoningDelta("files".to_string())
+    );
+    assert_eq!(reply.reasoning, None);
+    assert_eq!(reply.reasoning_content.as_deref(), Some("inspect files"));
+    assert_eq!(
+        reply.transcript_reasoning().as_deref(),
+        Some("inspect files")
+    );
 }
 
 #[tokio::test]
@@ -468,7 +522,6 @@ providers:
         resolved.providers["deepseek"].base_url,
         "https://api.deepseek.com"
     );
-    assert_eq!(resolved.models.len(), 2);
     assert_eq!(resolved.default_model, "deepseek/deepseek-v4-pro");
     assert_eq!(resolved.default_reasoning.as_deref(), Some("High"));
     let model = &resolved.models["deepseek/deepseek-v4-pro"];

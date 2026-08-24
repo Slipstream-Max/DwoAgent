@@ -55,8 +55,12 @@ pub enum FinishReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelReply {
     pub content: String,
+    /// Provider-authored summary for models whose underlying reasoning is hidden or encrypted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Plaintext reasoning content explicitly exposed by the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -68,6 +72,14 @@ pub struct ModelReply {
 }
 
 impl ModelReply {
+    pub fn transcript_reasoning(&self) -> Option<String> {
+        self.reasoning_content
+            .as_ref()
+            .filter(|text| !text.is_empty())
+            .or_else(|| self.reasoning.as_ref().filter(|text| !text.is_empty()))
+            .cloned()
+    }
+
     /// Return item-first Responses output. The fallback keeps lightweight test
     /// clients and custom implementations on the same context contract.
     pub fn context_output_items(&self) -> Vec<Value> {

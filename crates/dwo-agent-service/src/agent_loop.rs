@@ -348,10 +348,11 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             .append_response_items(model_step.provider.clone(), response.context_output_items());
         turn.context
             .record_model_success(model_step.selection.model.clone());
+        let reasoning = response.transcript_reasoning();
         turn.emit(TurnEvent::AssistantCompleted {
             turn_id: turn.turn_id.clone(),
             content: response.content,
-            reasoning: response.reasoning,
+            reasoning,
             tool_calls: active_tool_calls
                 .iter()
                 .filter(|call| call.tool_name != "plan")

@@ -10,7 +10,8 @@ use crate::{FinishReason, ModelClientError, ModelReply, ModelUsage, StreamToolCa
 #[derive(Debug, Default)]
 pub(crate) struct StreamAccumulator {
     pub content: String,
-    pub reasoning: String,
+    pub reasoning_summary: String,
+    pub reasoning_content: String,
     pub output_items: BTreeMap<u64, Value>,
     pub response: Option<Value>,
 }
@@ -72,12 +73,20 @@ impl StreamAccumulator {
 
     pub fn finish(self) -> Result<ModelReply, ModelClientError> {
         if let Some(response) = self.response {
-            return parse_response(&response);
+            let mut reply = parse_response(&response)?;
+            if reply.reasoning.is_none() && !self.reasoning_summary.is_empty() {
+                reply.reasoning = Some(self.reasoning_summary);
+            }
+            if reply.reasoning_content.is_none() && !self.reasoning_content.is_empty() {
+                reply.reasoning_content = Some(self.reasoning_content);
+            }
+            return Ok(reply);
         }
         let output = self.output_items.into_values().collect::<Vec<_>>();
         reply_from_output(
             self.content,
-            (!self.reasoning.is_empty()).then_some(self.reasoning),
+            (!self.reasoning_summary.is_empty()).then_some(self.reasoning_summary),
+            (!self.reasoning_content.is_empty()).then_some(self.reasoning_content),
             output,
             FinishReason::Stop,
             ModelUsage::default(),
@@ -293,7 +302,8 @@ pub(crate) fn parse_response(payload: &Value) -> Result<ModelReply, ModelClientE
     };
     reply_from_output(
         response_text(&output),
-        response_reasoning(&output),
+        response_reasoning_summary(&output),
+        response_reasoning_content(&output),
         output,
         finish_reason,
         usage(payload.get("usage")),
@@ -303,6 +313,7 @@ pub(crate) fn parse_response(payload: &Value) -> Result<ModelReply, ModelClientE
 fn reply_from_output(
     content: String,
     reasoning: Option<String>,
+    reasoning_content: Option<String>,
     output_items: Vec<Value>,
     mut finish_reason: FinishReason,
     usage: ModelUsage,
@@ -315,6 +326,7 @@ fn reply_from_output(
     Ok(ModelReply {
         content,
         reasoning,
+        reasoning_content,
         tool_calls,
         remote_tool_calls,
         output_items,
@@ -334,12 +346,26 @@ fn response_text(output: &[Value]) -> String {
         .collect::<String>()
 }
 
-fn response_reasoning(output: &[Value]) -> Option<String> {
+fn response_reasoning_summary(output: &[Value]) -> Option<String> {
     let text = output
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
         .filter_map(|item| item.get("summary").and_then(Value::as_array))
         .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn response_reasoning_content(output: &[Value]) -> Option<String> {
+    let text = output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("reasoning_text"))
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()

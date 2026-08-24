@@ -171,7 +171,8 @@ impl BaseClient {
         let mut stream = response.bytes_stream().eventsource();
         let mut accumulated = StreamAccumulator::default();
         let mut emitted_tool_calls = HashSet::new();
-        let mut reasoning_part = None;
+        let mut reasoning_summary_part = None;
+        let mut reasoning_content_part = None;
         loop {
             let next = tokio::select! {
                 _ = cancellation.cancelled() => return Err(ModelClientError::Cancelled),
@@ -214,17 +215,29 @@ impl BaseClient {
                 ) => {
                     if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
                         let part = reasoning_part_key(&payload, event_type);
+                        let (reasoning, reasoning_part) =
+                            if event_type == "response.reasoning_summary_text.delta" {
+                                (
+                                    &mut accumulated.reasoning_summary,
+                                    &mut reasoning_summary_part,
+                                )
+                            } else {
+                                (
+                                    &mut accumulated.reasoning_content,
+                                    &mut reasoning_content_part,
+                                )
+                            };
                         let starts_new_part =
-                            reasoning_part.is_some() && part.is_some() && reasoning_part != part;
+                            reasoning_part.is_some() && part.is_some() && *reasoning_part != part;
                         if starts_new_part {
-                            accumulated.reasoning.push_str("\n\n");
+                            reasoning.push_str("\n\n");
                             let _ =
                                 events.send(ModelStreamEvent::ReasoningDelta("\n\n".to_string()));
                         }
                         if part.is_some() {
-                            reasoning_part = part;
+                            *reasoning_part = part;
                         }
-                        accumulated.reasoning.push_str(delta);
+                        reasoning.push_str(delta);
                         let _ = events.send(ModelStreamEvent::ReasoningDelta(delta.to_string()));
                     }
                 }

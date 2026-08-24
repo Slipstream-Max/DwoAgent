@@ -343,6 +343,7 @@ impl ModelClient for ScriptedModelGateway {
                 Ok(ModelReply {
                     content,
                     reasoning: None,
+                    reasoning_content: None,
                     tool_calls,
                     remote_tool_calls: Vec::new(),
                     output_items: Vec::new(),
@@ -360,6 +361,7 @@ impl ModelClient for ScriptedModelGateway {
                 Ok(ModelReply {
                     content,
                     reasoning: Some(reasoning),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     remote_tool_calls: Vec::new(),
                     output_items: Vec::new(),
@@ -431,6 +433,7 @@ impl ModelClient for ScriptedModelGateway {
         Ok(ModelReply {
             content: step.content,
             reasoning: None,
+            reasoning_content: None,
             tool_calls: Vec::new(),
             remote_tool_calls: Vec::new(),
             output_items: Vec::new(),

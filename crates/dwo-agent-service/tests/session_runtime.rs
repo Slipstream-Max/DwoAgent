@@ -762,6 +762,7 @@ async fn streamed_hosted_tool_is_created_once_and_updated_by_id() {
     let reply = ModelReply {
         content: String::new(),
         reasoning: None,
+        reasoning_content: None,
         tool_calls: Vec::new(),
         remote_tool_calls: vec![json!({
             "id": "fs-1",

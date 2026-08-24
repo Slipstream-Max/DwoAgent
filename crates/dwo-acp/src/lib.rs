@@ -22,8 +22,8 @@ use agent_client_protocol::schema::v2::{
     SessionDeleteCapabilities, SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StateUpdate,
     StopReason, Terminal, TerminalExitStatus, TerminalOutput, TerminalOutputChunk, TerminalUpdate,
-    TextCommandInput, TextContent, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
+    TextCommandInput, TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
 };
 use agent_client_protocol::schema::v2::{
     PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanEntryPriority,
@@ -1868,9 +1868,7 @@ fn send_terminal_exited(cx: &AcpConnection, session_id: &str, payload: &Value) {
 }
 
 fn send_file_read(cx: &AcpConnection, session_id: &str, payload: &Value) {
-    let (Some(tool_call_id), Some(path)) =
-        (payload["tool_call_id"].as_str(), payload["path"].as_str())
-    else {
+    let Some(tool_call_id) = payload["tool_call_id"].as_str() else {
         return;
     };
     send_update(
@@ -1879,8 +1877,7 @@ fn send_file_read(cx: &AcpConnection, session_id: &str, payload: &Value) {
         SessionUpdate::ToolCallUpdate(
             ToolCallUpdate::new(tool_call_id.to_string())
                 .kind(ToolKind::Read)
-                .status(ToolCallStatus::Completed)
-                .locations(vec![ToolCallLocation::new(PathBuf::from(path))]),
+                .status(ToolCallStatus::Completed),
         ),
     );
 }

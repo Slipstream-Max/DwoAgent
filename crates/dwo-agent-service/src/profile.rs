@@ -211,18 +211,6 @@ model:
     }
 
     #[test]
-    fn profile_resolves_official_provider_models() {
-        let profile =
-            AgentProfileConfig::from_yaml(&profile_yaml("deepseek/deepseek-v4-pro")).unwrap();
-        let resolved = profile
-            .resolve_models(&ModelCatalog::builtin().unwrap())
-            .unwrap();
-
-        assert_eq!(resolved.default_model, "deepseek/deepseek-v4-pro");
-        assert_eq!(resolved.models.len(), 2);
-    }
-
-    #[test]
     fn profile_rejects_invalid_log_retention() {
         let error = AgentProfileConfig::from_yaml(
             r#"

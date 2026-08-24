@@ -18,17 +18,24 @@ pub fn write_sync(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create parent directory {}", parent.display()))?;
     let temporary = temporary_path(path);
     let result: Result<()> = (|| {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        replace(&temporary, path)?;
-        sync_parent(parent)?;
+            .open(&temporary)
+            .with_context(|| format!("create temporary file {}", temporary.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write temporary file {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temporary file {}", temporary.display()))?;
+        drop(file);
+        replace(&temporary, path)
+            .with_context(|| format!("replace {} with {}", path.display(), temporary.display()))?;
+        sync_parent(parent)
+            .with_context(|| format!("sync parent directory {}", parent.display()))?;
         Ok(())
     })();
     if result.is_err() {
@@ -48,6 +55,10 @@ fn temporary_path(path: &Path) -> PathBuf {
 #[cfg(windows)]
 fn replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
@@ -62,17 +73,35 @@ fn replace(source: &Path, destination: &Path) -> std::io::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
+    const ATTEMPTS: usize = 10;
+    let mut delay = Duration::from_millis(10);
+    for attempt in 1..=ATTEMPTS {
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result != 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        let retryable = matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32
+                    || code == ERROR_SHARING_VIOLATION as i32
+                    || code == ERROR_LOCK_VIOLATION as i32
+        );
+        if !retryable || attempt == ATTEMPTS {
+            return Err(error);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(200));
     }
-    Ok(())
+    unreachable!("replace attempts always return")
 }
 
 #[cfg(not(windows))]
@@ -101,6 +130,33 @@ mod tests {
         std::fs::write(&path, "old").unwrap();
 
         write_sync(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retries_when_a_reader_temporarily_blocks_replacement() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::Duration;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.yaml");
+        std::fs::write(&path, "old").unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            drop(reader);
+        });
+
+        write_sync(&path, b"new").unwrap();
+        release.join().unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);

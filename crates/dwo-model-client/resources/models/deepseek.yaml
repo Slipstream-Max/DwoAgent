@@ -40,3 +40,23 @@ models:
         reasoning: {effort: high}
       Max:
         reasoning: {effort: max}
+  deepseek-v4-flash-vision-exp:
+    contextWindowTokens: 1000000
+    maxOutputTokens: 384000
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    hostedTools:
+      webSearch:
+        type: web_search
+    defaultReasoningMode: High
+    reasoning:
+      Auto: {}
+      Off:
+        reasoning: {effort: none}
+      Low:
+        reasoning: {effort: low}
+      High:
+        reasoning: {effort: high}
+      Max:
+        reasoning: {effort: max}

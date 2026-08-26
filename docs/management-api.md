@@ -33,8 +33,8 @@ Host 发布，客户端断开不会停止 Host。当前事件还包括 `channel.
 
 ## Project 与看板
 
-Project 拥有 `pwd` 和 Board；Topic 保存 `sessionIds`、`taskIds` 与 `labelIds`。Session 和
-Automation Job 不保存 `topicId`。完整数据关系、默认未分类话题和文件布局见
+Project 拥有 `pwd`、Board 和 automation 配置/历史；Topic 保存 `sessionIds` 与 `labelIds`，
+Automation Job 保存可选的 `topicId`。完整数据关系、默认未分类话题和文件布局见
 [Project 与看板](project-board.md)。
 
 | 方法 | 用途 |
@@ -42,11 +42,10 @@ Automation Job 不保存 `topicId`。完整数据关系、默认未分类话题�
 | `project.list/get/create/update` | Project 查询、创建和改名 |
 | `project.board` | 获取 Sections、Topics 和 Labels |
 | `project.section.create/update/delete/reorder` | 分区 CRUD 和排序 |
-| `project.topic.get/create/update/delete/move/reorder` | Topic 管理；`get` 聚合 Session/Task 状态 |
+| `project.topic.get/create/update/delete/move/reorder` | Topic 管理；`get` 聚合 Session/Automation 状态 |
 | `project.topic.overview.get/set` | 读写概述与计划 Markdown |
 | `project.topic.agents.get/set` | 读写 Knowledge `AGENTS.md` |
 | `project.topic.session.assign/unassign` | Session 归类或移回未分类 Topic |
-| `project.topic.task.create/assign/unassign` | 创建、关联或取消归类 Automation Job |
 | `project.label.create/update/delete/assign/unassign` | Board 标签管理 |
 
 `session.new` 可传 `project_id` 与可选 `topic_id`；指定 Project 时不能再传 `cwd`。省略
@@ -70,8 +69,8 @@ Automation Job 不保存 `topicId`。完整数据关系、默认未分类话题�
 | `model.catalog.upsert` / `model.catalog.remove` | 校验后写入或删除 Model List family 扩展 |
 
 Model/Provider 写入会先合并完整 Model List 并解析整个 Host 配置，成功后原子替换
-`profile.yaml`，再让
-SessionService、Automation 和 Channel runtime 一次性应用。`maxModelSteps` 只存在于 Host，
+`profile.yaml`，再让 SessionService 和 Channel runtime 一次性应用。Automation 的 Project 配置
+由 `automation.*` 方法单独写入对应 Project。`maxModelSteps` 只存在于 Host，
 每个 turn 启动时读取，不进入 Session metadata。
 
 ## Prompt、Rule 与 Skill
@@ -112,6 +111,9 @@ Skill 名称只能是单个路径组件。安装失败会清除未通过 frontma
 | `automation.enable/disable` | 启停单个或全部 Job |
 | `automation.run` | 立即排队执行并返回 `runId` |
 | `automation.history` | 按 Job 和 limit 返回轻量 run history |
+
+所有 Automation 方法都要求 `project_id`，配置和 history 位于
+`runtime/projects/<project-id>/automation/`；Topic 详情通过 Job 的 `topicId` 筛选任务。
 
 Job 支持 cron/timezone，`every_time`、`once`、`fixed` 三种 Session 策略，以及 prompt、
 model、reasoning 和 policy。History 最多保留 100 条，只持久化回答摘要、时间、状态、

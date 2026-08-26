@@ -65,6 +65,8 @@ enum Command {
         command: McpCommand,
     },
     Automation {
+        #[arg(long, global = true)]
+        project: Option<String>,
         #[command(subcommand)]
         command: AutomationCommand,
     },
@@ -221,7 +223,7 @@ enum AutomationCommand {
         #[arg(long)]
         session_id: Option<String>,
         #[arg(long)]
-        cwd: Option<PathBuf>,
+        topic: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -316,16 +318,32 @@ where
         Command::Channel { command } => run_channel(command, &config_path).await?,
         Command::Websocket { command } => run_websocket(command, &config_path).await?,
         Command::Mcp { command } => run_mcp(command, &config_path).await?,
-        Command::Automation { command } => run_automation(command, &config_path).await?,
+        Command::Automation { project, command } => {
+            run_automation(command, project, &config_path).await?
+        }
         Command::Acp { protocol } => acp::run(config_path, protocol).await?,
     }
     Ok(())
 }
 
-async fn run_automation(command: AutomationCommand, config_path: &Path) -> Result<()> {
+async fn run_automation(
+    command: AutomationCommand,
+    project: Option<String>,
+    config_path: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        !matches!(&command, AutomationCommand::Delete { .. }) || current_session_id().is_none(),
+        "automation delete is unavailable inside an agent session"
+    );
+    let project_id = resolve_automation_project(config_path, project).await?;
     match command {
         AutomationCommand::List { json } => {
-            let value = ipc::request_dwo(config_path, "automation.list", json!({})).await?;
+            let value = ipc::request_dwo(
+                config_path,
+                "automation.list",
+                json!({"project_id": project_id}),
+            )
+            .await?;
             if json {
                 render::write_value(&value)?;
             } else {
@@ -334,8 +352,12 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
             }
         }
         AutomationCommand::Status { job, json } => {
-            let value =
-                ipc::request_dwo(config_path, "automation.status", json!({"job": job})).await?;
+            let value = ipc::request_dwo(
+                config_path,
+                "automation.status",
+                json!({"project_id": project_id, "job": job}),
+            )
+            .await?;
             if json {
                 render::write_value(&value)?;
             } else {
@@ -350,7 +372,7 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
             prompt,
             session,
             session_id,
-            cwd,
+            topic,
             title,
             disabled,
             json,
@@ -367,12 +389,10 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
                         } else {
                             AutomationNewBehavior::Once
                         },
-                        cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
                         title,
                     }
                 }
                 AutomationSessionArg::Fixed => {
-                    anyhow::ensure!(cwd.is_none(), "--cwd is unavailable with --session fixed");
                     anyhow::ensure!(
                         title.is_none(),
                         "--title is unavailable with --session fixed"
@@ -389,12 +409,17 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
                 schedule: AutomationSchedule { cron, timezone },
                 session,
                 prompt,
+                topic_id: topic,
                 model: None,
                 reasoning: None,
                 policy: None,
             };
-            let value =
-                ipc::request_dwo(config_path, "automation.add", json!({"job": job})).await?;
+            let value = ipc::request_dwo(
+                config_path,
+                "automation.add",
+                json!({"project_id": project_id, "job": job}),
+            )
+            .await?;
             if json {
                 render::write_value(&value)?;
             } else {
@@ -403,17 +428,17 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
             }
         }
         AutomationCommand::Enable { job, all } => {
-            set_automation_enabled(config_path, job, all, true).await?;
+            set_automation_enabled(config_path, &project_id, job, all, true).await?;
         }
         AutomationCommand::Disable { job, all } => {
-            set_automation_enabled(config_path, job, all, false).await?;
+            set_automation_enabled(config_path, &project_id, job, all, false).await?;
         }
         AutomationCommand::Delete { job, all, yes } => {
             anyhow::ensure!(!all || yes, "automation delete --all requires --yes");
             ipc::request_dwo(
                 config_path,
                 "automation.delete",
-                json!({"job": job, "all": all}),
+                json!({"project_id": project_id, "job": job, "all": all}),
             )
             .await?;
             output::line(format_args!(
@@ -429,7 +454,11 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
             let value = ipc::request_dwo(
                 config_path,
                 "automation.run",
-                json!({"job": job, "caller_session_id": current_session_id()}),
+                json!({
+                    "project_id": project_id,
+                    "job": job,
+                    "caller_session_id": current_session_id()
+                }),
             )
             .await?;
             if json {
@@ -451,6 +480,7 @@ async fn run_automation(command: AutomationCommand, config_path: &Path) -> Resul
 
 async fn set_automation_enabled(
     config_path: &Path,
+    project_id: &str,
     job: Option<String>,
     all: bool,
     enabled: bool,
@@ -460,7 +490,12 @@ async fn set_automation_enabled(
     } else {
         "automation.disable"
     };
-    ipc::request_dwo(config_path, method, json!({"job": job, "all": all})).await?;
+    ipc::request_dwo(
+        config_path,
+        method,
+        json!({"project_id": project_id, "job": job, "all": all}),
+    )
+    .await?;
     output::line(format_args!(
         "{} automation {}",
         if enabled { "Enabled" } else { "Disabled" },
@@ -471,6 +506,29 @@ async fn set_automation_enabled(
         }
     ))?;
     Ok(())
+}
+
+async fn resolve_automation_project(config_path: &Path, project: Option<String>) -> Result<String> {
+    if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+        return Ok(project);
+    }
+    let session_id = current_session_id().context(
+        "--project is required when the command is not running inside a project session",
+    )?;
+    let value = ipc::request_dwo(config_path, "project.list", json!({})).await?;
+    let projects: Vec<dwo_project::Project> = serde_json::from_value(value)?;
+    projects
+        .into_iter()
+        .find(|project| {
+            project.board.topics.iter().any(|topic| {
+                topic
+                    .session_ids
+                    .iter()
+                    .any(|assigned| assigned == &session_id)
+            })
+        })
+        .map(|project| project.id)
+        .with_context(|| format!("session {session_id} does not belong to a project"))
 }
 
 async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
@@ -1000,10 +1058,6 @@ websocket:
   enabled: false
   bind: 127.0.0.1
   port: 8787
-automation:
-  enabled: false
-  timeoutSeconds: 900
-  jobs: []
 model:
   default:
     model: deepseek/deepseek-v4-pro
@@ -1186,7 +1240,8 @@ mod tests {
         assert!(matches!(
             run.command,
             Command::Automation {
-                command: AutomationCommand::Run { ref job, json: false }
+                command: AutomationCommand::Run { ref job, json: false },
+                ..
             } if job == "daily-report"
         ));
 
@@ -1210,7 +1265,8 @@ mod tests {
                     ref name,
                     session: AutomationSessionArg::Once,
                     ..
-                }
+                },
+                ..
             } if name == "daily-report"
         ));
 
@@ -1221,7 +1277,8 @@ mod tests {
                 command: AutomationCommand::Enable {
                     job: None,
                     all: true
-                }
+                },
+                ..
             }
         ));
         assert!(Cli::try_parse_from(["dwo", "automation", "enable"]).is_err());

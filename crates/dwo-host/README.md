@@ -175,9 +175,10 @@ WebSocket 是 transport，不是 Channel。新的 transport 不应注册为 `cha
 
 ## Automation 与 Channel
 
-`automation` 模块公开配置、Job、Schedule、Session 策略、运行记录和 `AutomationRuntime`，
-适合实现新的调度器或做领域测试。正常嵌入应让 Host 创建并持有唯一 runtime，并通过
-`automation.*` Management 方法修改配置。
+`automation` 模块公开 Job、Schedule、Session 策略、运行记录和 `AutomationRuntime`，
+适合实现新的调度器或做领域测试。每个 Project 在
+`runtime/projects/<project-id>/automation/` 保存配置与 history；正常嵌入应让 Host 创建并持有唯一
+runtime，并通过带 `project_id` 的 `automation.*` Management 方法修改配置。
 
 `ChannelHost` 适配层可以读取当前 `ChannelManager` 和 profile 根目录，主要供 Channel adapter
 运行时使用。配置、绑定、启停和 secret 清理应走 `channel.<kind>.*`，不能只修改 manager。

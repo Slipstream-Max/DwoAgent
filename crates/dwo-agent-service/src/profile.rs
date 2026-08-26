@@ -27,8 +27,6 @@ pub struct AgentProfileConfig {
     pub channels: BTreeMap<String, serde_yaml::Value>,
     #[serde(default)]
     pub websocket: WebsocketConfig,
-    #[serde(default)]
-    pub automation: serde_yaml::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

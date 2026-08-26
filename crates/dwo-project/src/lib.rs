@@ -9,6 +9,9 @@ use thiserror::Error;
 
 pub const OVERVIEW_FILE: &str = "overview.md";
 pub const AGENTS_FILE: &str = "AGENTS.md";
+pub const AUTOMATION_DIR: &str = "automation";
+pub const AUTOMATION_CONFIG_FILE: &str = "config.yaml";
+pub const AUTOMATION_HISTORY_FILE: &str = "history.yaml";
 
 #[derive(Debug, Error)]
 pub enum ProjectError {
@@ -76,8 +79,6 @@ pub struct Topic {
     pub order: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub task_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_ids: Vec<String>,
 }
@@ -217,7 +218,6 @@ impl ProjectService {
                     title: "未分类".to_string(),
                     order: 0,
                     session_ids: Vec::new(),
-                    task_ids: Vec::new(),
                     label_ids: Vec::new(),
                 }],
                 labels: Vec::new(),
@@ -355,7 +355,6 @@ impl ProjectService {
                 title,
                 order,
                 session_ids: Vec::new(),
-                task_ids: Vec::new(),
                 label_ids: Vec::new(),
             });
             Ok(())
@@ -434,7 +433,6 @@ impl ProjectService {
             let uncategorized_id = project.board.uncategorized_topic_id.clone();
             let uncategorized = find_topic_mut(project, &uncategorized_id)?;
             append_unique(&mut uncategorized.session_ids, removed.session_ids);
-            append_unique(&mut uncategorized.task_ids, removed.task_ids);
             normalize_topic_orders(&mut project.board.topics, &removed.section_id);
             Ok(())
         })?;
@@ -449,19 +447,26 @@ impl ProjectService {
     }
 
     pub fn assign_session(&self, project_id: &str, topic_id: &str, id: String) -> Result<Topic> {
-        self.assign_reference(project_id, topic_id, id, ReferenceKind::Session)
+        let id = nonempty("session id", id)?;
+        self.unassign_session_everywhere(&id)?;
+        let topic_id = topic_id.to_string();
+        let project = self.mutate(project_id, |project| {
+            let topic = find_topic_mut(project, &topic_id)?;
+            push_unique(&mut topic.session_ids, id);
+            Ok(())
+        })?;
+        find_topic(&project, &topic_id).cloned()
     }
 
     pub fn unassign_session(&self, project_id: &str, topic_id: &str, id: &str) -> Result<Topic> {
-        self.unassign_reference(project_id, topic_id, id, ReferenceKind::Session)
-    }
-
-    pub fn assign_task(&self, project_id: &str, topic_id: &str, id: String) -> Result<Topic> {
-        self.assign_reference(project_id, topic_id, id, ReferenceKind::Task)
-    }
-
-    pub fn unassign_task(&self, project_id: &str, topic_id: &str, id: &str) -> Result<Topic> {
-        self.unassign_reference(project_id, topic_id, id, ReferenceKind::Task)
+        let topic_id = topic_id.to_string();
+        let id = id.to_string();
+        let project = self.mutate(project_id, |project| {
+            let topic = find_topic_mut(project, &topic_id)?;
+            topic.session_ids.retain(|value| value != &id);
+            Ok(())
+        })?;
+        find_topic(&project, &topic_id).cloned()
     }
 
     pub fn create_label(
@@ -588,6 +593,23 @@ impl ProjectService {
         Ok(self.topic_dir(project_id, topic_id).join(AGENTS_FILE))
     }
 
+    fn project_automation_dir(&self, project_id: &str) -> Result<PathBuf> {
+        self.ensure_project(project_id)?;
+        Ok(self.project_dir(project_id).join(AUTOMATION_DIR))
+    }
+
+    pub fn automation_config_path(&self, project_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .project_automation_dir(project_id)?
+            .join(AUTOMATION_CONFIG_FILE))
+    }
+
+    pub fn automation_history_path(&self, project_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .project_automation_dir(project_id)?
+            .join(AUTOMATION_HISTORY_FILE))
+    }
+
     pub fn locate_session(&self, session_id: &str) -> Option<(Project, Topic)> {
         self.projects
             .read()
@@ -599,22 +621,6 @@ impl ProjectService {
                     .topics
                     .iter()
                     .find(|topic| topic.session_ids.iter().any(|id| id == session_id))
-                    .cloned()
-                    .map(|topic| (project.clone(), topic))
-            })
-    }
-
-    pub fn locate_task(&self, task_id: &str) -> Option<(Project, Topic)> {
-        self.projects
-            .read()
-            .expect("project lock poisoned")
-            .iter()
-            .find_map(|project| {
-                project
-                    .board
-                    .topics
-                    .iter()
-                    .find(|topic| topic.task_ids.iter().any(|id| id == task_id))
                     .cloned()
                     .map(|topic| (project.clone(), topic))
             })
@@ -647,82 +653,6 @@ impl ProjectService {
         Ok(())
     }
 
-    pub fn unassign_task_everywhere(&self, task_id: &str) -> Result<()> {
-        let project_ids = self
-            .projects
-            .read()
-            .expect("project lock poisoned")
-            .iter()
-            .filter(|project| {
-                project
-                    .board
-                    .topics
-                    .iter()
-                    .any(|topic| topic.task_ids.iter().any(|existing| existing == task_id))
-            })
-            .map(|project| project.id.clone())
-            .collect::<Vec<_>>();
-        for project_id in project_ids {
-            self.mutate(&project_id, |project| {
-                for topic in &mut project.board.topics {
-                    topic.task_ids.retain(|existing| existing != task_id);
-                }
-                Ok(())
-            })?;
-        }
-        Ok(())
-    }
-
-    fn assign_reference(
-        &self,
-        project_id: &str,
-        topic_id: &str,
-        id: String,
-        kind: ReferenceKind,
-    ) -> Result<Topic> {
-        let id = nonempty("reference id", id)?;
-        match kind {
-            ReferenceKind::Session => self.unassign_session_everywhere(&id)?,
-            ReferenceKind::Task => self.unassign_task_everywhere(&id)?,
-        }
-        let topic_id = topic_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            for topic in &mut project.board.topics {
-                match kind {
-                    ReferenceKind::Session => topic.session_ids.retain(|value| value != &id),
-                    ReferenceKind::Task => topic.task_ids.retain(|value| value != &id),
-                }
-            }
-            let topic = find_topic_mut(project, &topic_id)?;
-            match kind {
-                ReferenceKind::Session => push_unique(&mut topic.session_ids, id),
-                ReferenceKind::Task => push_unique(&mut topic.task_ids, id),
-            }
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    fn unassign_reference(
-        &self,
-        project_id: &str,
-        topic_id: &str,
-        id: &str,
-        kind: ReferenceKind,
-    ) -> Result<Topic> {
-        let topic_id = topic_id.to_string();
-        let id = id.to_string();
-        let project = self.mutate(project_id, |project| {
-            let topic = find_topic_mut(project, &topic_id)?;
-            match kind {
-                ReferenceKind::Session => topic.session_ids.retain(|value| value != &id),
-                ReferenceKind::Task => topic.task_ids.retain(|value| value != &id),
-            }
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
     fn mutate(
         &self,
         project_id: &str,
@@ -738,6 +668,10 @@ impl ProjectService {
         validate_project(project)?;
         self.persist(project)?;
         Ok(project.clone())
+    }
+
+    fn ensure_project(&self, project_id: &str) -> Result<()> {
+        self.get(project_id).map(|_| ())
     }
 
     fn ensure_topic(&self, project_id: &str, topic_id: &str) -> Result<()> {
@@ -786,12 +720,6 @@ impl ProjectService {
     fn topic_dir(&self, project_id: &str, topic_id: &str) -> PathBuf {
         self.project_dir(project_id).join("topics").join(topic_id)
     }
-}
-
-#[derive(Clone, Copy)]
-enum ReferenceKind {
-    Session,
-    Task,
 }
 
 fn validate_project(project: &Project) -> Result<()> {
@@ -844,13 +772,14 @@ fn validate_project(project: &Project) -> Result<()> {
         return Err(ProjectError::Invalid("invalid board labels".to_string()));
     }
     let mut sessions = HashSet::new();
-    let mut tasks = HashSet::new();
-    if project.board.topics.iter().any(|topic| {
-        topic.session_ids.iter().any(|id| !sessions.insert(id))
-            || topic.task_ids.iter().any(|id| !tasks.insert(id))
-    }) {
+    if project
+        .board
+        .topics
+        .iter()
+        .any(|topic| topic.session_ids.iter().any(|id| !sessions.insert(id)))
+    {
         return Err(ProjectError::Invalid(
-            "a session or task can belong to only one topic in a project".to_string(),
+            "a session can belong to only one topic in a project".to_string(),
         ));
     }
     Ok(())
@@ -1069,9 +998,6 @@ mod tests {
             .assign_session(&project.id, &topic.id, "session-1".to_string())
             .unwrap();
         service
-            .assign_task(&project.id, &topic.id, "task-1".to_string())
-            .unwrap();
-        service
             .set_overview(&project.id, &topic.id, "# Plan")
             .unwrap();
         service
@@ -1082,7 +1008,6 @@ mod tests {
         let loaded = reloaded.get(&project.id).unwrap();
         let loaded_topic = find_topic(&loaded, &topic.id).unwrap();
         assert_eq!(loaded_topic.session_ids, ["session-1"]);
-        assert_eq!(loaded_topic.task_ids, ["task-1"]);
         assert_eq!(loaded_topic.label_ids, [label.id]);
         assert_eq!(reloaded.overview(&project.id, &topic.id).unwrap(), "# Plan");
         assert_eq!(

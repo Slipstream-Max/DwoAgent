@@ -184,21 +184,6 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         Some("project.changed"),
     ),
     command(
-        "project.topic.task.assign",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.topic.task.unassign",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.topic.task.create",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
         "project.label.create",
         MethodRoute::Dwo,
         Some("project.changed"),

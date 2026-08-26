@@ -8,7 +8,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::Host;
-use crate::automation::AutomationJob;
 
 #[derive(Deserialize)]
 struct ProjectIdParam {
@@ -93,20 +92,6 @@ struct TopicSessionParam {
     project_id: String,
     topic_id: String,
     session_id: String,
-}
-
-#[derive(Deserialize)]
-struct TopicTaskParam {
-    project_id: String,
-    topic_id: String,
-    task_id: String,
-}
-
-#[derive(Deserialize)]
-struct CreateTopicTaskParam {
-    project_id: String,
-    topic_id: String,
-    job: AutomationJob,
 }
 
 #[derive(Deserialize)]
@@ -255,7 +240,15 @@ impl Host {
             }
             "project.topic.delete" => {
                 let params: TopicParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&params.project_id)?;
                 self.move_topic_sessions_to_uncategorized(&params.project_id, &params.topic_id)
+                    .await?;
+                self.automation
+                    .move_topic_jobs(
+                        &params.project_id,
+                        &params.topic_id,
+                        &project.board.uncategorized_topic_id,
+                    )
                     .await?;
                 let project = self
                     .projects
@@ -317,43 +310,6 @@ impl Host {
                 self.project_changed(&params.project_id, "topic.session.unassign")
                     .await;
                 serde_json::to_value(topic)?
-            }
-            "project.topic.task.assign" => {
-                let params: TopicTaskParam = serde_json::from_value(params)?;
-                self.automation.status(&params.task_id).await?;
-                let topic = self.projects.assign_task(
-                    &params.project_id,
-                    &params.topic_id,
-                    params.task_id,
-                )?;
-                self.project_changed(&params.project_id, "topic.task.assign")
-                    .await;
-                serde_json::to_value(topic)?
-            }
-            "project.topic.task.unassign" => {
-                let params: TopicTaskParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
-                let topic = self.projects.assign_task(
-                    &params.project_id,
-                    &project.board.uncategorized_topic_id,
-                    params.task_id,
-                )?;
-                self.project_changed(&params.project_id, "topic.task.unassign")
-                    .await;
-                serde_json::to_value(topic)?
-            }
-            "project.topic.task.create" => {
-                let params: CreateTopicTaskParam = serde_json::from_value(params)?;
-                let task_id = params.job.name.clone();
-                self.automation_add(params.job).await?;
-                let topic = self.projects.assign_task(
-                    &params.project_id,
-                    &params.topic_id,
-                    task_id.clone(),
-                )?;
-                self.project_changed(&params.project_id, "topic.task.create")
-                    .await;
-                json!({"task": self.automation.status(&task_id).await?, "topic": topic})
             }
             "project.label.create" => {
                 let params: CreateLabelParam = serde_json::from_value(params)?;
@@ -439,12 +395,21 @@ impl Host {
                 sessions.push(status);
             }
         }
-        let mut tasks = Vec::new();
-        for id in &topic.task_ids {
-            if let Ok(status) = self.automation.status(id).await {
-                tasks.push(status);
-            }
-        }
+        let uncategorized_topic_id = project.board.uncategorized_topic_id.as_str();
+        let tasks = self
+            .automation
+            .list(Some(project_id))
+            .await
+            .into_iter()
+            .filter(|status| {
+                status
+                    .job
+                    .topic_id
+                    .as_deref()
+                    .unwrap_or(uncategorized_topic_id)
+                    == topic_id
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "topic": topic,
             "overview": self.projects.overview(project_id, topic_id)?,
@@ -513,5 +478,172 @@ impl Host {
                 json!({"projectId": project_id, "action": action}),
             )
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::tests::write_test_profile;
+
+    #[tokio::test]
+    async fn topic_sessions_inherit_the_project_workspace_and_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+
+        let project = host
+            .handle_method("project.create", json!({"name": "Demo", "pwd": workspace}))
+            .await
+            .unwrap();
+        let project_id = project["id"].as_str().unwrap();
+        let section_id = project["board"]["uncategorizedSectionId"].as_str().unwrap();
+        let topic = host
+            .handle_method(
+                "project.topic.create",
+                json!({
+                    "project_id": project_id,
+                    "section_id": section_id,
+                    "title": "Project API"
+                }),
+            )
+            .await
+            .unwrap();
+        let topic_id = topic["id"].as_str().unwrap();
+        host.handle_method(
+            "project.topic.agents.set",
+            json!({
+                "project_id": project_id,
+                "topic_id": topic_id,
+                "content": "Keep changes inside the project API."
+            }),
+        )
+        .await
+        .unwrap();
+
+        let created = host
+            .handle_method(
+                "session.new",
+                json!({"project_id": project_id, "topic_id": topic_id}),
+            )
+            .await
+            .unwrap();
+        let session_id =
+            SessionId::parse(created["session_id"].as_str().unwrap().to_string()).unwrap();
+        let snapshot = host.service.snapshot(&session_id).await.unwrap();
+        assert_eq!(
+            snapshot.record.info.cwd,
+            std::fs::canonicalize(workspace).unwrap()
+        );
+        assert!(
+            snapshot
+                .record
+                .context
+                .system_prompt
+                .content
+                .contains("Keep changes inside the project API.")
+        );
+        let (_, assigned_topic) = host.projects.locate_session(session_id.as_str()).unwrap();
+        assert_eq!(assigned_topic.id, topic_id);
+
+        host.handle_method(
+            "automation.add",
+            json!({
+                "project_id": project_id,
+                "job": {
+                    "name": "topic-review",
+                    "enabled": true,
+                    "schedule": {"cron": "0 9 * * *", "timezone": "Asia/Shanghai"},
+                    "session": {"mode": "new", "behavior": "every_time"},
+                    "topicId": topic_id,
+                    "prompt": "Review now"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let run = host
+            .handle_method(
+                "automation.run",
+                json!({"project_id": project_id, "job": "topic-review", "caller_session_id": null}),
+            )
+            .await
+            .unwrap();
+        let automation_session_id = run["sessionId"].as_str().unwrap();
+        let (_, automation_topic) = host
+            .projects
+            .locate_session(automation_session_id)
+            .expect("topic automation session is assigned to its topic");
+        assert_eq!(automation_topic.id, topic_id);
+        let automation_snapshot = host
+            .service
+            .snapshot(&SessionId::parse(automation_session_id.to_string()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            automation_snapshot
+                .record
+                .context
+                .system_prompt
+                .content
+                .contains("Keep changes inside the project API.")
+        );
+
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_topic_moves_its_jobs_to_uncategorized() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let project = host
+            .handle_method(
+                "project.create",
+                json!({"name": "Demo", "pwd": root.path()}),
+            )
+            .await
+            .unwrap();
+        let project_id = project["id"].as_str().unwrap();
+        let uncategorized_topic_id = project["board"]["uncategorizedTopicId"].as_str().unwrap();
+        let section_id = project["board"]["uncategorizedSectionId"].as_str().unwrap();
+        let topic = host
+            .handle_method(
+                "project.topic.create",
+                json!({"project_id": project_id, "section_id": section_id, "title": "Review"}),
+            )
+            .await
+            .unwrap();
+        let topic_id = topic["id"].as_str().unwrap();
+        host.handle_method(
+            "automation.add",
+            json!({
+                "project_id": project_id,
+                "job": {
+                    "name": "topic-review",
+                    "schedule": {"cron": "0 9 * * *"},
+                    "session": {"mode": "new", "behavior": "every_time"},
+                    "topicId": topic_id,
+                    "prompt": "Review now"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        host.handle_method(
+            "project.topic.delete",
+            json!({"project_id": project_id, "topic_id": topic_id}),
+        )
+        .await
+        .unwrap();
+
+        let status = host
+            .automation
+            .status(project_id, "topic-review")
+            .await
+            .unwrap();
+        assert_eq!(status.job.topic_id.as_deref(), Some(uncategorized_topic_id));
+        host.shutdown().await;
     }
 }

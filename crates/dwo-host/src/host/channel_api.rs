@@ -258,3 +258,32 @@ impl Host {
         Ok(json!({"removed": removed}))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_channel_actions_share_one_rpc_route() {
+        for channel in ChannelKind::ALL {
+            let method = |action| format!("channel.{}.{action}", channel.as_str());
+            assert!(matches!(
+                managed_channel_action(&method("status")),
+                Some((found, ManagedChannelAction::Status)) if found == channel
+            ));
+            assert!(matches!(
+                managed_channel_action(&method("send_message")),
+                Some((found, ManagedChannelAction::SendMessage)) if found == channel
+            ));
+            assert!(matches!(
+                managed_channel_action(&method("send_file")),
+                Some((found, ManagedChannelAction::SendFile)) if found == channel
+            ));
+            assert!(matches!(
+                managed_channel_action(&method("remove")),
+                Some((found, ManagedChannelAction::Remove)) if found == channel
+            ));
+            assert!(managed_channel_action(&method("begin")).is_none());
+        }
+    }
+}

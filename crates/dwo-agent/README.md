@@ -63,14 +63,14 @@ dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
 dwo mcp auth <server> --logout
-dwo automation list [--json]
-dwo automation status <job> [--json]
-dwo automation add <job> --cron <expr> --prompt <text> [options]
-dwo automation enable|disable <job>
-dwo automation enable|disable --all
-dwo automation delete <job>
-dwo automation delete --all --yes
-dwo automation run <job> [--json]
+dwo automation --project <id> list [--json]
+dwo automation --project <id> status <job> [--json]
+dwo automation --project <id> add <job> --cron <expr> --prompt <text> [options]
+dwo automation --project <id> enable|disable <job>
+dwo automation --project <id> enable|disable --all
+dwo automation --project <id> delete <job>
+dwo automation --project <id> delete --all --yes
+dwo automation --project <id> run <job> [--json]
 dwo acp [--protocol v1|v2]
 ```
 
@@ -311,7 +311,7 @@ waking another model step after the cancelled turn.
 ## Automation
 
 The daemon validates and hot-reloads the complete `profile.yaml`, including
-models, defaults, logging, channels, and automation. Invalid intermediate
+models, defaults, logging, and channels. Invalid intermediate
 writes leave the previous runtime configuration active. Channel changes
 restart managed connections; model changes reach existing sessions on their
 next request, while changed defaults apply only to newly created sessions.
@@ -322,29 +322,27 @@ session owned by that job. A fixed-session run targets
 an explicit ID and uses the same FIFO prompt semantics as other clients.
 
 Automation is unattended. Tool confirmation requests are denied automatically
-instead of waiting forever. Full execution remains in the target session; a
-profile-level `timeoutSeconds` limit asks an overdue turn to stop using tools
+instead of waiting forever. Full execution remains in the target session; the
+Project-level `timeoutSeconds` limit asks an overdue turn to stop using tools
 and provide its final answer on the next model step. Runs targeting the same
 session are queued by the Automation runtime and submitted as separate turns.
-bounded `runtime/automation-runs.yaml` keeps the latest run status, session and
-turn IDs, and a 100-character answer preview. Manual `automation run` returns
+Each Project owns `runtime/projects/<project-id>/automation/config.yaml` and
+`history.yaml`; the runtime keeps no global automation file. Manual `automation run` returns
 after the session and prompt have started, without waiting for completion.
 When invoked from an agent session, its
 completion, cancellation, or failure is delivered back as an internal
 `<automation_result>` message, so the caller never needs to wait or poll.
 
 ```yaml
-automation:
-  enabled: true
-  timeoutSeconds: 900
-  jobs:
-    - name: daily-report
-      schedule:
-        cron: "0 9 * * *"
-        timezone: Asia/Shanghai
-      session:
-        mode: new
-        behavior: every_time
-        cwd: .
-      prompt: Summarize the current project status.
+enabled: true
+timeoutSeconds: 900
+jobs:
+  - name: daily-report
+    schedule:
+      cron: "0 9 * * *"
+      timezone: Asia/Shanghai
+    session:
+      mode: new
+      behavior: every_time
+    prompt: Summarize the current project status.
 ```

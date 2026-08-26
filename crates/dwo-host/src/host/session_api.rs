@@ -968,3 +968,241 @@ async fn remove_session_attachment_dirs(root: &Path, session_id: &str) -> Result
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::tests::write_test_profile;
+
+    #[test]
+    fn prompt_message_accepts_text_and_structured_content() {
+        let text: PromptMessage = serde_json::from_value(json!("hello")).unwrap();
+        assert_eq!(text.into_content(), MessageContent::text("hello"));
+
+        let content: PromptMessage = serde_json::from_value(json!([
+            {"type": "text", "text": "inspect"},
+            {"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}
+        ]))
+        .unwrap();
+        let content = content.into_content();
+        assert_eq!(content.as_blocks().len(), 2);
+        assert!(content.contains_images());
+    }
+
+    #[test]
+    fn subsession_policy_cannot_exceed_parent() {
+        assert!(ensure_policy_ceiling(SessionMode::Watch, SessionMode::Confirm).is_ok());
+        assert!(ensure_policy_ceiling(SessionMode::Confirm, SessionMode::Confirm).is_ok());
+        assert!(ensure_policy_ceiling(SessionMode::FullAccess, SessionMode::Confirm).is_err());
+        assert!(ensure_policy_ceiling(SessionMode::Confirm, SessionMode::Watch).is_err());
+    }
+
+    #[tokio::test]
+    async fn prompt_directives_use_the_effective_session_skill_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        let profile_skill = root.path().join("resource/skills/shared");
+        std::fs::create_dir_all(&profile_skill).unwrap();
+        std::fs::write(
+            profile_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: profile version\n---\nProfile instructions",
+        )
+        .unwrap();
+        let project = root.path().join("project");
+        let project_skill = project.join(".agents/skills/shared");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::write(
+            project_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: project version\n---\nProject instructions",
+        )
+        .unwrap();
+
+        let host = Host::build(&config).await.unwrap();
+        let expanded = host
+            .expand_prompt_directives(
+                &project,
+                MessageContent::text(
+                    "use /skill shared now; keep /skill missing and bare /mcp unchanged",
+                ),
+            )
+            .await
+            .unwrap();
+        let text = expanded.as_text().unwrap();
+        let expected_path = std::fs::canonicalize(project_skill.join("SKILL.md")).unwrap();
+        assert!(text.contains(&expected_path.display().to_string()));
+        assert!(!text.contains(&profile_skill.display().to_string()));
+        assert!(text.contains("/skill missing"));
+        assert!(text.contains("bare /mcp unchanged"));
+
+        let session_id = host
+            .create_session(HostSessionOptions {
+                cwd: Some(project),
+                ..HostSessionOptions::default()
+            })
+            .await
+            .unwrap();
+        let options = host.prompt_directive_options(&session_id).await.unwrap();
+        assert_eq!(options["skills"][0]["name"], "shared");
+        assert_eq!(options["skills"][0]["description"], "project version");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prompt_from_forks_a_direct_child_and_rejects_to() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let parent_id = host
+            .create_session(HostSessionOptions {
+                title: Some("parent".to_string()),
+                ..HostSessionOptions::default()
+            })
+            .await
+            .unwrap();
+        let create = PromptParam {
+            session_id: None,
+            from_session_id: None,
+            caller_session_id: None,
+            endpoint_id: "test".to_string(),
+            message: PromptMessage::Text("unused".to_string()),
+            title: Some("child".to_string()),
+            cwd: None,
+            policy: None,
+            model: None,
+            reasoning: None,
+            ephemeral: false,
+        };
+        let (source_id, _) = host
+            .resolve_prompt_session(&create, Some(parent_id.clone()))
+            .await
+            .unwrap();
+        let source_snapshot = host.service.snapshot(&source_id).await.unwrap();
+        let fork = PromptParam {
+            from_session_id: Some(source_id.to_string()),
+            title: Some("forked child".to_string()),
+            ..create
+        };
+
+        let (forked_id, returned_parent) = host
+            .resolve_prompt_session(&fork, Some(parent_id.clone()))
+            .await
+            .unwrap();
+        let forked_snapshot = host.service.snapshot(&forked_id).await.unwrap();
+
+        assert_ne!(forked_id, source_id);
+        assert_eq!(returned_parent.as_ref(), Some(&parent_id));
+        assert_eq!(
+            forked_snapshot.record.info.parent_session_id.as_ref(),
+            Some(&parent_id)
+        );
+        assert_eq!(forked_snapshot.record.info.title, "forked child");
+        assert_eq!(
+            forked_snapshot.record.context,
+            source_snapshot.record.context
+        );
+
+        let slash_fork = host
+            .handle_method("session.fork", json!({"session_id": source_id.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(slash_fork["accepted"], false);
+        assert_ne!(slash_fork["session_id"], source_id.as_str());
+
+        let invalid = PromptParam {
+            session_id: Some(source_id.to_string()),
+            from_session_id: Some(source_id.to_string()),
+            ..fork
+        };
+        let error = host
+            .resolve_prompt_session(&invalid, Some(parent_id))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "--from cannot be used with --to");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_use_project_workspaces_and_cleanup_only_session_resources() {
+        let profile = tempfile::tempdir().unwrap();
+        let config = write_test_profile(profile.path());
+        let host = Host::build(&config).await.unwrap();
+
+        let generated_id = host
+            .create_session(HostSessionOptions::default())
+            .await
+            .unwrap();
+        let generated_snapshot = host.service.snapshot(&generated_id).await.unwrap();
+        let generated_cwd = generated_snapshot.record.info.cwd.clone();
+        let (generated_project, generated_topic) = host
+            .projects
+            .locate_session(generated_id.as_str())
+            .expect("generated session belongs to the uncategorized topic");
+        assert_eq!(generated_cwd, generated_project.pwd);
+        assert_eq!(
+            generated_topic.id,
+            generated_project.board.uncategorized_topic_id
+        );
+        assert!(generated_cwd.is_dir());
+
+        let explicit = profile.path().join("projects/demo");
+        std::fs::create_dir_all(&explicit).unwrap();
+        let custom_id = host
+            .create_session(HostSessionOptions {
+                cwd: Some(PathBuf::from("projects/demo")),
+                ..HostSessionOptions::default()
+            })
+            .await
+            .unwrap();
+        let second_custom_id = host
+            .create_session(HostSessionOptions {
+                title: Some("second".to_string()),
+                cwd: Some(PathBuf::from("projects/demo")),
+                ..HostSessionOptions::default()
+            })
+            .await
+            .unwrap();
+        let (custom_project, custom_topic) =
+            host.projects.locate_session(custom_id.as_str()).unwrap();
+        let (second_project, second_topic) = host
+            .projects
+            .locate_session(second_custom_id.as_str())
+            .unwrap();
+        assert_eq!(
+            custom_project.pwd,
+            std::fs::canonicalize(&explicit).unwrap()
+        );
+        assert_eq!(custom_project.id, second_project.id);
+        assert_eq!(custom_topic.id, second_topic.id);
+        assert_eq!(second_topic.session_ids.len(), 2);
+
+        for date in ["2026/07/15", "2026/07/16"] {
+            let attachment = profile
+                .path()
+                .join("runtime/attachments/weixin")
+                .join(date)
+                .join(generated_id.as_str())
+                .join("image.jpg");
+            std::fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+            std::fs::write(attachment, b"image").unwrap();
+        }
+
+        host.delete_session(&generated_id).await.unwrap();
+        assert!(generated_cwd.exists(), "Project owns its workspace");
+        assert!(
+            host.projects
+                .locate_session(generated_id.as_str())
+                .is_none()
+        );
+        assert!(
+            !profile
+                .path()
+                .join("runtime/attachments/weixin/2026/07/15")
+                .join(generated_id.as_str())
+                .exists()
+        );
+        host.delete_session(&custom_id).await.unwrap();
+        host.delete_session(&second_custom_id).await.unwrap();
+        assert!(explicit.is_dir(), "an explicit cwd must never be deleted");
+
+        host.shutdown().await;
+    }
+}

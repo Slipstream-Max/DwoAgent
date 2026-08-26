@@ -122,23 +122,23 @@ Feishu/Lark 使用 `openlark` WebSocket 长连接，也不需要 webhook 或公�
 配置示例、cron、时区、session 模式和无人值守权限行为见 [Automation 使用指南](automation.md)。
 
 ```text
-dwo automation list [--json]
-dwo automation status <job> [--json]
-dwo automation add <job> --cron <expr> --prompt <text> [--timezone <zone>] [--session every-time|once|fixed] [--session-id <id>] [--cwd <path>] [--title <title>] [--disabled] [--json]
-dwo automation enable <job>
-dwo automation enable --all
-dwo automation disable <job>
-dwo automation disable --all
-dwo automation delete <job>
-dwo automation delete --all --yes
-dwo automation run <job> [--json]
+dwo automation --project <id> list [--json]
+dwo automation --project <id> status <job> [--json]
+dwo automation --project <id> add <job> --cron <expr> --prompt <text> [--topic <id>] [--session every-time|once|fixed] [--session-id <id>] [--title <title>] [--disabled] [--json]
+dwo automation --project <id> enable <job>
+dwo automation --project <id> enable --all
+dwo automation --project <id> disable <job>
+dwo automation --project <id> disable --all
+dwo automation --project <id> delete <job>
+dwo automation --project <id> delete --all --yes
+dwo automation --project <id> run <job> [--json]
 ```
 
 默认输出为可读文本；仅指定 `--json` 时保留机器读取的 JSON 输出。
 
 `add` 默认创建启用的 `new + every_time` 任务；`--session once` 复用 sticky session，`--session fixed` 必须同时提供 `--session-id`。`enable` 和 `disable` 接受任务名或 `--all`，只控制定时调度；手动 `run` 仍可执行 disabled 任务。`delete --all` 必须显式提供 `--yes`。
 
-`automation run` 在 session 已创建或解析、prompt 已成功提交后返回 `runId`、`sessionId` 和 `turnId`，但不等待 Agent 完成。在 Agent session 内调用时，最终结果或错误会作为 `<automation_result>` 内部消息自动进入调用方上下文，无需轮询。
+Automation Job 属于 Project，配置和 history 写在 `runtime/projects/<project-id>/automation/`。Agent Session 内可省略 `--project`，CLI 会从 `DWO_SESSION_ID` 推导当前 Project；外部 shell 必须显式指定。`automation delete` 在存在 `DWO_SESSION_ID` 时被拒绝。`automation run` 在 session 已创建或解析、prompt 已成功提交后返回 `runId`、`sessionId` 和 `turnId`，但不等待 Agent 完成。在 Agent session 内调用时，最终结果或错误会作为 `<automation_result>` 内部消息自动进入调用方上下文，无需轮询。
 
 ## ACP
 

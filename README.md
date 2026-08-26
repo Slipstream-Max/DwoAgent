@@ -191,7 +191,7 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
 
 ## ⏰ 让它替你值班
 
-在 `profile.yaml` 里写一段 cron，daemon 到点自动创建 session 跑任务。支持每次新建 session 或持续投递同一个 session。无人值守时工具权限请求会自动拒绝，不会卡住。完整配置和示例 → [Automation 使用指南](docs/automation.md)
+在 Project 的 `automation/config.yaml` 里写一段 cron，daemon 到点自动创建 session 跑任务。支持每次新建 session 或持续投递同一个 session。无人值守时工具权限请求会自动拒绝，不会卡住。完整配置和示例 → [Automation 使用指南](docs/automation.md)
 
 ## 🔀 运行全景
 
@@ -233,7 +233,7 @@ System prompt 位于 `resource/prompts/System.md`，项目规则位于 `resource
 | [文档索引](docs/README.md) | 按首次使用、日常操作和深入理解组织的阅读入口 |
 | [ACP 使用指南](docs/acp.md) | ACP 启动、session、权限、内容类型与限制 |
 | [Channel 部署与使用](docs/channels.md) | 微信、Telegram、飞书/Lark、QQ Bot 部署和 slash commands |
-| [Project 与看板](docs/project-board.md) | Project workspace、分区、话题、标签及 Session/Task 关系 |
+| [Project 与看板](docs/project-board.md) | Project workspace、分区、话题、标签及 Session/Automation 关系 |
 | [Slash Commands 使用指南](docs/slash-commands.md) | 所有 `/` 命令的用途、示例与入口对照 |
 | [Subsessions 使用指南](docs/subsessions.md) | 父子 session、配置继承、结果回传和常用命令 |
 | [Automation 使用指南](docs/automation.md) | Cron、时区、新建/固定 session 和无人值守行为 |

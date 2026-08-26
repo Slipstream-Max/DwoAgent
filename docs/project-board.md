@@ -1,6 +1,6 @@
 # Project 与看板
 
-Project 是 Host 中工作目录和看板的聚合根。看板用于把持续工作组织成分区和话题；它不替代 Session 或 Automation，而是保存对这些对象的 ID 引用。
+Project 是 Host 中工作目录、看板和 Automation 的聚合根。看板用于把持续工作组织成分区和话题；它不替代 Session，Session 通过 Topic 归类。
 
 ## 结构
 
@@ -15,13 +15,12 @@ Project
 Topic
 |- sectionId / title / order
 |- sessionIds[]
-|- taskIds[]
 |- labelIds[]
 |- overview.md
 `- AGENTS.md
 ```
 
-关系只由 Topic 保存：Session 不含 `topicId`，Automation Job 也不含 `topicId`。Host 根据 Topic 中的 ID 向 SessionService 和 Automation 查询详情。
+Session 归属由 Topic 的 `sessionIds[]` 保存；Automation Job 自己保存可选的 `topicId`，因为任务配置和运行历史属于 Project 的 automation 目录。
 
 每个 Project 创建时都有一个“未分类”分区和话题。调用 `session.new` 时可以省略 `topic_id`，Host 会使用该 Project 的未分类话题；完全省略 `project_id` 时，Host 按 canonical cwd 查找已有 Project，找不到才创建，没有 `cwd` 则生成 Project workspace。显式 `project.create` 不允许两个 Project 使用同一个 canonical pwd。
 
@@ -33,12 +32,15 @@ ACP 的标准 `new_session` 只有 cwd，没有 Project/Topic 字段。ACP adapt
 runtime/projects/<project-id>/
 |- project.json
 |- workspace/                 # 创建 Project 时没有提供 pwd 才生成
+|- automation/
+|  |- config.yaml
+|  `- history.yaml
 `- topics/<topic-id>/
    |- overview.md
    `- AGENTS.md
 ```
 
-`project.json` 保存 Board 元数据和 ID 关联。Project 的 workspace 不属于某个 Session，因此删除 Session 不删除 Project workspace。
+`project.json` 保存 Board 元数据和 Session 关联。Project 的 workspace、Automation 配置和运行历史不属于某个 Session，因此删除 Session 不删除这些 Project 资源。
 
 ## Topic Knowledge
 
@@ -63,13 +65,13 @@ model step 扫描共享 registry，并通过既有 EnvironmentWatcher 注入变�
 
 ```text
 dwo-project       -> Topic、Markdown、Label
-SessionService      -> sessionIds 对应的 Session 状态
-AutomationRuntime -> taskIds 对应的任务状态
+SessionService    -> sessionIds 对应的 Session 状态
+AutomationRuntime -> Project automation 中 topicId 匹配的任务状态
 ```
 
-Topic 中新建自动任务时，Host 先通过现有 Automation 配置创建 Job，再把 Job name 作为 `taskId` 关联到 Topic。全局 Tasks 仍读取全部 Automation Job；Topic 详情只显示自己的 `taskIds`。
+Automation Job 通过 `automation.add` 写入 Project 的 `automation/config.yaml`，需要归类时设置 `job.topicId`。全局 AutomationRuntime 负责调度，Topic 详情筛选当前 Project 中 `topicId` 匹配的 Job。
 
-Topic Task 创建或选择 Session 执行时，AutomationRuntime 根据 Topic 的 `taskIds` 找回 Project 和 Topic，使执行 Session 使用 `Project.pwd`、加入 `Topic.sessionIds`，并加载同一份 Topic `AGENTS.md`。Automation Job 自身仍不保存 `topicId`。
+Automation 执行 Session 时使用 `Project.pwd`、加入 `Topic.sessionIds`，并加载同一份 Topic `AGENTS.md`。删除 Topic 会把关联 Session 和 Job 移回未分类 Topic。
 
 ## Inbox
 
@@ -86,7 +88,8 @@ Inbox 没有后端实体。`session.list` 返回运行阶段、模型、思维�
 | `project.topic.overview.get/set` | 概述与计划 Markdown |
 | `project.topic.agents.get/set` | Knowledge Markdown |
 | `project.topic.session.assign/unassign` | Session 归类；unassign 移回未分类话题 |
-| `project.topic.task.create/assign/unassign` | 自动任务创建和归类 |
+| `automation.list/status/history` | 查询指定 Project 的任务和运行历史 |
+| `automation.add/update/enable/disable/delete/run` | 修改或执行指定 Project 的任务 |
 | `project.label.create/update/delete/assign/unassign` | 看板标签管理 |
 
-所有看板变更发布 `project.changed`。删除 Label 会清理所有 Topic 的对应 `labelId`；删除普通 Topic 会把 Session 和 Task 移回未分类话题。
+所有看板变更发布 `project.changed`。删除 Label 会清理所有 Topic 的对应 `labelId`；删除普通 Topic 会把 Session 和 Job 移回未分类话题。

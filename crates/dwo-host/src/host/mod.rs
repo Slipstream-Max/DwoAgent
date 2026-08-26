@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::automation::{AutomationRuntime, parse_config as parse_automation_config};
+use crate::automation::AutomationRuntime;
 use dwo_channels::{ChannelGateway, ChannelManager};
 mod automation_api;
 mod channel_api;
@@ -24,7 +24,6 @@ mod channel_host;
 mod config_api;
 mod config_manager;
 pub mod events;
-pub(crate) mod management_api;
 mod mcp_api;
 mod model_api;
 mod project_api;
@@ -173,7 +172,6 @@ impl Host {
         let source = config_manager.fingerprint()?;
         let runtime_profile = RuntimeProfile::from_loaded(source, &profile);
         let (default_model, default_reasoning, default_mode) = runtime_profile.defaults();
-        let automation_config = parse_automation_config(runtime_profile.config.automation.clone())?;
         let repository =
             Arc::new(FsSessionRepository::new(profile_root.join("runtime/sessions")).await?);
         let channels =
@@ -201,8 +199,6 @@ impl Host {
         let automation = AutomationRuntime::new(
             service.clone(),
             projects.clone(),
-            profile_root.clone(),
-            automation_config,
             default_model.clone(),
             default_reasoning,
             default_mode,
@@ -272,7 +268,7 @@ impl Host {
             return self.dispatch_session(method, params).await;
         }
         match method {
-            "dwo.capabilities" => Ok(serde_json::to_value(self.management_capabilities())?),
+            "dwo.capabilities" => Ok(serde_json::to_value(dwo_protocol::capabilities())?),
             "event.read" => {
                 let params: EventReadParam = serde_json::from_value(params)?;
                 let result: EventReadResult = self
@@ -288,7 +284,7 @@ impl Host {
                     "profile_root": self.profile_root,
                     "sessions": session_count,
                     "channels": self.channels().list().await?.len(),
-                    "automationJobs": self.automation.list().await.len(),
+                    "automationJobs": self.automation.list(None).await.len(),
                 }))
             }
             "daemon.shutdown" => {
@@ -319,7 +315,7 @@ impl Host {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        let cacheable = management_api::is_side_effect_method(method);
+        let cacheable = dwo_protocol::is_side_effect_method(method);
         let cache_key = format!("{client_id}:{request_id}");
         if cacheable {
             let now = std::time::Instant::now();
@@ -408,7 +404,6 @@ impl Host {
         let _reload = self.profile_reload.lock().await;
         let source = self.config_manager.fingerprint()?;
         let runtime_profile = RuntimeProfile::from_loaded(source, &loaded);
-        let automation_config = parse_automation_config(runtime_profile.config.automation.clone())?;
         let channels_changed = self
             .profile
             .read()
@@ -427,13 +422,8 @@ impl Host {
 
         self.service.apply_profile(loaded)?;
         self.automation
-            .apply_profile(
-                automation_config,
-                default_model,
-                default_reasoning,
-                default_mode,
-            )
-            .await?;
+            .apply_defaults(default_model, default_reasoning, default_mode)
+            .await;
         crate::logging::reload(&runtime_profile.config.logging)?;
 
         if let Some(channels) = replacement_channels {

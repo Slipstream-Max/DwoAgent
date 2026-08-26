@@ -330,3 +330,41 @@ impl Host {
         Ok(json!({"family": family, "removed": removed}))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::tests::write_test_profile;
+
+    #[tokio::test]
+    async fn provider_list_reports_a_configured_key_without_exposing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        host.handle_method(
+            "provider.upsert",
+            json!({
+                "name": "private",
+                "provider": {
+                    "baseUrl": "https://private.example.com/v1",
+                    "apiKey": "secret",
+                    "models": {
+                        "Private GPT": {
+                            "modelId": "private-gpt",
+                            "profile": "openai/gpt-5.6-terra"
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let providers = host
+            .handle_method("provider.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(providers["private"]["apiKeyConfigured"], true);
+        assert!(providers["private"].get("apiKey").is_none());
+        host.shutdown().await;
+    }
+}

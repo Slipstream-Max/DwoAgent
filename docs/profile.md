@@ -52,12 +52,12 @@
 
 | 路径 | 是否手动编辑 | 内容 |
 | --- | --- | --- |
-| `profile.yaml` | 是 | 模型、默认权限、channels 和 automation。 |
+| `profile.yaml` | 是 | 模型、默认权限和 channels。 |
 | `resource/prompts/` | 是 | System prompt 和 profile 级规则。 |
 | `resource/models/` | 是 | 扩展或覆盖可引用的 Model List family。 |
 | `resource/skills/` | 是 | 本地 skill。 |
 | `resource/mcp/mcp.json` | 是 | MCP server 配置。 |
-| `runtime/` | 通常不需要 | Session、附件和 OAuth。 |
+| `runtime/` | 通常不需要 | Session、Project、Automation、附件和 OAuth。 |
 | `logs/` | 通常不需要 | Daemon 结构化诊断日志。 |
 | `channels/` | 由命令管理 | 绑定信息和当前选择的 session。 |
 
@@ -110,11 +110,6 @@ websocket:
   bind: 127.0.0.1
   port: 8787
 
-automation:
-  enabled: false
-  timeoutSeconds: 900
-  jobs: []
-
 model:
   default:
     model: deepseek/deepseek-v4-pro
@@ -138,7 +133,7 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 - `externalSkillsDirs` 变化会立即更新所有 session（含已有 session）可用的技能目录。
 - `externalRuleFiles` 变化会立即更新所有 session 的额外规则文件列表；文件内容或列表变化在
   下一 model step 由 EnvironmentWatcher 注入。
-- `automation` 会重新计算任务调度；`logging.level` 和 `logging.retentionDays` 也会立即更新。设置了 `DWO_LOG` 时，环境变量仍优先于 profile 日志级别。
+- `logging.level` 和 `logging.retentionDays` 会立即更新。设置了 `DWO_LOG` 时，环境变量仍优先于 profile 日志级别。
 
 `resource/prompts/`、`resource/skills/`、`resource/mcp/mcp.json` 和运行时 channel capability 仍由各自 watcher 热加载。channel capability 只存在于 daemon 进程内，不写入 runtime；已有 session 会在模型步骤边界收到环境变更消息；发生 compaction 时，system prompt 会从当前资源重新构建。
 
@@ -152,7 +147,6 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 | `externalSkillsDirs` | 否 | 额外 skills 目录列表，可挂载他人的 skill；相对路径相对 profile 根目录解析。 |
 | `externalRuleFiles` | 否 | 额外规则文件列表；相对路径相对 profile 根目录解析，规则 pwd 为 profile 根目录。 |
 | `channels` | 否 | 微信、Telegram、飞书/Lark 和 QQ Bot adapter。 |
-| `automation` | 否 | Cron 定时任务。 |
 | `model` | 是 | Provider、模型部署和默认模型。 |
 
 ## 权限模式
@@ -307,35 +301,10 @@ websocket:
 
 ## Automation
 
-```yaml
-automation:
-  enabled: true
-  timeoutSeconds: 900
-  jobs:
-    - name: daily-report
-      enabled: true
-      schedule:
-        cron: "0 9 * * *"
-        timezone: Asia/Shanghai
-      session:
-        mode: new
-        behavior: every_time
-        cwd: projects/demo
-      prompt: 检查项目状态。
-```
-
-| 字段 | 默认值/限制 | 说明 |
-| --- | --- | --- |
-| `automation.enabled` | 默认 `false` | 是否按照 cron 自动调度；手动 `dwo automation run` 不受此开关影响。 |
-| `automation.timeoutSeconds` | 默认 `900`，范围 `1..=86400` | 单次 automation turn 的最长运行时间。到时会要求 agent 停止使用工具并回答。 |
-| `automation.jobs` | 默认 `[]` | 定时任务列表；每个任务的 `name` 必须唯一。 |
-| `jobs[].enabled` | 默认 `true` | 是否参与调度。 |
-| `jobs[].schedule.cron` | 必填 | 标准五字段 cron：分 时 日 月 周。 |
-| `jobs[].schedule.timezone` | 默认 `local` | `local`、`UTC` 或有效 IANA 时区，例如 `Asia/Shanghai`。 |
-| `jobs[].session` | 必填 | `mode: new` 创建新 session，`mode: fixed` 投递到指定 `sessionId`。 |
-| `jobs[].prompt` | 必填 | 每次触发提交给 agent 的文本。 |
-
-`mode: new` 还需要 `behavior: every_time` 或 `once`；`cwd` 和 `title` 可选。`mode: fixed` 需要已有的 `sessionId`。完整字段和运行行为见 [Automation 使用指南](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/automation.md)。
+Automation 不属于 profile。每个 Project 在
+`runtime/projects/<project-id>/automation/config.yaml` 保存自己的 Job；运行历史保存在同目录的
+`history.yaml`。Job 未覆盖模型、reasoning 或 policy 时仍使用当前 profile 默认值。完整字段和
+运行行为见 [Automation 使用指南](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/automation.md)。
 
 ## Prompts 与 Skills
 
@@ -413,7 +382,6 @@ Session 由 Host 放入 Project：Project 可以使用显式 pwd，也可以使�
 | 文件 | 内容 |
 | --- | --- |
 | `channels/<channel>/runtime.yaml` | 当前选择的 session 等运行状态。 |
-| `runtime/automation-runs.yaml` | 最近 100 次 automation run 的有界状态与回答预览。 |
 | `channels/<channel>/secret.yaml` | 绑定用户和私聊目标。 |
 | `runtime/attachments/<channel>/...` | 从 channel 下载的图片和文件。 |
 

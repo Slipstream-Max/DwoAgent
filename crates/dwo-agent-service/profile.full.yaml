@@ -103,36 +103,6 @@ websocket:
   bind: 127.0.0.1
   port: 8787
 
-# The daemon watches this section and reschedules valid changes automatically.
-# Cron uses the standard five fields: minute hour day-of-month month weekday.
-automation:
-  enabled: false
-  # After this many seconds, the active turn is told to stop using tools and answer.
-  timeoutSeconds: 900
-  jobs:
-    - name: daily-report
-      enabled: true
-      schedule:
-        cron: "0 9 * * *"
-        timezone: Asia/Shanghai
-      session:
-        mode: new
-        behavior: every_time
-        cwd: .
-        title: Daily report
-      prompt: Summarize the current project status.
-
-    # A fixed job uses normal FIFO prompt semantics and never interrupts an active turn.
-    - name: continue-fixed-session
-      enabled: false
-      schedule:
-        cron: "*/30 * * * *"
-        timezone: local
-      session:
-        mode: fixed
-        sessionId: session-replace-me
-      prompt: Continue the scheduled task.
-
 model:
   # Stable provider/modelId selection. Reasoning is optional.
   default:

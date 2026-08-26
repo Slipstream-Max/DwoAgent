@@ -137,6 +137,7 @@ pub fn write_automation_list(statuses: &[AutomationJobStatus]) -> Result<()> {
 }
 
 pub fn write_automation_status(status: &AutomationJobStatus) -> Result<()> {
+    output::line(format_args!("projectId: {}", status.project_id))?;
     output::line(format_args!("name: {}", status.job.name))?;
     output::line(format_args!(
         "enabled: {}",
@@ -161,11 +162,7 @@ pub fn write_automation_status(status: &AutomationJobStatus) -> Result<()> {
         status.next_run_at.as_deref().unwrap_or("-")
     ))?;
     match &status.job.session {
-        AutomationSession::New {
-            behavior,
-            cwd,
-            title,
-        } => {
+        AutomationSession::New { behavior, title } => {
             output::line(format_args!("sessionMode: new"))?;
             output::line(format_args!(
                 "behavior: {}",
@@ -174,7 +171,6 @@ pub fn write_automation_status(status: &AutomationJobStatus) -> Result<()> {
                     AutomationNewBehavior::Once => "once",
                 }
             ))?;
-            output::line(format_args!("cwd: {}", cwd.display()))?;
             if let Some(title) = title {
                 output::line(format_args!("title: {}", yaml_scalar(title)))?;
             }
@@ -183,6 +179,10 @@ pub fn write_automation_status(status: &AutomationJobStatus) -> Result<()> {
             output::line(format_args!("sessionMode: fixed"))?;
         }
     }
+    output::line(format_args!(
+        "topicId: {}",
+        status.job.topic_id.as_deref().unwrap_or("-")
+    ))?;
     if let Some(session) = &status.bound_session_id {
         output::line(format_args!("sessionId: {session}"))?;
     }

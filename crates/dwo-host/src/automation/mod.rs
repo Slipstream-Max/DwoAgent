@@ -8,8 +8,8 @@ use chrono::{DateTime, Local, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 use dwo_agent_service::{
-    AgentService, AgentServiceError, EndpointId, NewSession, RuleSource, SessionAgent,
-    SessionEventPayload, SessionId, SessionLlmSettings, SessionSubscription, TurnId,
+    EndpointId, ExternalRuleFile, NewSession, SessionEventPayload, SessionId, SessionListQuery,
+    SessionLlmSettings, SessionService, SessionServiceError, SessionSubscription, TurnId,
 };
 use dwo_project::ProjectService;
 use dwo_tools::{ConfirmationDecision, SessionMode};
@@ -141,11 +141,13 @@ struct RuntimeState {
 struct AutomationHistory {
     #[serde(default)]
     runs: Vec<AutomationRunRecord>,
+    #[serde(default)]
+    once_sessions: BTreeMap<String, String>,
 }
 
 struct AutomationExecution {
     record: AutomationRunRecord,
-    agent: Arc<SessionAgent>,
+    session_id: SessionId,
     endpoint: EndpointId,
     subscription: SessionSubscription,
     turn_id: TurnId,
@@ -159,7 +161,7 @@ struct AutomationDefaults {
 }
 
 pub struct AutomationRuntime {
-    service: Arc<AgentService>,
+    service: Arc<SessionService>,
     projects: Arc<ProjectService>,
     profile_root: PathBuf,
     history_path: PathBuf,
@@ -172,7 +174,7 @@ pub struct AutomationRuntime {
 
 impl AutomationRuntime {
     pub fn new(
-        service: Arc<AgentService>,
+        service: Arc<SessionService>,
         projects: Arc<ProjectService>,
         profile_root: PathBuf,
         config: AutomationConfig,
@@ -233,15 +235,25 @@ impl AutomationRuntime {
                 state.active.values().cloned().collect::<Vec<_>>(),
             )
         };
-        let history = self.history.lock().await.runs.clone();
+        let (history, once_sessions) = {
+            let history = self.history.lock().await;
+            (history.runs.clone(), history.once_sessions.clone())
+        };
         let default_model = self.defaults.lock().await.model.clone();
-        let sessions = self
-            .service
-            .list()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut sessions = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .service
+                .list(SessionListQuery::new(cursor, Some(500)))
+                .await
+                .unwrap_or_default();
+            sessions.extend(page.sessions);
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
         jobs.iter()
             .cloned()
             .map(|job| {
@@ -249,10 +261,7 @@ impl AutomationRuntime {
                     AutomationSession::New {
                         behavior: AutomationNewBehavior::Once,
                         ..
-                    } => sessions
-                        .iter()
-                        .find(|record| record.info.automation_job.as_deref() == Some(&job.name))
-                        .map(|record| record.info.id.to_string()),
+                    } => once_sessions.get(&job.name).cloned(),
                     AutomationSession::Fixed { session_id } => Some(session_id.clone()),
                     AutomationSession::New { .. } => None,
                 };
@@ -261,9 +270,9 @@ impl AutomationRuntime {
                     .and_then(|session_id| {
                         sessions
                             .iter()
-                            .find(|record| record.info.id.to_string() == *session_id)
+                            .find(|item| item.session_id.as_str() == session_id)
                     })
-                    .map(|record| record.llm.model.clone())
+                    .map(|item| item.model.clone())
                     .unwrap_or_else(|| default_model.clone());
                 AutomationJobStatus {
                     scheduler_enabled,
@@ -310,17 +319,14 @@ impl AutomationRuntime {
     }
 
     pub async fn remove_job_state(&self, name: Option<&str>, all: bool) -> Result<()> {
-        if all {
-            self.service.clear_automation_job(None).await?;
-        } else if let Some(name) = name {
-            self.service.clear_automation_job(Some(name)).await?;
-        }
         {
             let mut history = self.history.lock().await;
             if all {
                 history.runs.clear();
+                history.once_sessions.clear();
             } else if let Some(name) = name {
                 history.runs.retain(|run| run.job != name);
+                history.once_sessions.remove(name);
             }
             write_history(&self.history_path, &history).await?;
         }
@@ -443,8 +449,8 @@ impl AutomationRuntime {
         };
         self.set_active(record.clone()).await;
         let mut started = record;
-        let agent = match self.resolve_session(&job).await {
-            Ok(agent) => agent,
+        let session_id = match self.resolve_session(&job).await {
+            Ok(session_id) => session_id,
             Err(error) => {
                 started.status = AutomationRunStatus::Failed;
                 started.finished_at = Some(Utc::now().to_rfc3339());
@@ -454,23 +460,30 @@ impl AutomationRuntime {
                 return Err(error);
             }
         };
-        started.session_id = Some(agent.id().to_string());
+        started.session_id = Some(session_id.to_string());
         self.set_active(started.clone()).await;
         if let Some(model) = &job.model {
-            agent
-                .set_config(dwo_agent_service::SessionConfigUpdate::Model(model.clone()))
+            self.service
+                .set_config(
+                    &session_id,
+                    dwo_agent_service::SessionConfigUpdate::Model(model.clone()),
+                )
                 .await?;
         }
         if let Some(reasoning) = &job.reasoning {
-            agent
-                .set_config(dwo_agent_service::SessionConfigUpdate::Reasoning(Some(
-                    reasoning.clone(),
-                )))
+            self.service
+                .set_config(
+                    &session_id,
+                    dwo_agent_service::SessionConfigUpdate::Reasoning(Some(reasoning.clone())),
+                )
                 .await?;
         }
         if let Some(policy) = job.policy {
-            agent
-                .set_config(dwo_agent_service::SessionConfigUpdate::Mode(policy))
+            self.service
+                .set_config(
+                    &session_id,
+                    dwo_agent_service::SessionConfigUpdate::Mode(policy),
+                )
                 .await?;
         }
         let session_queue = if matches!(
@@ -484,7 +497,7 @@ impl AutomationRuntime {
         } else {
             let mut queues = self.session_queues.lock().await;
             queues
-                .entry(agent.id().to_string())
+                .entry(session_id.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
@@ -492,14 +505,14 @@ impl AutomationRuntime {
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime
-                .run_queued_job(started, job.prompt, agent, session_queue, caller)
+                .run_queued_job(started, job.prompt, session_id, session_queue, caller)
                 .await
         });
         Ok(returned)
     }
 
-    async fn resolve_session(&self, job: &AutomationJob) -> Result<Arc<SessionAgent>> {
-        let agent = match &job.session {
+    async fn resolve_session(&self, job: &AutomationJob) -> Result<SessionId> {
+        let session_id = match &job.session {
             AutomationSession::New {
                 behavior,
                 cwd,
@@ -510,25 +523,34 @@ impl AutomationRuntime {
             },
             AutomationSession::Fixed { session_id } => {
                 let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
-                self.service.load(&id).await?
+                self.service.load(&id).await?;
+                id
             }
         };
-        self.bind_session_to_job_topic(job, &agent).await?;
-        Ok(agent)
+        self.bind_session_to_job_topic(job, &session_id).await?;
+        Ok(session_id)
     }
 
     async fn start_execution(
         &self,
-        agent: Arc<SessionAgent>,
+        session_id: SessionId,
         prompt: String,
         record: &mut AutomationRunRecord,
     ) -> Result<AutomationExecution> {
         let endpoint = EndpointId::new();
-        let mut subscription = agent.attach(endpoint.clone()).await?;
+        let mut subscription = self.service.subscribe(&session_id, None).await?;
         let turn_id = loop {
-            match agent.prompt_idle(endpoint.clone(), prompt.clone()).await {
+            match self
+                .service
+                .prompt(
+                    &session_id,
+                    endpoint.clone(),
+                    dwo_context::MessageContent::text(prompt.clone()),
+                )
+                .await
+            {
                 Ok(accepted) => break accepted.turn_id,
-                Err(AgentServiceError::SessionBusy(_)) => {}
+                Err(SessionServiceError::SessionBusy(_)) => {}
                 Err(error) => return Err(error.into()),
             }
             tokio::select! {
@@ -553,7 +575,7 @@ impl AutomationRuntime {
         self.set_active(record.clone()).await;
         Ok(AutomationExecution {
             record: record.clone(),
-            agent,
+            session_id,
             endpoint,
             subscription,
             turn_id,
@@ -565,19 +587,19 @@ impl AutomationRuntime {
         job: &AutomationJob,
         cwd: &Path,
         title: &Option<String>,
-    ) -> Result<Arc<SessionAgent>> {
+    ) -> Result<SessionId> {
         let configured_cwd = if cwd.is_absolute() {
             cwd.to_path_buf()
         } else {
             self.profile_root.join(cwd)
         };
         let topic = self.projects.locate_task(&job.name);
-        let (cwd, rule_sources) = topic.as_ref().map_or_else(
+        let (cwd, external_rule_files) = topic.as_ref().map_or_else(
             || (configured_cwd, Vec::new()),
             |(project, topic)| {
                 (
                     project.pwd.clone(),
-                    vec![RuleSource::new(
+                    vec![ExternalRuleFile::new(
                         self.projects
                             .agents_path(&project.id, &topic.id)
                             .expect("located topic has an AGENTS path"),
@@ -594,55 +616,48 @@ impl AutomationRuntime {
                 .then(|| defaults.reasoning.clone())
                 .flatten()
         });
-        Ok(self
-            .service
+        let id = SessionId::new();
+        self.service
             .create(NewSession {
-                id: None,
+                from: None,
+                id: Some(id.clone()),
                 parent_session_id: None,
                 title: Some(
                     title
                         .clone()
                         .unwrap_or_else(|| format!("automation/{}", job.name)),
                 ),
-                cwd,
-                rule_sources,
-                mode: job.policy.unwrap_or(defaults.mode),
-                llm: SessionLlmSettings::new(model, reasoning),
-                automation_job: matches!(
-                    &job.session,
-                    AutomationSession::New {
-                        behavior: AutomationNewBehavior::Once,
-                        ..
-                    }
-                )
-                .then(|| job.name.clone()),
+                cwd: Some(cwd),
+                external_rule_files,
+                mode: Some(job.policy.unwrap_or(defaults.mode)),
+                llm: Some(SessionLlmSettings::new(model, reasoning)),
                 ephemeral: false,
             })
-            .await?)
+            .await?;
+        Ok(id)
     }
 
     async fn bind_session_to_job_topic(
         &self,
         job: &AutomationJob,
-        agent: &SessionAgent,
+        session_id: &SessionId,
     ) -> Result<()> {
         let Some((project, topic)) = self.projects.locate_task(&job.name) else {
             return Ok(());
         };
-        let snapshot = agent.snapshot().await?;
+        let snapshot = self.service.snapshot(session_id).await?;
         anyhow::ensure!(
             snapshot.record.info.cwd == project.pwd,
             "automation session cwd does not match the topic project pwd"
         );
-        let source = RuleSource::new(
+        let source = ExternalRuleFile::new(
             self.projects.agents_path(&project.id, &topic.id)?,
             project.pwd,
         );
-        if snapshot.record.context.rule_sources != [source.clone()] {
-            agent.set_rule_sources(vec![source]).await?;
-        }
+        self.service
+            .set_external_rule_files(session_id, vec![source]);
         self.projects
-            .assign_session(&project.id, &topic.id, agent.id().to_string())?;
+            .assign_session(&project.id, &topic.id, session_id.to_string())?;
         Ok(())
     }
 
@@ -651,24 +666,36 @@ impl AutomationRuntime {
         job: &AutomationJob,
         cwd: &Path,
         title: &Option<String>,
-    ) -> Result<Arc<SessionAgent>> {
-        if let Some(record) = self
-            .service
-            .list()
-            .await?
-            .into_iter()
-            .find(|record| record.info.automation_job.as_deref() == Some(&job.name))
-        {
-            return Ok(self.service.load(&record.info.id).await?);
+    ) -> Result<SessionId> {
+        let bound = self
+            .history
+            .lock()
+            .await
+            .once_sessions
+            .get(&job.name)
+            .cloned();
+        if let Some(bound) = bound {
+            let id = SessionId::parse(bound).map_err(anyhow::Error::msg)?;
+            match self.service.load(&id).await {
+                Ok(_) => return Ok(id),
+                Err(SessionServiceError::SessionNotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        self.create_session(job, cwd, title).await
+        let session_id = self.create_session(job, cwd, title).await?;
+        let mut history = self.history.lock().await;
+        history
+            .once_sessions
+            .insert(job.name.clone(), session_id.to_string());
+        write_history(&self.history_path, &history).await?;
+        Ok(session_id)
     }
 
     async fn run_queued_job(
         self: &Arc<Self>,
         mut record: AutomationRunRecord,
         prompt: String,
-        agent: Arc<SessionAgent>,
+        session_id: SessionId,
         session_queue: Arc<Mutex<()>>,
         caller: Option<SessionId>,
     ) {
@@ -677,7 +704,7 @@ impl AutomationRuntime {
             guard = session_queue.lock_owned() => Some(guard),
         };
         let result = if queue.is_some() {
-            match self.start_execution(agent, prompt, &mut record).await {
+            match self.start_execution(session_id, prompt, &mut record).await {
                 Ok(mut execution) => {
                     let result = self.monitor_execution(&mut execution).await;
                     record = execution.record;
@@ -722,7 +749,7 @@ impl AutomationRuntime {
     async fn monitor_execution(&self, execution: &mut AutomationExecution) -> Result<()> {
         let AutomationExecution {
             record,
-            agent,
+            session_id,
             endpoint,
             subscription,
             turn_id,
@@ -730,23 +757,22 @@ impl AutomationRuntime {
         let timeout_seconds = self.state.lock().await.config.timeout_seconds;
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_seconds));
         tokio::pin!(timeout);
-        let mut timeout_sent = false;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
-                    let _ = agent.cancel(Some(turn_id.clone())).await;
+                    let _ = self.service.cancel(session_id, Some(turn_id.clone())).await;
                     record.status = AutomationRunStatus::Cancelled;
                     return Ok(());
                 }
-                _ = &mut timeout, if !timeout_sent => {
-                    timeout_sent = true;
-                    match agent.append_internal(
-                        turn_id.clone(),
-                        automation_timeout_notification(timeout_seconds),
-                    ).await {
-                        Ok(()) | Err(AgentServiceError::TurnNotActive(_)) => {}
-                        Err(error) => return Err(error.into()),
-                    }
+                _ = &mut timeout => {
+                    let _ = self.service.cancel(session_id, Some(turn_id.clone())).await;
+                    record.status = AutomationRunStatus::Failed;
+                    record.error = Some(format!(
+                        "automation exceeded its {} second timeout",
+                        timeout_seconds
+                    ));
+                    record.finish_reason = Some("timeout".to_string());
+                    return Ok(());
                 }
                 event = subscription.events.recv() => {
                     let Some(event) = event else {
@@ -757,7 +783,8 @@ impl AutomationRuntime {
                             if event_turn == *turn_id => record.response = content,
                         SessionEventPayload::PermissionRequested { turn_id: event_turn, permission }
                             if event_turn == *turn_id => {
-                                agent.respond_permission(
+                                self.service.respond_permission(
+                                    session_id,
                                     endpoint.clone(),
                                     permission.request_id,
                                     ConfirmationDecision {
@@ -787,20 +814,11 @@ impl AutomationRuntime {
 
     async fn deliver_result(&self, caller: SessionId, record: &AutomationRunRecord) {
         let notification = automation_result_notification(record);
-        let agent = match self.service.load(&caller).await {
-            Ok(agent) => agent,
-            Err(error) => {
-                tracing::error!(
-                    event = "automation.caller_load_failed",
-                    caller_session_id = %caller,
-                    run_id = %record.run_id,
-                    error = %format!("{error:#}"),
-                    "load automation caller failed"
-                );
-                return;
-            }
-        };
-        if let Err(error) = agent.notify_internal(notification).await {
+        if let Err(error) = self
+            .service
+            .prompt_internal(&caller, dwo_context::MessageContent::text(notification))
+            .await
+        {
             tracing::error!(
                 event = "automation.result_delivery_failed",
                 caller_session_id = %caller,
@@ -860,12 +878,6 @@ fn automation_result_notification(record: &AutomationRunRecord) -> String {
             "error": record.error,
             "finish_reason": record.finish_reason,
         })
-    )
-}
-
-fn automation_timeout_notification(timeout_seconds: u64) -> String {
-    format!(
-        "<automation_timeout>\nThe automation time limit of {timeout_seconds} seconds has been reached. Stop using tools and provide the final answer now using the information already available.\n</automation_timeout>"
     )
 }
 
@@ -1002,57 +1014,6 @@ mod tests {
         assert!(preview.starts_with("first "));
         assert!(preview.ends_with("..."));
     }
-    use async_trait::async_trait;
-    use dwo_agent_service::{
-        CompactionView, ContextMessage, MemorySessionRepository, ModelClient, ModelClientError,
-        ModelLimits, ModelReply, ModelSelection, ModelStreamEvent, SummaryReply,
-    };
-    use serde_json::Value;
-    use tokio::sync::mpsc;
-
-    struct UnusedModel;
-
-    #[async_trait]
-    impl ModelClient for UnusedModel {
-        fn model_limits(&self, _model: &str) -> Result<ModelLimits, ModelClientError> {
-            Ok(ModelLimits {
-                context_window_tokens: 16_000,
-                max_output_tokens: 1_000,
-                max_input_tokens: 15_000,
-                compact_trigger_tokens: 12_000,
-            })
-        }
-
-        async fn stream_turn(
-            &self,
-            _selection: ModelSelection,
-            _messages: &[ContextMessage],
-            _tools: &[Value],
-            _events: mpsc::UnboundedSender<ModelStreamEvent>,
-            _cancellation: &CancellationToken,
-        ) -> Result<ModelReply, ModelClientError> {
-            unreachable!("once-session resolution does not call the model")
-        }
-
-        async fn complete(
-            &self,
-            _selection: ModelSelection,
-            _messages: Vec<ContextMessage>,
-            _cancellation: CancellationToken,
-        ) -> Result<ModelReply, ModelClientError> {
-            unreachable!("once-session resolution does not call the model")
-        }
-
-        async fn summarize(
-            &self,
-            _selection: ModelSelection,
-            _view: CompactionView,
-            _cancellation: CancellationToken,
-        ) -> Result<SummaryReply, ModelClientError> {
-            unreachable!("once-session resolution does not call the model")
-        }
-    }
-
     #[test]
     fn parses_new_and_fixed_jobs() {
         let config: AutomationConfig = serde_yaml::from_str(
@@ -1117,69 +1078,6 @@ jobs:
     fn new_session_requires_an_explicit_behavior() {
         let error = serde_yaml::from_str::<AutomationSession>("mode: new\ncwd: .\n").unwrap_err();
         assert!(error.to_string().contains("behavior"));
-    }
-
-    #[tokio::test]
-    async fn once_behavior_reuses_the_persisted_session_after_runtime_restart() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("profile.yaml"),
-            "automation: { enabled: false, jobs: [] }\n",
-        )
-        .unwrap();
-        let service = Arc::new(AgentService::new(
-            Arc::new(MemorySessionRepository::default()),
-            Arc::new(UnusedModel),
-            dwo_tools::PolicyConfig::default(),
-        ));
-        let job = AutomationJob {
-            name: "sticky".to_string(),
-            enabled: true,
-            schedule: AutomationSchedule {
-                cron: "0 9 * * *".to_string(),
-                timezone: "Asia/Shanghai".to_string(),
-            },
-            session: AutomationSession::New {
-                behavior: AutomationNewBehavior::Once,
-                cwd: PathBuf::from("."),
-                title: None,
-            },
-            prompt: "continue".to_string(),
-            model: None,
-            reasoning: None,
-            policy: None,
-        };
-        let build_runtime = || {
-            AutomationRuntime::new(
-                service.clone(),
-                Arc::new(ProjectService::open(root.path().join("runtime/projects")).unwrap()),
-                root.path().to_path_buf(),
-                AutomationConfig {
-                    enabled: false,
-                    timeout_seconds: default_timeout_seconds(),
-                    jobs: vec![job.clone()],
-                },
-                "test-model".to_string(),
-                None,
-                SessionMode::Watch,
-                CancellationToken::new(),
-            )
-            .unwrap()
-        };
-
-        let first_runtime = build_runtime();
-        let first = first_runtime
-            .once_session(&job, Path::new("."), &None)
-            .await
-            .unwrap();
-        drop(first_runtime);
-        let second = build_runtime()
-            .once_session(&job, Path::new("."), &None)
-            .await
-            .unwrap();
-
-        assert_eq!(first.id(), second.id());
-        assert_eq!(service.list().await.unwrap().len(), 1);
     }
 
     #[test]

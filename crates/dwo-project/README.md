@@ -4,7 +4,7 @@ Filesystem-backed Project and Board domain for DwoAgent.
 
 The crate owns Project metadata, generated Project workspaces, Sections,
 Topics, Labels, Topic Markdown, and opaque Session/Task ID associations. It
-does not depend on AgentService, Automation, Host, or transport types.
+does not depend on SessionService, Automation, Host, or transport types.
 
 ```text
 ProjectService

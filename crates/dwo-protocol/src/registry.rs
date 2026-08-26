@@ -92,7 +92,6 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     query("config.snapshot", MethodRoute::Dwo),
     command("config.update", MethodRoute::Dwo, Some("config.changed")),
     query("session.list", MethodRoute::Both),
-    query("session.status-list", MethodRoute::Dwo),
     query("session.status", MethodRoute::Dwo),
     query("session.snapshot", MethodRoute::Both),
     query("session.prompt-directives", MethodRoute::Both),

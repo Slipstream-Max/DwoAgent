@@ -21,7 +21,7 @@ Topic
 `- AGENTS.md
 ```
 
-关系只由 Topic 保存：Session 不含 `topicId`，Automation Job 也不含 `topicId`。Host 根据 Topic 中的 ID 向 AgentService 和 Automation 查询详情。
+关系只由 Topic 保存：Session 不含 `topicId`，Automation Job 也不含 `topicId`。Host 根据 Topic 中的 ID 向 SessionService 和 Automation 查询详情。
 
 每个 Project 创建时都有一个“未分类”分区和话题。调用 `session.new` 时可以省略 `topic_id`，Host 会使用该 Project 的未分类话题；完全省略 `project_id` 时，Host 按 canonical cwd 查找已有 Project，找不到才创建，没有 `cwd` 则生成 Project workspace。显式 `project.create` 不允许两个 Project 使用同一个 canonical pwd。
 
@@ -42,17 +42,20 @@ runtime/projects/<project-id>/
 
 ## Topic Knowledge
 
-Desktop 将 Topic 的 `AGENTS.md` 显示为 Knowledge。Host 创建 Topic Session 时，将该文件注册为额外 `RuleSource`：
+Desktop 将 Topic 的 `AGENTS.md` 显示为 Knowledge。Host 创建 Topic Session 时，将该文件注册到
+SessionService 的 per-session external rule file registry：
 
 ```text
-RuleSource
+ExternalRuleFile
 |- path = runtime/projects/<project-id>/topics/<topic-id>/AGENTS.md
 `- pwd  = Project.pwd
 ```
 
-ContextManager 自己读取文件。初始 prompt、上下文压缩重建和环境 watcher 使用同一规则源；Host 不读取内容后拼接 prompt。每份规则快照都带 `source`、`pwd` 和内容。未分类话题的空 `AGENTS.md` 不增加规则，但文件以后写入内容时 watcher 仍会发现。
+SystemPromptBuilder 自己读取文件。初始 prompt、上下文压缩重建和 environment watcher 使用同一规则源；Host 不读取内容后拼接 prompt。每份规则快照都带 `source`、`pwd` 和内容。未分类话题的空 `AGENTS.md` 不增加规则，但文件以后写入内容时 watcher 仍会发现。
 
-移动 Session 到另一个 Topic 时，Host 同时更新 Topic 的 `sessionIds` 和 Session 的通用 RuleSource。该操作要求 Session 当前 idle，避免正在运行的 turn 被中途换规则。
+移动 Session 到另一个 Topic 时，Host 同时更新 Topic 的 `sessionIds` 和 SessionService 的
+per-session external rule file registry。Actor/Handle 不接收规则更新请求；active turn 在下一
+model step 扫描共享 registry，并通过既有 EnvironmentWatcher 注入变化。
 
 ## Topic 详情
 
@@ -60,7 +63,7 @@ ContextManager 自己读取文件。初始 prompt、上下文压缩重建和环�
 
 ```text
 dwo-project       -> Topic、Markdown、Label
-AgentService      -> sessionIds 对应的 Session 状态
+SessionService      -> sessionIds 对应的 Session 状态
 AutomationRuntime -> taskIds 对应的任务状态
 ```
 
@@ -70,7 +73,7 @@ Topic Task 创建或选择 Session 执行时，AutomationRuntime 根据 Topic �
 
 ## Inbox
 
-Inbox 没有后端实体。`session.status-list` 和 `session.status` 返回运行阶段，以及最近一次终态的 `lastTurnStatus`、`lastTurnFinishedAtMs`。Desktop 按终态和完成时间筛选、排序即可生成 Inbox。
+Inbox 没有后端实体。`session.list` 返回运行阶段、模型、思维链模式和 policy；需要最近一次终态时按需调用 `session.status`。Desktop 按这些字段筛选、排序即可生成 Inbox。
 
 ## Management API
 

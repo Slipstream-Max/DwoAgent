@@ -112,12 +112,8 @@ fn usage_estimates_the_complete_context_without_provider_token_fields() {
         manager.context().usage.last_model.as_deref(),
         Some("second-model")
     );
-    assert!(
-        manager
-            .scheduled_compaction(with_user + 1, &tools)
-            .is_none()
-    );
-    assert!(manager.scheduled_compaction(with_user, &tools).is_some());
+    assert!(!manager.compaction_due(with_user + 1, &tools));
+    assert!(manager.compaction_due(with_user, &tools));
 
     let usage = serde_json::to_value(&manager.context().usage).unwrap();
     assert!(usage.get("input_tokens").is_none());
@@ -282,7 +278,7 @@ fn prompt_discovers_external_skill_dirs_and_applies_project_priority() {
     assert!(watcher.content.contains("Project shared skill"));
     assert!(!watcher.content.contains("External shared skill"));
 
-    // 热更新：Arc 内容变化（模拟 service.replace_external_skill_dirs）
+    // 热更新：Arc 内容变化（模拟 service.apply_profile）
     *dirs.write().unwrap() = vec![];
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let watcher = manager.model_messages().last().unwrap();
@@ -502,7 +498,7 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
     manager.append_user("continue");
     manager.append_assistant("done", Vec::new());
 
-    let plan = manager.plan_compaction(&CompactionPlanner::new(20, 5_000));
+    let plan = CompactionPlanner::new(20, 5_000).build(manager.context());
     let historical_assistant = plan
         .view
         .messages
@@ -529,7 +525,7 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
 }
 
 #[test]
-fn prompt_uses_and_watches_extra_rules_with_their_pwd() {
+fn prompt_uses_and_watches_session_rule_files_with_their_pwd() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
     let cwd = root.path().join("workspace");
@@ -541,9 +537,12 @@ fn prompt_uses_and_watches_extra_rules_with_their_pwd() {
     );
     write(&topic_rules, "topic rule v1");
 
-    let builder = SystemPromptBuilder::new(Some(profile), cwd.clone()).with_rule_sources(vec![
-        dwo_context::RuleSource::new(topic_rules.clone(), cwd.clone()),
-    ]);
+    let builder = SystemPromptBuilder::new(Some(profile), cwd.clone()).with_external_rule_files(
+        std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+        std::sync::Arc::new(std::sync::RwLock::new(vec![
+            dwo_context::ExternalRuleFile::new(topic_rules.clone(), cwd.clone()),
+        ])),
+    );
     let mut manager = ContextManager::initialize(&builder).unwrap();
     let prompt = manager.system_prompt();
     assert!(prompt.contains("topic rule v1"));
@@ -564,48 +563,45 @@ fn prompt_uses_and_watches_extra_rules_with_their_pwd() {
 }
 
 #[test]
-fn compaction_preserves_plan_watcher_without_summarizing_or_reordering_it() {
+fn prompt_watches_profile_rule_file_content_and_list_changes() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
+    let profile = root.path().join("profile");
+    let cwd = root.path().join("workspace");
+    let first = root.path().join("shared/first.md");
+    let second = root.path().join("shared/second.md");
+    std::fs::create_dir_all(&cwd).unwrap();
+    write(
+        &profile.join("resource/prompts/System.md"),
+        "Profile system prompt",
+    );
+    write(&first, "profile rule v1");
+    write(&second, "replacement profile rule");
+    let profile_rules = std::sync::Arc::new(std::sync::RwLock::new(vec![
+        dwo_context::ExternalRuleFile::new(first.clone(), profile.clone()),
+    ]));
+    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd).with_external_rule_files(
+        profile_rules.clone(),
+        std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+    );
     let mut manager = ContextManager::initialize(&builder).unwrap();
-    manager.append_user("old request");
-    manager.append_assistant("old answer", Vec::new());
-    let watcher = MessageContent::text("<execution_plan>continue</execution_plan>");
-    assert!(manager.replace_plan_watcher(Some(watcher.clone())));
-    manager.append_user("new request");
-    let before_reload = manager.model_messages().to_vec();
-    assert!(!manager.replace_plan_watcher(Some(watcher.clone())));
-    assert_eq!(manager.model_messages(), before_reload);
+    assert!(manager.system_prompt().contains("profile rule v1"));
 
-    let plan = manager.plan_compaction(&CompactionPlanner::new(1, 5_000));
+    write(&first, "profile rule v2");
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     assert!(
-        plan.view
-            .messages
-            .iter()
-            .all(|message| message.kind != MessageKind::PlanWatcher)
+        manager
+            .model_messages()
+            .last()
+            .unwrap()
+            .content
+            .contains("profile rule v2")
     );
-    manager
-        .apply_compaction(plan, "old summary", &builder, &[])
-        .unwrap();
 
-    let messages = manager.model_messages();
-    let watcher_index = messages
-        .iter()
-        .position(|message| message.kind == MessageKind::PlanWatcher)
-        .unwrap();
-    let user_index = messages
-        .iter()
-        .position(|message| message.content.as_text() == Some("new request"))
-        .unwrap();
-    assert_eq!(messages[watcher_index].content, watcher);
-    assert!(watcher_index < user_index);
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|message| message.kind == MessageKind::PlanWatcher)
-            .count(),
-        1
-    );
+    *profile_rules.write().unwrap() = vec![dwo_context::ExternalRuleFile::new(second, profile)];
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
+    let watcher = manager.model_messages().last().unwrap();
+    assert_eq!(watcher.kind, MessageKind::EnvWatcher);
+    assert!(watcher.content.contains("replacement profile rule"));
 }
 
 #[test]
@@ -618,7 +614,7 @@ fn historical_and_reserved_users_share_one_token_budget() {
         manager.append_assistant(format!("answer {index}"), Vec::new());
     }
 
-    let plan = manager.plan_compaction(&CompactionPlanner::new(50, 40));
+    let plan = CompactionPlanner::new(50, 40).build(manager.context());
     let retained_user_tokens = plan
         .front_user_messages
         .iter()
@@ -655,7 +651,7 @@ fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
         model_context: Vec::new(),
     });
 
-    let plan = manager.plan_compaction(&CompactionPlanner::new(10_000, 5_000));
+    let plan = CompactionPlanner::new(10_000, 5_000).build(manager.context());
     assert!(!plan.has_compactable_history());
     assert!(plan.needs_replacement());
     assert!(
@@ -682,7 +678,7 @@ fn compaction_projection_preserves_images_only_for_image_capable_models() {
         manager.append_assistant(format!("answer {index}"), Vec::new());
     }
 
-    let normal = manager.plan_compaction(&CompactionPlanner::new(1_500, 5_000));
+    let normal = CompactionPlanner::new(1_500, 5_000).build(manager.context());
     assert!(normal.view.messages.iter().any(|message| {
         message
             .content
@@ -748,7 +744,7 @@ fn compaction_rebuild_absorbs_current_rules_and_reestimates_usage() {
     write(&profile.join("resource/prompts/System.md"), "system v2");
     write(&cwd.join("AGENTS.md"), "cwd rules v2");
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 2);
-    let plan = manager.plan_compaction(&CompactionPlanner::new(1, 5_000));
+    let plan = CompactionPlanner::new(1, 5_000).build(manager.context());
     manager
         .apply_compaction(plan, "summary", &builder, &[])
         .unwrap();

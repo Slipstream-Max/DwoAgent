@@ -276,23 +276,28 @@ async fn list_sessions(
     config_path: &Path,
     request: v2::ListSessionsRequest,
 ) -> Result<Vec<v2::SessionInfo>> {
-    if request.cursor.is_some() {
-        return Ok(Vec::new());
-    }
-    let value = ipc::request_acp(config_path, "session.list", json!({"all": true})).await?;
-    let records: Vec<ipc_schema::SessionRecord> = serde_json::from_value(value).unwrap_or_default();
-    Ok(records
-        .into_iter()
-        .filter(|record| {
-            request
+    let value = ipc::request_acp(
+        config_path,
+        "session.list",
+        json!({
+            "all": true,
+            "cursor": request.cursor.as_ref().map(ToString::to_string),
+            "cwd": request
                 .cwd
                 .as_ref()
-                .is_none_or(|cwd| record.info.cwd == AsRef::<Path>::as_ref(cwd))
-        })
-        .map(|record| {
-            v2::SessionInfo::new(v2::SessionId::new(record.info.id.as_str()), record.info.cwd)
-                .title(record.info.title)
-                .updated_at(timestamp_rfc3339(record.info.updated_at_ms))
+                .map(|cwd| AsRef::<Path>::as_ref(cwd).to_path_buf()),
+        }),
+    )
+    .await?;
+    let page: dwo_agent_service::SessionListPage =
+        serde_json::from_value(value).unwrap_or_default();
+    Ok(page
+        .sessions
+        .into_iter()
+        .map(|session| {
+            v2::SessionInfo::new(v2::SessionId::new(session.session_id.as_str()), session.cwd)
+                .title(session.title)
+                .updated_at(timestamp_rfc3339(session.updated_at))
         })
         .collect())
 }

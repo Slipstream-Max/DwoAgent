@@ -1,6 +1,6 @@
 # dwo-host API
 
-`dwo-host` 是 DwoAgent 的长期运行应用层。一个 `Host` 拥有唯一的 AgentService、Session
+`dwo-host` 是 DwoAgent 的长期运行应用层。一个 `Host` 拥有唯一的 SessionService、Session
 repository、ProjectService、有效配置、MCP runtime、Channel runtime、Automation scheduler、事件历史和
 shutdown 边界。IPC、WebSocket、ACP shim、CLI 和 Flutter 都是它外面的适配器。
 
@@ -18,9 +18,9 @@ shutdown 边界。IPC、WebSocket、ACP shim、CLI 和 Flutter 都是它外面�
 
 ```rust,ignore
 use std::path::Path;
-use dwo_host::Host;
+use dwo_host::{Host, HostSessionOptions};
 
-let host = Host::load(Path::new("C:/Users/me/.dwoagent/profile.yaml")).await?;
+let host = Host::build(Path::new("C:/Users/me/.dwoagent/profile.yaml")).await?;
 let shutdown = host.shutdown_token();
 
 // 在这里启动自定义 transport，或直接调用 Session API。
@@ -29,11 +29,11 @@ shutdown.cancel();
 host.shutdown().await;
 ```
 
-`Host::load` 接受 profile 根目录或其中的配置文件路径，并完成：
+`Host::build` 接受 profile 根目录或其中的配置文件路径，并完成：
 
 - 解析严格的单 Host 配置；
 - 启动和同步 MCP runtime；
-- 创建 Session repository 与 AgentService；
+- 创建 Session repository 与 SessionService；
 - 恢复 Channel、Automation 和 ephemeral Session 状态；
 - 启动配置、MCP watcher 和 Automation scheduler。
 
@@ -42,10 +42,9 @@ host.shutdown().await;
 
 | API | 说明 |
 | --- | --- |
-| `Host::load(path)` | 加载并启动 Host，返回 `Arc<Host>` |
+| `Host::build(path)` | 加载并启动 Host，返回 `Arc<Host>` |
 | `Host::shutdown_token()` | transport 和后台任务共享的 cancellation token |
-| `Host::shutdown()` | 停止 Channel、MCP、AgentService，并清理 ephemeral Session |
-| `Host::profile_root_path()` | 返回规范化后的 profile 根目录 |
+| `Host::shutdown()` | 停止 Channel、MCP、SessionService，并清理 ephemeral Session |
 | `profile_root(path)` | 在创建 Host 前解析根目录 |
 | `logging::init(path)` | 初始化 JSONL 文件日志并返回必须持有的 `LoggingGuard` |
 | `logging::reload(config)` | 更新日志级别和保留天数 |
@@ -60,11 +59,13 @@ Session API 使用 `dwo-agent-service` 和 `dwo-context` 的领域类型，不�
 use dwo_agent_service::{EndpointId, SessionId};
 use dwo_context::MessageContent;
 
-let snapshot = host.setup_session(Some("review".into()), None).await?;
-let id: SessionId = snapshot.record.info.id.clone();
+let id: SessionId = host.create_session(HostSessionOptions {
+    title: Some("review".into()),
+    ..HostSessionOptions::default()
+}).await?;
 let endpoint = EndpointId::parse("my-client").map_err(anyhow::Error::msg)?;
 
-let mut subscription = host.subscribe_session(&id, endpoint.clone(), None).await?;
+let mut subscription = host.subscribe_session(&id, None).await?;
 let accepted = host
     .prompt_session(&id, endpoint, MessageContent::text("Review this workspace"))
     .await?;
@@ -77,29 +78,17 @@ let accepted = host
 
 | API | 行为 |
 | --- | --- |
-| `list_sessions(all, caller)` | 列出全部 Session 或某个 caller 的直接子 Session |
-| `list_session_statuses(all, caller)` | 带运行状态的列表 |
-| `session_status(id)` | 单个 Session 的状态摘要 |
-| `session_snapshot(id)` | 一致的当前快照 |
-| `setup_session(title, cwd)` | 建立 Project 和未分类根 Session；无 cwd 时创建 Project workspace |
-| `setup_project_session(title, project, topic)` | 在已有 Project/Topic 中建立 Session |
-| `create_session(title, cwd)` | 建立 Project 与 Session，并返回 `Arc<SessionAgent>` |
-| `create_project_session(title, project, topic)` | 在已有 Project/Topic 中建立 SessionAgent |
-| `fork_session(source)` | 从 idle Session 复制 context/transcript |
-| `subscribe_session(id, endpoint, cursor)` | 先取得快照/回放，再接收 live Session 事件 |
+| `create_session(options)` | 创建、fork 或绑定 Project/Topic，并返回 `SessionId` |
+| `subscribe_session(id, cursor)` | 先取得快照/回放，再接收 live Session 事件 |
 | `prompt_session(id, endpoint, content)` | 展开有效 Skill/MCP directive 后提交 prompt |
-| `compact_session(id, endpoint)` | 启动一次显式上下文压缩 |
-| `resume_session_turn(id, endpoint)` | 在允许时继续 idle turn |
-| `cancel_session(id, expected_turn)` | 取消当前或指定 turn |
-| `set_session_config(id, update)` | 更新 model、reasoning 或 policy 等 Session 选择 |
-| `resolve_session_permission(...)` | 回答待处理的工具权限请求 |
-| `publish_session_notification(...)` | 向 Session 写入结构化 Host/adapter 通知 |
-| `close_session(id)` | 关闭已加载 actor，不删除持久记录 |
 | `delete_session(id)` | 关闭并删除 Session 记录，同时清理 Topic 引用；不删除 Project workspace |
-| `watch(session_id, endpoint_id, cursor)` | 面向字符串 transport 参数的订阅便捷方法 |
+| `subscribe_events(cursor, limit, event)` | 订阅 Host 级事件 |
+| `handle_request(client, request, method, params)` | Management/ACP 协议入口 |
 
 `SessionSubscription` 提供的 snapshot/checkpoint 与 live event 是恢复边界。自定义客户端应保存
 cursor，并在重连时传回；不要把 transport 连接本身当作 Session 生命周期。
+单 session 的 compact、cancel、set_config、permission、unload 等操作由 `SessionService`
+统一提供；Host dispatch 直接路由到 Service，不再保留同名纯转发 wrapper。
 
 ## Management transport API
 
@@ -190,8 +179,8 @@ WebSocket 是 transport，不是 Channel。新的 transport 不应注册为 `cha
 适合实现新的调度器或做领域测试。正常嵌入应让 Host 创建并持有唯一 runtime，并通过
 `automation.*` Management 方法修改配置。
 
-`Host::channels()` 返回当前 `ChannelManager` handle，主要供 Host 内部 adapter/composition
-使用。配置、绑定、启停和 secret 清理应走 `channel.<kind>.*`，不能只修改 manager。
+`ChannelHost` 适配层可以读取当前 `ChannelManager` 和 profile 根目录，主要供 Channel adapter
+运行时使用。配置、绑定、启停和 secret 清理应走 `channel.<kind>.*`，不能只修改 manager。
 
 ## 增加 Host 能力
 

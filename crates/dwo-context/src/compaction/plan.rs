@@ -22,8 +22,6 @@ pub struct CompactionPlan {
     pub view: CompactionView,
     pub front_user_messages: Vec<ContextMessage>,
     pub reserved_messages: Vec<ContextMessage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    plan_watcher: Option<ContextMessage>,
     reserve_was_filtered: bool,
 }
 
@@ -45,11 +43,6 @@ impl CompactionPlan {
             project_messages(self.front_user_messages, false);
         let (reserved_messages, reserve_was_filtered) =
             project_messages(self.reserved_messages, false);
-        if let Some(message) = self.plan_watcher.take() {
-            let projected = message.project_for_image_input(false);
-            self.reserve_was_filtered |= projected.as_ref() != Some(&message);
-            self.plan_watcher = projected;
-        }
         self.reserve_was_filtered |=
             view_was_filtered || front_was_filtered || reserve_was_filtered;
         self.view.messages = view_messages;
@@ -69,7 +62,6 @@ impl CompactionPlan {
         if !summary.is_empty() {
             messages.push(ContextMessage::summary(summary));
         }
-        messages.extend(self.plan_watcher);
         messages.extend(self.reserved_messages);
         messages
     }
@@ -109,18 +101,7 @@ impl CompactionPlanner {
     }
 
     pub fn build(&self, context: &SessionContext) -> CompactionPlan {
-        let source = without_initial_system(&context.messages);
-        let plan_watcher = source
-            .iter()
-            .rev()
-            .find(|message| message.kind == MessageKind::PlanWatcher)
-            .cloned();
-        let messages = source
-            .iter()
-            .filter(|message| message.kind != MessageKind::PlanWatcher)
-            .cloned()
-            .collect::<Vec<_>>();
-        let messages = messages.as_slice();
+        let messages = without_initial_system(&context.messages);
         let mut cut = find_reserve_cut(messages, self.recent_context_tokens);
         cut.index = align_cut_to_tool_calls(messages, cut.index);
         if cut.split_turn_user.is_some_and(|index| index >= cut.index) {
@@ -148,7 +129,6 @@ impl CompactionPlanner {
             },
             front_user_messages,
             reserved_messages,
-            plan_watcher,
             reserve_was_filtered,
         }
     }
@@ -159,11 +139,7 @@ impl CompactionPlanner {
             return plan;
         }
 
-        let messages = without_initial_system(&context.messages)
-            .iter()
-            .filter(|message| message.kind != MessageKind::PlanWatcher)
-            .cloned()
-            .collect::<Vec<_>>();
+        let messages = without_initial_system(&context.messages);
         let conversation_tokens = messages
             .iter()
             .map(estimate_message_tokens)

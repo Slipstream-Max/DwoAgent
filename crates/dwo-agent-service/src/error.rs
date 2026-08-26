@@ -1,7 +1,7 @@
 use crate::{SessionId, TurnId};
 
 #[derive(Debug, thiserror::Error)]
-pub enum AgentServiceError {
+pub enum SessionServiceError {
     #[error("session not found: {0}")]
     SessionNotFound(SessionId),
     #[error("queued prompt was cancelled: {0}")]

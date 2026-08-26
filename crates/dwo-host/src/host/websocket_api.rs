@@ -43,6 +43,22 @@ impl WebsocketSecret {
 }
 
 impl Host {
+    pub(crate) async fn dispatch_websocket(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        match method {
+            "websocket.status" => self.websocket_status().await,
+            "websocket.enable" => self.websocket_set_enabled(true).await,
+            "websocket.disable" => self.websocket_set_enabled(false).await,
+            "websocket.config" => self.websocket_config(params.get("config").cloned()).await,
+            "websocket.token" => self.websocket_token().await,
+            "websocket.reset_token" => self.websocket_reset_token().await,
+            other => anyhow::bail!("unknown RPC method: {other}"),
+        }
+    }
+
     pub fn websocket_snapshot(&self) -> WebsocketConfig {
         self.profile
             .read()
@@ -79,13 +95,11 @@ impl Host {
     }
 
     pub async fn websocket_set_enabled(self: &Arc<Self>, enabled: bool) -> Result<Value> {
-        self.config_manager
-            .update(|profile| {
-                profile.websocket.enabled = enabled;
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            profile.websocket.enabled = enabled;
+            Ok(())
+        })
+        .await?;
         let status = self.websocket_status().await?;
         self.events
             .publish("websocket.status", status.clone())
@@ -97,13 +111,11 @@ impl Host {
         if let Some(update) = update {
             let config: WebsocketConfig = serde_json::from_value(update)?;
             config.validate().map_err(anyhow::Error::msg)?;
-            self.config_manager
-                .update(|profile| {
-                    profile.websocket = config.clone();
-                    Ok(())
-                })
-                .await?;
-            self.reload_profile_if_changed().await?;
+            self.edit_profile(|profile| {
+                profile.websocket = config.clone();
+                Ok(())
+            })
+            .await?;
             self.events
                 .publish("websocket.status", self.websocket_status().await?)
                 .await;

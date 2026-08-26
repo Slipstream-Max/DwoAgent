@@ -1,11 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use dwo_agent_service::{
-    ConfirmationDecision, EndpointId, PromptAccepted, SessionConfigUpdate, SessionId,
-    SessionRecord, SessionSnapshot, SessionSubscription, TurnId,
+    CompactionAccepted, ConfirmationDecision, EndpointId, PromptAccepted, SessionConfigUpdate,
+    SessionId, SessionListItem, SessionSnapshot, SessionSubscription, TurnId,
 };
 use dwo_context::MessageContent;
 
@@ -27,6 +27,13 @@ pub use manager::{
 
 pub const BIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[derive(Debug, Default)]
+pub struct SessionCreateRequest {
+    pub title: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub from: Option<SessionId>,
+}
+
 #[async_trait]
 pub trait ChannelHost: Send + Sync {
     fn profile_root_path(&self) -> &Path;
@@ -36,13 +43,8 @@ pub trait ChannelHost: Send + Sync {
         &self,
         all: bool,
         caller: Option<&SessionId>,
-    ) -> Result<Vec<SessionRecord>>;
-    async fn setup_session(
-        &self,
-        title: Option<String>,
-        cwd: Option<std::path::PathBuf>,
-    ) -> Result<SessionSnapshot>;
-    async fn fork_session(&self, source_id: &SessionId) -> Result<SessionSnapshot>;
+    ) -> Result<Vec<SessionListItem>>;
+    async fn create_session(&self, request: SessionCreateRequest) -> Result<SessionSnapshot>;
     async fn subscribe_session(
         &self,
         id: &SessionId,
@@ -52,18 +54,13 @@ pub trait ChannelHost: Send + Sync {
     async fn session_snapshot(&self, id: &SessionId) -> Result<SessionSnapshot>;
     async fn delete_session(&self, id: &SessionId) -> Result<()>;
     async fn cancel_session(&self, id: &SessionId, expected_turn_id: Option<TurnId>) -> Result<()>;
-    async fn compact_session(&self, id: &SessionId, endpoint: EndpointId)
-    -> Result<PromptAccepted>;
-    async fn resume_session_turn(
+    async fn compact_session(
         &self,
         id: &SessionId,
         endpoint: EndpointId,
-    ) -> Result<Option<PromptAccepted>>;
-    async fn set_session_config(
-        &self,
-        id: &SessionId,
-        update: SessionConfigUpdate,
-    ) -> Result<SessionSnapshot>;
+    ) -> Result<CompactionAccepted>;
+    async fn prompt_internal(&self, id: &SessionId, content: MessageContent) -> Result<TurnId>;
+    async fn set_session_config(&self, id: &SessionId, update: SessionConfigUpdate) -> Result<()>;
     async fn resolve_session_permission(
         &self,
         id: &SessionId,

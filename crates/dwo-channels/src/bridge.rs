@@ -9,7 +9,7 @@ use dwo_agent_service::{
 use dwo_tools::{ConfirmationDecision, SessionMode};
 use tokio::sync::Mutex;
 
-use super::ChannelHost;
+use super::{ChannelHost, SessionCreateRequest};
 use dwo_command::{ChannelCommand, render_command_help};
 
 use super::manager::ChannelOutputMode;
@@ -144,7 +144,7 @@ impl SessionBridge {
                 let selected = self.selected_session_id.lock().await.clone();
                 let choices = records
                     .iter()
-                    .map(|record| record.info.id.to_string())
+                    .map(|record| record.session_id.to_string())
                     .collect::<Vec<_>>();
                 *self.session_choices.lock().await = choices;
                 let text = records
@@ -153,14 +153,14 @@ impl SessionBridge {
                     .map(|(index, record)| {
                         format!(
                             "{} {}. {} [{}]",
-                            if selected.as_deref() == Some(record.info.id.as_str()) {
+                            if selected.as_deref() == Some(record.session_id.as_str()) {
                                 "*"
                             } else {
                                 " "
                             },
                             index + 1,
-                            short_session_title(&record.info.title),
-                            short_session_id(&record.info.id),
+                            short_session_title(&record.title),
+                            short_session_id(&record.session_id),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -173,7 +173,14 @@ impl SessionBridge {
             }
             ChannelCommand::New { name, cwd } => {
                 let title = (!name.is_empty()).then(|| name.join(" "));
-                let snapshot = self.host.setup_session(title, cwd).await?;
+                let snapshot = self
+                    .host
+                    .create_session(SessionCreateRequest {
+                        title,
+                        cwd,
+                        ..SessionCreateRequest::default()
+                    })
+                    .await?;
                 let session_id = snapshot.record.info.id.clone();
                 self.select_session(session_id.as_str()).await?;
                 vec![format!(
@@ -184,7 +191,13 @@ impl SessionBridge {
             }
             ChannelCommand::Fork => {
                 let source_id = self.selected_session_id().await?;
-                let snapshot = self.host.fork_session(&source_id).await?;
+                let snapshot = self
+                    .host
+                    .create_session(SessionCreateRequest {
+                        from: Some(source_id),
+                        ..SessionCreateRequest::default()
+                    })
+                    .await?;
                 vec![format!(
                     "Forked session {}\nTitle: {}",
                     snapshot.record.info.id, snapshot.record.info.title
@@ -240,7 +253,12 @@ impl SessionBridge {
                 self.ensure_observer(&id).await?;
                 let _ = self
                     .host
-                    .resume_session_turn(&id, self.endpoint.clone())
+                    .prompt_internal(
+                        &id,
+                        MessageContent::text(
+                            "<resume>Continue the previous task from the current session state.</resume>",
+                        ),
+                    )
                     .await?;
                 Vec::new()
             }
@@ -348,7 +366,10 @@ impl SessionBridge {
             return SessionId::parse(id).map_err(anyhow::Error::msg);
         }
         let session_id = {
-            let snapshot = self.host.setup_session(None, None).await?;
+            let snapshot = self
+                .host
+                .create_session(SessionCreateRequest::default())
+                .await?;
             let session_id = snapshot.record.info.id;
             self.select_session(session_id.as_str()).await?;
             session_id
@@ -401,8 +422,8 @@ impl SessionBridge {
         let records = self.host.list_sessions(true, None).await?;
         let matches = records
             .into_iter()
-            .filter(|record| session_id_matches(&record.info.id, reference))
-            .map(|record| record.info.id.to_string())
+            .filter(|record| session_id_matches(&record.session_id, reference))
+            .map(|record| record.session_id.to_string())
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [id] => Ok(id.clone()),

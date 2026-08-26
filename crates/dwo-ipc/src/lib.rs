@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use dwo_host::Host;
+#[cfg(test)]
+use dwo_host::HostSessionOptions;
 use dwo_protocol::{RpcError, RpcEvent, RpcRequest, RpcResponse, RpcRoute};
 
 pub fn endpoint(_config_path: &Path) -> String {
@@ -265,7 +267,11 @@ where
                 .map(usize::try_from)
                 .transpose()
                 .context("checkpoint_cursor exceeds usize")?;
-            match host.watch(session_id, endpoint_id, checkpoint_cursor).await {
+            let subscription = match dwo_host::SessionId::parse(session_id.to_string()) {
+                Ok(id) => host.subscribe_session(&id, checkpoint_cursor).await,
+                Err(error) => Err(anyhow::Error::msg(error)),
+            };
+            match subscription {
                 Ok(mut subscription) => {
                     tracing::info!(
                         event = "ipc.watch_attached",
@@ -575,14 +581,17 @@ model:
     #[tokio::test]
     async fn watch_writes_snapshot_before_waiting_for_events() {
         let profile = tempfile::tempdir().unwrap();
-        let host = Host::load(&write_test_profile(profile.path()))
+        let host = Host::build(&write_test_profile(profile.path()))
             .await
             .unwrap();
-        let session = host
-            .create_session(Some("watch test".to_string()), None)
+        let session_id = host
+            .create_session(HostSessionOptions {
+                title: Some("watch test".to_string()),
+                ..HostSessionOptions::default()
+            })
             .await
-            .unwrap();
-        let session_id = session.id().to_string();
+            .unwrap()
+            .to_string();
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(handle_connection(server, host.clone()));
         let request = RpcRequest {

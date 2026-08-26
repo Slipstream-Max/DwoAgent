@@ -1,11 +1,59 @@
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
 use anyhow::Result;
+use dwo_context::{PromptBuildError, SkillSnapshot, SystemPromptBuilder};
 use serde_json::{Value, json};
 
 use super::Host;
 
 impl Host {
+    pub(crate) async fn dispatch_skill(&self, method: &str, params: Value) -> Result<Value> {
+        let action = method.strip_prefix("skill.").unwrap_or_default();
+        match action {
+            "list" => self.skill_list(),
+            "enable" | "disable" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("skill name is required"))?
+                    .to_string();
+                self.skill_set_enabled(name, action == "enable").await
+            }
+            "install" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("skill name is required"))?
+                    .to_string();
+                let content = params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("skill content is required"))?
+                    .to_string();
+                self.skill_install(name, content).await
+            }
+            "uninstall" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("skill name is required"))?
+                    .to_string();
+                self.skill_uninstall(name).await
+            }
+            _ => anyhow::bail!("unknown skill action: {action}"),
+        }
+    }
+
     pub(crate) fn skill_list(&self) -> Result<Value> {
-        let active = self.service.skill_snapshots(&self.profile_root)?;
+        let external = self
+            .profile
+            .read()
+            .expect("profile lock poisoned")
+            .config
+            .external_skills_dirs
+            .clone();
+        let active = skill_snapshots(&self.profile_root, &external, &self.profile_root)?;
         let disabled = list_skill_names(&self.profile_root.join("resource/skills.disabled"))?;
         Ok(json!({"skills": active, "disabled": disabled}))
     }
@@ -42,7 +90,14 @@ impl Host {
             let _ = tokio::fs::remove_dir_all(&dir).await;
             return Err(error);
         }
-        if let Err(error) = self.service.skill_snapshots(&self.profile_root) {
+        let external = self
+            .profile
+            .read()
+            .expect("profile lock poisoned")
+            .config
+            .external_skills_dirs
+            .clone();
+        if let Err(error) = skill_snapshots(&self.profile_root, &external, &self.profile_root) {
             let _ = tokio::fs::remove_dir_all(&dir).await;
             return Err(error.into());
         }
@@ -73,6 +128,26 @@ impl Host {
         }
         Ok(json!({"name": name, "removed": removed}))
     }
+}
+
+pub(super) fn skill_snapshots(
+    profile_root: &Path,
+    external_dirs: &[PathBuf],
+    cwd: &Path,
+) -> Result<Vec<SkillSnapshot>, PromptBuildError> {
+    let external_dirs = external_dirs
+        .iter()
+        .map(|dir| {
+            if dir.is_absolute() {
+                dir.clone()
+            } else {
+                profile_root.join(dir)
+            }
+        })
+        .collect();
+    SystemPromptBuilder::new(Some(profile_root.to_path_buf()), cwd.to_path_buf())
+        .with_external_skill_dirs(Arc::new(RwLock::new(external_dirs)))
+        .scan_skills()
 }
 
 fn list_skill_names(root: &std::path::Path) -> Result<Vec<String>> {

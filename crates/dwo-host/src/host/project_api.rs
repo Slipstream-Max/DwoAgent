@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use dwo_agent_service::{RuleSource, SessionId};
+use dwo_agent_service::{ExternalRuleFile, SessionId};
 use dwo_project::CreateProject;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -464,14 +464,15 @@ impl Host {
         let project = self.projects.get(project_id)?;
         let agents_path = self.projects.agents_path(project_id, topic_id)?;
         let session_id = SessionId::parse(session_id.to_string()).map_err(anyhow::Error::msg)?;
-        let agent = self.service.load(&session_id).await?;
+        let snapshot = self.service.snapshot(&session_id).await?;
         anyhow::ensure!(
-            agent.snapshot().await?.record.info.cwd == project.pwd,
+            snapshot.record.info.cwd == project.pwd,
             "session cwd does not match project pwd"
         );
-        agent
-            .set_rule_sources(vec![RuleSource::new(agents_path, project.pwd)])
-            .await?;
+        self.service.set_external_rule_files(
+            &session_id,
+            vec![ExternalRuleFile::new(agents_path, project.pwd)],
+        );
         Ok(self
             .projects
             .assign_session(project_id, topic_id, session_id.to_string())?)

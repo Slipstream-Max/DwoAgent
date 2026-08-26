@@ -1,11 +1,110 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::Host;
 
 impl Host {
+    pub(crate) async fn dispatch_model(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        match method {
+            "model.catalog.list" => return self.model_catalog_list(),
+            "model.catalog.upsert" => {
+                let family = params
+                    .get("family")
+                    .and_then(Value::as_str)
+                    .context("model family is required")?
+                    .to_string();
+                super::validate_resource_name(&family)?;
+                let spec: dwo_agent_service::ModelFamilySpec = serde_json::from_value(
+                    params
+                        .get("spec")
+                        .cloned()
+                        .context("model family spec is required")?,
+                )?;
+                return self.model_catalog_upsert(family, spec).await;
+            }
+            "model.catalog.remove" => {
+                let family = params
+                    .get("family")
+                    .and_then(Value::as_str)
+                    .context("model family is required")?
+                    .to_string();
+                return self.model_catalog_remove(family).await;
+            }
+            _ => {}
+        }
+        let mut parts = method.split('.');
+        let domain = parts.next().unwrap_or_default();
+        let action = parts.next().unwrap_or_default();
+        anyhow::ensure!(
+            parts.next().is_none(),
+            "invalid model/provider method: {method}"
+        );
+        match (domain, action) {
+            ("model", "list") => self.model_list(),
+            ("provider", "list") => self.provider_list(),
+            ("model", "set_default") => {
+                let default: dwo_agent_service::DefaultModelConfig =
+                    serde_json::from_value(params)?;
+                self.model_set_default(default).await
+            }
+            ("model", "upsert") => {
+                let entry: dwo_agent_service::AgentModelEntry = serde_json::from_value(
+                    params.get("model").cloned().context("model is required")?,
+                )?;
+                let provider = params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .context("provider is required")?
+                    .to_string();
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("model display name is required")?
+                    .to_string();
+                self.model_upsert(provider, name, entry).await
+            }
+            ("model", "remove") => {
+                let provider = params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .context("provider is required")?
+                    .to_string();
+                let model_id = params
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .context("modelId is required")?
+                    .to_string();
+                self.model_remove(provider, model_id).await
+            }
+            ("provider", "upsert") => {
+                let provider: dwo_agent_service::AgentProviderConfig = serde_json::from_value(
+                    params.get("provider").cloned().unwrap_or(params.clone()),
+                )?;
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("provider name is required")?
+                    .to_string();
+                self.provider_upsert(name, provider).await
+            }
+            ("provider", "remove") => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("provider name is required")?
+                    .to_string();
+                self.provider_remove(name).await
+            }
+            _ => anyhow::bail!("unknown model/provider method: {method}"),
+        }
+    }
+
     pub(crate) fn model_list(&self) -> Result<Value> {
         super::redacted_model_config(
             &self
@@ -21,13 +120,11 @@ impl Host {
         self: &Arc<Self>,
         default: dwo_agent_service::DefaultModelConfig,
     ) -> Result<Value> {
-        self.config_manager
-            .update(|profile| {
-                profile.model.default = default.clone();
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            profile.model.default = default.clone();
+            Ok(())
+        })
+        .await?;
         Ok(json!({"default": default}))
     }
 
@@ -39,52 +136,50 @@ impl Host {
     ) -> Result<Value> {
         let mut catalog = dwo_agent_service::ModelCatalog::builtin()?;
         catalog.merge_model_directory(self.profile_root.join("resource/models"))?;
-        self.config_manager
-            .update(|profile| {
-                let provider = profile
-                    .model
-                    .providers
-                    .get_mut(&provider_name)
-                    .ok_or_else(|| anyhow::anyhow!("provider not found: {provider_name}"))?;
-                if provider.models.is_none() {
-                    let family = catalog.families.get(&provider_name).ok_or_else(|| {
-                        anyhow::anyhow!("provider {provider_name} has no implicit model family")
-                    })?;
-                    provider.models = Some(
-                        family
-                            .models
-                            .keys()
-                            .map(|id| {
-                                (
-                                    id.clone(),
-                                    dwo_agent_service::AgentModelEntry {
-                                        model_id: None,
-                                        profile: None,
-                                        context_window_tokens: None,
-                                        max_output_tokens: None,
-                                        default_reasoning_mode: None,
-                                        capabilities: None,
-                                        reasoning: None,
-                                        hosted_tools: None,
-                                        temperature: None,
-                                        top_p: None,
-                                        extra_body: serde_json::Map::new(),
-                                    },
-                                )
-                            })
-                            .collect(),
-                    );
-                }
-                let models = provider.models.as_mut().expect("models materialized");
-                let model_id = entry.effective_model_id(&model_name).to_string();
-                models.retain(|name, model| {
-                    name == &model_name || model.effective_model_id(name) != model_id
-                });
-                models.insert(model_name.clone(), entry.clone());
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            let provider = profile
+                .model
+                .providers
+                .get_mut(&provider_name)
+                .ok_or_else(|| anyhow::anyhow!("provider not found: {provider_name}"))?;
+            if provider.models.is_none() {
+                let family = catalog.families.get(&provider_name).ok_or_else(|| {
+                    anyhow::anyhow!("provider {provider_name} has no implicit model family")
+                })?;
+                provider.models = Some(
+                    family
+                        .models
+                        .keys()
+                        .map(|id| {
+                            (
+                                id.clone(),
+                                dwo_agent_service::AgentModelEntry {
+                                    model_id: None,
+                                    profile: None,
+                                    context_window_tokens: None,
+                                    max_output_tokens: None,
+                                    default_reasoning_mode: None,
+                                    capabilities: None,
+                                    reasoning: None,
+                                    hosted_tools: None,
+                                    temperature: None,
+                                    top_p: None,
+                                    extra_body: serde_json::Map::new(),
+                                },
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            let models = provider.models.as_mut().expect("models materialized");
+            let model_id = entry.effective_model_id(&model_name).to_string();
+            models.retain(|name, model| {
+                name == &model_name || model.effective_model_id(name) != model_id
+            });
+            models.insert(model_name.clone(), entry.clone());
+            Ok(())
+        })
+        .await?;
         Ok(json!({
             "provider": provider_name,
             "modelName": model_name,
@@ -98,8 +193,7 @@ impl Host {
         model_id: String,
     ) -> Result<Value> {
         let stable_id = format!("{provider_name}/{model_id}");
-        self.config_manager
-            .update(|profile| {
+        self.edit_profile(|profile| {
                 anyhow::ensure!(
                     profile.model.default.model != stable_id,
                     "cannot remove the default model"
@@ -121,7 +215,6 @@ impl Host {
                 Ok(())
             })
             .await?;
-        self.reload_profile_if_changed().await?;
         Ok(json!({"model": stable_id, "removed": true}))
     }
 
@@ -138,34 +231,30 @@ impl Host {
         name: String,
         provider: dwo_agent_service::AgentProviderConfig,
     ) -> Result<Value> {
-        self.config_manager
-            .update(|profile| {
-                profile
-                    .model
-                    .providers
-                    .insert(name.clone(), provider.clone());
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            profile
+                .model
+                .providers
+                .insert(name.clone(), provider.clone());
+            Ok(())
+        })
+        .await?;
         Ok(json!({"provider": name, "updated": true}))
     }
 
     pub(crate) async fn provider_remove(self: &Arc<Self>, name: String) -> Result<Value> {
-        self.config_manager
-            .update(|profile| {
-                anyhow::ensure!(
-                    !profile.model.default.model.starts_with(&format!("{name}/")),
-                    "cannot remove the default model provider"
-                );
-                anyhow::ensure!(
-                    profile.model.providers.shift_remove(&name).is_some(),
-                    "provider not found: {name}"
-                );
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            anyhow::ensure!(
+                !profile.model.default.model.starts_with(&format!("{name}/")),
+                "cannot remove the default model provider"
+            );
+            anyhow::ensure!(
+                profile.model.providers.shift_remove(&name).is_some(),
+                "provider not found: {name}"
+            );
+            Ok(())
+        })
+        .await?;
         Ok(json!({"provider": name, "removed": true}))
     }
 
@@ -201,7 +290,7 @@ impl Host {
                 |_| Ok(()),
             )
             .await?;
-        self.reload_profile(true).await?;
+        self.apply_profile(self.config_manager.load()?).await?;
         Ok(json!({"family": family, "updated": true}))
     }
 
@@ -236,7 +325,7 @@ impl Host {
             .join(format!("{family}.yaml"));
         let removed = self.config_manager.remove_resource_file(&path).await?;
         if removed {
-            self.reload_profile(true).await?;
+            self.apply_profile(self.config_manager.load()?).await?;
         }
         Ok(json!({"family": family, "removed": removed}))
     }

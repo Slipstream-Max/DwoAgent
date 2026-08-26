@@ -5,7 +5,17 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::Host;
-use dwo_channels::{ChannelKind, ChannelPollParams};
+use dwo_channels::{ChannelKind, ChannelManager, ChannelPollParams};
+
+#[derive(serde::Deserialize)]
+struct SendMessageParam {
+    text: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SendFileParam {
+    path: PathBuf,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum ManagedChannelAction {
@@ -35,6 +45,71 @@ pub(crate) fn managed_channel_action(method: &str) -> Option<(ChannelKind, Manag
 }
 
 impl Host {
+    pub(crate) fn channels(&self) -> Arc<ChannelManager> {
+        self.channels
+            .read()
+            .expect("channel manager lock poisoned")
+            .clone()
+    }
+
+    pub(crate) async fn dispatch_channel(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        if let Some((channel, action)) = managed_channel_action(method) {
+            return match action {
+                ManagedChannelAction::Status => self.channel_status(channel).await,
+                ManagedChannelAction::Enable | ManagedChannelAction::Disable => {
+                    self.channel_set_enabled(
+                        channel,
+                        matches!(action, ManagedChannelAction::Enable),
+                    )
+                    .await
+                }
+                ManagedChannelAction::Config => {
+                    self.channel_config(channel, params.get("config").cloned())
+                        .await
+                }
+                ManagedChannelAction::SendMessage => {
+                    let params: SendMessageParam = serde_json::from_value(params)?;
+                    self.channel_send_message(channel, params.text).await
+                }
+                ManagedChannelAction::SendFile => {
+                    let params: SendFileParam = serde_json::from_value(params)?;
+                    self.channel_send_file(channel, params.path).await
+                }
+                ManagedChannelAction::Remove => self.channel_remove(channel).await,
+            };
+        }
+        if method == "channel.list" {
+            return self.channel_list().await;
+        }
+        let mut parts = method.split('.');
+        anyhow::ensure!(
+            parts.next() == Some("channel"),
+            "invalid channel method: {method}"
+        );
+        let channel_name = parts
+            .next()
+            .with_context(|| format!("missing channel name in method: {method}"))?;
+        let action = parts
+            .next()
+            .with_context(|| format!("missing channel action in method: {method}"))?;
+        anyhow::ensure!(parts.next().is_none(), "invalid channel method: {method}");
+        let channel = ChannelKind::parse(channel_name)
+            .with_context(|| format!("unknown channel in method: {method}"))?;
+        match action {
+            "begin" | "bind" => self.channel_begin_bind(channel).await,
+            "poll" => {
+                let params: ChannelPollParams = serde_json::from_value(params)?;
+                self.channel_poll_bind(channel, params).await
+            }
+            "unbind" => self.channel_unbind(channel).await,
+            other => anyhow::bail!("unknown channel action: {other}"),
+        }
+    }
+
     pub(crate) async fn channel_list(&self) -> Result<Value> {
         Ok(serde_json::to_value(self.channels().list().await?)?)
     }
@@ -90,23 +165,21 @@ impl Host {
         enabled: bool,
     ) -> Result<Value> {
         let name = channel.as_str().to_string();
-        self.config_manager
-            .update(|profile| {
-                let entry = profile
-                    .channels
-                    .get_mut(&name)
-                    .context("channel is not configured")?;
-                let object = entry
-                    .as_mapping_mut()
-                    .context("channel config must be an object")?;
-                object.insert(
-                    serde_yaml::Value::String("enabled".to_string()),
-                    serde_yaml::Value::Bool(enabled),
-                );
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            let entry = profile
+                .channels
+                .get_mut(&name)
+                .context("channel is not configured")?;
+            let object = entry
+                .as_mapping_mut()
+                .context("channel config must be an object")?;
+            object.insert(
+                serde_yaml::Value::String("enabled".to_string()),
+                serde_yaml::Value::Bool(enabled),
+            );
+            Ok(())
+        })
+        .await?;
         self.events
             .publish(
                 "channel.status",
@@ -136,17 +209,15 @@ impl Host {
         };
         let yaml: serde_yaml::Value = serde_json::from_value(config)?;
         anyhow::ensure!(yaml.is_mapping(), "channel config must be an object");
-        self.config_manager
-            .update(|profile| {
-                anyhow::ensure!(
-                    profile.channels.contains_key(&name),
-                    "channel is not configured"
-                );
-                profile.channels.insert(name.clone(), yaml.clone());
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            anyhow::ensure!(
+                profile.channels.contains_key(&name),
+                "channel is not configured"
+            );
+            profile.channels.insert(name.clone(), yaml.clone());
+            Ok(())
+        })
+        .await?;
         self.events
             .publish(
                 "channel.status",

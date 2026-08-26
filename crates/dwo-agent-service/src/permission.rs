@@ -6,22 +6,23 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::TurnId;
-use crate::error::AgentServiceError;
+use crate::error::SessionServiceError;
 use crate::events::PendingPermission;
+use crate::session::ActorEvent;
 
 #[derive(Clone)]
 pub(crate) struct PermissionRequester {
     turn_id: TurnId,
     cancellation: CancellationToken,
     gate: Arc<Mutex<()>>,
-    requests: mpsc::UnboundedSender<PermissionRequestEnvelope>,
+    requests: mpsc::UnboundedSender<ActorEvent>,
 }
 
 impl PermissionRequester {
     pub(crate) fn new(
         turn_id: TurnId,
         cancellation: CancellationToken,
-        requests: mpsc::UnboundedSender<PermissionRequestEnvelope>,
+        requests: mpsc::UnboundedSender<ActorEvent>,
     ) -> Self {
         Self {
             turn_id,
@@ -55,11 +56,11 @@ impl PermissionRequester {
                 let (response, decision) = oneshot::channel();
                 if requester
                     .requests
-                    .send(PermissionRequestEnvelope {
+                    .send(ActorEvent::PermissionRequested(PermissionRequestEnvelope {
                         turn_id: requester.turn_id.clone(),
                         permission,
                         response,
-                    })
+                    }))
                     .is_err()
                 {
                     return rejected("session closed while requesting permission");
@@ -105,15 +106,15 @@ impl PermissionState {
         &mut self,
         request_id: &str,
         decision: ConfirmationDecision,
-    ) -> Result<ResolvedPermission, AgentServiceError> {
+    ) -> Result<ResolvedPermission, SessionServiceError> {
         let Some(pending) = self.pending.take() else {
-            return Err(AgentServiceError::PermissionNotFound(
+            return Err(SessionServiceError::PermissionNotFound(
                 request_id.to_string(),
             ));
         };
         if pending.view.request_id != request_id {
             self.pending = Some(pending);
-            return Err(AgentServiceError::PermissionNotFound(
+            return Err(SessionServiceError::PermissionNotFound(
                 request_id.to_string(),
             ));
         }

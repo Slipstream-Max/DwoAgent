@@ -211,6 +211,7 @@ fn phase_name(phase: RuntimePhase) -> &'static str {
     match phase {
         RuntimePhase::Idle => "idle",
         RuntimePhase::Running => "running",
+        RuntimePhase::Compacting => "compacting",
         RuntimePhase::WaitingPermission => "waiting_permission",
         RuntimePhase::Cancelling => "cancelling",
         RuntimePhase::Closing => "closing",

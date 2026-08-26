@@ -60,6 +60,47 @@ fn default_history_limit() -> usize {
 }
 
 impl Host {
+    pub(crate) async fn dispatch_automation(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        match method {
+            "automation.list" => self.automation_list().await,
+            "automation.status" => {
+                let params: JobParam = serde_json::from_value(params)?;
+                self.automation_status(params.job).await
+            }
+            "automation.update" => {
+                let params: UpdateParam = serde_json::from_value(params)?;
+                self.automation_update(params).await
+            }
+            "automation.history" => {
+                let params: HistoryParam = serde_json::from_value(params)?;
+                self.automation_history(params.job, params.limit).await
+            }
+            "automation.add" => {
+                let params: AddParam = serde_json::from_value(params)?;
+                self.automation_add(params.job).await
+            }
+            "automation.enable" | "automation.disable" => {
+                let params: ToggleParam = serde_json::from_value(params)?;
+                self.automation_set_enabled(params.job, params.all, method == "automation.enable")
+                    .await
+            }
+            "automation.delete" => {
+                let params: ToggleParam = serde_json::from_value(params)?;
+                self.automation_delete(params.job, params.all).await
+            }
+            "automation.run" => {
+                let params: RunParam = serde_json::from_value(params)?;
+                self.automation_run(params.job, params.caller_session_id)
+                    .await
+            }
+            other => anyhow::bail!("unknown automation method: {other}"),
+        }
+    }
+
     pub(crate) async fn automation_list(&self) -> Result<Value> {
         Ok(serde_json::to_value(self.automation.list().await)?)
     }
@@ -223,7 +264,7 @@ impl Host {
         job: String,
         caller_session_id: Option<String>,
     ) -> Result<Value> {
-        let caller = super::parse_optional_session(caller_session_id)?;
+        let caller = super::session_api::parse_optional_session(caller_session_id)?;
         if let Some(caller) = &caller {
             self.service.load(caller).await?;
         }
@@ -238,16 +279,14 @@ impl Host {
     where
         F: FnOnce(&mut AutomationConfig) -> Result<()>,
     {
-        self.config_manager
-            .update(|profile| {
-                let mut automation = parse_automation_config(profile.automation.clone())?;
-                update(&mut automation)?;
-                parse_automation_config(serde_yaml::to_value(&automation)?)?;
-                profile.automation = serde_yaml::to_value(automation)?;
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            let mut automation = parse_automation_config(profile.automation.clone())?;
+            update(&mut automation)?;
+            parse_automation_config(serde_yaml::to_value(&automation)?)?;
+            profile.automation = serde_yaml::to_value(automation)?;
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 }

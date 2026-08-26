@@ -20,6 +20,8 @@ The rewrite profile has one strict `profile.yaml` and fixed resource paths:
 
 ```yaml
 policyMode: confirm
+externalSkillsDirs: []
+externalRuleFiles: []
 model:
   default:
     model: deepseek/deepseek-v4-pro
@@ -57,40 +59,38 @@ session with no history applies the same rule when its next prompt arrives.
 ## Runtime ownership
 
 ```text
-AgentService
+SessionService
 |- SessionRepository
-|- ModelClient
-|- optional AgentProfile root
+|- ModelRuntime
+|- AgentProfile root / external skill dirs / external rule files
 |- Arc<FileEditManager>
 |- Arc<ToolPolicyEngine>
-`- loaded: SessionId -> Arc<SessionAgent>
-   `- SessionAgent actor
+`- loaded: SessionId -> Arc<SessionHandle>
+   `- SessionActor behind the crate-private SessionHandle mailbox
       |- SessionRecord / ContextManager ownership
-      |- one active PromptTurn
+      |- one active TurnExecution or manual compaction
       |- one session-local ToolManager / TerminalManager
       `- sequence-numbered session event stream
 ```
 
 Loading an active ID returns the existing actor. Repository `list` does not load
 sessions. Different session actors run concurrently. `prompt` starts immediately
-when idle. During an active turn, user and internal messages enter one FIFO and
-are appended after the current model response or tool-call batch. User messages
-keep the turn running; watcher-style internal messages can be appended without
-waking another model step. Explicit cancellation clears queued user messages,
-preserves internal messages, and is the only prompt path that interrupts a turn.
+when idle. During an active turn, user and internal messages enter that turn's
+short-lived steer inbox and are consumed at the next model-step boundary. The
+actor does not maintain a long-lived queued-message business state. Environment
+changes are scanned directly by `TurnExecution`; they do not use `prompt_internal`.
 
 The filesystem repository serializes save/load/delete only within the same
 `SessionId`. Records for different sessions do not share a filesystem write
 lock.
 
-`close` cancels and unloads a session but retains its record for a later load.
-`delete` closes the actor first, removes the repository record, and prevents a
+`unload` cancels and unloads a session but retains its record for a later load.
+`delete` unloads the actor first, removes the repository record, and prevents a
 concurrent load from recreating the actor while deletion is in progress.
 
 ## Session configuration
 
-`SessionAgent::set_config` and `AgentService::set_config` accept one strongly
-typed `SessionConfigUpdate`:
+`SessionService::set_config` accepts one strongly typed `SessionConfigUpdate`:
 
 ```text
 Mode(SessionMode)
@@ -114,9 +114,9 @@ they are persisted.
 ## Turn call path
 
 ```text
-SessionAgent::prompt(origin, user_message)
+SessionService::prompt(session_id, origin, user_message)
   -> persist user checkpoint
-  -> AgentLoop with session SystemPromptBlock
+  -> TurnExecution with session SystemPromptBlock
      -> scan mutable profile/environment state and append watcher changes
      -> compare last turn input usage with the selected model compact trigger
      -> compact old history with the last successful model when the trigger is reached
@@ -124,19 +124,17 @@ SessionAgent::prompt(origin, user_message)
      -> on transient model failure, persist partial output and retry the same step up to five times
      -> on ContextLengthExceeded, compact and retry that request once
      -> stream assistant deltas
-     -> without tool calls, drain queued user/internal messages after the response
+     -> without tool calls, drain turn-local steer messages after the response
      -> with tool calls, ToolManager::execute_batch using current SessionMode snapshot
-     -> drain queued user/internal messages after the tool-call batch
+     -> drain turn-local steer messages after the tool-call batch
      -> persist the complete response/tool/message checkpoint
      -> repeat model/tool steps
   -> TurnCompleted | TurnCancelled | TurnFailed
-  -> persist the latest plan as a non-waking PlanWatcher for the next explicit turn
 ```
 
 `ModelClient` is implemented by the provider-configured HTTP client in
-`dwo-model-client`. A scripted implementation lives under `tests/support` for
-deterministic tests. User turns use streaming requests; compaction summaries
-use the non-streaming `ModelClient::summarize` path.
+`dwo-model-client`. User turns use streaming requests; compaction summaries use
+the non-streaming `ModelClient::summarize` path.
 
 Compaction estimates the complete model request and keeps approximately the
 newest 20K tokens. It can split a turn: the user question is retained with the
@@ -147,6 +145,13 @@ front section and reserve. A model switch
 uses the last successfully used model for that summary, preserves the session's
 current reasoning mode, and records the target as `last_model` only after its
 first successful turn request.
+
+Manual, automatic, recovery, and handoff compaction use the same executor.
+Automatic and recovery compaction ask the selected model for a summary when
+history must be removed. Handoff supplies `handoff_text` as the summary and
+therefore does not issue another summary-model request. Manual compaction is a
+session context operation with its own `compaction_id`; it does not create a
+turn, user message, or assistant response.
 
 Image capability downgrades use a stricter plan: the summary request retains
 all image blocks so the source model can describe them, while the rebuilt model
@@ -169,16 +174,10 @@ tool supports only `get` and `update`; an empty update clears the plan, and a
 plan whose entries are all `completed` or `cancelled` is removed from current
 session state after its terminal update is published.
 
-Plans never start, resume, or queue turns. When an agent turn reaches any
-terminal outcome, the actor places the latest unfinished plan in the normal
-pending buffer as a non-waking `PlanWatcher`. The idle drain replaces the
-previous watcher in model context and persists it. A later user prompt or
-explicit `/resume` naturally includes that watcher. Reloading a session only
-restores the plan and watcher; it does not call the model. Manual compaction
-does not create a plan watcher. Context compaction carries an existing
-`PlanWatcher` separately from summary history, preserving its position before
-the next user message so later plan updates or clears cannot leave stale plan
-text inside a compaction summary.
+Plans never start, resume, queue turns, or inject notices into model context.
+Complete plan entries remain solely in `SessionRecord.current_plan` and in the
+plan tool result. `PlanUpdated` is a client/UI event. An empty update clears the
+current plan.
 
 Context usage is recomputed from system prompt, messages, reasoning, images,
 tool calls/results, and tool schemas after each checkpoint. Provider input and
@@ -189,18 +188,16 @@ the target model's context-window size.
 
 ## Observation and control
 
-`attach(endpoint)` returns a snapshot plus a filtered live receiver. The actor subscribes
+`subscribe(cursor)` returns a snapshot plus a live receiver. The actor subscribes
 before capturing snapshot sequence `N`; the returned stream only forwards
 events with `seq > N`, so replay/snapshot and live delivery do not have a gap.
 The snapshot includes the persisted record, current phase, active turn, partial
 assistant output, active tools, pending permission, and sequence watermark.
 
 Any endpoint may cancel the current turn or resolve a pending permission; the
-first permission response wins. User prompts are broadcast to observers but
-filtered from the matching origin endpoint to avoid client-side echo. Close
-waits for cancellation checkpoints before unloading the actor.
+first permission response wins. `unload` waits for cancellation checkpoints
+before stopping the actor.
 
 Internal messages are persisted as `MessageKind::Runtime` context messages and
-do not emit `UserPromptSubmitted`. A waking internal message starts an idle
-session immediately. Cancellation preserves queued internal messages but
-suppresses their wake behavior after the cancelled turn finishes.
+do not emit `UserPromptSubmitted`. An internal prompt starts an idle session or
+enters the active turn's steer inbox.

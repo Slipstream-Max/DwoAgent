@@ -57,7 +57,10 @@ session:
   title: Daily report
 ```
 
-`behavior: every_time` 每次运行创建独立 session。`behavior: once` 第一次运行时创建一个带有 `automation_job` 归属标记的 session；daemon 重启后直接从 session repository 找回它继续复用。若该 session 已被删除，下一次运行会重新创建。
+`behavior: every_time` 每次运行创建独立 session。`behavior: once` 第一次运行时创建并由
+AutomationRuntime 在自己的持久化状态中保存 job 到 session 的绑定；daemon 重启后按该绑定
+继续复用。SessionRecord 不保存 automation owner 字段。若绑定的 session 已删除，下一次运行
+会重新创建并更新绑定。
 
 相对 `cwd` 从 profile 根目录 `~/.dwoagent/` 开始解析，默认值是 `.`。没有设置 `title` 时，session 名称使用 `automation/<job-name>`。模型和权限模式使用 profile 默认值。`behavior` 没有默认值，省略会使 profile 校验失败。
 

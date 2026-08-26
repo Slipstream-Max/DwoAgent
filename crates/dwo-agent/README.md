@@ -3,7 +3,7 @@
 `dwo` is the long-running dwoagent host and its control CLI. One daemon owns
 the profile, sessions, channel state, model clients, and tool runtimes. CLI and
 ACP processes connect to that daemon over local IPC instead of creating their
-own `AgentService`.
+own `SessionService`.
 
 ```text
 crates/dwo-agent/       binary composition entry point
@@ -17,7 +17,7 @@ crates/dwo-command/     shared slash-command behavior
 crates/dwo-protocol/    Dwo RPC envelopes and method registry
 ```
 
-Only `dwo serve` constructs the `Host` and its `AgentService`. CLI and ACP
+Only `dwo serve` constructs the `Host` and its `SessionService`. CLI and ACP
 commands are local clients; channel runtimes live inside the daemon and call
 the shared service directly. Platform adapters normalize inbound messages and
 perform final network sends. Channel adapters share command and session
@@ -267,7 +267,7 @@ because it is the MCP tool argument payload.
 
 Weixin binding uses the real `weixin-agent` QR flow. Bound channels reconnect
 inside the daemon, persist sync state, route slash commands through the shared
-`AgentService`, and support answer-only or full tool-progress streaming. A user
+`SessionService`, and support answer-only or full tool-progress streaming. A user
 prompt submitted by ACP is mirrored to the bound Weixin observer; a prompt that
 originates from Weixin is not echoed back to the same endpoint.
 

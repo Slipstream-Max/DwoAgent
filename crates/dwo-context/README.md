@@ -21,8 +21,8 @@ ContextManager
 `- mcp.json
 ```
 
-Rules also include `AGENTS.md` files at the session's initial `cwd` and any
-persisted extra `RuleSource`, such as a Board Topic's Knowledge file. Every
+Rules also include `AGENTS.md` files at the session's initial `cwd` and external
+rule files supplied by the profile or a Board Topic. Every
 rule snapshot carries the source file path, the `pwd` where its instructions
 apply, and its content. All configured rule paths are watched. Changes to the
 system prompt, rules, skills, MCP config, or environment append `EnvWatcher`

@@ -427,7 +427,7 @@ model:
         )
         .unwrap();
 
-        let host = Host::load(&config_path).await.unwrap();
+        let host = Host::build(&config_path).await.unwrap();
         let server = tokio::spawn(serve(host.clone()));
         wait_for_running(&host, true).await;
         let tokens = host.websocket_token().await.unwrap();

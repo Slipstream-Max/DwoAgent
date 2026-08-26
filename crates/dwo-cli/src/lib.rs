@@ -521,7 +521,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
         SessionCommand::List { all } => {
             let value = ipc::request_dwo(
                 config_path,
-                "session.status-list",
+                "session.list",
                 json!({"all": all, "caller_session_id": current_session_id()}),
             )
             .await?;

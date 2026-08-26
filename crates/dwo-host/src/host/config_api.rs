@@ -28,21 +28,22 @@ impl Host {
         self: &std::sync::Arc<Self>,
         params: ConfigUpdateParam,
     ) -> Result<()> {
-        self.config_manager
-            .update(|profile| {
-                if let Some(max_model_steps) = params.max_model_steps {
-                    profile.max_model_steps = max_model_steps;
-                }
-                if let Some(logging) = params.logging {
-                    profile.logging = logging;
-                }
-                if let Some(dirs) = params.external_skills_dirs {
-                    profile.external_skills_dirs = dirs;
-                }
-                Ok(())
-            })
-            .await?;
-        self.reload_profile_if_changed().await?;
+        self.edit_profile(|profile| {
+            if let Some(max_model_steps) = params.max_model_steps {
+                profile.max_model_steps = max_model_steps;
+            }
+            if let Some(logging) = params.logging {
+                profile.logging = logging;
+            }
+            if let Some(dirs) = params.external_skills_dirs {
+                profile.external_skills_dirs = dirs;
+            }
+            if let Some(files) = params.external_rule_files {
+                profile.external_rule_files = files;
+            }
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 }

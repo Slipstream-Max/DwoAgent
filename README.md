@@ -212,8 +212,8 @@ Telegram 使用 long polling，飞书/Lark 使用 WebSocket 长连接，都不�
 
 真正运行 session 和 agent loop 的代码在 `crates/dwo-agent-service`。它提供这些公开类型：
 
-- `AgentService`：创建、加载、列出和删除 session。
-- `SessionAgent`：提交 prompt、订阅事件、取消 turn、修改配置和处理权限请求。
+- `SessionService`：创建、加载、列出和删除 session。
+- `SessionHandle`：提交 prompt、订阅事件、取消 turn、修改配置和处理权限请求。
 - `SessionRepository`：session 存储接口，项目内已经有内存和文件系统实现。
 - `ModelClient`：模型接口，可以使用 profile 创建默认 client，也可以接入自定义实现。
 - `SessionSubscription`：先返回完整 snapshot，再持续接收广播事件。

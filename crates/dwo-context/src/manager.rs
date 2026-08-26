@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::compaction::{CompactionPlan, CompactionPlanner};
+use crate::compaction::CompactionPlan;
 use crate::env_watcher::{DynamicEnvironmentSnapshot, EnvWatcherState};
-use crate::prompt::{PromptBuildError, RuleSource, SystemPromptBlock, SystemPromptBuilder};
+use crate::prompt::{PromptBuildError, SystemPromptBlock, SystemPromptBuilder};
 use crate::{
     ContextMessage, MessageContent, MessageKind, ToolResultRecord, estimate_message_tokens,
     estimate_tool_tokens,
@@ -39,8 +39,6 @@ pub struct SessionContext {
     pub compaction: CompactionState,
     #[serde(default)]
     pub env_watcher: EnvWatcherState,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rule_sources: Vec<RuleSource>,
 }
 
 impl SessionContext {
@@ -102,9 +100,9 @@ impl ContextManager {
     }
 
     pub fn initialize(builder: &SystemPromptBuilder) -> Result<Self, PromptBuildError> {
-        let mut context = SessionContext::with_system_prompt(builder.build_initial()?);
-        context.rule_sources = builder.rule_sources().to_vec();
-        Ok(Self::new(context))
+        Ok(Self::new(SessionContext::with_system_prompt(
+            builder.build_initial()?,
+        )))
     }
 
     pub fn context(&self) -> &SessionContext {
@@ -136,37 +134,6 @@ impl ContextManager {
 
     pub fn append_internal(&mut self, kind: MessageKind, content: impl Into<MessageContent>) {
         self.extend_messages([ContextMessage::internal(kind, content)]);
-    }
-
-    pub fn replace_plan_watcher(&mut self, content: Option<MessageContent>) -> bool {
-        let watcher_count = self
-            .context
-            .messages
-            .iter()
-            .filter(|message| message.kind == MessageKind::PlanWatcher)
-            .count();
-        let already_current = match content.as_ref() {
-            Some(content) => {
-                watcher_count == 1
-                    && self.context.messages.iter().any(|message| {
-                        message.kind == MessageKind::PlanWatcher && &message.content == content
-                    })
-            }
-            None => watcher_count == 0,
-        };
-        if already_current {
-            return false;
-        }
-        self.context
-            .messages
-            .retain(|message| message.kind != MessageKind::PlanWatcher);
-        if let Some(content) = content {
-            self.context
-                .messages
-                .push(ContextMessage::internal(MessageKind::PlanWatcher, content));
-        }
-        self.recalculate_message_tokens();
-        true
     }
 
     pub fn append_assistant(&mut self, content: impl Into<String>, tool_calls: Vec<Value>) {
@@ -307,15 +274,10 @@ impl ContextManager {
         trigger_tokens > 0 && self.context.usage.current_tokens >= trigger_tokens
     }
 
-    /// Refresh the complete request estimate and plan scheduled compaction when needed.
-    pub fn scheduled_compaction(
-        &mut self,
-        trigger_tokens: u64,
-        tools: &[Value],
-    ) -> Option<CompactionPlan> {
+    /// Refresh the complete request estimate and report whether compaction is due.
+    pub fn compaction_due(&mut self, trigger_tokens: u64, tools: &[Value]) -> bool {
         self.refresh_usage(tools);
         self.should_compact(trigger_tokens)
-            .then(|| CompactionPlanner::default().build(&self.context))
     }
 
     /// Scan mutable profile/environment state at a model-step boundary.
@@ -336,18 +298,6 @@ impl ContextManager {
                 .map(|change| ContextMessage::internal(MessageKind::EnvWatcher, change.render())),
         );
         count
-    }
-
-    pub fn plan_compaction(&self, planner: &CompactionPlanner) -> CompactionPlan {
-        planner.build(&self.context)
-    }
-
-    pub fn plan_recovery_compaction(&self, planner: &CompactionPlanner) -> CompactionPlan {
-        planner.build_recovery(&self.context)
-    }
-
-    pub fn recovery_compaction(&self) -> CompactionPlan {
-        CompactionPlanner::default().build_recovery(&self.context)
     }
 
     /// Replace model context and estimate the complete rebuilt request.

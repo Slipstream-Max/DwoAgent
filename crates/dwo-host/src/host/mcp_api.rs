@@ -1,7 +1,78 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Host, McpInstallParam};
+use super::Host;
+
+#[derive(Deserialize)]
+pub(crate) struct McpInstallParam {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    config: Option<Value>,
+    #[serde(default)]
+    servers: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Deserialize)]
+struct McpSearchParam {
+    query: String,
+}
+
+#[derive(Deserialize)]
+struct McpCallParam {
+    selector: String,
+    arguments: Value,
+}
+
+#[derive(Deserialize)]
+struct McpAuthParam {
+    server: String,
+}
+
+#[derive(Deserialize)]
+struct McpServerParam {
+    server: String,
+}
+
+impl Host {
+    pub(crate) async fn dispatch_mcp(&self, method: &str, params: Value) -> Result<Value> {
+        match method {
+            "mcp.list" => self.mcp_list().await,
+            "mcp.config" => self.mcp_config(),
+            "mcp.search" => {
+                let params: McpSearchParam = serde_json::from_value(params)?;
+                self.mcp_search(params.query).await
+            }
+            "mcp.call" => {
+                let params: McpCallParam = serde_json::from_value(params)?;
+                self.mcp_call(params.selector, params.arguments).await
+            }
+            "mcp.auth.login" => {
+                let params: McpAuthParam = serde_json::from_value(params)?;
+                self.mcp_auth(params.server, true).await
+            }
+            "mcp.auth.logout" | "mcp.auth.unauth" => {
+                let params: McpAuthParam = serde_json::from_value(params)?;
+                self.mcp_auth(params.server, false).await
+            }
+            "mcp.enable" | "mcp.disable" => {
+                let params: McpServerParam = serde_json::from_value(params)?;
+                self.mcp_set_enabled(params.server, method == "mcp.enable")
+                    .await
+            }
+            "mcp.install" => {
+                let params: McpInstallParam = serde_json::from_value(params)?;
+                self.mcp_install(params).await
+            }
+            "mcp.uninstall" => {
+                let params: McpServerParam = serde_json::from_value(params)?;
+                self.mcp_uninstall(params.server).await
+            }
+            other => anyhow::bail!("unknown MCP method: {other}"),
+        }
+    }
+}
 
 impl Host {
     pub(crate) async fn mcp_list(&self) -> Result<Value> {

@@ -127,12 +127,12 @@ ACP adapter 会隐藏 `plan` 的普通 tool-call lifecycle，只发布计划状�
 计划清除时两个协议都发布空 entries；snapshot 没有当前计划时也发送空计划，确保持续
 连接和重新接入的客户端最终显示一致。
 
-agent turn 结束时，daemon 将最新未完成计划作为不唤醒 session 的 PlanWatcher 写入
-模型上下文。session 保持 Idle；只有后续用户 prompt 或显式 `/resume` 才会启动新
-turn 并携带该 watcher。Cancel、Failed、daemon shutdown 和重启都不会因为存在
-计划而自动调用模型。compaction 将 PlanWatcher 与 summary history 分开保存，避免
-旧计划被写进不可撤销的摘要。恢复 ACP session 时只从 snapshot 展示当前计划和真实
-phase。
+agent turn 结束时，如果仍有未完成计划，daemon 会向模型上下文追加一条简短的
+`PlanNotice`，提示模型通过 `plan(get)` 获取详情；完整 entries 只保存在
+`SessionRecord.current_plan`。session 保持 Idle；只有后续用户 prompt 或显式
+`/resume` 才会启动新 turn。Cancel、Failed、daemon shutdown 和重启都不会因为存在
+计划而自动调用模型。compaction 将 notice 当作普通内部消息处理，不维护可替换的计划
+快照。恢复 ACP session 时只从 snapshot 展示当前计划和真实 phase。
 
 ## 输入与输出能力
 

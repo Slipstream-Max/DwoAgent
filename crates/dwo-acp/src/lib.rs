@@ -37,7 +37,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::ValueEnum;
-use dwo_agent_service::ExecutionPlan;
+use dwo_agent_service::{ExecutionPlan, SessionListPage};
 use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
 use dwo_tools::{PlanEntry, PlanEntryPriority, PlanEntryStatus};
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,10 @@ impl AcpBackend {
                 ipc::subscribe_acp(config_path, session_id, endpoint_id).await
             }
             Self::Host { host, .. } => {
-                let subscription = host.watch(session_id, endpoint_id, None).await?;
+                let _ = endpoint_id;
+                let id = dwo_agent_service::SessionId::parse(session_id.to_string())
+                    .map_err(anyhow::Error::msg)?;
+                let subscription = host.subscribe_session(&id, None).await?;
                 let snapshot = json!({"snapshot": subscription.snapshot});
                 let (sender, receiver) = tokio::sync::mpsc::channel(256);
                 tokio::spawn(async move {
@@ -250,7 +253,6 @@ struct RawSessionNotification {
 struct DeliveredMessages {
     agent: HashSet<String>,
     thought: HashSet<String>,
-    manual_compaction_turns: HashSet<String>,
 }
 
 impl AcpConnection {
@@ -260,22 +262,6 @@ impl AcpConnection {
             inner,
             delivered: Arc::new(StdMutex::new(DeliveredMessages::default())),
         }
-    }
-
-    fn mark_manual_compaction(&self, turn_id: &str) {
-        self.delivered
-            .lock()
-            .expect("delivered messages lock poisoned")
-            .manual_compaction_turns
-            .insert(turn_id.to_string());
-    }
-
-    fn is_manual_compaction_turn(&self, turn_id: &str) -> bool {
-        self.delivered
-            .lock()
-            .expect("delivered messages lock poisoned")
-            .manual_compaction_turns
-            .contains(turn_id)
     }
 
     fn mark_streamed(&self, message_id: &str, thought: bool) {
@@ -475,33 +461,38 @@ where
             async move |request: ListSessionsRequest,
                         responder: Responder<ListSessionsResponse>,
                         _cx: ConnectionTo<Client>| {
-                if request.cursor.is_some() {
-                    return responder.respond(ListSessionsResponse::new(Vec::new()));
-                }
+                let cursor = request.cursor.as_ref().map(ToString::to_string);
+                let cwd = request
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| AsRef::<Path>::as_ref(cwd).to_path_buf());
                 match list_runtime
-                    .request("session.list", json!({"all": true}))
+                    .request(
+                        "session.list",
+                        json!({"all": true, "cursor": cursor, "cwd": cwd}),
+                    )
                     .await
                 {
                     Ok(value) => {
-                        let records: Vec<ipc_schema::SessionRecord> =
+                        let page: SessionListPage =
                             serde_json::from_value(value).unwrap_or_default();
-                        let cwd = request.cwd;
-                        let sessions = records
+                        let sessions = page
+                            .sessions
                             .into_iter()
-                            .filter(|record| {
-                                cwd.as_ref()
-                                    .is_none_or(|cwd| record.info.cwd == AsRef::<Path>::as_ref(cwd))
-                            })
-                            .map(|record| {
+                            .map(|session| {
                                 SessionInfo::new(
-                                    SessionId::new(record.info.id.as_str()),
-                                    record.info.cwd,
+                                    SessionId::new(session.session_id.as_str()),
+                                    session.cwd,
                                 )
-                                .title(record.info.title)
-                                .updated_at(timestamp_rfc3339(record.info.updated_at_ms))
+                                .title(session.title)
+                                .updated_at(timestamp_rfc3339(session.updated_at))
                             })
                             .collect();
-                        responder.respond(ListSessionsResponse::new(sessions))
+                        let response = ListSessionsResponse::new(sessions);
+                        let response = page.next_cursor.map_or(response.clone(), |cursor| {
+                            response.next_cursor(cursor.to_string())
+                        });
+                        responder.respond(response)
                     }
                     Err(error) => responder.respond_with_error(internal_error(error)),
                 }
@@ -1076,10 +1067,6 @@ async fn handle_session_event(
         "terminal_exited" => send_terminal_exited(cx, session_id, payload),
         "file_read" => send_file_read(cx, session_id, payload),
         "file_changed" => send_file_changed(cx, session_id, payload),
-        "compaction_started"
-        | "compaction_completed"
-        | "compaction_failed"
-        | "compaction_cancelled" => send_legacy_compaction_notification(cx, session_id, payload),
         "permission_requested" => {
             send_state(
                 cx,
@@ -1542,13 +1529,6 @@ fn send_thought_chunk(cx: &AcpConnection, session_id: &str, message_id: &str, te
 }
 
 fn send_assistant_completed(cx: &AcpConnection, session_id: &str, payload: &Value) {
-    if payload
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .is_some_and(|turn_id| cx.is_manual_compaction_turn(turn_id))
-    {
-        return;
-    }
     let (reasoning, content) = assistant_completed_text(payload);
     if let (Some(message_id), Some(reasoning)) = (
         payload.get("thought_message_id").and_then(Value::as_str),
@@ -1653,12 +1633,6 @@ fn send_notification(cx: &AcpConnection, session_id: &str, payload: &Value) {
         .and_then(Value::as_str)
         .unwrap_or("info");
     let data = payload.get("data").cloned().unwrap_or_else(|| json!({}));
-    if category == "compaction_started"
-        && data.get("trigger").and_then(Value::as_str) == Some("manual")
-        && let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str)
-    {
-        cx.mark_manual_compaction(turn_id);
-    }
     send_update(
         cx,
         session_id,
@@ -1718,40 +1692,6 @@ fn send_usage_update(cx: &AcpConnection, session_id: &str, used: u64, size: u64)
 
 fn usage_update(used: u64, size: u64) -> SessionUpdate {
     SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
-}
-
-fn send_legacy_compaction_notification(cx: &AcpConnection, session_id: &str, payload: &Value) {
-    let Some(compaction_id) = payload.get("compaction_id").and_then(Value::as_str) else {
-        return;
-    };
-    let (category, level, text) = match payload.get("kind").and_then(Value::as_str) {
-        Some("compaction_started") => ("compaction_started", "info", "Compacting context..."),
-        Some("compaction_completed") => ("compaction_completed", "success", "Context compacted."),
-        Some("compaction_failed") => ("compaction_failed", "error", "Context compaction failed."),
-        Some("compaction_cancelled") => (
-            "compaction_cancelled",
-            "warning",
-            "Context compaction cancelled.",
-        ),
-        _ => return,
-    };
-    send_notification(
-        cx,
-        session_id,
-        &json!({
-            "message_id": format!("notification-{compaction_id}-{category}"),
-            "turn_id": payload.get("turn_id").cloned().unwrap_or(Value::Null),
-            "category": category,
-            "level": level,
-            "text": text,
-            "data": {
-                "compactionId": compaction_id,
-                "trigger": payload.get("trigger").cloned().unwrap_or(Value::Null),
-                "summary": payload.get("summary").cloned().unwrap_or(Value::Null),
-                "error": payload.get("error").cloned().unwrap_or(Value::Null),
-            },
-        }),
-    );
 }
 
 fn send_tool_started(cx: &AcpConnection, session_id: &str, payload: &Value) {
@@ -2086,12 +2026,6 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
                 Some("terminal_exited") => send_terminal_exited(cx, session_id, payload),
                 Some("file_read") => send_file_read(cx, session_id, payload),
                 Some("file_changed") => send_file_changed(cx, session_id, payload),
-                Some(
-                    "compaction_started"
-                    | "compaction_completed"
-                    | "compaction_failed"
-                    | "compaction_cancelled",
-                ) => send_legacy_compaction_notification(cx, session_id, payload),
                 _ => {}
             }
         }
@@ -2111,7 +2045,7 @@ fn replay_snapshot_state(cx: &AcpConnection, session_id: &str, snapshot: &Value)
         );
     }
     match snapshot.get("phase").and_then(Value::as_str) {
-        Some("running" | "cancelling") => send_state(
+        Some("running" | "compacting" | "cancelling") => send_state(
             cx,
             session_id,
             StateUpdate::Running(RunningStateUpdate::new()),

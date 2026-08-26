@@ -7,10 +7,10 @@ shared by the service.
 ## Ownership
 
 ```text
-AgentService
+SessionService
 |- Arc<ToolPolicyEngine>
 |- Arc<FileEditManager>     shared by every session; FIFO mutation lock
-`- SessionAgent
+`- SessionHandle
    `- ToolManager           one per loaded session
       |- TerminalManager    one registry per session
       |- Arc<FileEditManager>

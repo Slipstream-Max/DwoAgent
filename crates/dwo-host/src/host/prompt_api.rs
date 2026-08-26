@@ -1,11 +1,46 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::Host;
 
 impl Host {
+    pub(crate) async fn dispatch_prompt_resource(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        let (domain, action) = method
+            .split_once('.')
+            .context("invalid prompt/rule method")?;
+        match action {
+            "list" => self.prompt_list().await,
+            "get" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or(Self::default_prompt_name(domain)?);
+                self.prompt_get(domain, name).await
+            }
+            "set" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or(Self::default_prompt_name(domain)?);
+                let content = params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .context("content is required")?
+                    .to_string();
+                self.prompt_set(domain, name, content).await
+            }
+            _ => anyhow::bail!("unknown prompt/rule action: {action}"),
+        }
+    }
+
     pub(crate) async fn prompt_list(&self) -> Result<Value> {
         let dir = self.profile_root.join("resource/prompts");
         let mut files = Vec::new();

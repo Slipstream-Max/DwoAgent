@@ -69,6 +69,7 @@
 policyMode: confirm
 maxModelSteps: 100
 externalSkillsDirs: []
+externalRuleFiles: []
 
 logging:
   level: info
@@ -135,6 +136,8 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 - `policyMode`、默认模型和 `maxModelSteps` 是创建新 session、subsession 或 automation session 时使用的默认值，不会改写已有 session 自己的配置。
 - `channels` 变化会重新构造 channel manager，并短暂停止和重启已连接且仍启用的 channel。
 - `externalSkillsDirs` 变化会立即更新所有 session（含已有 session）可用的技能目录。
+- `externalRuleFiles` 变化会立即更新所有 session 的额外规则文件列表；文件内容或列表变化在
+  下一 model step 由 EnvironmentWatcher 注入。
 - `automation` 会重新计算任务调度；`logging.level` 和 `logging.retentionDays` 也会立即更新。设置了 `DWO_LOG` 时，环境变量仍优先于 profile 日志级别。
 
 `resource/prompts/`、`resource/skills/`、`resource/mcp/mcp.json` 和运行时 channel capability 仍由各自 watcher 热加载。channel capability 只存在于 daemon 进程内，不写入 runtime；已有 session 会在模型步骤边界收到环境变更消息；发生 compaction 时，system prompt 会从当前资源重新构建。
@@ -147,6 +150,7 @@ Daemon 每秒检查 `profile.yaml`，完整解析并校验成功后应用整份�
 | `maxModelSteps` | 否 | 单回合 agent 循环的最大模型步数：`0`（无限）或 `5`–`200`，默认 `100`。 |
 | `logging` | 否 | Daemon 文件日志级别和保留天数。 |
 | `externalSkillsDirs` | 否 | 额外 skills 目录列表，可挂载他人的 skill；相对路径相对 profile 根目录解析。 |
+| `externalRuleFiles` | 否 | 额外规则文件列表；相对路径相对 profile 根目录解析，规则 pwd 为 profile 根目录。 |
 | `channels` | 否 | 微信、Telegram、飞书/Lark 和 QQ Bot adapter。 |
 | `automation` | 否 | Cron 定时任务。 |
 | `model` | 是 | Provider、模型部署和默认模型。 |
@@ -345,8 +349,12 @@ automation:
 | `resource/skills/<name>/SKILL.md` | Profile 内可用的 skill。 |
 | `<session-cwd>/.agents/skills/<name>/SKILL.md` | 项目级 skill，与 profile 同名时项目级生效。 |
 | `externalSkillsDirs` 指定的目录 | 外部 skill；同名时优先级为 profile < 外部 < 项目。 |
+| `externalRuleFiles` 指定的文件 | Profile 配置的额外规则文件；相对路径相对 profile 根目录解析。 |
 
-Daemon 会监听这些固定资源、session 初始工作目录、Topic RuleSource、`.agents/` 和 `externalSkillsDirs` 中的规则与技能变化，并在 agent loop 的边界通知现有 session。每份 AGENTS 规则同时向模型提供来源路径和适用的 pwd。
+SessionService 在创建 `SystemPromptBuilder` 时同时装配 external skill dirs 和 external rule files。
+Daemon 会监听这些固定资源、session 初始工作目录、Topic external rule file、`.agents/`、
+`externalSkillsDirs` 和 `externalRuleFiles` 中的规则与技能变化，并在 model step 边界通知现有
+session。每份规则同时向模型提供来源路径和适用的 pwd。
 
 ## MCP
 

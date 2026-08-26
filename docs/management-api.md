@@ -59,7 +59,7 @@ Automation Job 不保存 `topicId`。完整数据关系、默认未分类话题�
 | 方法 | 用途 |
 | --- | --- |
 | `config.snapshot` | Host 配置摘要、默认模型、模型选项、全局 `maxModelSteps` |
-| `config.update` | 修改 logging、external skill dirs、全局 `maxModelSteps` |
+| `config.update` | 修改 logging、external skill dirs、external rule files、全局 `maxModelSteps` |
 | `model.list` | 模型、Provider 和默认模型配置；credential 已脱敏 |
 | `model.set_default` | 以 `{model: "provider/modelId", reasoning?}` 修改 Host 默认选择 |
 | `model.upsert` | 以 `{provider, name, model}` 新增或替换 Provider 内的显示名模型映射 |
@@ -71,7 +71,7 @@ Automation Job 不保存 `topicId`。完整数据关系、默认未分类话题�
 
 Model/Provider 写入会先合并完整 Model List 并解析整个 Host 配置，成功后原子替换
 `profile.yaml`，再让
-AgentService、Automation 和 Channel runtime 一次性应用。`maxModelSteps` 只存在于 Host，
+SessionService、Automation 和 Channel runtime 一次性应用。`maxModelSteps` 只存在于 Host，
 每个 turn 启动时读取，不进入 Session metadata。
 
 ## Prompt、Rule 与 Skill
@@ -154,6 +154,6 @@ Dwo RPC 保留 Session 查询和管理方法。ACP 的 `session.watch` 首先返
 随后推送 `session.event`；事件包含单调递增的 `seq`。管理事件使用 `event.read` 和独立
 cursor。客户端连接关闭不会 cancel 已接受 turn、Automation run 或 Host。
 
-`session.status-list` 和 `session.status` 还返回 `lastTurnStatus` 与
-`lastTurnFinishedAtMs`。Desktop Inbox 直接按这些 Session 事实筛选和排序，不需要 Inbox
-repository 或单独的后端 API。
+`session.list` 返回轻量运行状态、模型、思维链模式和 policy；`session.status` 按需返回
+`lastTurnStatus` 与 `lastTurnFinishedAtMs`。Desktop Inbox 直接按这些 Session 事实筛选和
+排序，不需要 Inbox repository 或单独的后端 API。

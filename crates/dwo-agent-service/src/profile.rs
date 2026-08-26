@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
-use dwo_context::SystemPromptBuilder;
+use dwo_context::{ExternalRuleFile, SystemPromptBuilder};
 use dwo_model_client::{AgentModelConfig, ModelCatalog, ModelClientConfig};
 use dwo_tools::SessionMode;
 use serde::{Deserialize, Serialize};
 
-use crate::AgentServiceError;
-use crate::record::DEFAULT_MAX_MODEL_STEPS;
+use crate::SessionServiceError;
+use crate::session_record::DEFAULT_MAX_MODEL_STEPS;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -19,6 +20,8 @@ pub struct AgentProfileConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub external_skills_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub external_rule_files: Vec<PathBuf>,
     pub model: AgentModelConfig,
     #[serde(default)]
     pub channels: BTreeMap<String, serde_yaml::Value>,
@@ -112,22 +115,20 @@ pub struct LoadedAgentProfile {
     pub config: AgentProfileConfig,
     pub models: ModelClientConfig,
     pub external_skill_dirs: Vec<PathBuf>,
+    pub external_rule_files: Vec<ExternalRuleFile>,
 }
 
 impl LoadedAgentProfile {
-    pub fn load(root: impl AsRef<Path>) -> Result<Self, AgentServiceError> {
+    pub fn load(root: impl AsRef<Path>) -> Result<Self, SessionServiceError> {
         let root = std::fs::canonicalize(root.as_ref()).map_err(anyhow::Error::from)?;
         let config = AgentProfileConfig::load(&root)?;
         let mut catalog = ModelCatalog::builtin()
-            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+            .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
         catalog
             .merge_model_directory(root.join("resource/models"))
-            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+            .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
         let models = config.resolve_models(&catalog)?;
-        SystemPromptBuilder::new(Some(root.clone()), root.clone())
-            .build_initial()
-            .map_err(anyhow::Error::from)?;
-        let external_skill_dirs = config
+        let external_skill_dirs: Vec<PathBuf> = config
             .external_skills_dirs
             .iter()
             .map(|dir| {
@@ -138,58 +139,80 @@ impl LoadedAgentProfile {
                 }
             })
             .collect();
+        let external_rule_files: Vec<ExternalRuleFile> = config
+            .external_rule_files
+            .iter()
+            .map(|path| ExternalRuleFile::new(resolve_profile_path(&root, path), root.clone()))
+            .collect();
+        SystemPromptBuilder::new(Some(root.clone()), root.clone())
+            .with_external_skill_dirs(Arc::new(RwLock::new(external_skill_dirs.clone())))
+            .with_external_rule_files(
+                Arc::new(RwLock::new(external_rule_files.clone())),
+                Arc::new(RwLock::new(Vec::new())),
+            )
+            .build_initial()
+            .map_err(anyhow::Error::from)?;
         Ok(Self {
             root,
             config,
             models,
             external_skill_dirs,
+            external_rule_files,
         })
     }
 }
 
-pub fn load_profile(root: impl AsRef<Path>) -> Result<LoadedAgentProfile, AgentServiceError> {
+fn resolve_profile_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+pub fn load_profile(root: impl AsRef<Path>) -> Result<LoadedAgentProfile, SessionServiceError> {
     LoadedAgentProfile::load(root)
 }
 
 impl AgentProfileConfig {
-    pub fn from_yaml(source: &str) -> Result<Self, AgentServiceError> {
+    pub fn from_yaml(source: &str) -> Result<Self, SessionServiceError> {
         let profile: Self = serde_yaml::from_str(source)
-            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))?;
+            .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
         profile.validate()?;
         Ok(profile)
     }
 
-    pub fn load(root: impl AsRef<Path>) -> Result<Self, AgentServiceError> {
+    pub fn load(root: impl AsRef<Path>) -> Result<Self, SessionServiceError> {
         let path = root.as_ref().join("profile.yaml");
         let source = std::fs::read_to_string(&path).map_err(anyhow::Error::from)?;
         Self::from_yaml(&source)
     }
 
-    pub fn validate(&self) -> Result<(), AgentServiceError> {
+    pub fn validate(&self) -> Result<(), SessionServiceError> {
         if !(1..=365).contains(&self.logging.retention_days) {
-            return Err(AgentServiceError::InvalidConfig(
+            return Err(SessionServiceError::InvalidConfig(
                 "logging.retentionDays must be between 1 and 365".to_string(),
             ));
         }
         if self.max_model_steps != 0 && !(5..=200).contains(&self.max_model_steps) {
-            return Err(AgentServiceError::InvalidConfig(
+            return Err(SessionServiceError::InvalidConfig(
                 "maxModelSteps must be 0 (unlimited) or between 5 and 200".to_string(),
             ));
         }
         self.websocket
             .validate()
-            .map_err(AgentServiceError::InvalidConfig)?;
+            .map_err(SessionServiceError::InvalidConfig)?;
         self.model
             .validate()
-            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))
+            .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))
     }
 
     pub fn resolve_models(
         &self,
         catalog: &ModelCatalog,
-    ) -> Result<ModelClientConfig, AgentServiceError> {
+    ) -> Result<ModelClientConfig, SessionServiceError> {
         ModelClientConfig::resolve(catalog, &self.model)
-            .map_err(|error| AgentServiceError::InvalidConfig(error.to_string()))
+            .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))
     }
 }
 
@@ -306,7 +329,7 @@ model:
     }
 
     #[test]
-    fn profile_parses_external_skills_dirs_and_resolves_relative_paths() {
+    fn profile_resolves_external_skill_dirs_and_rule_files() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("resource/prompts")).unwrap();
         std::fs::write(
@@ -314,6 +337,7 @@ model:
             "You are a coding agent.",
         )
         .unwrap();
+        std::fs::write(root.path().join("team-rules.md"), "Team rules").unwrap();
         std::fs::write(
             root.path().join("profile.yaml"),
             r#"
@@ -321,6 +345,8 @@ policyMode: confirm
 externalSkillsDirs:
   - C:/Users/example/shared-skills
   - team-skills
+externalRuleFiles:
+  - team-rules.md
 model:
   default:
     model: deepseek/deepseek-v4-pro
@@ -337,6 +363,15 @@ model:
             PathBuf::from("C:/Users/example/shared-skills")
         );
         assert!(loaded.external_skill_dirs[1].is_absolute());
+        assert_eq!(loaded.external_rule_files.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&loaded.external_rule_files[0].path).unwrap(),
+            std::fs::canonicalize(root.path().join("team-rules.md")).unwrap()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&loaded.external_rule_files[0].pwd).unwrap(),
+            std::fs::canonicalize(root.path()).unwrap()
+        );
     }
 }
 

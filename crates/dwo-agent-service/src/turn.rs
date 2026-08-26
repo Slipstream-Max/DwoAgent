@@ -2,47 +2,27 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dwo_context::{
-    CompactionPlan, CompactionPlanner, ContextManager, MessageKind, PendingMessageBatch,
-    SessionContext, SystemPromptBuilder, TurnId,
+    ContextManager, MessageKind, PendingContextMessage, PendingMessageBatch, SessionContext,
+    SystemPromptBuilder, TurnId,
 };
 use dwo_model_client::{
     ModelClient, ModelClientError, ModelReply, ModelSelection, ModelStreamEvent, error_kind,
-    request_with_retry, retry_info, wait_before_retry,
+    retry_info, wait_before_retry,
 };
 use dwo_tools::{ExecutionContext, ParsedToolCall, ToolEvent, ToolManager, ToolResult};
-use dwo_tools::{PlanRequest, PlanResponse};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
+use crate::compaction::{self, CompactionRequest};
 use crate::events::{ActiveToolCall, CompactionTrigger, NotificationLevel};
 use crate::permission::PermissionRequester;
-use crate::record::{SessionConfig, SessionId, SessionLlmSettings};
+use crate::session::ActorEvent;
+use crate::session_record::{SessionConfig, SessionId};
 
 const HANDOFF_CONTINUATION: &str = "<handoff_continuation>The handoff has already been completed and the model context has been rebuilt from the handoff summary. Continue the user's original task from this context. Do not call handoff again unless a genuinely new context rebuild is necessary.</handoff_continuation>";
 
-pub(crate) enum TurnActorMessage {
-    Event(TurnEvent),
-    TitleGenerated {
-        original_title: String,
-        result: Result<ModelReply, dwo_model_client::ModelClientError>,
-    },
-    PersistContext {
-        context: Box<SessionContext>,
-        completed: oneshot::Sender<anyhow::Result<()>>,
-    },
-    TakePendingMessages {
-        completed: oneshot::Sender<PendingMessageBatch>,
-    },
-    Plan {
-        turn_id: TurnId,
-        request: PlanRequest,
-        completed: oneshot::Sender<Result<PlanResponse, String>>,
-    },
-}
-
-pub(crate) enum TurnEvent {
+pub(crate) enum TurnUpdate {
     AssistantDelta {
         turn_id: TurnId,
         delta: String,
@@ -86,25 +66,6 @@ pub(crate) enum TurnEvent {
         turn_id: TurnId,
         event: ToolEvent,
     },
-    CompactionStarted {
-        turn_id: TurnId,
-        compaction_id: String,
-        trigger: CompactionTrigger,
-    },
-    CompactionCompleted {
-        turn_id: TurnId,
-        compaction_id: String,
-        summary: Option<String>,
-    },
-    CompactionFailed {
-        turn_id: TurnId,
-        compaction_id: String,
-        error: String,
-    },
-    CompactionCancelled {
-        turn_id: TurnId,
-        compaction_id: String,
-    },
     Finished {
         turn_id: TurnId,
         outcome: TurnOutcome,
@@ -117,7 +78,7 @@ pub(crate) enum TurnOutcome {
     Failed(String),
 }
 
-pub(crate) struct RunTurn {
+pub(crate) struct TurnExecution {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub context: ContextManager,
@@ -128,7 +89,8 @@ pub(crate) struct RunTurn {
     pub max_model_steps: usize,
     pub permission: PermissionRequester,
     pub cancellation: CancellationToken,
-    pub actor: mpsc::UnboundedSender<TurnActorMessage>,
+    pub steer: mpsc::UnboundedReceiver<PendingContextMessage>,
+    pub actor: mpsc::UnboundedSender<ActorEvent>,
 }
 
 struct ModelStep {
@@ -137,17 +99,16 @@ struct ModelStep {
     allow_image_input: bool,
 }
 
-impl RunTurn {
-    fn emit(&self, event: TurnEvent) {
-        let _ = self.actor.send(TurnActorMessage::Event(event));
+impl TurnExecution {
+    fn emit(&self, event: TurnUpdate) {
+        let _ = self.actor.send(ActorEvent::Turn(event));
     }
 
     async fn checkpoint(&mut self) -> anyhow::Result<()> {
-        normalize_context_for_current_step(self)?;
         let context = self.context.checkpoint(self.tools.schemas());
         let (completed, wait) = oneshot::channel();
         self.actor
-            .send(TurnActorMessage::PersistContext {
+            .send(ActorEvent::PersistContext {
                 context: Box::new(context),
                 completed,
             })
@@ -156,19 +117,27 @@ impl RunTurn {
             .map_err(|_| anyhow::anyhow!("session actor dropped checkpoint"))?
     }
 
-    async fn take_pending_messages(&self) -> anyhow::Result<PendingMessageBatch> {
-        let (completed, wait) = oneshot::channel();
-        self.actor
-            .send(TurnActorMessage::TakePendingMessages { completed })
-            .map_err(|_| anyhow::anyhow!("session actor stopped"))?;
-        wait.await
-            .map_err(|_| anyhow::anyhow!("session actor dropped pending message request"))
+    fn take_steer_messages(&mut self) -> PendingMessageBatch {
+        let mut messages = Vec::new();
+        while let Ok(message) = self.steer.try_recv() {
+            messages.push(message);
+        }
+        PendingMessageBatch {
+            should_continue: !messages.is_empty(),
+            messages,
+        }
     }
 }
 
-pub(crate) async fn run(mut turn: RunTurn) {
+pub(crate) async fn run(mut turn: TurnExecution) {
     let started = Instant::now();
-    let selection = current_selection(&turn);
+    let selection = {
+        let config = turn.config.borrow();
+        ModelSelection {
+            model: config.model.clone(),
+            reasoning: config.reasoning.clone(),
+        }
+    };
     tracing::info!(
         event = "turn.started",
         session_id = %turn.session_id,
@@ -202,89 +171,13 @@ pub(crate) async fn run(mut turn: RunTurn) {
             "turn failed"
         ),
     }
-    turn.emit(TurnEvent::Finished {
+    turn.emit(TurnUpdate::Finished {
         turn_id: turn.turn_id.clone(),
         outcome,
     });
 }
 
-pub(crate) async fn run_manual_compaction(mut turn: RunTurn) {
-    let started = Instant::now();
-    tracing::info!(
-        event = "turn.manual_compaction_started",
-        session_id = %turn.session_id,
-        turn_id = %turn.turn_id,
-        "manual context compaction started"
-    );
-    let outcome = manual_compaction_inner(&mut turn).await;
-    match &outcome {
-        TurnOutcome::Completed => tracing::info!(
-            event = "turn.manual_compaction_completed",
-            session_id = %turn.session_id,
-            turn_id = %turn.turn_id,
-            duration_ms = started.elapsed().as_millis() as u64,
-            "manual context compaction completed"
-        ),
-        TurnOutcome::Cancelled => tracing::info!(
-            event = "turn.manual_compaction_cancelled",
-            session_id = %turn.session_id,
-            turn_id = %turn.turn_id,
-            duration_ms = started.elapsed().as_millis() as u64,
-            "manual context compaction cancelled"
-        ),
-        TurnOutcome::Failed(error) => tracing::error!(
-            event = "turn.manual_compaction_failed",
-            session_id = %turn.session_id,
-            turn_id = %turn.turn_id,
-            duration_ms = started.elapsed().as_millis() as u64,
-            error = %error,
-            "manual context compaction failed"
-        ),
-    }
-    turn.emit(TurnEvent::Finished {
-        turn_id: turn.turn_id.clone(),
-        outcome,
-    });
-}
-
-async fn manual_compaction_inner(turn: &mut RunTurn) -> TurnOutcome {
-    if turn.cancellation.is_cancelled() {
-        return TurnOutcome::Cancelled;
-    }
-    let before = turn.context.context().usage.current_tokens;
-    let step = match current_model_step(turn) {
-        Ok(step) => step,
-        Err(error) => return TurnOutcome::Failed(format!("resolve model: {error:#}")),
-    };
-    if let Err(error) = prepare_context_for_step(turn, &step).await {
-        return TurnOutcome::Failed(format!("normalize model context: {error:#}"));
-    }
-    let plan = turn.context.plan_compaction(&CompactionPlanner::default());
-    let recovery = recovery_selection(turn, &step.selection);
-    match compact_context(turn, plan, recovery, CompactionTrigger::Manual).await {
-        Ok(compacted) => {
-            let content = if compacted {
-                format!(
-                    "Context compacted from {before} to {} estimated tokens.",
-                    turn.context.context().usage.current_tokens
-                )
-            } else {
-                "Nothing to compact.".to_string()
-            };
-            turn.emit(TurnEvent::AssistantCompleted {
-                turn_id: turn.turn_id.clone(),
-                content,
-                reasoning: None,
-                tool_calls: Vec::new(),
-            });
-            TurnOutcome::Completed
-        }
-        Err(_) if turn.cancellation.is_cancelled() => TurnOutcome::Cancelled,
-        Err(error) => TurnOutcome::Failed(format!("compact context: {error:#}")),
-    }
-}
-
-async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
+async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
     let max_model_steps = turn.max_model_steps;
     let mut step = 0usize;
     loop {
@@ -309,14 +202,64 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             }
         };
         turn.context.refresh_environment_snapshot(current);
-        let model_step = match current_model_step(turn) {
+        let selection = {
+            let config = turn.config.borrow();
+            ModelSelection {
+                model: config.model.clone(),
+                reasoning: config.reasoning.clone(),
+            }
+        };
+        let model_step = match (|| {
+            Ok::<_, ModelClientError>(ModelStep {
+                provider: turn.model.context_owner_id(&selection.model)?,
+                allow_image_input: turn.model.supports_image_input(&selection.model)?,
+                selection,
+            })
+        })() {
             Ok(step) => step,
             Err(error) => return TurnOutcome::Failed(format!("resolve model: {error:#}")),
         };
-        if let Err(error) = prepare_context_for_step(turn, &model_step).await {
+        let previous_provider = if turn.context.context().provider.is_none() {
+            match turn
+                .context
+                .context()
+                .usage
+                .last_model
+                .as_deref()
+                .map(|model| turn.model.context_owner_id(model))
+                .transpose()
+            {
+                Ok(provider) => provider,
+                Err(error) => {
+                    return TurnOutcome::Failed(format!("normalize model context: {error:#}"));
+                }
+            }
+        } else {
+            None
+        };
+        if turn.context.normalize_for_selection(
+            &model_step.provider,
+            previous_provider.as_deref(),
+            model_step.allow_image_input,
+        ) && let Err(error) = turn.checkpoint().await
+        {
             return TurnOutcome::Failed(format!("normalize model context: {error:#}"));
         }
-        if let Err(error) = compact_if_needed(turn, &model_step).await {
+        let compact_trigger_tokens = match turn.model.model_limits(&model_step.selection.model) {
+            Ok(limits) => limits.compact_trigger_tokens,
+            Err(error) => return TurnOutcome::Failed(format!("compact context: {error:#}")),
+        };
+        if turn
+            .context
+            .compaction_due(compact_trigger_tokens, turn.tools.schemas())
+            && let Err(error) = compact(
+                turn,
+                model_step.selection.clone(),
+                None,
+                CompactionTrigger::Automatic,
+            )
+            .await
+        {
             return if turn.cancellation.is_cancelled() {
                 TurnOutcome::Cancelled
             } else {
@@ -349,7 +292,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
         turn.context
             .record_model_success(model_step.selection.model.clone());
         let reasoning = response.transcript_reasoning();
-        turn.emit(TurnEvent::AssistantCompleted {
+        turn.emit(TurnUpdate::AssistantCompleted {
             turn_id: turn.turn_id.clone(),
             content: response.content,
             reasoning,
@@ -363,7 +306,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
         for call in &remote_tool_calls {
             let mut started = call.clone();
             started.status = "in_progress".to_string();
-            turn.emit(TurnEvent::ToolChanged {
+            turn.emit(TurnUpdate::ToolChanged {
                 turn_id: turn.turn_id.clone(),
                 call: started,
             });
@@ -374,7 +317,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                 .and_then(|raw| raw.get("arguments"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            turn.emit(TurnEvent::ToolCompleted {
+            turn.emit(TurnUpdate::ToolCompleted {
                 turn_id: turn.turn_id.clone(),
                 result: ToolResult {
                     tool_call_id: call.tool_call_id.clone(),
@@ -385,12 +328,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             });
         }
         if response.tool_calls.is_empty() {
-            let pending = match turn.take_pending_messages().await {
-                Ok(pending) => pending,
-                Err(error) => {
-                    return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
-                }
-            };
+            let pending = turn.take_steer_messages();
             if turn.context.append_pending(pending) {
                 if let Err(error) = turn.checkpoint().await {
                     return TurnOutcome::Failed(format!(
@@ -410,7 +348,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             .filter(|call| call.tool_name != "plan")
         {
             call.status = "in_progress".to_string();
-            turn.emit(TurnEvent::ToolChanged {
+            turn.emit(TurnUpdate::ToolChanged {
                 turn_id: turn.turn_id.clone(),
                 call,
             });
@@ -427,7 +365,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             Box::pin(async move {
                 let (completed, wait) = oneshot::channel();
                 actor
-                    .send(TurnActorMessage::Plan {
+                    .send(ActorEvent::Plan {
                         turn_id,
                         request,
                         completed,
@@ -440,7 +378,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
         let actor = turn.actor.clone();
         let telemetry_turn_id = turn.turn_id.clone();
         execution.events = Some(Arc::new(move |event| {
-            let _ = actor.send(TurnActorMessage::Event(TurnEvent::ToolTelemetry {
+            let _ = actor.send(ActorEvent::Turn(TurnUpdate::ToolTelemetry {
                 turn_id: telemetry_turn_id.clone(),
                 event,
             }));
@@ -480,7 +418,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
                 "tool call completed"
             );
             if result.tool_name != "plan" {
-                turn.emit(TurnEvent::ToolCompleted {
+                turn.emit(TurnUpdate::ToolCompleted {
                     turn_id: turn.turn_id.clone(),
                     result: result.clone(),
                 });
@@ -495,23 +433,16 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
             "tool batch completed"
         );
         turn.context.append_tool_batch(context_results);
-        let pending = match turn.take_pending_messages().await {
-            Ok(pending) => pending,
-            Err(error) => {
-                return TurnOutcome::Failed(format!("receive pending messages: {error:#}"));
-            }
-        };
+        let pending = turn.take_steer_messages();
         turn.context.append_pending(pending);
         if let Some(handoff_text) = tool_results.iter().find_map(handoff_text) {
             for tool_call_id in handoff_ids {
                 turn.context.remove_tool_call(&tool_call_id);
             }
-            let plan = turn.context.plan_compaction(&CompactionPlanner::default());
-            if let Err(error) = compact_context_with_summary(
+            if let Err(error) = compact(
                 turn,
-                plan,
-                handoff_text.to_string(),
-                &model_step.selection,
+                model_step.selection.clone(),
+                Some(handoff_text.to_string()),
                 CompactionTrigger::Handoff,
             )
             .await
@@ -541,7 +472,7 @@ async fn run_inner(turn: &mut RunTurn) -> TurnOutcome {
 }
 
 async fn request_with_context_recovery(
-    turn: &mut RunTurn,
+    turn: &mut TurnExecution,
     selection: &ModelSelection,
 ) -> anyhow::Result<ModelReply> {
     match request_model(turn, selection).await {
@@ -551,9 +482,7 @@ async fn request_with_context_recovery(
                 .downcast_ref::<ModelClientError>()
                 .is_some_and(ModelClientError::is_context_length_exceeded) =>
         {
-            let recovery = recovery_selection(turn, selection);
-            let plan = turn.context.recovery_compaction();
-            if !compact_context(turn, plan, recovery, CompactionTrigger::Recovery).await? {
+            if !compact(turn, selection.clone(), None, CompactionTrigger::Recovery).await? {
                 return Err(error);
             }
             request_model(turn, selection).await
@@ -563,7 +492,7 @@ async fn request_with_context_recovery(
 }
 
 async fn request_model(
-    turn: &mut RunTurn,
+    turn: &mut TurnExecution,
     selection: &ModelSelection,
 ) -> anyhow::Result<ModelReply> {
     let mut retry = 0;
@@ -660,14 +589,14 @@ async fn request_model(
                 } else {
                     "failed"
                 };
-                turn.emit(TurnEvent::ToolCallsInterrupted {
+                turn.emit(TurnUpdate::ToolCallsInterrupted {
                     turn_id: turn.turn_id.clone(),
                     status,
                 });
                 retry += 1;
                 let Some(info) = retry_info(&error, retry) else {
                     if retry > 1 {
-                        turn.emit(TurnEvent::Notification {
+                        turn.emit(TurnUpdate::Notification {
                             turn_id: turn.turn_id.clone(),
                             category: "model_retry_exhausted".to_string(),
                             level: NotificationLevel::Error,
@@ -685,7 +614,7 @@ async fn request_model(
                     }
                     return Err(error.into());
                 };
-                turn.emit(TurnEvent::AssistantInterrupted {
+                turn.emit(TurnUpdate::AssistantInterrupted {
                     turn_id: turn.turn_id.clone(),
                     content: partial_content.clone(),
                     reasoning: partial_reasoning,
@@ -694,10 +623,10 @@ async fn request_model(
                 if !partial_content.is_empty() {
                     turn.context.append_assistant(partial_content, Vec::new());
                 }
-                let pending = turn.take_pending_messages().await?;
+                let pending = turn.take_steer_messages();
                 turn.context.append_pending(pending);
                 turn.checkpoint().await?;
-                turn.emit(TurnEvent::Notification {
+                turn.emit(TurnUpdate::Notification {
                     turn_id: turn.turn_id.clone(),
                     category: "model_retrying".to_string(),
                     level: NotificationLevel::Warning,
@@ -715,7 +644,7 @@ async fn request_model(
                     }),
                 });
                 wait_before_retry(&info, &turn.cancellation).await?;
-                let pending = turn.take_pending_messages().await?;
+                let pending = turn.take_steer_messages();
                 if !pending.messages.is_empty() {
                     turn.context.append_pending(pending);
                     turn.checkpoint().await?;
@@ -725,58 +654,27 @@ async fn request_model(
     }
 }
 
-fn normalize_context_for_step(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Result<bool> {
-    let previous_provider = if turn.context.context().provider.is_none() {
-        turn.context
-            .context()
-            .usage
-            .last_model
-            .as_deref()
-            .map(|model| turn.model.context_owner_id(model))
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(turn.context.normalize_for_selection(
-        &step.provider,
-        previous_provider.as_deref(),
-        step.allow_image_input,
-    ))
-}
-
-fn normalize_context_for_current_step(turn: &mut RunTurn) -> anyhow::Result<bool> {
-    let step = current_model_step(turn)?;
-    normalize_context_for_step(turn, &step)
-}
-
-async fn prepare_context_for_step(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Result<()> {
-    if normalize_context_for_step(turn, step)? {
-        turn.checkpoint().await?;
-    }
-    Ok(())
-}
-
 fn emit_model_event(
-    actor: &mpsc::UnboundedSender<TurnActorMessage>,
+    actor: &mpsc::UnboundedSender<ActorEvent>,
     turn_id: &TurnId,
     event: ModelStreamEvent,
     partial_content: &mut String,
     partial_reasoning: &mut String,
 ) {
     let emit = |event| {
-        let _ = actor.send(TurnActorMessage::Event(event));
+        let _ = actor.send(ActorEvent::Turn(event));
     };
     match event {
         ModelStreamEvent::TextDelta(delta) => {
             partial_content.push_str(&delta);
-            emit(TurnEvent::AssistantDelta {
+            emit(TurnUpdate::AssistantDelta {
                 turn_id: turn_id.clone(),
                 delta,
             });
         }
         ModelStreamEvent::ReasoningDelta(delta) => {
             partial_reasoning.push_str(&delta);
-            emit(TurnEvent::AssistantReasoningDelta {
+            emit(TurnUpdate::AssistantReasoningDelta {
                 turn_id: turn_id.clone(),
                 delta,
             });
@@ -788,7 +686,7 @@ fn emit_model_event(
                 raw_input: call.raw_input,
                 status: call.status,
             };
-            emit(TurnEvent::ToolChanged {
+            emit(TurnUpdate::ToolChanged {
                 turn_id: turn_id.clone(),
                 call,
             });
@@ -808,41 +706,22 @@ fn human_error_kind(error: &ModelClientError) -> &'static str {
     }
 }
 
-async fn compact_context(
-    turn: &mut RunTurn,
-    plan: CompactionPlan,
-    selection: ModelSelection,
-    trigger: CompactionTrigger,
-) -> anyhow::Result<bool> {
-    if !plan.needs_replacement() {
-        return Ok(false);
-    }
-    perform_compaction(turn, plan, selection, None, trigger).await?;
-    Ok(true)
-}
-
-async fn compact_context_with_summary(
-    turn: &mut RunTurn,
-    plan: CompactionPlan,
-    summary: String,
-    selection: &ModelSelection,
-    trigger: CompactionTrigger,
-) -> anyhow::Result<()> {
-    perform_compaction(turn, plan, selection.clone(), Some(summary), trigger).await
-}
-
-async fn perform_compaction(
-    turn: &mut RunTurn,
-    plan: CompactionPlan,
+async fn compact(
+    turn: &mut TurnExecution,
     selection: ModelSelection,
     supplied_summary: Option<String>,
     trigger: CompactionTrigger,
-) -> anyhow::Result<()> {
-    let compaction_id = format!("cmp_{}", Uuid::new_v4().simple());
-    turn.emit(TurnEvent::CompactionStarted {
+) -> anyhow::Result<bool> {
+    let compaction_id = format!("cmp_{}", uuid::Uuid::new_v4().simple());
+    turn.emit(TurnUpdate::Notification {
         turn_id: turn.turn_id.clone(),
-        compaction_id: compaction_id.clone(),
-        trigger,
+        category: "compaction_started".to_string(),
+        level: NotificationLevel::Info,
+        text: "Compacting context...".to_string(),
+        data: json!({
+            "compactionId": compaction_id,
+            "trigger": trigger,
+        }),
     });
     let started = Instant::now();
     tracing::info!(
@@ -853,50 +732,65 @@ async fn perform_compaction(
         "context compaction started"
     );
     let result = async {
-        let summary = match supplied_summary {
-            Some(summary) => summary,
-            None if plan.has_compactable_history() => {
-                request_with_retry(&turn.cancellation, || {
-                    turn.model.summarize(
-                        selection.clone(),
-                        plan.view.clone(),
-                        turn.cancellation.clone(),
-                    )
-                })
-                .await?
-                .summary
-            }
-            None => String::new(),
-        };
-        let display_summary = (!summary.is_empty()).then(|| summary.clone());
-        turn.context
-            .apply_compaction(plan, summary, &turn.prompt_builder, turn.tools.schemas())?;
+        let context = std::mem::replace(
+            &mut turn.context,
+            ContextManager::new(SessionContext::default()),
+        );
+        let result = compaction::execute(
+            context,
+            &turn.prompt_builder,
+            &turn.model,
+            turn.tools.schemas(),
+            &turn.cancellation,
+            CompactionRequest {
+                selection: selection.clone(),
+                trigger,
+                supplied_summary,
+            },
+        )
+        .await?;
+        let compacted = result.compacted;
+        turn.context = result.context;
         turn.checkpoint().await?;
-        anyhow::Ok(display_summary)
+        anyhow::Ok((compacted, result.summary))
     }
     .await;
-    let display_summary = match result {
-        Ok(summary) => summary,
+    let (compacted, summary) = match result {
+        Ok(result) => result,
         Err(error) => {
             if turn.cancellation.is_cancelled() {
-                turn.emit(TurnEvent::CompactionCancelled {
+                turn.emit(TurnUpdate::Notification {
                     turn_id: turn.turn_id.clone(),
-                    compaction_id,
+                    category: "compaction_cancelled".to_string(),
+                    level: NotificationLevel::Warning,
+                    text: "Context compaction cancelled.".to_string(),
+                    data: json!({"compactionId": compaction_id}),
                 });
             } else {
-                turn.emit(TurnEvent::CompactionFailed {
+                turn.emit(TurnUpdate::Notification {
                     turn_id: turn.turn_id.clone(),
-                    compaction_id,
-                    error: format!("{error:#}"),
+                    category: "compaction_failed".to_string(),
+                    level: NotificationLevel::Error,
+                    text: "Context compaction failed.".to_string(),
+                    data: json!({
+                        "compactionId": compaction_id,
+                        "error": format!("{error:#}"),
+                    }),
                 });
             }
             return Err(error);
         }
     };
-    turn.emit(TurnEvent::CompactionCompleted {
+    turn.emit(TurnUpdate::Notification {
         turn_id: turn.turn_id.clone(),
-        compaction_id,
-        summary: display_summary,
+        category: "compaction_completed".to_string(),
+        level: NotificationLevel::Success,
+        text: "Context compacted.".to_string(),
+        data: json!({
+            "compactionId": compaction_id,
+            "summary": summary,
+            "compacted": compacted,
+        }),
     });
     tracing::info!(
         event = "context.compaction_completed",
@@ -906,7 +800,7 @@ async fn perform_compaction(
         duration_ms = started.elapsed().as_millis() as u64,
         "context compaction completed"
     );
-    Ok(())
+    Ok(compacted)
 }
 
 fn handoff_text(result: &ToolResult) -> Option<&str> {
@@ -914,52 +808,6 @@ fn handoff_text(result: &ToolResult) -> Option<&str> {
         && result.output.get("status").and_then(Value::as_str) == Some("completed"))
     .then(|| result.output.get("handoff_text").and_then(Value::as_str))
     .flatten()
-}
-
-async fn compact_if_needed(turn: &mut RunTurn, step: &ModelStep) -> anyhow::Result<()> {
-    let trigger_tokens = turn
-        .model
-        .model_limits(&step.selection.model)?
-        .compact_trigger_tokens;
-    let schemas = turn.tools.schemas();
-    let Some(plan) = turn.context.scheduled_compaction(trigger_tokens, schemas) else {
-        return Ok(());
-    };
-    let recovery = recovery_selection(turn, &step.selection);
-    compact_context(turn, plan, recovery, CompactionTrigger::Automatic).await?;
-    Ok(())
-}
-
-fn current_selection(turn: &RunTurn) -> ModelSelection {
-    let settings = llm_settings(&turn.config.borrow());
-    ModelSelection {
-        model: settings.model,
-        reasoning: settings.reasoning,
-    }
-}
-
-fn current_model_step(turn: &RunTurn) -> Result<ModelStep, dwo_model_client::ModelClientError> {
-    let selection = current_selection(turn);
-    Ok(ModelStep {
-        provider: turn.model.context_owner_id(&selection.model)?,
-        allow_image_input: turn.model.supports_image_input(&selection.model)?,
-        selection,
-    })
-}
-
-fn recovery_selection(turn: &RunTurn, desired: &ModelSelection) -> ModelSelection {
-    let usage = &turn.context.context().usage;
-    ModelSelection {
-        model: usage
-            .last_model
-            .clone()
-            .unwrap_or_else(|| desired.model.clone()),
-        reasoning: desired.reasoning.clone(),
-    }
-}
-
-fn llm_settings(config: &SessionConfig) -> SessionLlmSettings {
-    SessionLlmSettings::new(config.model.clone(), config.reasoning.clone())
 }
 
 fn cancelled_results(calls: &[Value]) -> Vec<ToolResult> {

@@ -38,12 +38,12 @@ impl AgentProfilePaths {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuleSource {
+pub struct ExternalRuleFile {
     pub path: PathBuf,
     pub pwd: PathBuf,
 }
 
-impl RuleSource {
+impl ExternalRuleFile {
     pub fn new(path: impl Into<PathBuf>, pwd: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -100,8 +100,9 @@ impl SystemPromptBlock {
 pub struct SystemPromptBuilder {
     profile: Option<AgentProfilePaths>,
     cwd: PathBuf,
-    rule_sources: Vec<RuleSource>,
     external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
+    profile_rule_files: Arc<RwLock<Vec<ExternalRuleFile>>>,
+    session_rule_files: Arc<RwLock<Vec<ExternalRuleFile>>>,
     tool_prompt: Option<String>,
     subsession_prompt: Option<String>,
     automation_prompt: Option<String>,
@@ -113,8 +114,9 @@ impl SystemPromptBuilder {
         Self {
             profile: profile_root.map(AgentProfilePaths::new),
             cwd: cwd.into(),
-            rule_sources: Vec::new(),
             external_skill_dirs: Arc::new(RwLock::new(Vec::new())),
+            profile_rule_files: Arc::new(RwLock::new(Vec::new())),
+            session_rule_files: Arc::new(RwLock::new(Vec::new())),
             tool_prompt: None,
             subsession_prompt: None,
             automation_prompt: None,
@@ -132,13 +134,14 @@ impl SystemPromptBuilder {
         self
     }
 
-    pub fn with_rule_sources(mut self, sources: Vec<RuleSource>) -> Self {
-        self.rule_sources = sources;
+    pub fn with_external_rule_files(
+        mut self,
+        profile: Arc<RwLock<Vec<ExternalRuleFile>>>,
+        session: Arc<RwLock<Vec<ExternalRuleFile>>>,
+    ) -> Self {
+        self.profile_rule_files = profile;
+        self.session_rule_files = session;
         self
-    }
-
-    pub fn rule_sources(&self) -> &[RuleSource] {
-        &self.rule_sources
     }
 
     pub fn with_subsession_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -240,7 +243,17 @@ impl SystemPromptBuilder {
                 content,
             });
         }
-        for source in &self.rule_sources {
+        let profile_rule_files = self
+            .profile_rule_files
+            .read()
+            .expect("external rule files lock poisoned")
+            .clone();
+        let session_rule_files = self
+            .session_rule_files
+            .read()
+            .expect("session external rule files lock poisoned")
+            .clone();
+        for source in profile_rule_files.iter().chain(&session_rule_files) {
             if let Some(content) = read_optional_nonempty(&source.path)? {
                 let path = resolve_or_original(&source.path);
                 if let Some(existing) = rules.iter_mut().find(|rule| rule.path == path) {

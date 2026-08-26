@@ -21,8 +21,8 @@ pub use message::{
     EmbeddedResourceContents, MessageContent, MessageKind, MessageRole, ToolResultRecord, TurnId,
 };
 pub use prompt::{
-    AgentProfilePaths, ChannelCapabilitySnapshot, EnvironmentSnapshot, McpSnapshot,
-    PromptBuildError, PromptSnapshot, RuleSnapshot, RuleSource, SkillSnapshot, SystemPromptBlock,
+    AgentProfilePaths, ChannelCapabilitySnapshot, EnvironmentSnapshot, ExternalRuleFile,
+    McpSnapshot, PromptBuildError, PromptSnapshot, RuleSnapshot, SkillSnapshot, SystemPromptBlock,
     SystemPromptBuilder,
 };
 pub use token::{

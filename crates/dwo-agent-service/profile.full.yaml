@@ -109,7 +109,7 @@ model:
     model: deepseek/deepseek-v4-pro
     reasoning: High
 
-  # Agent context policy, shared by every configured model.
+  # Agent context policy default; an explicit provider model may override it.
   compactionTriggerRatio: 0.5
 
   # An official family name supplies its base URL and complete model list.

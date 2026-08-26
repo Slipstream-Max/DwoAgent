@@ -164,6 +164,7 @@ impl Host {
                                     hosted_tools: None,
                                     temperature: None,
                                     top_p: None,
+                                    compaction_trigger_ratio: None,
                                     extra_body: serde_json::Map::new(),
                                 },
                             )

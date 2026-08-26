@@ -223,6 +223,8 @@ model:
         "DeepSeek V4 Pro":
           modelId: ds-v4-pro
           profile: deepseek/deepseek-v4-pro
+          # 可选；只覆盖这个部署模型的自动压缩比例。
+          compactionTriggerRatio: 0.6
 ```
 
 外层 map key 是显示名称；`modelId` 是请求参数和 session 稳定身份；`profile` 是
@@ -232,7 +234,8 @@ model:
 
 部署模型可以覆盖 `contextWindowTokens`、`maxOutputTokens`、
 `defaultReasoningMode`、`capabilities`、`reasoning`、`hostedTools`、
-`temperature`、`topP` 和 `extraBody`。显式 `models` 是 allowlist。
+`temperature`、`topP`、`compactionTriggerRatio` 和 `extraBody`。显式 `models` 是
+allowlist。模型 entry 未设置 `compactionTriggerRatio` 时使用 `model` 下的全局默认值。
 
 用户可在 `resource/models/<family>.yaml` 添加 Model List。文件与同名内置 family
 合并，同 ID 定义由用户文件覆盖。完整格式见
@@ -245,7 +248,8 @@ Context token 根据 system prompt、消息、reasoning、图片、tool call/res
 (contextWindowTokens - maxOutputTokens) * compactionTriggerRatio
 ```
 
-不额外预留固定 token。压缩比例属于 Agent profile，不写进 Model List。
+不额外预留固定 token。压缩比例属于 Agent profile，不写进 Model List；可在单个
+Provider 模型 entry 中覆盖 profile 默认值。
 
 ### Responses 上下文与模型切换
 

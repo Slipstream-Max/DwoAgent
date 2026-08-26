@@ -182,9 +182,9 @@ current plan.
 Context usage is recomputed from system prompt, messages, reasoning, images,
 tool calls/results, and tool schemas after each checkpoint. Provider input and
 output usage is optional transport metadata and is not accumulated. The model
-trigger uses `contextWindowTokens - maxOutputTokens`, multiplied by the profile
-`compactionTriggerRatio`; changing models immediately publishes the estimate against
-the target model's context-window size.
+trigger uses `contextWindowTokens - maxOutputTokens`, multiplied by the effective
+model `compactionTriggerRatio` (or its profile-level default); changing models
+immediately publishes the estimate against the target model's context-window size.
 
 ## Observation and control
 

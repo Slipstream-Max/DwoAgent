@@ -79,7 +79,8 @@ Live tool calls and results are stored unchanged. Current usage is recomputed
 from the complete context and tool schemas after each message checkpoint; model
 provider input/output usage is not accumulated or used as the session context
 counter. The model trigger is based on `contextWindowTokens - maxOutputTokens`
-and the profile `compactionTriggerRatio`, with no additional fixed headroom.
+and the effective model's `compactionTriggerRatio` (falling back to the profile
+default), with no additional fixed headroom.
 
 Handoff compaction uses the same plan and replacement path, except the summary
 comes from the model-provided `handoff_text` instead of a summary request.

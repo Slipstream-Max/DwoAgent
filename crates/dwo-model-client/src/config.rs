@@ -300,7 +300,10 @@ impl AgentModelConfig {
         if let Some(reasoning) = &self.default.reasoning {
             validate_identifier(reasoning, "model.default.reasoning")?;
         }
-        validate_compaction_trigger_ratio(self.compaction_trigger_ratio)?;
+        validate_compaction_trigger_ratio(
+            self.compaction_trigger_ratio,
+            "model.compactionTriggerRatio",
+        )?;
         if self.providers.is_empty() {
             return Err(ModelClientError::config(
                 "model.providers must not be empty",
@@ -393,6 +396,8 @@ pub struct AgentModelEntry {
     #[serde(default)]
     pub top_p: Option<f64>,
     #[serde(default)]
+    pub compaction_trigger_ratio: Option<f64>,
+    #[serde(default)]
     pub extra_body: Map<String, Value>,
 }
 
@@ -427,6 +432,12 @@ impl AgentModelEntry {
                     )));
                 }
             }
+        }
+        if let Some(ratio) = self.compaction_trigger_ratio {
+            validate_compaction_trigger_ratio(
+                ratio,
+                &format!("provider {provider_id} model {model_name} compactionTriggerRatio"),
+            )?;
         }
         validate_body(&self.extra_body, &format!("model {model_name} extraBody"))
     }
@@ -650,7 +661,10 @@ impl ModelConfig {
         }
         validate_identifier(&self.model_id, "modelId")?;
         let _ = self.max_input_tokens()?;
-        validate_compaction_trigger_ratio(self.compaction_trigger_ratio)?;
+        validate_compaction_trigger_ratio(
+            self.compaction_trigger_ratio,
+            &format!("model {id} compactionTriggerRatio"),
+        )?;
         validate_body(&self.extra_body, &format!("model {id} extraBody"))?;
         validate_reasoning(
             &self.reasoning,
@@ -716,7 +730,9 @@ fn resolved_model(
         max_output_tokens: entry
             .and_then(|entry| entry.max_output_tokens)
             .unwrap_or(spec.max_output_tokens),
-        compaction_trigger_ratio,
+        compaction_trigger_ratio: entry
+            .and_then(|entry| entry.compaction_trigger_ratio)
+            .unwrap_or(compaction_trigger_ratio),
         temperature: entry
             .and_then(|entry| entry.temperature)
             .or(spec.temperature),
@@ -800,11 +816,11 @@ fn validate_reasoning(
     Ok(())
 }
 
-fn validate_compaction_trigger_ratio(value: f64) -> Result<(), ModelClientError> {
+fn validate_compaction_trigger_ratio(value: f64, source: &str) -> Result<(), ModelClientError> {
     if !value.is_finite() || value <= 0.0 || value > 1.0 {
-        return Err(ModelClientError::config(
-            "model.compactionTriggerRatio must be in (0, 1]",
-        ));
+        return Err(ModelClientError::config(format!(
+            "{source} must be in (0, 1]"
+        )));
     }
     Ok(())
 }

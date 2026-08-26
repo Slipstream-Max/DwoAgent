@@ -49,6 +49,8 @@ model:
         "Grok 4.6":
           modelId: grok-4.6
           profile: grok/grok-4.6
+          # 可选；省略时使用上面的 profile 默认值。
+          compactionTriggerRatio: 0.5
           hostedTools: [webSearch, xSearch]
 
         "DeepSeek V4 Pro":
@@ -58,7 +60,9 @@ model:
 
 模型部署可以覆盖 `contextWindowTokens`、`maxOutputTokens`、
 `defaultReasoningMode`、`capabilities`、`reasoning`、`hostedTools`、
-`temperature`、`topP` 和 `extraBody`。`modelId` 省略时使用外层显示名称。
+`temperature`、`topP`、`compactionTriggerRatio` 和 `extraBody`。
+`compactionTriggerRatio` 省略时使用 `model.compactionTriggerRatio`；
+`modelId` 省略时使用外层显示名称。
 
 同一 Provider 下解析后的 `modelId` 必须唯一。外层显示名称可以修改，不影响已有
 session；改变 `modelId` 会改变稳定身份。
@@ -133,7 +137,8 @@ models:
 ```
 
 引用为 `minimax/minimax-m2.5`。Model List 不保存凭据、Provider 实例、显示名称或
-`compactionTriggerRatio`。
+`compactionTriggerRatio`；该值由 profile model 配置（全局默认或单个部署模型
+override）提供。
 
 ## Hosted tools
 

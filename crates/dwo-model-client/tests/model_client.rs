@@ -548,6 +548,7 @@ providers:
       "Grok 4.6":
         modelId: grok-4.6
         profile: grok/grok-4.6
+        compactionTriggerRatio: 0.5
       "DeepSeek V4 Pro":
         modelId: ds-v4-pro
         profile: deepseek/deepseek-v4-pro
@@ -571,6 +572,14 @@ providers:
         resolved.models["newapi/grok-4.6"].context_owner_id(),
         "newapi/grok"
     );
+    assert_eq!(
+        resolved.models["newapi/grok-4.6"].compaction_trigger_ratio,
+        0.5
+    );
+    assert_eq!(
+        resolved.models["newapi/gpt-5.6-terra"].compaction_trigger_ratio,
+        0.8
+    );
 
     let client = ConfiguredModelClient::new(&catalog, &agent).unwrap();
     assert_eq!(
@@ -582,6 +591,53 @@ providers:
         "newapi/grok"
     );
     assert_eq!(client.provider_id("newapi/grok-4.6").unwrap(), "newapi");
+    assert_eq!(
+        client
+            .model_limits("newapi/grok-4.6")
+            .unwrap()
+            .compact_trigger_tokens,
+        186_000
+    );
+    assert_eq!(
+        client
+            .model_limits("newapi/gpt-5.6-terra")
+            .unwrap()
+            .compact_trigger_tokens,
+        737_600
+    );
+}
+
+#[test]
+fn model_compaction_trigger_ratio_must_be_in_range() {
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: openai/gpt-5.6-terra
+providers:
+  openai:
+    models:
+      "5.6 Terra":
+        modelId: gpt-5.6-terra
+        compactionTriggerRatio: 0
+"#,
+    )
+    .unwrap_err();
+    assert!(agent.to_string().contains("compactionTriggerRatio"));
+
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: openai/gpt-5.6-terra
+providers:
+  openai:
+    models:
+      "5.6 Terra":
+        modelId: gpt-5.6-terra
+        compactionTriggerRatio: 1.1
+"#,
+    )
+    .unwrap_err();
+    assert!(agent.to_string().contains("compactionTriggerRatio"));
 }
 
 #[test]

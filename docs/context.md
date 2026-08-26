@@ -12,7 +12,8 @@
 
 ## 自动压缩与 `/compact`
 
-自动压缩在 `profile.yaml` 的 `model.compactionTriggerRatio` 达到时触发，阈值公式：
+自动压缩在 `profile.yaml` 的 `model.compactionTriggerRatio`（或当前模型 entry
+覆盖值）达到时触发，阈值公式：
 
 ```text
 (contextWindowTokens - maxOutputTokens) * compactionTriggerRatio

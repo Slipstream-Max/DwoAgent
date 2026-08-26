@@ -27,11 +27,14 @@ providers:
       "DeepSeek V4 Pro":
         modelId: ds-v4-pro
         profile: deepseek/deepseek-v4-pro
+        compactionTriggerRatio: 0.6 # optional per-model override
 ```
 
 The map key is the display name. `modelId` is sent upstream and forms the stable selection
 `provider/modelId`. `profile` selects model metadata from the built-in catalog or
 `resource/models/<family>.yaml`.
+`compactionTriggerRatio` may be set per model; when omitted, the profile-level
+`compactionTriggerRatio` is used.
 
 Official family names provide their base URL and full model list, so direct configuration only
 needs credentials:

@@ -121,6 +121,26 @@ impl ContextManager {
         &self.context.messages
     }
 
+    pub fn replace_system_prompt(&mut self, prompt: SystemPromptBlock) {
+        self.context.system_prompt = prompt.clone();
+        if let Some(system) = self
+            .context
+            .messages
+            .iter_mut()
+            .find(|message| message.role == crate::MessageRole::System)
+        {
+            system.content = prompt.content.clone().into();
+        } else {
+            self.context
+                .messages
+                .insert(0, ContextMessage::system(prompt.content.clone()));
+        }
+        self.context.env_watcher = EnvWatcherState {
+            baseline: prompt.snapshot.as_ref().map(|snapshot| snapshot.dynamic()),
+        };
+        self.recalculate_message_tokens();
+    }
+
     pub fn contains_images(&self) -> bool {
         self.context
             .messages

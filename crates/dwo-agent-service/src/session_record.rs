@@ -101,6 +101,8 @@ pub struct SessionInfo {
     pub parent_session_id: Option<SessionId>,
     pub title: String,
     pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
     pub mode: SessionMode,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -200,6 +202,7 @@ impl SessionRecord {
                 parent_session_id: None,
                 title,
                 cwd,
+                worktree_id: None,
                 mode,
                 created_at_ms: now,
                 updated_at_ms: now,

@@ -25,6 +25,7 @@ mod channel_host;
 mod config_api;
 mod config_manager;
 pub mod events;
+mod git;
 mod mcp_api;
 mod model_api;
 mod project_api;
@@ -59,6 +60,7 @@ pub struct HostSessionOptions {
     pub cwd: Option<PathBuf>,
     pub project_id: Option<String>,
     pub topic_id: Option<String>,
+    pub worktree_id: Option<String>,
     pub from: Option<SessionId>,
     pub parent_session_id: Option<SessionId>,
     pub mode: Option<SessionMode>,

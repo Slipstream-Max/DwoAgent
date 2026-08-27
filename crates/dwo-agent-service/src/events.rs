@@ -235,6 +235,12 @@ pub enum SessionEventPayload {
         title: String,
         updated_at_ms: u64,
     },
+    WorkspaceChanged {
+        old_cwd: PathBuf,
+        cwd: PathBuf,
+        old_worktree_id: Option<String>,
+        worktree_id: Option<String>,
+    },
     Closing,
 }
 

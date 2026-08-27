@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
-    EndpointId, NotificationLevel, PromptAccepted, SessionConfigUpdate, SessionEventPayload,
-    SessionId, SessionListQuery, SessionLlmSettings, SessionNotification, SessionService,
-    SessionSubscription, SessionUpdate,
+    EndpointId, ExternalRuleFile, NotificationLevel, PromptAccepted, SessionConfigUpdate,
+    SessionEventPayload, SessionId, SessionListQuery, SessionLlmSettings, SessionNotification,
+    SessionService, SessionSubscription, SessionUpdate,
 };
 use dwo_context::MessageContent;
 use dwo_project::CreateProject;
@@ -13,6 +13,7 @@ use dwo_tools::{ConfirmationDecision, SessionMode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::project_api::find_worktree;
 use super::{Host, HostSessionOptions};
 use dwo_command::{
     AvailableSkill, DirectiveKinds, directive_kinds, expand as expand_prompt_directives,
@@ -29,6 +30,7 @@ struct NewSessionParam {
     cwd: Option<PathBuf>,
     project_id: Option<String>,
     topic_id: Option<String>,
+    worktree_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +125,7 @@ struct SessionSetParam {
     policy: Option<SessionMode>,
     model: Option<String>,
     reasoning: Option<String>,
+    worktree_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -159,11 +162,20 @@ impl Host {
                     .any(|topic| topic.id == topic_id),
                 "topic not found in project: {topic_id}"
             );
-            Some((project, topic_id))
+            let selected = match options.worktree_id.as_ref() {
+                Some(id) => Some((id.clone(), find_worktree(&project, id)?.path.clone())),
+                None => None,
+            };
+            let cwd = selected
+                .as_ref()
+                .map(|(_, path)| path.clone())
+                .or_else(|| (!is_fork).then(|| project.pwd.clone()));
+            let worktree_id = selected.map(|(id, _)| id);
+            Some((project, topic_id, cwd, worktree_id))
         } else if let Some(source_id) = &options.from {
             self.projects
                 .locate_session(source_id.as_str())
-                .map(|(project, topic)| (project, topic.id))
+                .map(|(project, topic)| (project, topic.id, None, None))
         } else {
             let pwd = options.cwd.clone().map(|cwd| {
                 if cwd.is_absolute() {
@@ -181,15 +193,15 @@ impl Host {
                         .map(|name| name.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| "Untitled Project".to_string());
-            let project = match pwd {
-                Some(pwd) => self.projects.get_or_create_by_pwd(project_name, &pwd)?,
+            let project = match &pwd {
+                Some(pwd) => self.projects.get_or_create_by_pwd(project_name, pwd)?,
                 None => self.projects.create(CreateProject {
                     name: project_name,
                     pwd: None,
                 })?,
             };
             let topic_id = project.board.uncategorized_topic_id.clone();
-            Some((project, topic_id))
+            Some((project, topic_id, pwd, None))
         };
         let (default_model, default_reasoning, default_mode) = self
             .profile
@@ -198,11 +210,11 @@ impl Host {
             .defaults();
         let id = SessionId::new();
         let (cwd, external_rule_files) = match &binding {
-            Some((project, topic_id)) => (
-                (!is_fork).then(|| project.pwd.clone()),
+            Some((project, topic_id, selected_cwd, _)) => (
+                selected_cwd.clone(),
                 vec![dwo_context::ExternalRuleFile::new(
                     self.projects.agents_path(&project.id, topic_id)?,
-                    project.pwd.clone(),
+                    selected_cwd.clone().unwrap_or_else(|| project.pwd.clone()),
                 )],
             ),
             _ => (None, Vec::new()),
@@ -214,6 +226,7 @@ impl Host {
                 parent_session_id: options.parent_session_id,
                 title: options.title,
                 cwd,
+                worktree_id: options.worktree_id,
                 external_rule_files,
                 mode: options.mode.or((!is_fork).then_some(default_mode)),
                 llm: options.llm.or_else(|| {
@@ -222,7 +235,7 @@ impl Host {
                 ephemeral: options.ephemeral,
             })
             .await?;
-        if let Some((project, topic_id)) = binding
+        if let Some((project, topic_id, _, _)) = binding
             && let Err(error) = self
                 .projects
                 .assign_session(&project.id, &topic_id, id.to_string())
@@ -322,6 +335,7 @@ impl Host {
                         cwd: params.cwd,
                         project_id: params.project_id,
                         topic_id: params.topic_id,
+                        worktree_id: params.worktree_id,
                         ..HostSessionOptions::default()
                     })
                     .await?;
@@ -522,21 +536,62 @@ impl Host {
                     params.title.is_some()
                         || params.policy.is_some()
                         || params.model.is_some()
-                        || params.reasoning.is_some(),
+                        || params.reasoning.is_some()
+                        || params.worktree_id.is_some(),
                     "session.set requires at least one field"
                 );
+                if params.worktree_id.is_some() {
+                    anyhow::ensure!(
+                        params.title.is_none()
+                            && params.policy.is_none()
+                            && params.model.is_none()
+                            && params.reasoning.is_none(),
+                        "session.set --worktree cannot be combined with other fields"
+                    );
+                }
                 let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
                 let caller = parse_optional_session(params.caller_session_id)?;
                 let target = self.service.snapshot(&id).await?.record;
                 if let Some(caller) = &caller {
-                    anyhow::ensure!(
-                        target.info.parent_session_id.as_ref() == Some(caller),
-                        "session {id} is not a direct subsession of {caller}"
-                    );
-                    if let Some(mode) = params.policy {
-                        let parent = self.service.snapshot(caller).await?.record;
-                        ensure_policy_ceiling(mode, parent.info.mode)?;
+                    if caller == &id {
+                        anyhow::ensure!(
+                            params.worktree_id.is_some()
+                                && params.title.is_none()
+                                && params.policy.is_none()
+                                && params.model.is_none()
+                                && params.reasoning.is_none(),
+                            "a session can only bind its own worktree"
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            target.info.parent_session_id.as_ref() == Some(caller),
+                            "session {id} is not a direct subsession of {caller}"
+                        );
+                        if let Some(mode) = params.policy {
+                            let parent = self.service.snapshot(caller).await?.record;
+                            ensure_policy_ceiling(mode, parent.info.mode)?;
+                        }
                     }
+                }
+                if let Some(worktree_id) = params.worktree_id {
+                    let (project, topic) = self
+                        .projects
+                        .locate_session(id.as_str())
+                        .context("session is not assigned to a project topic")?;
+                    let worktree = find_worktree(&project, &worktree_id)?;
+                    self.service
+                        .set_workspace(
+                            &id,
+                            Some(worktree.id.clone()),
+                            worktree.path.clone(),
+                            vec![ExternalRuleFile::new(
+                                self.projects.agents_path(&project.id, &topic.id)?,
+                                worktree.path.clone(),
+                            )],
+                        )
+                        .await?;
+                    let snapshot = self.service.snapshot(&id).await?;
+                    return Ok(json!({"updated": true, "session": snapshot.record}));
                 }
                 self.service
                     .set(

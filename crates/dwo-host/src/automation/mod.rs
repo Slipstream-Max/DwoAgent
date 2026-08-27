@@ -689,6 +689,7 @@ impl AutomationRuntime {
                         .unwrap_or_else(|| format!("automation/{}", job.name)),
                 ),
                 cwd: Some(project.pwd),
+                worktree_id: None,
                 external_rule_files,
                 mode: Some(job.policy.unwrap_or(defaults.mode)),
                 llm: Some(SessionLlmSettings::new(model, reasoning)),

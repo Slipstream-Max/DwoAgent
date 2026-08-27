@@ -53,6 +53,10 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
     ConfigShow,
     Channel {
         #[command(subcommand)]
@@ -115,6 +119,8 @@ enum SessionCommand {
         model: Option<String>,
         #[arg(long)]
         reasoning: Option<String>,
+        #[arg(long)]
+        worktree: Option<String>,
     },
     Status {
         id: String,
@@ -157,6 +163,77 @@ enum SessionCommand {
     Deny {
         id: String,
         permission_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    Repository {
+        #[command(subcommand)]
+        command: RepositoryCommand,
+    },
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepositoryCommand {
+    Get {
+        project: String,
+    },
+    Clone {
+        project: String,
+        url: String,
+        path: PathBuf,
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    Attach {
+        project: String,
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCommand {
+    List {
+        project: String,
+    },
+    Get {
+        project: String,
+        id: String,
+    },
+    Create {
+        project: String,
+        branch: String,
+        path: PathBuf,
+        #[arg(long)]
+        start_point: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Attach {
+        project: String,
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Rename {
+        project: String,
+        id: String,
+        name: String,
+    },
+    Detach {
+        project: String,
+        id: String,
+    },
+    Remove {
+        project: String,
+        id: String,
     },
 }
 
@@ -403,6 +480,7 @@ where
             }
         },
         Command::Session { command } => run_session(command, &config_path).await?,
+        Command::Project { command } => run_project(command, &config_path).await?,
         Command::ConfigShow => {
             let value = ipc::request_dwo(&config_path, "config.snapshot", json!({})).await?;
             render::write_value(&value)?;
@@ -990,9 +1068,14 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             policy,
             model,
             reasoning,
+            worktree,
         } => {
             anyhow::ensure!(
-                title.is_some() || policy.is_some() || model.is_some() || reasoning.is_some(),
+                title.is_some()
+                    || policy.is_some()
+                    || model.is_some()
+                    || reasoning.is_some()
+                    || worktree.is_some(),
                 "session set requires at least one field"
             );
             let policy = policy
@@ -1008,6 +1091,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                     "policy": policy,
                     "model": model,
                     "reasoning": reasoning,
+                    "worktree_id": worktree,
                 }),
             )
             .await?;
@@ -1077,6 +1161,74 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
         }
     }
     Ok(())
+}
+
+async fn run_project(command: ProjectCommand, config_path: &Path) -> Result<()> {
+    let (method, params) = match command {
+        ProjectCommand::Repository { command } => match command {
+            RepositoryCommand::Get { project } => {
+                ("project.repository.get", json!({"project_id": project}))
+            }
+            RepositoryCommand::Clone {
+                project,
+                url,
+                path,
+                branch,
+            } => (
+                "project.repository.clone",
+                json!({"project_id": project, "url": url, "path": path, "branch": branch}),
+            ),
+            RepositoryCommand::Attach {
+                project,
+                path,
+                name,
+            } => (
+                "project.repository.attach",
+                json!({"project_id": project, "path": path, "name": name}),
+            ),
+        },
+        ProjectCommand::Worktree { command } => match command {
+            WorktreeCommand::List { project } => {
+                ("project.worktree.list", json!({"project_id": project}))
+            }
+            WorktreeCommand::Get { project, id } => (
+                "project.worktree.get",
+                json!({"project_id": project, "worktree_id": id}),
+            ),
+            WorktreeCommand::Create {
+                project,
+                branch,
+                path,
+                start_point,
+                name,
+            } => (
+                "project.worktree.create",
+                json!({"project_id": project, "branch": branch, "path": path, "start_point": start_point, "name": name}),
+            ),
+            WorktreeCommand::Attach {
+                project,
+                path,
+                name,
+            } => (
+                "project.worktree.attach",
+                json!({"project_id": project, "path": path, "name": name}),
+            ),
+            WorktreeCommand::Rename { project, id, name } => (
+                "project.worktree.update",
+                json!({"project_id": project, "worktree_id": id, "name": name}),
+            ),
+            WorktreeCommand::Detach { project, id } => (
+                "project.worktree.detach",
+                json!({"project_id": project, "worktree_id": id}),
+            ),
+            WorktreeCommand::Remove { project, id } => (
+                "project.worktree.remove",
+                json!({"project_id": project, "worktree_id": id}),
+            ),
+        },
+    };
+    let value = ipc::request_dwo(config_path, method, params).await?;
+    render::write_value(&value)
 }
 
 fn current_session_id() -> Option<String> {

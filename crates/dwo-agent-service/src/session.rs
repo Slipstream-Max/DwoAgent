@@ -247,6 +247,26 @@ impl SessionHandle {
             .map_err(|_| SessionServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub(crate) async fn set_workspace(
+        &self,
+        worktree_id: Option<String>,
+        cwd: std::path::PathBuf,
+        tools: Arc<ToolManager>,
+        prompt_builder: SystemPromptBuilder,
+    ) -> Result<(), SessionServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(SessionRequest::SetWorkspace {
+            worktree_id,
+            cwd,
+            tools,
+            prompt_builder,
+            response,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| SessionServiceError::SessionClosed(self.id.clone()))?
+    }
+
     pub(crate) async fn keep(&self) -> Result<bool, SessionServiceError> {
         let (response, wait) = oneshot::channel();
         self.send(SessionRequest::Keep { response }).await?;
@@ -348,6 +368,13 @@ enum SessionRequest {
     },
     Set {
         update: SessionUpdate,
+        response: oneshot::Sender<Result<(), SessionServiceError>>,
+    },
+    SetWorkspace {
+        worktree_id: Option<String>,
+        cwd: std::path::PathBuf,
+        tools: Arc<ToolManager>,
+        prompt_builder: SystemPromptBuilder,
         response: oneshot::Sender<Result<(), SessionServiceError>>,
     },
     Keep {
@@ -575,6 +602,18 @@ impl SessionActor {
             }
             SessionRequest::Set { update, response } => {
                 let _ = response.send(self.set_session(update).await);
+            }
+            SessionRequest::SetWorkspace {
+                worktree_id,
+                cwd,
+                tools,
+                prompt_builder,
+                response,
+            } => {
+                let _ = response.send(
+                    self.set_workspace(worktree_id, cwd, tools, prompt_builder)
+                        .await,
+                );
             }
             SessionRequest::Keep { response } => {
                 let _ = response.send(self.keep().await);
@@ -926,6 +965,53 @@ impl SessionActor {
         if model_changed {
             self.emit_usage_changed();
         }
+        Ok(())
+    }
+
+    async fn set_workspace(
+        &mut self,
+        worktree_id: Option<String>,
+        cwd: std::path::PathBuf,
+        tools: Arc<ToolManager>,
+        prompt_builder: SystemPromptBuilder,
+    ) -> Result<(), SessionServiceError> {
+        if self.phase != RuntimePhase::Idle {
+            tools.shutdown().await;
+            return Err(SessionServiceError::SessionBusy(
+                self.record.info.id.clone(),
+            ));
+        }
+        let old_cwd = self.record.info.cwd.clone();
+        let old_worktree_id = self.record.info.worktree_id.clone();
+        let mut context = ContextManager::new(self.record.context.clone());
+        let prompt = prompt_builder.rebuild().map_err(anyhow::Error::from)?;
+        context.replace_system_prompt(prompt);
+        context.append_internal(
+            MessageKind::Runtime,
+            format!(
+                "Workspace changed from {} to {}.",
+                old_cwd.display(),
+                cwd.display()
+            ),
+        );
+        context.refresh_usage(tools.schemas());
+        let mut updated = self.record.clone();
+        updated.info.cwd = cwd.clone();
+        updated.info.worktree_id = worktree_id.clone();
+        updated.context = context.into_context();
+        updated.touch();
+        self.repository.save(&updated).await?;
+        self.tools.shutdown().await;
+        self.record = updated;
+        self.tools = tools;
+        self.prompt_builder = prompt_builder;
+        self.emit_usage_changed();
+        self.broadcast_event(SessionEventPayload::WorkspaceChanged {
+            old_cwd,
+            cwd,
+            old_worktree_id,
+            worktree_id,
+        });
         Ok(())
     }
 

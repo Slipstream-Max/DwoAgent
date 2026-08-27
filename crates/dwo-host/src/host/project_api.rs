@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{ExternalRuleFile, SessionId};
-use dwo_project::CreateProject;
+use dwo_project::{CreateProject, Project, RepositoryRecord, WorktreeRecord, WorktreeSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -23,6 +23,50 @@ struct CreateProjectParam {
 #[derive(Deserialize)]
 struct UpdateProjectParam {
     project_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct CloneRepositoryParam {
+    project_id: String,
+    url: String,
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttachRepositoryParam {
+    project_id: String,
+    path: PathBuf,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorktreeParam {
+    project_id: String,
+    worktree_id: String,
+}
+
+#[derive(Deserialize)]
+struct AttachWorktreeParam {
+    project_id: String,
+    path: PathBuf,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateWorktreeParam {
+    project_id: String,
+    path: PathBuf,
+    branch: String,
+    start_point: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateWorktreeParam {
+    project_id: String,
+    worktree_id: String,
     name: String,
 }
 
@@ -158,6 +202,143 @@ impl Host {
                     .projects
                     .update_project(&params.project_id, params.name)?;
                 self.project_changed(&params.project_id, "update").await;
+                serde_json::to_value(project)?
+            }
+            "project.repository.get" => {
+                let params: ProjectIdParam = serde_json::from_value(params)?;
+                serde_json::to_value(self.projects.get(&params.project_id)?.repository)?
+            }
+            "project.repository.clone" => {
+                let params: CloneRepositoryParam = serde_json::from_value(params)?;
+                let info = super::git::clone_repository(
+                    &params.url,
+                    &self.profile_path(params.path),
+                    params.branch.as_deref(),
+                )
+                .await?;
+                let project = self.register_repository(&params.project_id, info, "Local")?;
+                self.project_changed(&params.project_id, "repository.clone")
+                    .await;
+                serde_json::to_value(project)?
+            }
+            "project.repository.attach" => {
+                let params: AttachRepositoryParam = serde_json::from_value(params)?;
+                let info = super::git::inspect_repository(&self.profile_path(params.path)).await?;
+                let project = self.register_repository(
+                    &params.project_id,
+                    info,
+                    params.name.as_deref().unwrap_or("Local"),
+                )?;
+                self.project_changed(&params.project_id, "repository.attach")
+                    .await;
+                serde_json::to_value(project)?
+            }
+            "project.worktree.list" => {
+                let params: ProjectIdParam = serde_json::from_value(params)?;
+                serde_json::to_value(self.worktree_views(&params.project_id).await?)?
+            }
+            "project.worktree.get" => {
+                let params: WorktreeParam = serde_json::from_value(params)?;
+                let view = self
+                    .worktree_views(&params.project_id)
+                    .await?
+                    .into_iter()
+                    .find(|view| view["worktree"]["id"] == params.worktree_id)
+                    .with_context(|| format!("worktree not found: {}", params.worktree_id))?;
+                view
+            }
+            "project.worktree.attach" => {
+                let params: AttachWorktreeParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&params.project_id)?;
+                let repository = project
+                    .repository
+                    .as_ref()
+                    .context("project has no attached repository")?;
+                let info = super::git::inspect_repository(&self.profile_path(params.path)).await?;
+                anyhow::ensure!(
+                    info.common_dir == repository.common_dir,
+                    "worktree belongs to a different Git repository"
+                );
+                let path = info.root;
+                let name = params.name.unwrap_or_else(|| default_worktree_name(&path));
+                let project = self.projects.add_worktree(
+                    &params.project_id,
+                    worktree_record(name, path, WorktreeSource::External),
+                )?;
+                self.project_changed(&params.project_id, "worktree.attach")
+                    .await;
+                serde_json::to_value(project)?
+            }
+            "project.worktree.create" => {
+                let params: CreateWorktreeParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&params.project_id)?;
+                let repository = project
+                    .repository
+                    .as_ref()
+                    .context("project has no attached repository")?;
+                let status = super::git::create_worktree(
+                    &repository.root,
+                    &self.profile_path(params.path),
+                    &params.branch,
+                    params.start_point.as_deref(),
+                )
+                .await?;
+                let name = params.name.unwrap_or_else(|| params.branch.clone());
+                let project = self.projects.add_worktree(
+                    &params.project_id,
+                    worktree_record(name, status.path, WorktreeSource::Managed),
+                )?;
+                self.project_changed(&params.project_id, "worktree.create")
+                    .await;
+                serde_json::to_value(project)?
+            }
+            "project.worktree.update" => {
+                let params: UpdateWorktreeParam = serde_json::from_value(params)?;
+                let worktree = self.projects.update_worktree(
+                    &params.project_id,
+                    &params.worktree_id,
+                    params.name,
+                )?;
+                self.project_changed(&params.project_id, "worktree.update")
+                    .await;
+                serde_json::to_value(worktree)?
+            }
+            "project.worktree.detach" => {
+                let params: WorktreeParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&params.project_id)?;
+                anyhow::ensure!(
+                    find_worktree(&project, &params.worktree_id)?.source != WorktreeSource::Primary,
+                    "the primary worktree cannot be detached"
+                );
+                self.ensure_worktree_unused(&project, &params.worktree_id)
+                    .await?;
+                let project = self
+                    .projects
+                    .remove_worktree(&params.project_id, &params.worktree_id)?;
+                self.project_changed(&params.project_id, "worktree.detach")
+                    .await;
+                serde_json::to_value(project)?
+            }
+            "project.worktree.remove" => {
+                let params: WorktreeParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&params.project_id)?;
+                let repository = project
+                    .repository
+                    .as_ref()
+                    .context("project has no attached repository")?;
+                let worktree = find_worktree(&project, &params.worktree_id)?;
+                anyhow::ensure!(
+                    worktree.source == WorktreeSource::Managed,
+                    "only DWO-managed worktrees can be removed"
+                );
+                self.ensure_worktree_unused(&project, &params.worktree_id)
+                    .await?;
+                super::git::remove_worktree(&repository.root, &worktree.path).await?;
+                let project = self
+                    .projects
+                    .remove_worktree(&params.project_id, &params.worktree_id)?;
+                self.project_changed(&params.project_id, "worktree.remove")
+                    .await;
                 serde_json::to_value(project)?
             }
             "project.section.create" => {
@@ -420,6 +601,84 @@ impl Host {
         }))
     }
 
+    fn profile_path(&self, path: PathBuf) -> PathBuf {
+        if path.is_absolute() {
+            path
+        } else {
+            self.profile_root.join(path)
+        }
+    }
+
+    fn register_repository(
+        &self,
+        project_id: &str,
+        info: super::git::RepositoryInfo,
+        name: impl Into<String>,
+    ) -> Result<Project> {
+        anyhow::ensure!(
+            self.projects.get(project_id)?.repository.is_none(),
+            "project already has an attached repository"
+        );
+        self.projects
+            .set_repository(
+                project_id,
+                RepositoryRecord {
+                    root: info.root.clone(),
+                    common_dir: info.common_dir,
+                    remote_url: info.remote_url,
+                },
+                worktree_record(name.into(), info.root, WorktreeSource::Primary),
+            )
+            .map_err(Into::into)
+    }
+
+    async fn worktree_views(&self, project_id: &str) -> Result<Vec<Value>> {
+        let project = self.projects.get(project_id)?;
+        let mut views = Vec::with_capacity(project.worktrees.len());
+        for worktree in project.worktrees {
+            let status = super::git::worktree_status(&worktree.path).await;
+            let mut topics = Vec::new();
+            for topic in &project.board.topics {
+                let mut sessions = Vec::new();
+                for session_id in &topic.session_ids {
+                    let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
+                    if let Ok(snapshot) = self.service.status(&id).await
+                        && snapshot.record.info.worktree_id.as_deref() == Some(worktree.id.as_str())
+                    {
+                        sessions.push(snapshot);
+                    }
+                }
+                if !sessions.is_empty() {
+                    topics.push(json!({"topic": topic, "sessions": sessions}));
+                }
+            }
+            views.push(json!({
+                "worktree": worktree,
+                "git": status.as_ref().ok(),
+                "available": status.is_ok(),
+                "topics": topics,
+            }));
+        }
+        Ok(views)
+    }
+
+    async fn ensure_worktree_unused(&self, project: &Project, worktree_id: &str) -> Result<()> {
+        for session_id in project
+            .board
+            .topics
+            .iter()
+            .flat_map(|topic| &topic.session_ids)
+        {
+            let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
+            if let Ok(snapshot) = self.service.snapshot(&id).await
+                && snapshot.record.info.worktree_id.as_deref() == Some(worktree_id)
+            {
+                anyhow::bail!("worktree is still used by session {id}");
+            }
+        }
+        Ok(())
+    }
+
     async fn assign_session_to_topic(
         &self,
         project_id: &str,
@@ -430,14 +689,16 @@ impl Host {
         let agents_path = self.projects.agents_path(project_id, topic_id)?;
         let session_id = SessionId::parse(session_id.to_string()).map_err(anyhow::Error::msg)?;
         let snapshot = self.service.snapshot(&session_id).await?;
+        let cwd = match snapshot.record.info.worktree_id.as_deref() {
+            Some(worktree_id) => find_worktree(&project, worktree_id)?.path.clone(),
+            None => project.pwd.clone(),
+        };
         anyhow::ensure!(
-            snapshot.record.info.cwd == project.pwd,
-            "session cwd does not match project pwd"
+            snapshot.record.info.cwd == cwd,
+            "session workspace is invalid"
         );
-        self.service.set_external_rule_files(
-            &session_id,
-            vec![ExternalRuleFile::new(agents_path, project.pwd)],
-        );
+        self.service
+            .set_external_rule_files(&session_id, vec![ExternalRuleFile::new(agents_path, cwd)]);
         Ok(self
             .projects
             .assign_session(project_id, topic_id, session_id.to_string())?)
@@ -479,6 +740,36 @@ impl Host {
             )
             .await;
     }
+}
+
+fn worktree_record(name: String, path: PathBuf, source: WorktreeSource) -> WorktreeRecord {
+    WorktreeRecord {
+        id: format!("worktree-{}", uuid::Uuid::new_v4()),
+        name,
+        path,
+        source,
+        created_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    }
+}
+
+pub(super) fn find_worktree<'a>(
+    project: &'a Project,
+    worktree_id: &str,
+) -> Result<&'a WorktreeRecord> {
+    project
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.id == worktree_id)
+        .with_context(|| format!("worktree not found: {worktree_id}"))
+}
+
+fn default_worktree_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Worktree".to_string())
 }
 
 #[cfg(test)]

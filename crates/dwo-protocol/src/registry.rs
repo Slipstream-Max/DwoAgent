@@ -116,6 +116,44 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     query("project.board", MethodRoute::Dwo),
     command("project.create", MethodRoute::Dwo, Some("project.changed")),
     command("project.update", MethodRoute::Dwo, Some("project.changed")),
+    query("project.repository.get", MethodRoute::Dwo),
+    command(
+        "project.repository.clone",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.repository.attach",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    query("project.worktree.list", MethodRoute::Dwo),
+    query("project.worktree.get", MethodRoute::Dwo),
+    command(
+        "project.worktree.create",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.worktree.attach",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.worktree.update",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.worktree.detach",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
+        "project.worktree.remove",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
     command(
         "project.section.create",
         MethodRoute::Dwo,

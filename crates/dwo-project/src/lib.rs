@@ -23,6 +23,8 @@ pub enum ProjectError {
     TopicNotFound(String),
     #[error("label not found: {0}")]
     LabelNotFound(String),
+    #[error("worktree not found: {0}")]
+    WorktreeNotFound(String),
     #[error("invalid project data: {0}")]
     Invalid(String),
     #[error("project storage error at {path}: {source}")]
@@ -47,9 +49,42 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub pwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worktrees: Vec<WorktreeRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_worktree_id: Option<String>,
     pub board: Board,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryRecord {
+    pub root: PathBuf,
+    pub common_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSource {
+    Primary,
+    Managed,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeRecord {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub source: WorktreeSource,
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +239,9 @@ impl ProjectService {
             id,
             name,
             pwd,
+            repository: None,
+            worktrees: Vec::new(),
+            default_worktree_id: None,
             board: Board {
                 uncategorized_section_id: section_id.clone(),
                 uncategorized_topic_id: topic_id.clone(),
@@ -235,6 +273,87 @@ impl ProjectService {
         let name = nonempty("project name", name)?;
         self.mutate(project_id, |project| {
             project.name = name;
+            Ok(())
+        })
+    }
+
+    pub fn set_repository(
+        &self,
+        project_id: &str,
+        repository: RepositoryRecord,
+        primary: WorktreeRecord,
+    ) -> Result<Project> {
+        self.mutate(project_id, |project| {
+            project.pwd = primary.path.clone();
+            project.repository = Some(repository);
+            project.default_worktree_id = Some(primary.id.clone());
+            project.worktrees = vec![primary];
+            Ok(())
+        })
+    }
+
+    pub fn add_worktree(&self, project_id: &str, worktree: WorktreeRecord) -> Result<Project> {
+        self.mutate(project_id, |project| {
+            if project.repository.is_none() {
+                return Err(ProjectError::Invalid(
+                    "project has no attached repository".to_string(),
+                ));
+            }
+            if project
+                .worktrees
+                .iter()
+                .any(|existing| existing.id == worktree.id || existing.path == worktree.path)
+            {
+                return Err(ProjectError::Invalid(format!(
+                    "worktree is already registered: {}",
+                    worktree.path.display()
+                )));
+            }
+            project.worktrees.push(worktree);
+            Ok(())
+        })
+    }
+
+    pub fn update_worktree(
+        &self,
+        project_id: &str,
+        worktree_id: &str,
+        name: String,
+    ) -> Result<WorktreeRecord> {
+        let name = nonempty("worktree name", name)?;
+        let worktree_id = worktree_id.to_string();
+        let project = self.mutate(project_id, |project| {
+            let worktree = project
+                .worktrees
+                .iter_mut()
+                .find(|worktree| worktree.id == worktree_id)
+                .ok_or_else(|| ProjectError::WorktreeNotFound(worktree_id.clone()))?;
+            worktree.name = name;
+            Ok(())
+        })?;
+        project
+            .worktrees
+            .into_iter()
+            .find(|worktree| worktree.id == worktree_id)
+            .ok_or(ProjectError::WorktreeNotFound(worktree_id))
+    }
+
+    pub fn remove_worktree(&self, project_id: &str, worktree_id: &str) -> Result<Project> {
+        let worktree_id = worktree_id.to_string();
+        self.mutate(project_id, |project| {
+            let before = project.worktrees.len();
+            project
+                .worktrees
+                .retain(|worktree| worktree.id != worktree_id);
+            if project.worktrees.len() == before {
+                return Err(ProjectError::WorktreeNotFound(worktree_id.clone()));
+            }
+            if project.default_worktree_id.as_deref() == Some(worktree_id.as_str()) {
+                project.default_worktree_id = project
+                    .worktrees
+                    .first()
+                    .map(|worktree| worktree.id.clone());
+            }
             Ok(())
         })
     }
@@ -728,6 +847,33 @@ fn validate_project(project: &Project) -> Result<()> {
             "project id and name are required".to_string(),
         ));
     }
+    let worktree_ids = project
+        .worktrees
+        .iter()
+        .map(|worktree| worktree.id.as_str())
+        .collect::<HashSet<_>>();
+    let worktree_paths = project
+        .worktrees
+        .iter()
+        .map(|worktree| &worktree.path)
+        .collect::<HashSet<_>>();
+    if worktree_ids.len() != project.worktrees.len()
+        || worktree_paths.len() != project.worktrees.len()
+        || project
+            .default_worktree_id
+            .as_deref()
+            .is_some_and(|id| !worktree_ids.contains(id))
+        || (project.repository.is_none() && !project.worktrees.is_empty())
+        || project.worktrees.iter().any(|worktree| {
+            worktree.id.trim().is_empty()
+                || worktree.name.trim().is_empty()
+                || !worktree.path.is_absolute()
+        })
+    {
+        return Err(ProjectError::Invalid(
+            "invalid project worktree records".to_string(),
+        ));
+    }
     let section_ids = project
         .board
         .sections
@@ -1003,6 +1149,25 @@ mod tests {
         service
             .set_agents(&project.id, &topic.id, "Stay scoped.")
             .unwrap();
+        let common_dir = root.path().join("repo.git");
+        fs::create_dir_all(&common_dir).unwrap();
+        service
+            .set_repository(
+                &project.id,
+                RepositoryRecord {
+                    root: fs::canonicalize(&workspace).unwrap(),
+                    common_dir: fs::canonicalize(common_dir).unwrap(),
+                    remote_url: Some("https://example.test/repo.git".to_string()),
+                },
+                WorktreeRecord {
+                    id: "worktree-local".to_string(),
+                    name: "Local".to_string(),
+                    path: fs::canonicalize(&workspace).unwrap(),
+                    source: WorktreeSource::Primary,
+                    created_at_ms: 1,
+                },
+            )
+            .unwrap();
 
         let reloaded = ProjectService::open(root.path().join("projects")).unwrap();
         let loaded = reloaded.get(&project.id).unwrap();
@@ -1015,6 +1180,15 @@ mod tests {
             "Stay scoped."
         );
         assert_eq!(loaded.pwd, fs::canonicalize(workspace).unwrap());
+        assert_eq!(
+            loaded.default_worktree_id.as_deref(),
+            Some("worktree-local")
+        );
+        assert_eq!(loaded.worktrees.len(), 1);
+        assert_eq!(
+            loaded.repository.unwrap().remote_url.as_deref(),
+            Some("https://example.test/repo.git")
+        );
     }
 
     #[test]

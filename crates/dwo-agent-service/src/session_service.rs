@@ -39,6 +39,7 @@ pub struct NewSession {
     pub parent_session_id: Option<SessionId>,
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,
+    pub worktree_id: Option<String>,
     pub external_rule_files: Vec<ExternalRuleFile>,
     pub mode: Option<SessionMode>,
     pub llm: Option<SessionLlmSettings>,
@@ -253,70 +254,73 @@ impl SessionService {
     ) -> Result<Arc<SessionHandle>, SessionServiceError> {
         let id = new_session.id.clone().unwrap_or_default();
         self.set_external_rule_files(&id, new_session.external_rule_files.clone());
-        let (record, transcript, rollback_on_load_error) =
-            if let Some(source_id) = &new_session.from {
-                let snapshot = self.load(source_id).await?.snapshot().await?;
-                if snapshot.phase != RuntimePhase::Idle {
-                    return Err(SessionServiceError::SessionBusy(source_id.clone()));
-                }
-                let source = snapshot.record;
-                let title = new_session
-                    .title
-                    .map(|title| title.trim().to_string())
-                    .filter(|title| !title.is_empty())
-                    .unwrap_or_else(|| source.info.title.clone());
-                let mut record = SessionRecord::new(
-                    id.clone(),
-                    title,
-                    source.info.cwd.clone(),
-                    new_session.mode.unwrap_or(source.info.mode),
-                    new_session.llm.unwrap_or_else(|| source.llm.clone()),
-                );
-                record.set_parent_session_id(
-                    new_session
-                        .parent_session_id
-                        .or_else(|| source.info.parent_session_id.clone()),
-                );
-                record.info.ephemeral = new_session.ephemeral;
-                record.context = source.context;
-                record.current_plan = source.current_plan;
-                (record, snapshot.transcript, true)
-            } else {
-                let cwd = new_session.cwd.ok_or_else(|| {
-                    SessionServiceError::InvalidConfig("new session requires cwd".to_string())
-                })?;
-                let mode = new_session.mode.ok_or_else(|| {
-                    SessionServiceError::InvalidConfig("new session requires mode".to_string())
-                })?;
-                let llm = new_session.llm.ok_or_else(|| {
-                    SessionServiceError::InvalidConfig("new session requires llm".to_string())
-                })?;
-                self.model
-                    .validate_selection(&ModelSelection {
-                        model: llm.model.clone(),
-                        reasoning: llm.reasoning.clone(),
-                    })
-                    .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
-                let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
-                let explicit_title = new_session
-                    .title
-                    .map(|title| title.trim().to_string())
-                    .filter(|title| !title.is_empty());
-                let automatic_title = explicit_title.is_none();
-                let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
-                let prompt_builder = self.prompt_builder(&id, cwd.clone());
-                let context = ContextManager::initialize(&prompt_builder)
-                    .map_err(anyhow::Error::from)?
-                    .into_context();
-                let mut record = SessionRecord::new(id.clone(), title, cwd, mode, llm);
-                record.set_parent_session_id(new_session.parent_session_id);
-                record.info.ephemeral = new_session.ephemeral;
-                if automatic_title {
-                    record.enable_auto_title();
-                }
-                record.context = context;
-                (record, Vec::new(), false)
-            };
+        let (record, transcript, rollback_on_load_error) = if let Some(source_id) =
+            &new_session.from
+        {
+            let snapshot = self.load(source_id).await?.snapshot().await?;
+            if snapshot.phase != RuntimePhase::Idle {
+                return Err(SessionServiceError::SessionBusy(source_id.clone()));
+            }
+            let source = snapshot.record;
+            let title = new_session
+                .title
+                .map(|title| title.trim().to_string())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| source.info.title.clone());
+            let mut record = SessionRecord::new(
+                id.clone(),
+                title,
+                source.info.cwd.clone(),
+                new_session.mode.unwrap_or(source.info.mode),
+                new_session.llm.unwrap_or_else(|| source.llm.clone()),
+            );
+            record.set_parent_session_id(
+                new_session
+                    .parent_session_id
+                    .or_else(|| source.info.parent_session_id.clone()),
+            );
+            record.info.ephemeral = new_session.ephemeral;
+            record.info.worktree_id = new_session.worktree_id.or(source.info.worktree_id.clone());
+            record.context = source.context;
+            record.current_plan = source.current_plan;
+            (record, snapshot.transcript, true)
+        } else {
+            let cwd = new_session.cwd.ok_or_else(|| {
+                SessionServiceError::InvalidConfig("new session requires cwd".to_string())
+            })?;
+            let mode = new_session.mode.ok_or_else(|| {
+                SessionServiceError::InvalidConfig("new session requires mode".to_string())
+            })?;
+            let llm = new_session.llm.ok_or_else(|| {
+                SessionServiceError::InvalidConfig("new session requires llm".to_string())
+            })?;
+            self.model
+                .validate_selection(&ModelSelection {
+                    model: llm.model.clone(),
+                    reasoning: llm.reasoning.clone(),
+                })
+                .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
+            let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
+            let explicit_title = new_session
+                .title
+                .map(|title| title.trim().to_string())
+                .filter(|title| !title.is_empty());
+            let automatic_title = explicit_title.is_none();
+            let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
+            let prompt_builder = self.prompt_builder(&id, cwd.clone());
+            let context = ContextManager::initialize(&prompt_builder)
+                .map_err(anyhow::Error::from)?
+                .into_context();
+            let mut record = SessionRecord::new(id.clone(), title, cwd, mode, llm);
+            record.set_parent_session_id(new_session.parent_session_id);
+            record.info.worktree_id = new_session.worktree_id;
+            record.info.ephemeral = new_session.ephemeral;
+            if automatic_title {
+                record.enable_auto_title();
+            }
+            record.context = context;
+            (record, Vec::new(), false)
+        };
 
         let id = record.info.id.clone();
         let session_lock = {
@@ -596,6 +600,40 @@ impl SessionService {
         update: SessionUpdate,
     ) -> Result<(), SessionServiceError> {
         self.load(id).await?.set(update).await
+    }
+
+    pub async fn set_workspace(
+        &self,
+        id: &SessionId,
+        worktree_id: Option<String>,
+        cwd: PathBuf,
+        external_rule_files: Vec<ExternalRuleFile>,
+    ) -> Result<(), SessionServiceError> {
+        let previous_rule_files = self
+            .session_rule_files
+            .read()
+            .expect("session rule files registry lock poisoned")
+            .get(id)
+            .and_then(|files| files.read().ok().map(|files| files.clone()))
+            .unwrap_or_default();
+        self.set_external_rule_files(id, external_rule_files);
+        let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
+        let prompt_builder = self.prompt_builder(id, cwd.clone());
+        let tools = Arc::new(ToolManager::new_with_environment(
+            cwd.clone(),
+            self.policy.clone(),
+            self.file_edit.clone(),
+            [("DWO_SESSION_ID".to_string(), id.to_string())],
+        )?);
+        let result = self
+            .load(id)
+            .await?
+            .set_workspace(worktree_id, cwd, tools, prompt_builder)
+            .await;
+        if result.is_err() {
+            self.set_external_rule_files(id, previous_rule_files);
+        }
+        result
     }
 
     pub fn set_external_rule_files(&self, id: &SessionId, files: Vec<ExternalRuleFile>) {

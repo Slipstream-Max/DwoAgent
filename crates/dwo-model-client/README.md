@@ -14,7 +14,7 @@ One provider can expose models from multiple families while sharing one `BaseCli
 ```yaml
 default:
   model: newapi/ds-v4-pro
-  reasoning: High
+  reasoning: high
 compactionTriggerRatio: 0.8
 providers:
   newapi:

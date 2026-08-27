@@ -19,7 +19,7 @@ model:
   default:
     # 稳定身份始终是 provider/modelId，不使用显示名称。
     model: newapi/ds-v4-pro
-    reasoning: High # 可选
+    reasoning: high # 可选：off/auto/low/medium/high/xhigh/max
 
   # Agent 上下文策略，不属于模型能力。
   compactionTriggerRatio: 0.8
@@ -51,7 +51,7 @@ model:
           profile: grok/grok-4.6
           # 可选；省略时使用上面的 profile 默认值。
           compactionTriggerRatio: 0.5
-          hostedTools: [webSearch, xSearch]
+          hostedTools: [web_search, x_search]
 
         "DeepSeek V4 Pro":
           modelId: ds-v4-pro
@@ -59,7 +59,8 @@ model:
 ```
 
 模型部署可以覆盖 `contextWindowTokens`、`maxOutputTokens`、
-`defaultReasoningMode`、`capabilities`、`reasoning`、`hostedTools`、
+`defaultReasoningEffort`、`reasoningEfforts`、`reasoningSummary`、`capabilities`、
+`hostedTools`、
 `temperature`、`topP`、`compactionTriggerRatio` 和 `extraBody`。
 `compactionTriggerRatio` 省略时使用 `model.compactionTriggerRatio`；
 `modelId` 省略时使用外层显示名称。
@@ -76,7 +77,7 @@ session；改变 `modelId` 会改变稳定身份。
 model:
   default:
     model: deepseek/deepseek-v4-pro
-    reasoning: High
+    reasoning: high
   providers:
     deepseek:
       apiKeyEnv: DEEPSEEK_API_KEY
@@ -118,18 +119,11 @@ models:
       imageInput: false
       toolCalls: true
 
-    hostedTools:
-      webSearch:
-        type: web_search
+    hostedTools: [web_search]
 
-    defaultReasoningMode: High
-    reasoning:
-      Off:
-        reasoning:
-          effort: none
-      High:
-        reasoning:
-          effort: high
+    defaultReasoningEffort: high
+    reasoningEfforts: [off, auto, low, medium, high, xhigh, max]
+    reasoningSummary: auto # 可选；模型返回隐藏思维的摘要时设置
 
     temperature: null
     topP: null
@@ -142,8 +136,8 @@ override）提供。
 
 ## Hosted tools
 
-Model List 的 `hostedTools` 是名称到 Responses 原生工具对象的映射。部署模型省略
-`hostedTools` 时启用 profile 中的全部 hosted tools；配置名称列表时只启用选中项；
+Model List 的 `hostedTools` 是 Responses 原生工具 type 列表。部署模型省略
+`hostedTools` 时启用 profile 中的全部 hosted tools；配置 type 列表时只启用选中项；
 配置 `[]` 时全部关闭。DWO 本地 function tools 不在这里配置，只要求
 `capabilities.toolCalls: true`。
 

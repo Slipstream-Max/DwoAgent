@@ -6,77 +6,35 @@ models:
     capabilities:
       imageInput: true
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-    defaultReasoningMode: Medium
-    reasoning:
-      Low:
-        reasoning: {effort: low, summary: auto}
-      Medium:
-        reasoning: {effort: medium, summary: auto}
-      High:
-        reasoning: {effort: high, summary: auto}
-      XHigh:
-        reasoning: {effort: xhigh, summary: auto}
-      Max:
-        reasoning: {effort: max, summary: auto}
+    hostedTools: [web_search]
+    defaultReasoningEffort: medium
+    reasoningEfforts: [low, medium, high, xhigh, max]
+    reasoningSummary: auto
   gpt-5.6-terra:
     contextWindowTokens: 1050000
     maxOutputTokens: 128000
     capabilities:
       imageInput: true
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-    defaultReasoningMode: Medium
-    reasoning:
-      Low:
-        reasoning: {effort: low, summary: auto}
-      Medium:
-        reasoning: {effort: medium, summary: auto}
-      High:
-        reasoning: {effort: high, summary: auto}
-      XHigh:
-        reasoning: {effort: xhigh, summary: auto}
-      Max:
-        reasoning: {effort: max, summary: auto}
+    hostedTools: [web_search]
+    defaultReasoningEffort: medium
+    reasoningEfforts: [low, medium, high, xhigh, max]
+    reasoningSummary: auto
   gpt-5.5:
     contextWindowTokens: 1050000
     maxOutputTokens: 128000
     capabilities:
       imageInput: true
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-    defaultReasoningMode: Medium
-    reasoning:
-      Low:
-        reasoning: {effort: low}
-      Medium:
-        reasoning: {effort: medium}
-      High:
-        reasoning: {effort: high}
-      XHigh:
-        reasoning: {effort: xhigh}
+    hostedTools: [web_search]
+    defaultReasoningEffort: medium
+    reasoningEfforts: [low, medium, high, xhigh]
   gpt-5.4:
     contextWindowTokens: 1050000
     maxOutputTokens: 128000
     capabilities:
       imageInput: true
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-    defaultReasoningMode: Medium
-    reasoning:
-      Low:
-        reasoning: {effort: low}
-      Medium:
-        reasoning: {effort: medium}
-      High:
-        reasoning: {effort: high}
-      XHigh:
-        reasoning: {effort: xhigh}
+    hostedTools: [web_search]
+    defaultReasoningEffort: medium
+    reasoningEfforts: [low, medium, high, xhigh]

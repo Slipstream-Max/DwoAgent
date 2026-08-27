@@ -1244,7 +1244,7 @@ fn build_session_config_options(snapshot: SessionOptions) -> Result<Vec<SessionC
             reasoning,
             reasoning_options
                 .into_iter()
-                .map(|mode| SessionConfigSelectOption::new(mode.clone(), mode))
+                .map(|option| SessionConfigSelectOption::new(option.id, option.name))
                 .collect::<Vec<_>>(),
         )
         .category(SessionConfigOptionCategory::ThoughtLevel),
@@ -2463,14 +2463,27 @@ mod tests {
             config: ipc_schema::SessionConfig {
                 mode: ipc_schema::SessionMode::FullAccess,
                 model: "deepseek-v4-flash".to_string(),
-                reasoning: Some("Max".to_string()),
+                reasoning: Some("max".to_string()),
             },
             models: vec![ipc_schema::SessionModelOption {
                 id: "deepseek-v4-flash".to_string(),
                 name: "DeepSeek V4 Flash".to_string(),
                 provider: "deepseek".to_string(),
-                reasoning: vec!["Low".to_string(), "High".to_string(), "Max".to_string()],
-                default_reasoning: "High".to_string(),
+                reasoning: vec![
+                    ipc_schema::ReasoningOption {
+                        id: "low".to_string(),
+                        name: "Low".to_string(),
+                    },
+                    ipc_schema::ReasoningOption {
+                        id: "high".to_string(),
+                        name: "High".to_string(),
+                    },
+                    ipc_schema::ReasoningOption {
+                        id: "max".to_string(),
+                        name: "Max".to_string(),
+                    },
+                ],
+                default_reasoning: "high".to_string(),
             }],
         })
         .unwrap();
@@ -2480,10 +2493,11 @@ mod tests {
         assert_eq!(json[0]["currentValue"], "deepseek-v4-flash");
         assert_eq!(json[1]["configId"], "reasoning_mode");
         assert_eq!(json[1]["type"], "select");
-        assert_eq!(json[1]["currentValue"], "Max");
-        assert_eq!(json[1]["options"][0]["value"], "Low");
-        assert_eq!(json[1]["options"][1]["value"], "High");
-        assert_eq!(json[1]["options"][2]["value"], "Max");
+        assert_eq!(json[1]["currentValue"], "max");
+        assert_eq!(json[1]["options"][0]["value"], "low");
+        assert_eq!(json[1]["options"][0]["name"], "Low");
+        assert_eq!(json[1]["options"][1]["value"], "high");
+        assert_eq!(json[1]["options"][2]["value"], "max");
         assert_eq!(json[2]["configId"], "policy_mode");
         assert_eq!(json[2]["type"], "select");
         assert_eq!(json[2]["currentValue"], "full_access");
@@ -2503,14 +2517,26 @@ mod tests {
                     id: "deepseek-v4-flash".to_string(),
                     name: "DeepSeek V4 Flash".to_string(),
                     provider: "deepseek".to_string(),
-                    reasoning: vec!["high".to_string(), "max".to_string()],
+                    reasoning: vec![
+                        ipc_schema::ReasoningOption {
+                            id: "high".to_string(),
+                            name: "High".to_string(),
+                        },
+                        ipc_schema::ReasoningOption {
+                            id: "max".to_string(),
+                            name: "Max".to_string(),
+                        },
+                    ],
                     default_reasoning: "high".to_string(),
                 },
                 ipc_schema::SessionModelOption {
                     id: "qwen3.8-max".to_string(),
                     name: "Qwen 3.8 Max".to_string(),
                     provider: "tokenrhythm".to_string(),
-                    reasoning: vec!["high".to_string()],
+                    reasoning: vec![ipc_schema::ReasoningOption {
+                        id: "high".to_string(),
+                        name: "High".to_string(),
+                    }],
                     default_reasoning: "high".to_string(),
                 },
             ],

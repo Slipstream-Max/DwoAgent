@@ -6,57 +6,24 @@ models:
     capabilities:
       imageInput: false
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-    defaultReasoningMode: High
-    reasoning:
-      Auto: {}
-      Off:
-        reasoning: {effort: none}
-      Low:
-        reasoning: {effort: low}
-      High:
-        reasoning: {effort: high}
-      Max:
-        reasoning: {effort: max}
+    hostedTools: [web_search]
+    defaultReasoningEffort: high
+    reasoningEfforts: [off, auto, low, high, max]
   deepseek-v4-flash:
     contextWindowTokens: 1000000
     maxOutputTokens: 384000
     capabilities:
       imageInput: false
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-    defaultReasoningMode: High
-    reasoning:
-      Auto: {}
-      Off:
-        reasoning: {effort: none}
-      Low:
-        reasoning: {effort: low}
-      High:
-        reasoning: {effort: high}
-      Max:
-        reasoning: {effort: max}
+    hostedTools: [web_search]
+    defaultReasoningEffort: high
+    reasoningEfforts: [off, auto, low, high, max]
   deepseek-v4-flash-vision-exp:
     contextWindowTokens: 1000000
     maxOutputTokens: 384000
     capabilities:
       imageInput: true
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-    defaultReasoningMode: High
-    reasoning:
-      Auto: {}
-      Off:
-        reasoning: {effort: none}
-      Low:
-        reasoning: {effort: low}
-      High:
-        reasoning: {effort: high}
-      Max:
-        reasoning: {effort: max}
+    hostedTools: [web_search]
+    defaultReasoningEffort: high
+    reasoningEfforts: [off, auto, low, high, max]

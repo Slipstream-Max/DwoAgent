@@ -18,28 +18,18 @@ families:
         capabilities:
           imageInput: true
           toolCalls: true
-        hostedTools:
-          selected:
-            type: {tool}
-        defaultReasoningMode: High
-        reasoning:
-          High:
-            reasoning:
-              effort: high
+        hostedTools: [{tool}]
+        defaultReasoningEffort: high
+        reasoningEfforts: [high]
       grok-4.6:
         contextWindowTokens: 500000
         maxOutputTokens: 128000
         capabilities:
           imageInput: true
           toolCalls: true
-        hostedTools:
-          selected:
-            type: {tool}
-        defaultReasoningMode: High
-        reasoning:
-          High:
-            reasoning:
-              effort: high
+        hostedTools: [{tool}]
+        defaultReasoningEffort: high
+        reasoningEfforts: [high]
 "#
     );
     let agent = r#"
@@ -233,8 +223,11 @@ providers:
     let web_client = grok_client_with_hosted_tool("web_search");
     let x_client = grok_client_with_hosted_tool("x_search");
 
-    for model in ["grok/grok-4.5", "grok/grok-4.6"] {
-        for reasoning in ["Low", "Medium", "High", "XHigh"] {
+    for (model, efforts) in [
+        ("grok/grok-4.5", &["low", "medium", "high"][..]),
+        ("grok/grok-4.6", &["low", "medium", "high", "xhigh"][..]),
+    ] {
+        for reasoning in efforts {
             let reply = stream_with_reasoning(
                 &client,
                 model,

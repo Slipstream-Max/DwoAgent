@@ -93,19 +93,36 @@ impl ModelClient for ConfiguredModelClient {
     }
 
     fn reasoning_modes(&self, model: &str) -> Result<Vec<String>, ModelClientError> {
-        Ok(self.resolve(model)?.1.reasoning.keys().cloned().collect())
+        Ok(self
+            .resolve(model)?
+            .1
+            .reasoning_efforts
+            .iter()
+            .map(|effort| effort.as_str().to_string())
+            .collect())
     }
 
     fn validate_selection(&self, selection: &ModelSelection) -> Result<(), ModelClientError> {
         let (_, model) = self.resolve(&selection.model)?;
-        let mode = selection
+        let effort = selection
             .reasoning
             .as_deref()
-            .unwrap_or(&model.default_reasoning_mode);
-        if mode != "auto" && !model.reasoning.contains_key(mode) {
+            .and_then(crate::ReasoningEffort::parse)
+            .unwrap_or(model.default_reasoning_effort);
+        if !model.reasoning_efforts.contains(&effort)
+            && (selection.reasoning.is_some() || effort != crate::ReasoningEffort::Auto)
+        {
             return Err(ModelClientError::config(format!(
-                "model {} does not configure reasoning mode {mode}",
-                model.model_id
+                "model {} does not support reasoning effort {}",
+                model.model_id,
+                effort.as_str()
+            )));
+        }
+        if let Some(value) = selection.reasoning.as_deref()
+            && crate::ReasoningEffort::parse(value).is_none()
+        {
+            return Err(ModelClientError::config(format!(
+                "unknown reasoning effort {value}"
             )));
         }
         Ok(())

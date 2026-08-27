@@ -113,7 +113,7 @@ websocket:
 model:
   default:
     model: deepseek/deepseek-v4-pro
-    reasoning: High
+    reasoning: high
   compactionTriggerRatio: 0.8
   providers:
     deepseek:
@@ -185,7 +185,7 @@ DWO_LOG=dwo_agent_service=debug,dwo_mcp=trace
 model:
   default:
     model: deepseek/deepseek-v4-pro
-    reasoning: High
+    reasoning: high
   compactionTriggerRatio: 0.8
   providers:
     deepseek:
@@ -194,7 +194,7 @@ model:
 
 `default.model` 使用稳定的 `provider/modelId`。Provider 名称命中内置 family 且省略
 `models` 时，使用官方地址并启用 family 的全部模型；`baseUrl` 可选覆盖官方地址。
-`default.reasoning` 省略时使用 Model List 中模型的 `defaultReasoningMode`。
+`default.reasoning` 省略时使用 Model List 中模型的 `defaultReasoningEffort`。
 
 第三方中转站显式声明地址和模型映射：
 
@@ -202,7 +202,7 @@ model:
 model:
   default:
     model: newapi/ds-v4-pro
-    reasoning: High
+    reasoning: high
   compactionTriggerRatio: 0.8
   providers:
     newapi:
@@ -233,7 +233,8 @@ model:
 `baseUrl` 是 API root，Client 请求 `{baseUrl}/responses`。
 
 部署模型可以覆盖 `contextWindowTokens`、`maxOutputTokens`、
-`defaultReasoningMode`、`capabilities`、`reasoning`、`hostedTools`、
+`defaultReasoningEffort`、`reasoningEfforts`、`reasoningSummary`、`capabilities`、
+`hostedTools`、
 `temperature`、`topP`、`compactionTriggerRatio` 和 `extraBody`。显式 `models` 是
 allowlist。模型 entry 未设置 `compactionTriggerRatio` 时使用 `model` 下的全局默认值。
 

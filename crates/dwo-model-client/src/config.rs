@@ -5,7 +5,7 @@ use std::time::Duration;
 use indexmap::IndexMap;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::ModelClientError;
 
@@ -29,6 +29,83 @@ const RESERVED_BODY_FIELDS: &[&str] = &[
     "max_completion_tokens",
     "max_output_tokens",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Off,
+    Auto,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Auto => "Auto",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::XHigh => "XHigh",
+            Self::Max => "Max",
+        }
+    }
+
+    pub(crate) const fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Off => Some("none"),
+            Self::Auto => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "nonthink" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningSummary {
+    Auto,
+}
+
+impl ReasoningSummary {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -226,11 +303,13 @@ pub struct ModelSpec {
     #[serde(default)]
     pub extra_body: Map<String, Value>,
     #[serde(default)]
-    pub hosted_tools: IndexMap<String, Value>,
+    pub hosted_tools: Vec<String>,
     #[serde(default)]
-    pub reasoning: IndexMap<String, Map<String, Value>>,
-    #[serde(default = "default_reasoning_mode")]
-    pub default_reasoning_mode: String,
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+    #[serde(default = "default_reasoning_effort")]
+    pub default_reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    pub reasoning_summary: Option<ReasoningSummary>,
     #[serde(default)]
     pub capabilities: ModelCapabilities,
 }
@@ -241,15 +320,20 @@ impl ModelSpec {
         let _ =
             available_input_tokens(self.context_window_tokens, self.max_output_tokens, &source)?;
         validate_body(&self.extra_body, &format!("{source} extraBody"))?;
-        for (name, tool) in &self.hosted_tools {
-            validate_identifier(name, &format!("{source} hosted tool name"))?;
-            if !tool.is_object() {
+        let mut hosted_tools = HashSet::new();
+        for tool_type in &self.hosted_tools {
+            validate_identifier(tool_type, &format!("{source} hosted tool type"))?;
+            if !hosted_tools.insert(tool_type) {
                 return Err(ModelClientError::config(format!(
-                    "{source} hostedTools.{name} must be an object"
+                    "{source} repeats hosted tool type {tool_type}"
                 )));
             }
         }
-        validate_reasoning(&self.reasoning, &self.default_reasoning_mode, &source)
+        validate_reasoning(
+            &self.reasoning_efforts,
+            self.default_reasoning_effort,
+            &source,
+        )
     }
 }
 
@@ -262,8 +346,8 @@ pub struct ModelCapabilities {
     pub tool_calls: bool,
 }
 
-fn default_reasoning_mode() -> String {
-    "auto".to_string()
+fn default_reasoning_effort() -> ReasoningEffort {
+    ReasoningEffort::Auto
 }
 
 fn default_compaction_trigger_ratio() -> f64 {
@@ -384,11 +468,13 @@ pub struct AgentModelEntry {
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
-    pub default_reasoning_mode: Option<String>,
+    pub default_reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
     #[serde(default)]
-    pub reasoning: Option<IndexMap<String, Map<String, Value>>>,
+    pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
+    #[serde(default)]
+    pub reasoning_summary: Option<ReasoningSummary>,
     #[serde(default)]
     pub hosted_tools: Option<Vec<String>>,
     #[serde(default)]
@@ -413,13 +499,15 @@ impl AgentModelEntry {
                 ))
             })?;
         }
-        if let Some(mode) = &self.default_reasoning_mode {
-            validate_identifier(mode, "defaultReasoningMode")?;
-        }
-        if let Some(reasoning) = &self.reasoning {
-            for (mode, body) in reasoning {
-                validate_identifier(mode, "reasoning mode")?;
-                validate_body(body, &format!("reasoning.{mode}"))?;
+        if let Some(efforts) = &self.reasoning_efforts {
+            let mut unique = HashSet::new();
+            for effort in efforts {
+                if !unique.insert(*effort) {
+                    return Err(ModelClientError::config(format!(
+                        "provider {provider_id} model {model_name} repeats reasoning effort {}",
+                        effort.as_str()
+                    )));
+                }
             }
         }
         if let Some(hosted_tools) = &self.hosted_tools {
@@ -563,18 +651,26 @@ impl ModelClientConfig {
                 "model.default.model references unavailable model {default_model}"
             ))
         })?;
-        if let Some(reasoning) = &agent.default.reasoning
-            && reasoning != "auto"
-            && !default_config.reasoning.contains_key(reasoning)
-        {
-            return Err(ModelClientError::config(format!(
-                "default model {default_model} does not configure reasoning mode {reasoning}"
-            )));
-        }
+        let default_reasoning = agent
+            .default
+            .reasoning
+            .as_deref()
+            .map(|reasoning| {
+                let effort = ReasoningEffort::parse(reasoning).ok_or_else(|| {
+                    ModelClientError::config(format!("unknown reasoning effort {reasoning}"))
+                })?;
+                if !default_config.reasoning_efforts.contains(&effort) {
+                    return Err(ModelClientError::config(format!(
+                        "default model {default_model} does not support reasoning effort {reasoning}"
+                    )));
+                }
+                Ok(effort.as_str().to_string())
+            })
+            .transpose()?;
 
         Ok(Self {
             default_model,
-            default_reasoning: agent.default.reasoning.clone(),
+            default_reasoning,
             providers,
             models,
         })
@@ -642,8 +738,9 @@ pub struct ModelConfig {
     pub top_p: Option<f64>,
     pub extra_body: Map<String, Value>,
     pub hosted_tools: Vec<Value>,
-    pub reasoning: IndexMap<String, Map<String, Value>>,
-    pub default_reasoning_mode: String,
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+    pub default_reasoning_effort: ReasoningEffort,
+    pub reasoning_summary: Option<ReasoningSummary>,
     pub capabilities: ModelCapabilities,
 }
 
@@ -667,8 +764,8 @@ impl ModelConfig {
         )?;
         validate_body(&self.extra_body, &format!("model {id} extraBody"))?;
         validate_reasoning(
-            &self.reasoning,
-            &self.default_reasoning_mode,
+            &self.reasoning_efforts,
+            self.default_reasoning_effort,
             &format!("model {id}"),
         )
     }
@@ -697,24 +794,32 @@ fn resolved_model(
     providers: &BTreeMap<String, ProviderConfig>,
 ) -> Result<ModelConfig, ModelClientError> {
     let hosted_tools = match entry.and_then(|entry| entry.hosted_tools.as_ref()) {
-        Some(names) => names
+        Some(tool_types) => tool_types
             .iter()
-            .map(|name| {
-                spec.hosted_tools.get(name).cloned().ok_or_else(|| {
-                    ModelClientError::config(format!(
-                        "model {provider_id}/{model_id} selects unknown hosted tool {name}"
-                    ))
-                })
+            .map(|tool_type| {
+                if !spec.hosted_tools.contains(tool_type) {
+                    return Err(ModelClientError::config(format!(
+                        "model {provider_id}/{model_id} selects unknown hosted tool {tool_type}"
+                    )));
+                }
+                Ok(json!({"type": tool_type}))
             })
-            .collect::<Result<Vec<_>, _>>()?,
-        None => spec.hosted_tools.values().cloned().collect(),
+            .collect::<Result<Vec<_>, ModelClientError>>()?,
+        None => spec
+            .hosted_tools
+            .iter()
+            .map(|tool_type| json!({"type": tool_type}))
+            .collect(),
     };
-    let reasoning = entry
-        .and_then(|entry| entry.reasoning.clone())
-        .unwrap_or_else(|| spec.reasoning.clone());
-    let default_reasoning_mode = entry
-        .and_then(|entry| entry.default_reasoning_mode.clone())
-        .unwrap_or_else(|| spec.default_reasoning_mode.clone());
+    let reasoning_efforts = entry
+        .and_then(|entry| entry.reasoning_efforts.clone())
+        .unwrap_or_else(|| spec.reasoning_efforts.clone());
+    let default_reasoning_effort = entry
+        .and_then(|entry| entry.default_reasoning_effort)
+        .unwrap_or(spec.default_reasoning_effort);
+    let reasoning_summary = entry
+        .and_then(|entry| entry.reasoning_summary)
+        .or(spec.reasoning_summary);
     let mut extra_body = spec.extra_body.clone();
     if let Some(entry) = entry {
         merge_map(&mut extra_body, &entry.extra_body);
@@ -739,8 +844,9 @@ fn resolved_model(
         top_p: entry.and_then(|entry| entry.top_p).or(spec.top_p),
         extra_body,
         hosted_tools,
-        reasoning,
-        default_reasoning_mode,
+        reasoning_efforts,
+        default_reasoning_effort,
+        reasoning_summary,
         capabilities: entry
             .and_then(|entry| entry.capabilities)
             .unwrap_or(spec.capabilities),
@@ -799,18 +905,23 @@ fn available_input_tokens(
 }
 
 fn validate_reasoning(
-    reasoning: &IndexMap<String, Map<String, Value>>,
-    default_mode: &str,
+    efforts: &[ReasoningEffort],
+    default_effort: ReasoningEffort,
     source: &str,
 ) -> Result<(), ModelClientError> {
-    validate_identifier(default_mode, &format!("{source} defaultReasoningMode"))?;
-    for (mode, body) in reasoning {
-        validate_identifier(mode, &format!("{source} reasoning mode"))?;
-        validate_body(body, &format!("{source} reasoning.{mode}"))?;
+    let mut unique = HashSet::new();
+    for effort in efforts {
+        if !unique.insert(*effort) {
+            return Err(ModelClientError::config(format!(
+                "{source} repeats reasoning effort {}",
+                effort.as_str()
+            )));
+        }
     }
-    if default_mode != "auto" && !reasoning.contains_key(default_mode) {
+    if !efforts.is_empty() && !efforts.contains(&default_effort) {
         return Err(ModelClientError::config(format!(
-            "{source} defaultReasoningMode {default_mode} is not configured"
+            "{source} defaultReasoningEffort {} is not supported",
+            default_effort.as_str()
         )));
     }
     Ok(())

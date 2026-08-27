@@ -1761,7 +1761,7 @@ fn middle_reasoning_mode(modes: &[String]) -> Option<String> {
 
 fn reasoning_mode_rank(mode: &str) -> u8 {
     match mode.trim().to_ascii_lowercase().as_str() {
-        "none" | "nonthink" => 0,
+        "off" | "none" | "nonthink" => 0,
         "auto" => 1,
         "minimal" => 2,
         "low" => 3,

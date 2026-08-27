@@ -6,37 +6,17 @@ models:
     capabilities:
       imageInput: true
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-      xSearch:
-        type: x_search
-    defaultReasoningMode: High
-    reasoning:
-      Low:
-        reasoning: {effort: low, summary: auto}
-      Medium:
-        reasoning: {effort: medium, summary: auto}
-      High:
-        reasoning: {effort: high, summary: auto}
+    hostedTools: [web_search, x_search]
+    defaultReasoningEffort: high
+    reasoningEfforts: [low, medium, high]
+    reasoningSummary: auto
   grok-4.6:
     contextWindowTokens: 500000
     maxOutputTokens: 128000
     capabilities:
       imageInput: true
       toolCalls: true
-    hostedTools:
-      webSearch:
-        type: web_search
-      xSearch:
-        type: x_search
-    defaultReasoningMode: High
-    reasoning:
-      Low:
-        reasoning: {effort: low, summary: auto}
-      Medium:
-        reasoning: {effort: medium, summary: auto}
-      High:
-        reasoning: {effort: high, summary: auto}
-      XHigh:
-        reasoning: {effort: xhigh, summary: auto}
+    hostedTools: [web_search, x_search]
+    defaultReasoningEffort: high
+    reasoningEfforts: [low, medium, high, xhigh]
+    reasoningSummary: auto

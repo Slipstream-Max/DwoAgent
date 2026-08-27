@@ -267,8 +267,14 @@ pub struct SessionModelOption {
     pub id: String,
     pub name: String,
     pub provider: String,
-    pub reasoning: Vec<String>,
+    pub reasoning: Vec<ReasoningOption>,
     pub default_reasoning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningOption {
+    pub id: String,
+    pub name: String,
 }
 
 #[cfg(test)]

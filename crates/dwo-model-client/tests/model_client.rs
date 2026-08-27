@@ -70,16 +70,14 @@ families:
         capabilities:
           imageInput: true
           toolCalls: true
-        hostedTools:
-          webSearch:
-            type: web_search
-        reasoning:
-          Low:
-            reasoning:
-              effort: low
-            extra_body:
-              thinking:
-                type: enabled
+        hostedTools: [web_search]
+        defaultReasoningEffort: low
+        reasoningEfforts: [off, auto, low, high]
+        reasoningSummary: auto
+        extraBody:
+          extra_body:
+            thinking:
+              type: enabled
 "#
 }
 
@@ -88,7 +86,7 @@ fn agent(endpoint: &str) -> String {
         r#"
 default:
   model: local/test-model
-  reasoning: Low
+  reasoning: low
 compactionTriggerRatio: 0.8
 providers:
   local:
@@ -156,7 +154,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
         .stream_turn(
             ModelSelection {
                 model: "local/test-model".to_string(),
-                reasoning: Some("Low".to_string()),
+                reasoning: Some("low".to_string()),
             },
             &messages,
             &tools,
@@ -224,6 +222,7 @@ async fn streaming_turn_emits_deltas_and_assembles_tool_calls() {
     assert_eq!(request["tools"][0]["type"], "web_search");
     assert_eq!(request["tools"][1]["name"], "terminal");
     assert_eq!(request["reasoning"]["effort"], "low");
+    assert_eq!(request["reasoning"]["summary"], "auto");
     assert_eq!(request["extra_body"]["provider_flag"], true);
     assert_eq!(request["extra_body"]["thinking"]["type"], "enabled");
 }
@@ -255,7 +254,7 @@ async fn streaming_turn_preserves_plaintext_reasoning_content() {
         .stream_turn(
             ModelSelection {
                 model: "local/test-model".to_string(),
-                reasoning: Some("Low".to_string()),
+                reasoning: Some("low".to_string()),
             },
             &messages,
             &[],
@@ -413,6 +412,72 @@ async fn completion_uses_non_streaming_request_without_tools() {
 }
 
 #[tokio::test]
+async fn auto_reasoning_omits_effort_but_keeps_model_summary() {
+    let payload = json!({
+        "status":"completed",
+        "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]
+    });
+    let body = payload.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (endpoint, request_rx) = one_response_server(response).await;
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
+    client
+        .complete(
+            ModelSelection {
+                model: "local/test-model".to_string(),
+                reasoning: Some("auto".to_string()),
+            },
+            vec![
+                ContextMessage::system("system"),
+                ContextMessage::user("hello"),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let request = request_rx.await.unwrap();
+    assert!(request["reasoning"].get("effort").is_none());
+    assert_eq!(request["reasoning"]["summary"], "auto");
+}
+
+#[tokio::test]
+async fn off_reasoning_maps_to_none_and_keeps_model_summary() {
+    let payload = json!({
+        "status":"completed",
+        "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]
+    });
+    let body = payload.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (endpoint, request_rx) = one_response_server(response).await;
+    let client = ConfiguredModelClient::from_yaml(catalog(), &agent(&endpoint)).unwrap();
+    client
+        .complete(
+            ModelSelection {
+                model: "local/test-model".to_string(),
+                reasoning: Some("off".to_string()),
+            },
+            vec![
+                ContextMessage::system("system"),
+                ContextMessage::user("hello"),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let request = request_rx.await.unwrap();
+    assert_eq!(request["reasoning"]["effort"], "none");
+    assert_eq!(request["reasoning"]["summary"], "auto");
+}
+
+#[tokio::test]
 async fn responses_always_uses_max_output_tokens() {
     let payload = json!({
         "status":"completed",
@@ -507,7 +572,7 @@ fn official_provider_expands_the_complete_family() {
         r#"
 default:
   model: deepseek/deepseek-v4-pro
-  reasoning: High
+  reasoning: high
 compactionTriggerRatio: 0.5
 providers:
   deepseek:
@@ -523,7 +588,7 @@ providers:
         "https://api.deepseek.com"
     );
     assert_eq!(resolved.default_model, "deepseek/deepseek-v4-pro");
-    assert_eq!(resolved.default_reasoning.as_deref(), Some("High"));
+    assert_eq!(resolved.default_reasoning.as_deref(), Some("high"));
     let model = &resolved.models["deepseek/deepseek-v4-pro"];
     assert_eq!(model.model_name, "deepseek-v4-pro");
     assert_eq!(model.max_input_tokens().unwrap(), 616_000);
@@ -740,11 +805,8 @@ models:
     maxOutputTokens: 32000
     capabilities:
       toolCalls: true
-    defaultReasoningMode: High
-    reasoning:
-      High:
-        reasoning:
-          effort: high
+    defaultReasoningEffort: high
+    reasoningEfforts: [high]
 "#,
     )
     .unwrap();

@@ -11,6 +11,7 @@ use dwo_agent_service::{
 use dwo_context::ExternalRuleFile;
 use dwo_mcp::McpRuntime;
 use dwo_project::ProjectService;
+use dwo_protocol::ReasoningOption;
 use dwo_tools::{PolicyConfig, SessionMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -91,8 +92,50 @@ impl RuntimeProfile {
                     id: id.clone(),
                     name: model.model_name.clone(),
                     provider: model.provider.clone(),
-                    reasoning: model.reasoning.keys().cloned().collect(),
-                    default_reasoning: model.default_reasoning_mode.clone(),
+                    reasoning: model
+                        .reasoning_efforts
+                        .iter()
+                        .map(|effort| ReasoningOption {
+                            id: effort.as_str().to_string(),
+                            name: effort.display_name().to_string(),
+                        })
+                        .collect(),
+                    default_reasoning: model.default_reasoning_effort.as_str().to_string(),
+                })
+                .collect(),
+            available_models: loaded
+                .models
+                .models
+                .iter()
+                .map(|(id, model)| {
+                    let mut hosted_tools = model
+                        .hosted_tools
+                        .iter()
+                        .filter_map(|tool| {
+                            tool.get("type").and_then(Value::as_str).map(str::to_owned)
+                        })
+                        .collect::<Vec<_>>();
+                    hosted_tools.sort();
+                    hosted_tools.dedup();
+                    AvailableModel {
+                        id: id.clone(),
+                        name: model.model_name.clone(),
+                        provider: model.provider.clone(),
+                        capabilities: AvailableModelCapabilities {
+                            image_input: model.capabilities.image_input,
+                            tool_calls: model.capabilities.tool_calls,
+                            hosted_tools,
+                        },
+                        reasoning: model
+                            .reasoning_efforts
+                            .iter()
+                            .map(|effort| ReasoningOption {
+                                id: effort.as_str().to_string(),
+                                name: effort.display_name().to_string(),
+                            })
+                            .collect(),
+                        default_reasoning: model.default_reasoning_effort.as_str().to_string(),
+                    }
                 })
                 .collect(),
         }
@@ -139,8 +182,27 @@ pub(crate) struct SessionModelOption {
     id: String,
     name: String,
     provider: String,
-    reasoning: Vec<String>,
+    reasoning: Vec<ReasoningOption>,
     default_reasoning: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AvailableModel {
+    id: String,
+    name: String,
+    provider: String,
+    capabilities: AvailableModelCapabilities,
+    reasoning: Vec<ReasoningOption>,
+    default_reasoning: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AvailableModelCapabilities {
+    image_input: bool,
+    tool_calls: bool,
+    hosted_tools: Vec<String>,
 }
 
 #[derive(Serialize)]

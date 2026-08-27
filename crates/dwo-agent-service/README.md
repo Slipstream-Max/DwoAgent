@@ -25,7 +25,7 @@ externalRuleFiles: []
 model:
   default:
     model: deepseek/deepseek-v4-pro
-    reasoning: High
+    reasoning: high
   compactionTriggerRatio: 0.5
   providers:
     deepseek:

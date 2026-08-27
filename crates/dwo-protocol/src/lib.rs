@@ -8,7 +8,7 @@ pub use registry::{
     is_side_effect_method, method_allowed, method_spec,
 };
 pub use rpc::{
-    PromptDirectiveOption, PromptDirectiveOptions, RpcError, RpcEvent, RpcRequest, RpcResponse,
-    RpcRoute, SessionConfig, SessionInfo, SessionMode, SessionModelOption, SessionOptions,
-    SessionRecord, SessionSnapshot,
+    PromptDirectiveOption, PromptDirectiveOptions, ReasoningOption, RpcError, RpcEvent, RpcRequest,
+    RpcResponse, RpcRoute, SessionConfig, SessionInfo, SessionMode, SessionModelOption,
+    SessionOptions, SessionRecord, SessionSnapshot,
 };

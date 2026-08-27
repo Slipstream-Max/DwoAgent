@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ModelConfig, ProviderConfig};
+use crate::config::{ModelConfig, ProviderConfig, ReasoningEffort};
 use crate::message::{
     StreamAccumulator, parse_response, provider_input, provider_tool_event_state, provider_tools,
     stream_tool_call,
@@ -114,14 +114,30 @@ impl BaseClient {
             "max_output_tokens".to_string(),
             json!(model.max_output_tokens),
         );
-        let mode = reasoning.unwrap_or(&model.default_reasoning_mode);
-        if let Some(override_body) = model.reasoning.get(mode) {
-            merge_map(&mut body, override_body);
-        } else if mode != "auto" {
+        let effort = match reasoning {
+            Some(value) => ReasoningEffort::parse(value).ok_or_else(|| {
+                ModelClientError::config(format!("unknown reasoning effort {value}"))
+            })?,
+            None => model.default_reasoning_effort,
+        };
+        if !model.reasoning_efforts.contains(&effort)
+            && (reasoning.is_some() || effort != ReasoningEffort::Auto)
+        {
             return Err(ModelClientError::config(format!(
-                "model {} does not configure reasoning mode {mode}",
-                model.model_id
+                "model {} does not support reasoning effort {}",
+                model.model_id,
+                effort.as_str()
             )));
+        }
+        let mut reasoning_body = Map::new();
+        if let Some(effort) = effort.wire_value() {
+            reasoning_body.insert("effort".to_string(), json!(effort));
+        }
+        if let Some(summary) = model.reasoning_summary {
+            reasoning_body.insert("summary".to_string(), json!(summary.as_str()));
+        }
+        if !reasoning_body.is_empty() {
+            body.insert("reasoning".to_string(), Value::Object(reasoning_body));
         }
         body.insert("model".to_string(), Value::String(model.model_id.clone()));
         body.insert("input".to_string(), Value::Array(input));

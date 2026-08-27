@@ -107,7 +107,7 @@ model:
   # Stable provider/modelId selection. Reasoning is optional.
   default:
     model: deepseek/deepseek-v4-pro
-    reasoning: High
+    reasoning: high
 
   # Agent context policy default; an explicit provider model may override it.
   compactionTriggerRatio: 0.5

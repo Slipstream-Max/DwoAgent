@@ -172,7 +172,7 @@ fn parse_server(
             description,
         }));
     }
-    if !matches!(kind, Some("streamableHttp" | "http")) {
+    if !matches!(kind, Some("streamableHttp" | "streamable-http" | "http")) {
         return Err(Error::InvalidConfig(format!(
             "mcpServers.{name}.type is unsupported"
         )));
@@ -498,6 +498,19 @@ mod tests {
             McpConfig::from_slice(br#"{"mcpServers":{"bad":{"type":"sse","url":"x"}}}"#, None)
                 .unwrap_err();
         assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn accepts_claude_streamable_http_transport_alias() {
+        let config = McpConfig::from_slice(
+            br#"{"mcpServers":{"remote":{"type":"streamable-http","url":"https://example.test/mcp"}}}"#,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.servers["remote"],
+            McpServerConfig::StreamableHttp(_)
+        ));
     }
 
     #[test]

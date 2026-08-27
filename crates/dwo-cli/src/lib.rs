@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use dwo_mcp::SearchGroup;
 use serde_json::{Value, json};
@@ -63,6 +65,14 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
+    },
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
     },
     Automation {
         #[arg(long, global = true)]
@@ -180,6 +190,36 @@ enum ManagedChannelCommand {
 enum McpCommand {
     /// List configured MCP server names and their current status.
     List,
+    /// Show a configured MCP server with redacted configuration and runtime status.
+    Get { name: String },
+    /// Add an MCP server using Claude Code-compatible arguments.
+    Add {
+        /// MCP transport. DWO currently supports stdio and http.
+        #[arg(short = 't', long, value_enum, default_value_t = McpTransportArg::Stdio)]
+        transport: McpTransportArg,
+        /// Environment variable for a stdio server, in KEY=value form. May be repeated.
+        #[arg(short = 'e', long, value_name = "KEY=value")]
+        env: Vec<String>,
+        /// HTTP header for an HTTP server, in "Name: value" form. May be repeated.
+        #[arg(short = 'H', long, value_name = "Name: value")]
+        header: Vec<String>,
+        /// MCP server name.
+        name: String,
+        /// HTTP URL for --transport http.
+        #[arg(
+            conflicts_with = "command",
+            required_unless_present = "command",
+            value_name = "URL"
+        )]
+        url: Option<String>,
+        /// Stdio command and its arguments. Put these after `--`.
+        #[arg(last = true, allow_hyphen_values = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Add one MCP server entry from JSON.
+    AddJson { name: String, json: String },
+    /// Remove an MCP server configuration.
+    Remove { name: String },
     /// Search configured MCP servers and tools.
     Search {
         /// Case-insensitive terms matched against server and tool metadata.
@@ -197,6 +237,47 @@ enum McpCommand {
         #[arg(long)]
         logout: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum McpTransportArg {
+    Stdio,
+    #[value(alias = "streamable-http", alias = "streamableHttp")]
+    Http,
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// List enabled models grouped by provider.
+    List,
+    /// Show the model and reasoning mode used for new sessions.
+    GetDefault,
+    /// Set the model and reasoning mode used for new sessions.
+    SetDefault {
+        /// Model reference in provider/model form.
+        model: String,
+        /// Reasoning mode supported by the selected model.
+        #[arg(long)]
+        reasoning: String,
+        /// Context compaction trigger ratio used by models without an override.
+        #[arg(long)]
+        compaction_trigger_ratio: Option<f64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillsCommand {
+    /// List installed skills.
+    List,
+    /// Add one Markdown file or a directory containing SKILL.md.
+    Add {
+        source: PathBuf,
+        /// Destination skill name. Defaults to the source filename or directory name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove an installed skill.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -318,6 +399,8 @@ where
         Command::Channel { command } => run_channel(command, &config_path).await?,
         Command::Websocket { command } => run_websocket(command, &config_path).await?,
         Command::Mcp { command } => run_mcp(command, &config_path).await?,
+        Command::Model { command } => run_model(command, &config_path).await?,
+        Command::Skills { command } => run_skills(command, &config_path).await?,
         Command::Automation { project, command } => {
             run_automation(command, project, &config_path).await?
         }
@@ -538,6 +621,85 @@ async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
             let catalog: dwo_mcp::Catalog = serde_json::from_value(value)?;
             output::line(format_args!("{}", dwo_mcp::render_list(&catalog)))?;
         }
+        McpCommand::Get { name } => {
+            let value = ipc::request_dwo(config_path, "mcp.get", json!({"server": name})).await?;
+            render::write_value(&value)?;
+        }
+        McpCommand::Add {
+            transport,
+            env,
+            header,
+            name,
+            url,
+            command,
+        } => {
+            let config = match transport {
+                McpTransportArg::Stdio => {
+                    anyhow::ensure!(
+                        header.is_empty(),
+                        "--header is only available with --transport http"
+                    );
+                    let env = parse_mcp_assignments(&env, '=', "--env")?;
+                    anyhow::ensure!(url.is_none(), "a stdio command must be placed after --");
+                    let (command, args) = command
+                        .split_first()
+                        .context("a stdio command is required after --")?;
+                    json!({
+                        "command": command,
+                        "args": args,
+                        "env": env,
+                    })
+                }
+                McpTransportArg::Http => {
+                    anyhow::ensure!(
+                        env.is_empty(),
+                        "--env is only available with --transport stdio"
+                    );
+                    anyhow::ensure!(
+                        command.is_empty(),
+                        "--transport http accepts a URL, not a command after --"
+                    );
+                    let headers = parse_mcp_assignments(&header, ':', "--header")?;
+                    let url = url.context("--transport http requires a URL")?;
+                    json!({
+                        "type": "http",
+                        "url": url,
+                        "headers": headers,
+                    })
+                }
+            };
+            ipc::request_dwo(
+                config_path,
+                "mcp.install",
+                json!({"server": name, "config": config}),
+            )
+            .await?;
+            output::line(format_args!("Added MCP {name}"))?;
+        }
+        McpCommand::AddJson { name, json: source } => {
+            let config: Value = serde_json::from_str(&source).context("parse MCP JSON")?;
+            anyhow::ensure!(
+                config.is_object(),
+                "MCP JSON must be a server configuration object"
+            );
+            anyhow::ensure!(
+                config.get("mcpServers").is_none(),
+                "mcp add-json accepts one server entry, not an mcpServers wrapper"
+            );
+            ipc::request_dwo(
+                config_path,
+                "mcp.install",
+                json!({"server": name, "config": config}),
+            )
+            .await?;
+            output::line(format_args!("Added MCP {name}"))?;
+        }
+        McpCommand::Remove { name } => {
+            let value =
+                ipc::request_dwo(config_path, "mcp.uninstall", json!({"server": name})).await?;
+            anyhow::ensure!(value["removed"] == true, "MCP server not found: {name}");
+            output::line(format_args!("Removed MCP {name}"))?;
+        }
         McpCommand::Search { query } => {
             let value =
                 ipc::request_dwo(config_path, "mcp.search", json!({"query": query})).await?;
@@ -568,6 +730,216 @@ async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
                 "Authorization {}",
                 if logout { "removed" } else { "updated" }
             ))?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_model(command: ModelCommand, config_path: &Path) -> Result<()> {
+    match command {
+        ModelCommand::List => {
+            let value = ipc::request_dwo(config_path, "model.available", json!({})).await?;
+            render::write_model_list(&value)?;
+        }
+        ModelCommand::GetDefault => {
+            let value = ipc::request_dwo(config_path, "model.get_default", json!({})).await?;
+            render::write_value(&value)?;
+        }
+        ModelCommand::SetDefault {
+            model,
+            reasoning,
+            compaction_trigger_ratio,
+        } => {
+            let value = ipc::request_dwo(
+                config_path,
+                "model.set_default",
+                json!({
+                    "model": model,
+                    "reasoning": reasoning,
+                    "compactionTriggerRatio": compaction_trigger_ratio,
+                }),
+            )
+            .await?;
+            render::write_value(&value)?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_skills(command: SkillsCommand, config_path: &Path) -> Result<()> {
+    match command {
+        SkillsCommand::List => {
+            let value = ipc::request_dwo(config_path, "skill.list", json!({})).await?;
+            render::write_value(&value)?;
+        }
+        SkillsCommand::Add { source, name } => {
+            let import = read_skill_import(&source, name)?;
+            let files = import
+                .files
+                .into_iter()
+                .map(|file| {
+                    json!({
+                        "path": file.path,
+                        "contentBase64": STANDARD.encode(file.content),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let name = import.name;
+            ipc::request_dwo(
+                config_path,
+                "skill.install",
+                json!({"name": name, "files": files}),
+            )
+            .await?;
+            output::line(format_args!("Added skill {name}"))?;
+        }
+        SkillsCommand::Remove { name } => {
+            let value =
+                ipc::request_dwo(config_path, "skill.uninstall", json!({"name": name})).await?;
+            anyhow::ensure!(value["removed"] == true, "skill not found: {name}");
+            output::line(format_args!("Removed skill {name}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_mcp_assignments(
+    values: &[String],
+    separator: char,
+    option: &str,
+) -> Result<BTreeMap<String, String>> {
+    let mut assignments = BTreeMap::new();
+    for value in values {
+        let (key, raw_value) = value
+            .split_once(separator)
+            .with_context(|| format!("{option} expects KEY{separator}VALUE"))?;
+        let key = key.trim();
+        anyhow::ensure!(!key.is_empty(), "{option} key must not be empty");
+        let value = if separator == ':' {
+            raw_value.trim_start().to_string()
+        } else {
+            raw_value.to_string()
+        };
+        anyhow::ensure!(
+            assignments.insert(key.to_string(), value).is_none(),
+            "{option} repeats key {key}"
+        );
+    }
+    Ok(assignments)
+}
+
+struct SkillImport {
+    name: String,
+    files: Vec<SkillImportFile>,
+}
+
+struct SkillImportFile {
+    path: String,
+    content: Vec<u8>,
+}
+
+fn read_skill_import(source: &Path, name: Option<String>) -> Result<SkillImport> {
+    let metadata = std::fs::symlink_metadata(source)
+        .with_context(|| format!("read skill source {}", source.display()))?;
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "skill source must not be a symbolic link: {}",
+        source.display()
+    );
+    if metadata.is_file() {
+        let extension = source.extension().and_then(|extension| extension.to_str());
+        anyhow::ensure!(
+            extension.is_some_and(|extension| extension.eq_ignore_ascii_case("md")),
+            "skill file must have a .md extension: {}",
+            source.display()
+        );
+        let inferred = skill_name_for_file(source)?;
+        return Ok(SkillImport {
+            name: name.unwrap_or(inferred),
+            files: vec![SkillImportFile {
+                path: "SKILL.md".to_string(),
+                content: std::fs::read(source)
+                    .with_context(|| format!("read skill file {}", source.display()))?,
+            }],
+        });
+    }
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "skill source must be a Markdown file or directory: {}",
+        source.display()
+    );
+    let inferred = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .context("skill directory has no usable name; pass --name")?
+        .to_string();
+    let mut files = Vec::new();
+    collect_skill_import_files(source, source, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    anyhow::ensure!(
+        files.iter().any(|file| file.path == "SKILL.md"),
+        "skill directory must contain SKILL.md at its root"
+    );
+    Ok(SkillImport {
+        name: name.unwrap_or(inferred),
+        files,
+    })
+}
+
+fn skill_name_for_file(source: &Path) -> Result<String> {
+    let filename = source.file_name().and_then(|name| name.to_str());
+    let name = if filename.is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md")) {
+        source
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+    } else {
+        source.file_stem().and_then(|name| name.to_str())
+    };
+    name.filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .context("skill file has no usable name; pass --name")
+}
+
+fn collect_skill_import_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<SkillImportFile>,
+) -> Result<()> {
+    let mut entries = std::fs::read_dir(directory)
+        .with_context(|| format!("read skill directory {}", directory.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        anyhow::ensure!(
+            !file_type.is_symlink(),
+            "skill directory must not contain symbolic links: {}",
+            path.display()
+        );
+        if file_type.is_dir() {
+            collect_skill_import_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .expect("skill import path must remain below its root");
+            let path = relative
+                .components()
+                .map(|component| {
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .context("skill source path is not valid UTF-8")
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("/");
+            files.push(SkillImportFile {
+                path,
+                content: std::fs::read(&entry.path())
+                    .with_context(|| format!("read skill file {}", entry.path().display()))?,
+            });
         }
     }
     Ok(())
@@ -1232,6 +1604,204 @@ mod tests {
                 }
             } if server == "github"
         ));
+    }
+
+    #[test]
+    fn parses_mcp_management_commands() {
+        let stdio = Cli::try_parse_from([
+            "dwo",
+            "mcp",
+            "add",
+            "-e",
+            "TOKEN=value",
+            "filesystem",
+            "--",
+            "npx",
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+        ])
+        .unwrap();
+        let Command::Mcp {
+            command:
+                McpCommand::Add {
+                    transport,
+                    env,
+                    header,
+                    name,
+                    url,
+                    command,
+                },
+        } = stdio.command
+        else {
+            panic!("expected stdio MCP add command")
+        };
+        assert_eq!(transport, McpTransportArg::Stdio);
+        assert_eq!(env, vec!["TOKEN=value"]);
+        assert!(header.is_empty());
+        assert_eq!(name, "filesystem");
+        assert_eq!(
+            command,
+            vec!["npx", "-y", "@modelcontextprotocol/server-filesystem"]
+        );
+        assert!(url.is_none());
+
+        let http = Cli::try_parse_from([
+            "dwo",
+            "mcp",
+            "add",
+            "-t",
+            "http",
+            "-H",
+            "Authorization: Bearer token",
+            "notion",
+            "https://mcp.notion.com/mcp",
+        ])
+        .unwrap();
+        let Command::Mcp {
+            command:
+                McpCommand::Add {
+                    transport,
+                    header,
+                    name,
+                    url,
+                    command,
+                    ..
+                },
+        } = http.command
+        else {
+            panic!("expected HTTP MCP add command")
+        };
+        assert_eq!(transport, McpTransportArg::Http);
+        assert_eq!(header, vec!["Authorization: Bearer token"]);
+        assert_eq!(name, "notion");
+        assert_eq!(url.as_deref(), Some("https://mcp.notion.com/mcp"));
+        assert!(command.is_empty());
+
+        let get = Cli::try_parse_from(["dwo", "mcp", "get", "notion"]).unwrap();
+        assert!(matches!(
+            get.command,
+            Command::Mcp {
+                command: McpCommand::Get { ref name }
+            } if name == "notion"
+        ));
+
+        let add_json = Cli::try_parse_from([
+            "dwo",
+            "mcp",
+            "add-json",
+            "notion",
+            r#"{"type":"http","url":"https://mcp.notion.com/mcp"}"#,
+        ])
+        .unwrap();
+        assert!(matches!(
+            add_json.command,
+            Command::Mcp {
+                command: McpCommand::AddJson { ref name, ref json }
+            } if name == "notion" && json.contains("mcp.notion.com")
+        ));
+
+        let remove = Cli::try_parse_from(["dwo", "mcp", "remove", "notion"]).unwrap();
+        assert!(matches!(
+            remove.command,
+            Command::Mcp {
+                command: McpCommand::Remove { ref name }
+            } if name == "notion"
+        ));
+    }
+
+    #[test]
+    fn parses_model_and_skill_management_commands() {
+        let list = Cli::try_parse_from(["dwo", "model", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Model {
+                command: ModelCommand::List
+            }
+        ));
+
+        let get_default = Cli::try_parse_from(["dwo", "model", "get-default"]).unwrap();
+        assert!(matches!(
+            get_default.command,
+            Command::Model {
+                command: ModelCommand::GetDefault
+            }
+        ));
+
+        let set_default = Cli::try_parse_from([
+            "dwo",
+            "model",
+            "set-default",
+            "deepseek/deepseek-v4-pro",
+            "--reasoning",
+            "high",
+            "--compaction-trigger-ratio",
+            "0.75",
+        ])
+        .unwrap();
+        assert!(matches!(
+            set_default.command,
+            Command::Model {
+                command: ModelCommand::SetDefault {
+                    ref model,
+                    ref reasoning,
+                    compaction_trigger_ratio: Some(ratio),
+                }
+            } if model == "deepseek/deepseek-v4-pro" && reasoning == "high" && ratio == 0.75
+        ));
+        assert!(
+            Cli::try_parse_from(["dwo", "model", "set-default", "deepseek/deepseek-v4-pro",])
+                .is_err()
+        );
+
+        let add = Cli::try_parse_from([
+            "dwo",
+            "skills",
+            "add",
+            "C:/skills/release-notes",
+            "--name",
+            "release-notes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add.command,
+            Command::Skills {
+                command: SkillsCommand::Add { ref source, name: Some(ref name) }
+            } if source == &PathBuf::from("C:/skills/release-notes") && name == "release-notes"
+        ));
+
+        let remove = Cli::try_parse_from(["dwo", "skills", "remove", "release-notes"]).unwrap();
+        assert!(matches!(
+            remove.command,
+            Command::Skills {
+                command: SkillsCommand::Remove { ref name }
+            } if name == "release-notes"
+        ));
+    }
+
+    #[test]
+    fn reads_single_file_and_directory_skill_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("release-notes.md");
+        std::fs::write(&file, "Write release notes.").unwrap();
+        let file_import = read_skill_import(&file, None).unwrap();
+        assert_eq!(file_import.name, "release-notes");
+        assert_eq!(file_import.files.len(), 1);
+        assert_eq!(file_import.files[0].path, "SKILL.md");
+
+        let directory = root.path().join("deploy");
+        std::fs::create_dir_all(directory.join("references")).unwrap();
+        std::fs::write(directory.join("SKILL.md"), "Deploy safely.").unwrap();
+        std::fs::write(directory.join("references/example.txt"), "example").unwrap();
+        let directory_import = read_skill_import(&directory, None).unwrap();
+        assert_eq!(directory_import.name, "deploy");
+        assert_eq!(
+            directory_import
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["SKILL.md", "references/example.txt"]
+        );
     }
 
     #[test]

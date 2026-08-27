@@ -239,6 +239,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     command("automation.run", MethodRoute::Dwo, Some("automation.run")),
     query("mcp.list", MethodRoute::Dwo),
     query("mcp.config", MethodRoute::Dwo),
+    query("mcp.get", MethodRoute::Dwo),
     query("mcp.search", MethodRoute::Dwo),
     command("mcp.call", MethodRoute::Dwo, None),
     command("mcp.auth.login", MethodRoute::Dwo, Some("mcp.status")),
@@ -254,6 +255,8 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     command("skill.install", MethodRoute::Dwo, Some("skill.changed")),
     command("skill.uninstall", MethodRoute::Dwo, Some("skill.changed")),
     query("model.list", MethodRoute::Dwo),
+    query("model.available", MethodRoute::Dwo),
+    query("model.get_default", MethodRoute::Dwo),
     command(
         "model.set_default",
         MethodRoute::Dwo,

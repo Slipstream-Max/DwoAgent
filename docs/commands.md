@@ -55,16 +55,32 @@ active turn 运行期间收到的新 prompt 会进入 session FIFO，在当前 m
 
 Session 文件布局和持久化说明见 [Profile 配置指南](profile.md#session-数据)。
 
+## Model
+
+```text
+dwo model list
+dwo model get-default
+dwo model set-default <provider/model> --reasoning <mode> [--compaction-trigger-ratio <ratio>]
+```
+
+`list` 按 provider 分组列出当前有效模型的显示名称、稳定 ID、图片输入/tool call/hosted tool 能力和全部 reasoning mode。`get-default` 显示新 session 的默认 model/reasoning 和全局 `compactionTriggerRatio`。`set-default` 的 `--reasoning` 必填，daemon 会校验该 mode 属于指定模型；可选的 `--compaction-trigger-ratio` 同时更新没有单模型 override 时使用的全局压缩触发比例，有效范围为 `(0, 1]`。这些设置会原子写入 `profile.yaml`，影响之后创建的 session，不覆盖已有 session 的明确选择。
+
 ## MCP
 
 ```text
 dwo mcp list
+dwo mcp get <name>
+dwo mcp add [-t|--transport <stdio|http>] [-e|--env KEY=value] [-H|--header "Name: value"] <name> [<url> | -- <command> [args...]]
+dwo mcp add-json <name> <json>
+dwo mcp remove <name>
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server> [--logout]
 ```
 
-`list` 列出已配置的 MCP server 名称、当前状态和工具数量，不展开工具详情。`search` 只查询 daemon 当前的内存 catalog，不启动或重连 server。查询按 server 名称/描述和 tool 名称/描述匹配：
+`list` 列出已配置的 MCP server 名称、当前状态和工具数量，不展开工具详情。`get` 显示单个 server 的脱敏配置和 runtime status/tool catalog。`add` 的参数与 Claude Code MCP CLI 对齐：默认 transport 是 `stdio`，将命令及其参数放在 `--` 后；HTTP server 使用 `-t http <url>`，`-e` 仅用于 stdio env，`-H` 仅用于 HTTP header。DWO 当前支持 `stdio` 和 streamable HTTP，`streamable-http` 作为 HTTP 配置别名可用于 `add-json`。`add-json` 接受单个 server entry JSON，不接受 `mcpServers` 包装对象。`remove` 删除配置并关闭不再使用的托管连接。
+
+`search` 只查询 daemon 当前的内存 catalog，不启动或重连 server。查询按 server 名称/描述和 tool 名称/描述匹配：
 
 - 只命中 server：列出该 server 的全部工具，但不展开 schema。
 - 只命中 tool：只列出匹配工具，并展开其输入 schema。
@@ -73,6 +89,16 @@ dwo mcp auth <server> [--logout]
 `call` 使用 `server.tool` selector 调用已发现的工具；daemon 会复用托管连接，连接失效时按需重连并刷新 catalog。`auth` 启动 OAuth 登录，`--logout` 删除授权并使该 server 重新进入初始化流程。
 
 MCP 命令输出为 YAML 风格文本。只有 `--args` 的工具参数使用 JSON，因为它们会原样作为 MCP 调用 payload。
+
+## Skills
+
+```text
+dwo skills list
+dwo skills add <file-or-directory> [--name <name>]
+dwo skills remove <name>
+```
+
+`add` 接受单个 `.md` 文件或 skill 目录。单文件会安装为 `<name>/SKILL.md`，默认名称取文件名；目录会递归导入并要求根目录存在 `SKILL.md`，以保留 references、scripts 和 assets。`--name` 可覆盖目标名称。`list` 列出 active 和 disabled skills；`remove` 删除任一状态下的同名 skill。只有 active skills 会在构建 system prompt 时写入上下文。
 
 ## Channel
 

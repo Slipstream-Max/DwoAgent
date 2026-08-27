@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use dwo_agent_service::{RuntimePhase, SessionStatusSnapshot};
 use serde_json::Value;
@@ -15,6 +17,130 @@ pub fn write_value(value: &Value) -> Result<()> {
 
 pub fn render_value(value: &Value) -> String {
     serde_yaml::to_string(value).unwrap_or_else(|_| "value: <unrenderable>\n".to_string())
+}
+
+pub fn write_model_list(value: &Value) -> Result<()> {
+    let default_model = value
+        .get("default")
+        .and_then(|default| default.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let default_reasoning = value
+        .get("default")
+        .and_then(|default| default.get("reasoning"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    output::line(format_args!(
+        "Default: {default_model}  reasoning={default_reasoning}"
+    ))?;
+
+    let mut providers: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+    for model in value
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let provider = model
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        providers.entry(provider).or_default().push(model);
+    }
+    if providers.is_empty() {
+        output::line(format_args!("No models configured"))?;
+        return Ok(());
+    }
+
+    for (provider, models) in providers {
+        output::line(format_args!(""))?;
+        output::line(format_args!("{provider}"))?;
+        for model in models {
+            let name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let id = model
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let capabilities = render_model_capabilities(model.get("capabilities"));
+            let reasoning = model
+                .get("reasoning")
+                .and_then(Value::as_array)
+                .map(|modes| {
+                    modes
+                        .iter()
+                        .filter_map(|option| option.get("name").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|modes| !modes.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            let default_reasoning_id = model
+                .get("defaultReasoning")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let default_reasoning = model
+                .get("reasoning")
+                .and_then(Value::as_array)
+                .and_then(|options| {
+                    options.iter().find(|option| {
+                        option.get("id").and_then(Value::as_str) == Some(default_reasoning_id)
+                    })
+                })
+                .and_then(|option| option.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(default_reasoning_id);
+            output::line(format_args!("  {name}"))?;
+            output::line(format_args!("    id: {id}"))?;
+            output::line(format_args!("    capabilities: {capabilities}"))?;
+            output::line(format_args!(
+                "    reasoning: {reasoning}  default={default_reasoning}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn render_model_capabilities(capabilities: Option<&Value>) -> String {
+    let Some(capabilities) = capabilities else {
+        return "-".to_string();
+    };
+    let mut values = Vec::new();
+    if capabilities
+        .get("imageInput")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        values.push("imageInput".to_string());
+    }
+    if capabilities
+        .get("toolCalls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        values.push("toolCalls".to_string());
+    }
+    let hosted_tools = capabilities
+        .get("hostedTools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|tools| !tools.is_empty());
+    if let Some(hosted_tools) = hosted_tools {
+        values.push(format!("hostedTools={hosted_tools}"));
+    }
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(", ")
+    }
 }
 
 pub fn write_session_list(value: &Value) -> Result<()> {

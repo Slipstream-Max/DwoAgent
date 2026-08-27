@@ -40,6 +40,10 @@ impl Host {
         match method {
             "mcp.list" => self.mcp_list().await,
             "mcp.config" => self.mcp_config(),
+            "mcp.get" => {
+                let params: McpServerParam = serde_json::from_value(params)?;
+                self.mcp_get(params.server).await
+            }
             "mcp.search" => {
                 let params: McpSearchParam = serde_json::from_value(params)?;
                 self.mcp_search(params.query).await
@@ -83,6 +87,25 @@ impl Host {
         Ok(super::redacted_mcp_config(&super::read_mcp_document(
             self.mcp.config_path(),
         )?))
+    }
+
+    pub(crate) async fn mcp_get(&self, server: String) -> Result<Value> {
+        super::validate_resource_name(&server)?;
+        let document = super::read_mcp_document(self.mcp.config_path())?;
+        let config = document
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .and_then(|servers| servers.get(&server))
+            .with_context(|| format!("MCP server not found: {server}"))?;
+        let catalog = self.mcp.catalog_snapshot().await?;
+        let runtime = catalog
+            .servers
+            .into_iter()
+            .find(|entry| entry.name == server);
+        Ok(json!({
+            "config": super::redacted_mcp_server_config(&server, config),
+            "runtime": runtime,
+        }))
     }
 
     pub(crate) async fn mcp_search(&self, query: String) -> Result<Value> {
@@ -226,5 +249,44 @@ impl Host {
                 .await?;
         }
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::tests::write_test_profile;
+
+    #[tokio::test]
+    async fn get_returns_redacted_configuration_and_runtime_status() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        host.handle_method(
+            "mcp.install",
+            json!({
+                "server": "private",
+                "config": {
+                    "command": "not-a-real-mcp-command",
+                    "env": {"API_TOKEN": "secret-value"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let value = host
+            .handle_method("mcp.get", json!({"server": "private"}))
+            .await
+            .unwrap();
+        assert_eq!(value["config"]["name"], "private");
+        assert_eq!(value["config"]["type"], "stdio");
+        assert_eq!(value["config"]["credentialsConfigured"], true);
+        assert_eq!(value["runtime"]["name"], "private");
+        assert!(
+            !serde_json::to_string(&value)
+                .unwrap()
+                .contains("secret-value")
+        );
+        host.shutdown().await;
     }
 }

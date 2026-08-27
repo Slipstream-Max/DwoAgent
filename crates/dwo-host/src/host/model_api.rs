@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::Host;
@@ -12,6 +13,8 @@ impl Host {
         params: Value,
     ) -> Result<Value> {
         match method {
+            "model.available" => return self.model_available(),
+            "model.get_default" => return self.model_get_default(),
             "model.catalog.list" => return self.model_catalog_list(),
             "model.catalog.upsert" => {
                 let family = params
@@ -49,9 +52,8 @@ impl Host {
             ("model", "list") => self.model_list(),
             ("provider", "list") => self.provider_list(),
             ("model", "set_default") => {
-                let default: dwo_agent_service::DefaultModelConfig =
-                    serde_json::from_value(params)?;
-                self.model_set_default(default).await
+                let params: SetDefaultParams = serde_json::from_value(params)?;
+                self.model_set_default(params).await
             }
             ("model", "upsert") => {
                 let entry: dwo_agent_service::AgentModelEntry = serde_json::from_value(
@@ -116,16 +118,32 @@ impl Host {
         )
     }
 
-    pub(crate) async fn model_set_default(
-        self: &Arc<Self>,
-        default: dwo_agent_service::DefaultModelConfig,
-    ) -> Result<Value> {
+    pub(crate) fn model_available(&self) -> Result<Value> {
+        let profile = self.profile.read().expect("profile lock poisoned");
+        Ok(json!({
+            "default": default_model_value(&profile.config.model),
+            "models": profile.available_models.clone(),
+        }))
+    }
+
+    pub(crate) fn model_get_default(&self) -> Result<Value> {
+        let profile = self.profile.read().expect("profile lock poisoned");
+        Ok(default_model_value(&profile.config.model))
+    }
+
+    async fn model_set_default(self: &Arc<Self>, params: SetDefaultParams) -> Result<Value> {
         self.edit_profile(|profile| {
-            profile.model.default = default.clone();
+            profile.model.default = dwo_agent_service::DefaultModelConfig {
+                model: params.model.clone(),
+                reasoning: params.reasoning.clone(),
+            };
+            if let Some(ratio) = params.compaction_trigger_ratio {
+                profile.model.compaction_trigger_ratio = ratio;
+            }
             Ok(())
         })
         .await?;
-        Ok(json!({"default": default}))
+        Ok(json!({"default": self.model_get_default()?}))
     }
 
     pub(crate) async fn model_upsert(
@@ -333,10 +351,75 @@ impl Host {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetDefaultParams {
+    model: String,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    compaction_trigger_ratio: Option<f64>,
+}
+
+fn default_model_value(config: &dwo_agent_service::AgentModelConfig) -> Value {
+    json!({
+        "model": config.default.model,
+        "reasoning": config.default.reasoning,
+        "compactionTriggerRatio": config.compaction_trigger_ratio,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::tests::write_test_profile;
+
+    #[tokio::test]
+    async fn available_models_include_resolved_capabilities_and_reasoning() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+
+        let available = host
+            .handle_method("model.available", json!({}))
+            .await
+            .unwrap();
+        let model = available["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == "deepseek/deepseek-v4-pro")
+            .unwrap();
+        assert_eq!(model["name"], "deepseek-v4-pro");
+        assert_eq!(model["provider"], "deepseek");
+        assert_eq!(model["capabilities"]["imageInput"], false);
+        assert_eq!(model["capabilities"]["toolCalls"], true);
+        assert!(
+            model["reasoning"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mode| mode["id"] == "high" && mode["name"] == "High")
+        );
+
+        host.handle_method(
+            "model.set_default",
+            json!({
+                "model": "deepseek/deepseek-v4-pro",
+                "reasoning": "high",
+                "compactionTriggerRatio": 0.65,
+            }),
+        )
+        .await
+        .unwrap();
+        let default = host
+            .handle_method("model.get_default", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(default["model"], "deepseek/deepseek-v4-pro");
+        assert_eq!(default["reasoning"], "high");
+        assert_eq!(default["compactionTriggerRatio"], 0.65);
+        host.shutdown().await;
+    }
 
     #[tokio::test]
     async fn provider_list_reports_a_configured_key_without_exposing_it() {

@@ -77,6 +77,7 @@ struct RuntimeProfile {
     source: String,
     config: dwo_agent_service::AgentProfileConfig,
     model_options: Vec<SessionModelOption>,
+    available_models: Vec<AvailableModel>,
 }
 
 impl RuntimeProfile {
@@ -625,19 +626,21 @@ fn redacted_mcp_config(document: &Value) -> Value {
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|servers| servers.iter())
-        .map(|(name, value)| {
-            let object = value.as_object();
-            json!({
-                "name": name,
-                "enabled": object.and_then(|v| v.get("enabled")).and_then(Value::as_bool).unwrap_or(true),
-                "type": object.and_then(|v| v.get("type")).and_then(Value::as_str).unwrap_or("stdio"),
-                "description": object.and_then(|v| v.get("description")).and_then(Value::as_str),
-                "authConfigured": object.and_then(|v| v.get("auth")).is_some(),
-                "credentialsConfigured": object.is_some_and(|v| v.contains_key("env") || v.contains_key("headers")),
-            })
-        })
+        .map(|(name, value)| redacted_mcp_server_config(name, value))
         .collect::<Vec<_>>();
     json!({"servers": servers})
+}
+
+pub(super) fn redacted_mcp_server_config(name: &str, value: &Value) -> Value {
+    let object = value.as_object();
+    json!({
+        "name": name,
+        "enabled": object.and_then(|v| v.get("enabled")).and_then(Value::as_bool).unwrap_or(true),
+        "type": object.and_then(|v| v.get("type")).and_then(Value::as_str).unwrap_or("stdio"),
+        "description": object.and_then(|v| v.get("description")).and_then(Value::as_str),
+        "authConfigured": object.and_then(|v| v.get("auth")).is_some(),
+        "credentialsConfigured": object.is_some_and(|v| v.contains_key("env") || v.contains_key("headers")),
+    })
 }
 
 pub fn profile_root(config_path: &Path) -> Result<PathBuf> {

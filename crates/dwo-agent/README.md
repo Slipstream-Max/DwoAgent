@@ -58,11 +58,21 @@ dwo channel feishu send-file <path>
 dwo websocket status
 dwo websocket token
 dwo websocket reset-token
+dwo model list
+dwo model get-default
+dwo model set-default <provider/model> --reasoning <mode>
 dwo mcp list
+dwo mcp get <name>
+dwo mcp add [-t|--transport <stdio|http>] [-e|--env KEY=value] [-H|--header "Name: value"] <name> [<url> | -- <command> [args...]]
+dwo mcp add-json <name> <json>
+dwo mcp remove <name>
 dwo mcp search <query>
 dwo mcp call <server.tool> --args '<json>'
 dwo mcp auth <server>
 dwo mcp auth <server> --logout
+dwo skills list
+dwo skills add <file-or-directory> [--name <name>]
+dwo skills remove <name>
 dwo automation --project <id> list [--json]
 dwo automation --project <id> status <job> [--json]
 dwo automation --project <id> add <job> --cron <expr> --prompt <text> [options]

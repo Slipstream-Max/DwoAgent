@@ -60,7 +60,9 @@ Automation Job 保存可选的 `topicId`。完整数据关系、默认未分类�
 | `config.snapshot` | Host 配置摘要、默认模型、模型选项、全局 `maxModelSteps` |
 | `config.update` | 修改 logging、external skill dirs、external rule files、全局 `maxModelSteps` |
 | `model.list` | 模型、Provider 和默认模型配置；credential 已脱敏 |
-| `model.set_default` | 以 `{model: "provider/modelId", reasoning?}` 修改 Host 默认选择 |
+| `model.available` | 已解析的可用模型、能力、reasoning mode 与当前默认选择 |
+| `model.get_default` | 当前 `{model, reasoning, compactionTriggerRatio}` 默认选择 |
+| `model.set_default` | 以 `{model, reasoning?, compactionTriggerRatio?}` 修改 Host 默认选择；省略压缩比时保留现值 |
 | `model.upsert` | 以 `{provider, name, model}` 新增或替换 Provider 内的显示名模型映射 |
 | `model.remove` | 以 `{provider, modelId}` 删除显式模型映射 |
 | `provider.list` | Provider 配置与 credential 是否存在，不回显 key |
@@ -80,7 +82,7 @@ Model/Provider 写入会先合并完整 Model List 并解析整个 Host 配置�
 | `prompt.list/get/set` | 管理 `resource/prompts/*.md`，默认 `System.md` |
 | `rule.list/get/set` | 管理 `resource/prompts/*.md`，默认 `AGENTS.md` |
 | `skill.list` | 返回有效 Skill snapshot 和 disabled 名称 |
-| `skill.install` | 以 `{name, content}` 安装并验证 `SKILL.md` |
+| `skill.install` | 以 `{name, content}` 安装单个 `SKILL.md`，或以 `{name, files:[{path, contentBase64}]}` 导入完整目录 |
 | `skill.enable` / `skill.disable` | 在 active/disabled 目录间切换，下一次 prompt 构建立即生效 |
 | `skill.uninstall` | 删除 active 或 disabled Skill |
 
@@ -92,6 +94,7 @@ Skill 名称只能是单个路径组件。安装失败会清除未通过 frontma
 | --- | --- |
 | `mcp.list` | 当前 runtime catalog、server 状态和 tool schema |
 | `mcp.config` | 脱敏的 server 配置和 enable/auth/credential 状态 |
+| `mcp.get` | 单个 server 的脱敏配置与当前 runtime catalog entry |
 | `mcp.install` | 安装单个 `{server, config}` 或批量 `{servers}` / `{config:{mcpServers}}` |
 | `mcp.enable` / `mcp.disable` | 启停指定 server 并同步 runtime |
 | `mcp.uninstall` | 删除 server 并关闭不再使用的连接 |

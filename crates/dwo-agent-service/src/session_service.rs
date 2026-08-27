@@ -28,7 +28,8 @@ use crate::profile::LoadedAgentProfile;
 use crate::repository::SessionRepository;
 use crate::session::{EndpointId, PromptAccepted, SessionHandle};
 use crate::session_record::{
-    SessionConfigUpdate, SessionId, SessionLlmSettings, SessionRecord, title_from_user_content,
+    SessionConfigUpdate, SessionId, SessionLlmSettings, SessionRecord, SessionUpdate,
+    title_from_user_content,
 };
 use dwo_context::MessageContent;
 
@@ -587,6 +588,14 @@ impl SessionService {
         update: SessionConfigUpdate,
     ) -> Result<(), SessionServiceError> {
         self.load(id).await?.set_config(update).await
+    }
+
+    pub async fn set(
+        &self,
+        id: &SessionId,
+        update: SessionUpdate,
+    ) -> Result<(), SessionServiceError> {
+        self.load(id).await?.set(update).await
     }
 
     pub fn set_external_rule_files(&self, id: &SessionId, files: Vec<ExternalRuleFile>) {

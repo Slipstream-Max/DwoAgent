@@ -105,6 +105,17 @@ enum SessionCommand {
     Keep {
         id: String,
     },
+    Set {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        policy: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        reasoning: Option<String>,
+    },
     Status {
         id: String,
         #[arg(long)]
@@ -972,6 +983,35 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                     "Session already persistent"
                 }
             ))?;
+        }
+        SessionCommand::Set {
+            id,
+            title,
+            policy,
+            model,
+            reasoning,
+        } => {
+            anyhow::ensure!(
+                title.is_some() || policy.is_some() || model.is_some() || reasoning.is_some(),
+                "session set requires at least one field"
+            );
+            let policy = policy
+                .map(|value| dwo_tools::SessionMode::parse(&value).map_err(anyhow::Error::msg))
+                .transpose()?;
+            let value = ipc::request_dwo(
+                config_path,
+                "session.set",
+                json!({
+                    "session_id": id,
+                    "caller_session_id": current_session_id(),
+                    "title": title,
+                    "policy": policy,
+                    "model": model,
+                    "reasoning": reasoning,
+                }),
+            )
+            .await?;
+            render::write_value(&value)?;
         }
         SessionCommand::Status { id, json } => {
             let value =
@@ -1888,6 +1928,38 @@ mod tests {
             Command::Session {
                 command: SessionCommand::Keep { ref id }
             } if id == "session-child"
+        ));
+
+        let set = Cli::try_parse_from([
+            "dwo",
+            "session",
+            "set",
+            "session-child",
+            "--title",
+            "renamed",
+            "--policy",
+            "watch",
+            "--model",
+            "deepseek/deepseek-v4-flash",
+            "--reasoning",
+            "low",
+        ])
+        .unwrap();
+        assert!(matches!(
+            set.command,
+            Command::Session {
+                command: SessionCommand::Set {
+                    ref id,
+                    ref title,
+                    ref policy,
+                    ref model,
+                    ref reasoning,
+                }
+            } if id == "session-child"
+                && title.as_deref() == Some("renamed")
+                && policy.as_deref() == Some("watch")
+                && model.as_deref() == Some("deepseek/deepseek-v4-flash")
+                && reasoning.as_deref() == Some("low")
         ));
 
         let prompt = Cli::try_parse_from([

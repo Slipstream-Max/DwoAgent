@@ -40,7 +40,7 @@ pub use repository::{FsSessionRepository, MemorySessionRepository, SessionReposi
 pub use session::{CompactionAccepted, EndpointId, MessageId, PromptAccepted, SessionHandle};
 pub use session_record::{
     DEFAULT_MAX_MODEL_STEPS, ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionId,
-    SessionInfo, SessionLlmSettings, SessionRecord,
+    SessionInfo, SessionLlmSettings, SessionRecord, SessionUpdate,
 };
 pub use session_service::{
     NewSession, SessionListItem, SessionListPage, SessionListQuery, SessionService,

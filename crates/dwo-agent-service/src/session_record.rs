@@ -132,6 +132,14 @@ pub struct SessionConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUpdate {
+    pub title: Option<String>,
+    pub mode: Option<SessionMode>,
+    pub model: Option<String>,
+    pub reasoning: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "key", content = "value", rename_all = "snake_case")]
 pub enum SessionConfigUpdate {
     Mode(SessionMode),
@@ -277,6 +285,16 @@ impl SessionRecord {
                     .insert(self.llm.model.clone(), self.llm.reasoning.clone());
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn apply_title(&mut self, title: String) -> Result<(), String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("title must not be empty".to_string());
+        }
+        self.info.title = title.to_string();
+        self.auto_title_pending = false;
         Ok(())
     }
 }

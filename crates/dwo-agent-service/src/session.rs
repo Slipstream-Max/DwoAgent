@@ -25,7 +25,8 @@ use crate::events::{
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::repository::SessionRepository;
 use crate::session_record::{
-    ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionRecord, title_from_user_content,
+    ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionRecord, SessionUpdate,
+    title_from_user_content,
 };
 use crate::turn::{self, TurnExecution, TurnOutcome, TurnUpdate};
 
@@ -239,6 +240,13 @@ impl SessionHandle {
             .map_err(|_| SessionServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub(crate) async fn set(&self, update: SessionUpdate) -> Result<(), SessionServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(SessionRequest::Set { update, response }).await?;
+        wait.await
+            .map_err(|_| SessionServiceError::SessionClosed(self.id.clone()))?
+    }
+
     pub(crate) async fn keep(&self) -> Result<bool, SessionServiceError> {
         let (response, wait) = oneshot::channel();
         self.send(SessionRequest::Keep { response }).await?;
@@ -336,6 +344,10 @@ enum SessionRequest {
     },
     SetConfig {
         update: SessionConfigUpdate,
+        response: oneshot::Sender<Result<(), SessionServiceError>>,
+    },
+    Set {
+        update: SessionUpdate,
         response: oneshot::Sender<Result<(), SessionServiceError>>,
     },
     Keep {
@@ -560,6 +572,9 @@ impl SessionActor {
             }
             SessionRequest::SetConfig { update, response } => {
                 let _ = response.send(self.set_config(update).await);
+            }
+            SessionRequest::Set { update, response } => {
+                let _ = response.send(self.set_session(update).await);
             }
             SessionRequest::Keep { response } => {
                 let _ = response.send(self.keep().await);
@@ -795,32 +810,82 @@ impl SessionActor {
     }
 
     async fn set_config(&mut self, update: SessionConfigUpdate) -> Result<(), SessionServiceError> {
+        let update = match update {
+            SessionConfigUpdate::Mode(mode) => SessionUpdate {
+                title: None,
+                mode: Some(mode),
+                model: None,
+                reasoning: None,
+            },
+            SessionConfigUpdate::Model(model) => SessionUpdate {
+                title: None,
+                mode: None,
+                model: Some(model),
+                reasoning: None,
+            },
+            SessionConfigUpdate::Reasoning(reasoning) => SessionUpdate {
+                title: None,
+                mode: None,
+                model: None,
+                reasoning: Some(reasoning),
+            },
+        };
+        self.set_session(update).await
+    }
+
+    async fn set_session(&mut self, update: SessionUpdate) -> Result<(), SessionServiceError> {
         if self.phase == RuntimePhase::Closing {
             return Err(SessionServiceError::SessionClosed(
                 self.record.info.id.clone(),
             ));
         }
-        let model_changed = matches!(&update, SessionConfigUpdate::Model(_));
+        let SessionUpdate {
+            title,
+            mode,
+            model,
+            reasoning,
+        } = update;
+        let title_changed = title
+            .as_deref()
+            .is_some_and(|title| title.trim() != self.record.info.title);
+        let reasoning_changed = reasoning.is_some();
+        let config_changed = mode.is_some() || model.is_some() || reasoning.is_some();
+        let model_changed = model.is_some();
         let previous_model = self.record.llm.model.clone();
-        let new_model_reasoning = match &update {
-            SessionConfigUpdate::Model(model) => self
-                .model
+        let new_model_reasoning = model.as_deref().and_then(|model| {
+            self.model
                 .reasoning_modes(model)
                 .ok()
-                .and_then(|modes| middle_reasoning_mode(&modes)),
-            _ => None,
-        };
+                .and_then(|modes| middle_reasoning_mode(&modes))
+        });
         let mut updated = self.record.clone();
-        updated
-            .apply_config(update, new_model_reasoning)
-            .map_err(SessionServiceError::InvalidConfig)?;
+        if let Some(mode) = mode {
+            updated
+                .apply_config(SessionConfigUpdate::Mode(mode), None)
+                .map_err(SessionServiceError::InvalidConfig)?;
+        }
+        if let Some(model) = model {
+            updated
+                .apply_config(SessionConfigUpdate::Model(model), new_model_reasoning)
+                .map_err(SessionServiceError::InvalidConfig)?;
+        }
+        if let Some(reasoning) = reasoning {
+            updated
+                .apply_config(SessionConfigUpdate::Reasoning(reasoning), None)
+                .map_err(SessionServiceError::InvalidConfig)?;
+        }
+        if let Some(title) = title {
+            updated
+                .apply_title(title)
+                .map_err(SessionServiceError::InvalidConfig)?;
+        }
         let mut selection = ModelSelection {
             model: updated.llm.model.clone(),
             reasoning: updated.llm.reasoning.clone(),
         };
         let mut remember_reasoning = true;
         if let Err(error) = self.model.validate_selection(&selection) {
-            if !model_changed || updated.llm.reasoning.is_none() {
+            if !model_changed || reasoning_changed || updated.llm.reasoning.is_none() {
                 return Err(SessionServiceError::InvalidConfig(error.to_string()));
             }
             remember_reasoning = !updated
@@ -847,9 +912,17 @@ impl SessionActor {
         updated.touch();
         self.repository.save(&updated).await?;
         self.record = updated;
-        let config = self.record.config();
-        self.config_tx.send_replace(config.clone());
-        self.broadcast_event(SessionEventPayload::ConfigChanged { config });
+        if config_changed {
+            let config = self.record.config();
+            self.config_tx.send_replace(config.clone());
+            self.broadcast_event(SessionEventPayload::ConfigChanged { config });
+        }
+        if title_changed {
+            self.broadcast_event(SessionEventPayload::TitleChanged {
+                title: self.record.info.title.clone(),
+                updated_at_ms: self.record.info.updated_at_ms,
+            });
+        }
         if model_changed {
             self.emit_usage_changed();
         }

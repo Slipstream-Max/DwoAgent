@@ -102,6 +102,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     command("session.keep", MethodRoute::Dwo, None),
     command("session.close", MethodRoute::Both, None),
     command("session.set_config_option", MethodRoute::Acp, None),
+    command("session.set", MethodRoute::Dwo, None),
     command("session.notify", MethodRoute::Acp, None),
     command("session.compact", MethodRoute::Acp, None),
     command("session.resume-turn", MethodRoute::Acp, None),

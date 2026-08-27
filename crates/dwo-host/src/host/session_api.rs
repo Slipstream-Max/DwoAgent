@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use dwo_agent_service::{
     EndpointId, NotificationLevel, PromptAccepted, SessionConfigUpdate, SessionEventPayload,
     SessionId, SessionListQuery, SessionLlmSettings, SessionNotification, SessionService,
-    SessionSubscription,
+    SessionSubscription, SessionUpdate,
 };
 use dwo_context::MessageContent;
 use dwo_project::CreateProject;
@@ -113,6 +113,16 @@ struct SessionConfigOptionParam {
     session_id: String,
     config_id: String,
     value: Value,
+}
+
+#[derive(Deserialize)]
+struct SessionSetParam {
+    session_id: String,
+    caller_session_id: Option<String>,
+    title: Option<String>,
+    policy: Option<SessionMode>,
+    model: Option<String>,
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -505,6 +515,42 @@ impl Host {
                     "updated": true,
                     "usage": snapshot.usage,
                 }))
+            }
+            "session.set" => {
+                let params: SessionSetParam = serde_json::from_value(params)?;
+                anyhow::ensure!(
+                    params.title.is_some()
+                        || params.policy.is_some()
+                        || params.model.is_some()
+                        || params.reasoning.is_some(),
+                    "session.set requires at least one field"
+                );
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let caller = parse_optional_session(params.caller_session_id)?;
+                let target = self.service.snapshot(&id).await?.record;
+                if let Some(caller) = &caller {
+                    anyhow::ensure!(
+                        target.info.parent_session_id.as_ref() == Some(caller),
+                        "session {id} is not a direct subsession of {caller}"
+                    );
+                    if let Some(mode) = params.policy {
+                        let parent = self.service.snapshot(caller).await?.record;
+                        ensure_policy_ceiling(mode, parent.info.mode)?;
+                    }
+                }
+                self.service
+                    .set(
+                        &id,
+                        SessionUpdate {
+                            title: params.title,
+                            mode: params.policy,
+                            model: params.model,
+                            reasoning: params.reasoning.map(Some),
+                        },
+                    )
+                    .await?;
+                let snapshot = self.service.snapshot(&id).await?;
+                Ok(json!({"updated": true, "session": snapshot.record}))
             }
             "session.options" => {
                 let id = parse_session(params)?;
@@ -1117,6 +1163,77 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "--from cannot be used with --to");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_set_updates_existing_session_and_enforces_parent_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let root_id = host
+            .create_session(HostSessionOptions {
+                title: Some("before".to_string()),
+                ..HostSessionOptions::default()
+            })
+            .await
+            .unwrap();
+
+        host.handle_method(
+            "session.set",
+            json!({
+                "session_id": root_id,
+                "title": "after",
+                "policy": "watch",
+                "model": "deepseek/deepseek-v4-flash",
+                "reasoning": "low"
+            }),
+        )
+        .await
+        .unwrap();
+        host.service.unload(&root_id).await.unwrap();
+        let updated = host.service.snapshot(&root_id).await.unwrap().record;
+        assert_eq!(updated.info.title, "after");
+        assert_eq!(updated.info.mode, SessionMode::Watch);
+        assert_eq!(updated.llm.model, "deepseek/deepseek-v4-flash");
+        assert_eq!(updated.llm.reasoning.as_deref(), Some("low"));
+
+        let parent_id = host
+            .create_session(HostSessionOptions {
+                mode: Some(SessionMode::Confirm),
+                ..HostSessionOptions::default()
+            })
+            .await
+            .unwrap();
+        let child_id = host
+            .create_session(HostSessionOptions {
+                parent_session_id: Some(parent_id.clone()),
+                mode: Some(SessionMode::Watch),
+                ..HostSessionOptions::default()
+            })
+            .await
+            .unwrap();
+        let error = host
+            .handle_method(
+                "session.set",
+                json!({
+                    "session_id": child_id,
+                    "caller_session_id": parent_id,
+                    "policy": "full_access"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds parent policy"));
+        assert_eq!(
+            host.service
+                .snapshot(&child_id)
+                .await
+                .unwrap()
+                .record
+                .info
+                .mode,
+            SessionMode::Watch
+        );
         host.shutdown().await;
     }
 

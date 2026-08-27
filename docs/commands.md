@@ -29,6 +29,7 @@ dwo session list [--all]
 dwo session status <session-id> [--json]
 dwo session delete <session-id>
 dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <session-id> | --from <session-id>]
+dwo session set <session-id> [--title <title>] [--policy <policy>] [--model <model>] [--reasoning <mode>]
 dwo session cancel <session-id>
 dwo session watch <session-id> [--cursor <cursor>] [--limit <count>]
 dwo session approve <session-id> <permission-id>
@@ -38,6 +39,8 @@ dwo session deny <session-id> <permission-id>
 agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 或 `--from` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session；带 `--from` 时复制指定直接子 session 的 context 和 transcript，再把 prompt 发给副本。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此默认创建根 session。
 
 `--from` 和 `--to` 严格互斥。`--title` 可用于新建或重命名 fork；`--cwd` 只用于全新 session，和 `--to` 或 `--from` 同时使用会被拒绝。来源必须处于 idle，fork 会保留来源的 cwd、父子关系和配置。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `config-show` 中列出的有效组合。继续或 fork session 时，policy/model/reasoning 更新会在提交新 prompt 前写入目标配置。
+
+`session set` 原子修改已有 session 的标题、policy、model 和 reasoning，至少需要提供一个选项。Agent 内只能修改自己的直接子 session，且不能把子 session 的 policy 提升到父 session 以上；普通终端可以按 session ID 修改任意已有 session。
 
 `session list` 默认只列出当前 agent 的直接子 session；外部终端默认列出根 session。`--all` 列出 Host 中的全部 session。输出包含总数、运行状态、模型、更新时间和标题。`session status` 显示单个 session 的配置、usage、active turn 和最后一条最终回答；回答会折叠空白并限制在 100 个字符内。完整内容继续使用 `session watch`。`config-show` 输出默认 policy、可用 model/reasoning、默认 model、全局 `maxModelSteps` 和 session 总数。
 

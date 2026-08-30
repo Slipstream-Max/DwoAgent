@@ -36,7 +36,7 @@ impl OutputPipeline {
 
     pub fn finish(&mut self) -> Vec<u8> {
         let mut output = self.ansi.flush();
-        output.extend(self.utf8_pending.drain(..));
+        output.append(&mut self.utf8_pending);
         if output.is_empty() {
             return output;
         }

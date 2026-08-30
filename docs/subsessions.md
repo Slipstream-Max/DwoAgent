@@ -35,6 +35,12 @@ dwo session prompt "检查认证模块并列出潜在问题" --title "auth revie
 dwo session prompt "运行相关测试" --cwd C:\path\to\project --policy watch --model <model>
 ```
 
+也可以直接在已有 Project/Topic 中创建子 session：
+
+```powershell
+dwo session prompt "运行相关测试" --project <project-id> --topic <topic-id> --policy watch
+```
+
 继续已有的直接子 session：
 
 ```text

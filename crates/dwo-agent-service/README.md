@@ -45,7 +45,7 @@ resources. `profile.full.yaml` documents every supported profile field.
 
 ```text
 sessions/YYYY/MM/DD/<session-id>/
-|- session.json              identity, cwd, title, mode, timestamps, LLM settings
+|- session.json              identity, workspace binding, title, mode, timestamps, LLM settings
 |- model_context.json       system prompt, model messages, current usage, compaction state
 `- client_transcript.jsonl  append-only client-visible event stream for replay
 ```
@@ -82,7 +82,8 @@ changes are scanned directly by `TurnExecution`; they do not use `prompt_interna
 
 The filesystem repository serializes save/load/delete only within the same
 `SessionId`. Records for different sessions do not share a filesystem write
-lock.
+lock. `cwd` is runtime state resolved from the persisted workspace binding by
+the Host and is never written to `session.json`.
 
 `unload` cancels and unloads a session but retains its record for a later load.
 `delete` unloads the actor first, removes the repository record, and prevents a

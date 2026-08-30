@@ -29,8 +29,8 @@
 |  |  `- client_transcript.jsonl
 |  |- projects/<project-id>/
 |  |  |- project.json
-|  |  |- workspace/
 |  |  `- topics/<topic-id>/{overview.md,AGENTS.md}
+|  |- workspaces/<session-id>/
 |  |- attachments/<channel>/YYYY/MM/DD/<session-id>/
 |  `- websocket/
 |     `- secret.yaml
@@ -319,7 +319,7 @@ Automation 不属于 profile。每个 Project 在
 | `resource/prompts/AGENTS.md` | 可选 profile 级规则。 |
 | `<session-cwd>/AGENTS.md` | 当前工作目录规则。 |
 | `<session-cwd>/.agents/AGENTS.md` | 项目级规则。 |
-| `runtime/projects/<project-id>/topics/<topic-id>/AGENTS.md` | 看板 Topic 的 Knowledge；以 `Project.pwd` 作为规则 pwd。 |
+| `runtime/projects/<project-id>/topics/<topic-id>/AGENTS.md` | 看板 Topic 的 Knowledge；以当前 `Session.cwd` 作为规则 pwd。 |
 | `resource/skills/<name>/SKILL.md` | Profile 内可用的 skill。 |
 | `<session-cwd>/.agents/skills/<name>/SKILL.md` | 项目级 skill，与 profile 同名时项目级生效。 |
 | `externalSkillsDirs` 指定的目录 | 外部 skill；同名时优先级为 profile < 外部 < 项目。 |
@@ -374,13 +374,15 @@ dwo mcp auth <server> [--logout]
 
 | 文件 | 内容 |
 | --- | --- |
-| `session.json` | ID、标题、cwd、父 session、模型、reasoning 和权限模式。 |
+| `session.json` | ID、标题、Workspace 绑定、父 session、模型、reasoning 和权限模式；不保存解析后的 cwd。 |
 | `model_context.json` | 当前发送给模型的上下文和 usage。 |
 | `client_transcript.jsonl` | 完整、追加式的客户端事件记录。 |
 
 上下文压缩会重建 `model_context.json`，不会删除 `client_transcript.jsonl`。
 
-Session 由 Host 放入 Project：Project 可以使用显式 pwd，也可以使用 `runtime/projects/<project-id>/workspace/`。workspace 属于 Project，不属于 Session；删除 Session 不删除 Project workspace。Topic 归属由 `project.json` 中的 `sessionIds` 保存，不写入 Session metadata。
+Session 由 Host 放入 Project。没有显式 Project 的 Session 统一归入固定的 `independent`“未分配会话” Project；DWO 为没有外部 cwd 的 Session 在 `runtime/workspaces/<session-id>/` 下创建独立 Managed 目录。Project 目录不包含工作文件，`project.json` 保存 Project 的 `kind`、默认路径、可选 Repository/Worktree 和 Topic 的 `sessionIds`，不保存 Workspace 列表。
+
+Session 的 `workspace` 是 `project_default`、`worktree`、`managed` 或 `external` 之一。Host 每次加载时分别从 `Project.pwd`、Project Worktree、`runtime/workspaces/<session-id>/` 或绑定中的外部路径解析运行时 cwd。DWO 只删除 Managed 目录；跨 Project 移动会按目标 Project 类型重绑或复制 Workspace，但不会搬迁 Session 的持久化目录。
 
 ## Channel 数据
 

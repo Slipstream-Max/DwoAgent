@@ -34,10 +34,28 @@ dwo session list [--all]
 dwo session status <id> [--json]
 dwo session delete <id>
 dwo session keep <id>
-dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--ephemeral] [--to <id> | --from <id>]
+dwo session move <id> --project <project-id> --topic <topic-id>
+dwo session prompt <message> [--title <title>] [--cwd <path> | --project <project-id> [--topic <topic-id>]] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--ephemeral] [--to <id> | --from <id>]
 dwo session cancel <id>
 dwo session watch <id> [--cursor <cursor>] [--limit <count>]
 dwo session approve|deny <id> <permission-id>
+
+dwo project list
+dwo project get <project-id>
+dwo project create <name> [--kind <shared|independent>] [--cwd <path>] [--from-session <session-id>]
+dwo project update <project-id> <name>
+dwo section list <project-id>
+dwo section create <project-id> <name>
+dwo section update <project-id> <section-id> <name>
+dwo section delete <project-id> <section-id>
+dwo section reorder <project-id> <section-id> <position>
+dwo topic list <project-id>
+dwo topic get <project-id> <topic-id>
+dwo topic create <project-id> <section-id> <title>
+dwo topic update <project-id> <topic-id> <title>
+dwo topic delete <project-id> <topic-id>
+dwo topic move <project-id> <topic-id> <section-id> [--to-project <project-id>] [--position <n>]
+dwo topic reorder <project-id> <topic-id> <section-id> <position>
 
 dwo channel list
 dwo channel weixin status
@@ -111,6 +129,15 @@ keeps the original image events. The switch fails without changing state if
 that summary fails, and it is rejected while an image turn is active. A
 text-only model also rejects new image prompts before storing them.
 
+Project, Section, Topic, and Session are separate top-level CLI resources even
+though the management RPC uses `project.section.*` and `project.topic.*` method
+names. `topic move` can move a Topic between Sections or Projects; `session move`
+assigns a Session to a target Topic and rebinds its workspace when the target
+Project kind requires it, while preserving the Session's persisted data.
+`project create --from-session` creates a Project and moves the calling Session
+to its uncategorized Topic. The complete command reference is in
+[`docs/commands.md`](../../docs/commands.md).
+
 Windows uses a named pipe and an on-login scheduled task whose generated VBS
 launcher keeps the daemon window hidden. macOS uses a Unix domain socket and a
 per-user launchd agent. `serve` itself stays in the foreground; the
@@ -130,9 +157,9 @@ runtime/sessions/YYYY/MM/DD/<session-id>/
   client_transcript.jsonl
 runtime/projects/<project-id>/
   project.json
-  workspace/
   topics/<topic-id>/overview.md
   topics/<topic-id>/AGENTS.md
+runtime/workspaces/<session-id>/
 runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
 runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
 runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
@@ -217,9 +244,11 @@ image/file messages are downloaded under the selected session's dated channel
 attachment directory and submitted as a structured resource link containing
 the local path, MIME type, name, and size. A media-only message is a valid
 prompt. Telegram and Feishu send model output as plain text without markdown
-rewriting. Host-created sessions belong to a Project. Projects created without
-an explicit cwd use `runtime/projects/<project-id>/workspace`; the workspace is
-not owned or deleted by an individual Session.
+rewriting. Host-created sessions belong to a Project. Sessions without an
+explicit Project share the independent `project-unassigned` Project, while each
+generated workspace lives under `runtime/workspaces/<session-id>`. Project
+directories contain metadata and Topic resources rather than working files;
+they do not contain workspace records.
 
 Channel slash commands are declared as one clap-derived command enum shared by
 platform adapters. Parsing, argument validation, and `/help` descriptions

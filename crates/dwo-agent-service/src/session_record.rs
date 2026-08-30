@@ -101,8 +101,7 @@ pub struct SessionInfo {
     pub parent_session_id: Option<SessionId>,
     pub title: String,
     pub cwd: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree_id: Option<String>,
+    pub workspace: SessionWorkspace,
     pub mode: SessionMode,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -131,6 +130,28 @@ pub struct SessionConfig {
     pub mode: SessionMode,
     pub model: String,
     pub reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum SessionWorkspace {
+    ProjectDefault,
+    Worktree { worktree_id: String },
+    Managed,
+    External { pwd: PathBuf },
+}
+
+impl SessionWorkspace {
+    pub fn worktree_id(&self) -> Option<&str> {
+        match self {
+            Self::Worktree { worktree_id } => Some(worktree_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +211,7 @@ impl SessionRecord {
     pub fn new(
         id: SessionId,
         title: String,
+        workspace: SessionWorkspace,
         cwd: PathBuf,
         mode: SessionMode,
         mut llm: SessionLlmSettings,
@@ -202,7 +224,7 @@ impl SessionRecord {
                 parent_session_id: None,
                 title,
                 cwd,
-                worktree_id: None,
+                workspace,
                 mode,
                 created_at_ms: now,
                 updated_at_ms: now,

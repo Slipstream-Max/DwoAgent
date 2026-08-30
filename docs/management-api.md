@@ -33,7 +33,7 @@ Host 发布，客户端断开不会停止 Host。当前事件还包括 `channel.
 
 ## Project 与看板
 
-Project 拥有 `pwd`、Board 和 automation 配置/历史；Topic 保存 `sessionIds` 与 `labelIds`，
+Project 拥有 `kind`、Shared Project 必填的 `pwd`、可选 Repository/Worktree、Board 和 automation 配置/历史；Project 不保存 Workspace 列表。Topic 保存 `sessionIds` 与 `labelIds`，
 Automation Job 保存可选的 `topicId`。完整数据关系、默认未分类话题和文件布局见
 [Project 与看板](project-board.md)。
 
@@ -43,15 +43,24 @@ Automation Job 保存可选的 `topicId`。完整数据关系、默认未分类�
 | `project.board` | 获取 Sections、Topics 和 Labels |
 | `project.section.create/update/delete/reorder` | 分区 CRUD 和排序 |
 | `project.topic.get/create/update/delete/move/reorder` | Topic 管理；`get` 聚合 Session/Automation 状态 |
+| `project.topic.move_to_project` | 将 Topic、会话关联和 Topic 资源迁移到另一个 Project 的 Section |
 | `project.topic.overview.get/set` | 读写概述与计划 Markdown |
 | `project.topic.agents.get/set` | 读写 Knowledge `AGENTS.md` |
-| `project.topic.session.assign/unassign` | Session 归类或移回未分类 Topic |
+| `project.topic.session.assign/unassign` | Session 归类或移回未分类 Topic；可跨 Project 移动 |
 | `project.label.create/update/delete/assign/unassign` | Board 标签管理 |
 
 `session.new` 可传 `project_id` 与可选 `topic_id`；指定 Project 时不能再传 `cwd`。省略
-`topic_id` 使用该 Project 的未分类话题。省略 `project_id` 时 Host 按 canonical cwd 查找或
-创建 Project，没有 `cwd` 则创建 Project workspace。ACP new-session 因而可以只传 cwd；
-重复使用同一 cwd 会复用 Project。看板变更发布 `project.changed`。
+`topic_id` 使用该 Project 的未分类话题。省略 `project_id` 时 Host 始终使用固定的
+`project-unassigned`；没有 cwd 时在 `runtime/workspaces/<session-id>/` 创建 Session
+独立 Workspace，提供 cwd 时记录外部路径。ACP new-session 因而可以只传 cwd，且不再因
+cwd 不同创建多个 Project。看板变更发布 `project.changed`。
+
+`project.create` 要求 `kind` 为 `shared` 或 `independent`。Shared Project 要求绝对 `pwd`；Independent Project 禁止 `pwd`、Repository 和 Worktree。Session metadata 只保存 Workspace 绑定，解析后的 cwd 由 Host 从 Project、Worktree、Session ID 或 External 路径计算。
+
+`project.topic.move_to_project` 要求目标 Section 属于目标 Project，并迁移 Topic 的
+Markdown、会话关联和同名标签。带有关联 Automation Job 的 Topic 必须先处理 Job。
+`project.topic.session.assign` 接受可选的 `caller_session_id`；当调用来自 Agent Session
+时，只允许该 Session 移动自己。跨 Project 移动时，Host 会按目标 Project `kind` 重绑 Workspace；同一 Project 内只改变 Topic 归属。
 
 ## Host 配置与模型
 

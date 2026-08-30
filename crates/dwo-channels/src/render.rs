@@ -499,6 +499,9 @@ mod tests {
             record: SessionRecord::new(
                 session_id,
                 "Test".to_string(),
+                dwo_agent_service::SessionWorkspace::External {
+                    pwd: PathBuf::from("."),
+                },
                 PathBuf::from("."),
                 SessionMode::Confirm,
                 SessionLlmSettings::default(),

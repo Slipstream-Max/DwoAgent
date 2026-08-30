@@ -28,7 +28,8 @@ dwo config-show
 dwo session list [--all]
 dwo session status <session-id> [--json]
 dwo session delete <session-id>
-dwo session prompt <message> [--title <title>] [--cwd <path>] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <session-id> | --from <session-id>]
+dwo session move <session-id> --project <project-id> --topic <topic-id>
+dwo session prompt <message> [--title <title>] [--cwd <path> | --project <project-id> [--topic <topic-id>]] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--to <session-id> | --from <session-id>]
 dwo session set <session-id> [--title <title>] [--policy <policy>] [--model <model>] [--reasoning <mode>]
 dwo session cancel <session-id>
 dwo session watch <session-id> [--cursor <cursor>] [--limit <count>]
@@ -38,7 +39,7 @@ dwo session deny <session-id> <permission-id>
 
 agent 进程通过 `DWO_SESSION_ID` 标识当前 session。`session prompt` 不带 `--to` 或 `--from` 时创建当前 agent 的直接子 session，默认继承父 session 的 cwd、policy、model 和 reasoning；带 `--to` 时继续指定的直接子 session；带 `--from` 时复制指定直接子 session 的 context 和 transcript，再把 prompt 发给副本。子 session 的 policy 不得比父 session 更宽松。外部人工终端没有当前 session，因此默认创建根 session。
 
-`--from` 和 `--to` 严格互斥。`--title` 可用于新建或重命名 fork；`--cwd` 只用于全新 session，和 `--to` 或 `--from` 同时使用会被拒绝。来源必须处于 idle，fork 会保留来源的 cwd、父子关系和配置。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `config-show` 中列出的有效组合。继续或 fork session 时，policy/model/reasoning 更新会在提交新 prompt 前写入目标配置。
+`--from` 和 `--to` 严格互斥。`--title` 可用于新建或重命名 fork；`--cwd` 和 `--project` 只用于全新 session，并且互斥。`--topic` 必须和 `--project` 一起使用，省略时使用目标 Project 的未分类 Topic。来源必须处于 idle，fork 会保留来源的 cwd、父子关系和配置。`--policy` 接受 `full_access`、`confirm` 或 `watch`；`--model` 和 `--reasoning` 必须是 `config-show` 中列出的有效组合。继续或 fork session 时，policy/model/reasoning 更新会在提交新 prompt 前写入目标配置。
 
 `session set` 原子修改已有 session 的标题、policy、model 和 reasoning，至少需要提供一个选项。Agent 内只能修改自己的直接子 session，且不能把子 session 的 policy 提升到父 session 以上；普通终端可以按 session ID 修改任意已有 session。
 
@@ -57,6 +58,62 @@ active turn 运行期间收到的新 prompt 会进入 session FIFO，在当前 m
 若新模型属于另一个 provider instance，daemon 还会在下一次请求前移除只对旧 provider 有效的 reasoning 和托管工具调用。用户与 assistant 消息、本地工具 call/result 以及完整 client transcript 都会保留；同一 provider 内切换模型不会触发这项裁剪。
 
 Session 文件布局和持久化说明见 [Profile 配置指南](profile.md#session-数据)。
+
+## Project、Section 与 Topic
+
+Project、Section、Topic 和 Session 的关系是：
+
+```text
+Project
+`- Section
+   `- Topic
+      `- Session
+```
+
+CLI 使用扁平的资源命令；`section`、`topic` 和 `session` 不是 `project` 的 CLI 子命令。管理 API 内部虽然使用 `project.section.*` 和 `project.topic.*` 路由，但 CLI 会将它们分别暴露为 `dwo section`、`dwo topic` 和 `dwo session`。
+
+```text
+dwo project list
+dwo project get <project-id>
+dwo project create <name> [--kind <shared|independent>] [--cwd <path>] [--from-session <session-id>]
+dwo project update <project-id> <name>
+dwo project repository get <project-id>
+dwo project repository clone <project-id> <url> <path> [--branch <branch>]
+dwo project repository attach <project-id> <path> [--name <name>]
+dwo project worktree list <project-id>
+dwo project worktree get <project-id> <worktree-id>
+dwo project worktree create <project-id> <branch> <path> [--start-point <ref>] [--name <name>]
+dwo project worktree attach <project-id> <path> [--name <name>]
+dwo project worktree rename <project-id> <worktree-id> <name>
+dwo project worktree detach <project-id> <worktree-id>
+dwo project worktree remove <project-id> <worktree-id>
+
+dwo section list <project-id>
+dwo section create <project-id> <name>
+dwo section update <project-id> <section-id> <name>
+dwo section delete <project-id> <section-id>
+dwo section reorder <project-id> <section-id> <position>
+
+dwo topic list <project-id>
+dwo topic get <project-id> <topic-id>
+dwo topic create <project-id> <section-id> <title>
+dwo topic update <project-id> <topic-id> <title>
+dwo topic delete <project-id> <topic-id>
+dwo topic move <project-id> <topic-id> <section-id> [--to-project <project-id>] [--position <n>]
+dwo topic reorder <project-id> <topic-id> <section-id> <position>
+
+dwo session move <session-id> --project <project-id> --topic <topic-id>
+```
+
+`project create` 默认 `--kind shared`。Shared Project 必须有默认工作路径；未指定 `--cwd` 和 `--from-session` 时 CLI 使用当前 shell 路径，指定 `--from-session` 时 Host 可使用来源 Session 的 cwd。Independent Project 禁止 `--cwd`，也不能登记 Repository 或 Worktree。两种 Project 都只创建元数据和 Topic 文件，不在 Project 目录内生成 workspace。指定 `--from-session` 时，创建项目后把该 Session 移到新项目的未分类 Topic；在 agent session 内只能指定当前 session。
+
+没有显式 Project 的新 Session 全部进入固定的 `independent`“未分配会话” Project。没有外部 cwd 时，每个 Session 在 `runtime/workspaces/<session-id>/` 获得独立 Managed 目录；提供外部 cwd 时仍进入同一 Project，但 Session 只记录 External 绑定，DWO 不拥有或删除该路径。
+
+`topic move` 不带 `--to-project` 时只在当前项目内改变 Topic 所属 Section 和顺序；带 `--to-project` 时会跨项目迁移 Topic、Topic Markdown、会话关联和同名标签。目标 Section 必须属于目标项目。带有关联 Automation Job 的 Topic 暂时不能跨项目移动，需要先处理这些 Job。
+
+`session move` 的目标是 Topic，因此移动到另一个 Section 只需指定该 Section 中的 Topic。同一 Project 内只更新 Topic 归属。跨 Project 进入 Shared Project 时 Session 改用目标 Project 的默认路径；从 Shared 进入 Independent Project 时复制当前工作内容到 `runtime/workspaces/<session-id>/`；两个 Independent Project 之间保留原 Managed 或 External 绑定。Session 持久化目录不会搬迁。在 agent session 内，调用者只能移动自己。
+
+删除 Topic 会把其 Session 和 Automation Job 移回该项目的未分类 Topic；未分类 Section 和 Topic 不能删除。完整的持久化布局和 Board 语义见 [Project 与看板](project-board.md)。
 
 ## Model
 

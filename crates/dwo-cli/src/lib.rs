@@ -53,6 +53,14 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Section {
+        #[command(subcommand)]
+        command: SectionCommand,
+    },
+    Topic {
+        #[command(subcommand)]
+        command: TopicCommand,
+    },
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
@@ -109,6 +117,13 @@ enum SessionCommand {
     Keep {
         id: String,
     },
+    Move {
+        id: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        topic: String,
+    },
     Set {
         id: String,
         #[arg(long)]
@@ -133,6 +148,10 @@ enum SessionCommand {
         title: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["cwd", "to", "from"])]
+        project: Option<String>,
+        #[arg(long, requires = "project")]
+        topic: Option<String>,
         #[arg(long)]
         policy: Option<String>,
         #[arg(long)]
@@ -167,7 +186,89 @@ enum SessionCommand {
 }
 
 #[derive(Subcommand)]
+enum SectionCommand {
+    List {
+        project: String,
+    },
+    Create {
+        project: String,
+        name: String,
+    },
+    Update {
+        project: String,
+        id: String,
+        name: String,
+    },
+    Delete {
+        project: String,
+        id: String,
+    },
+    Reorder {
+        project: String,
+        id: String,
+        position: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum TopicCommand {
+    List {
+        project: String,
+    },
+    Get {
+        project: String,
+        id: String,
+    },
+    Create {
+        project: String,
+        section: String,
+        title: String,
+    },
+    Update {
+        project: String,
+        id: String,
+        title: String,
+    },
+    Delete {
+        project: String,
+        id: String,
+    },
+    Move {
+        project: String,
+        id: String,
+        section: String,
+        #[arg(long)]
+        to_project: Option<String>,
+        #[arg(long, default_value_t = usize::MAX)]
+        position: usize,
+    },
+    Reorder {
+        project: String,
+        id: String,
+        section: String,
+        position: usize,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProjectCommand {
+    List,
+    Get {
+        project: String,
+    },
+    Create {
+        name: String,
+        #[arg(long, value_enum, default_value_t = ProjectKindArg::Shared)]
+        kind: ProjectKindArg,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        from_session: Option<String>,
+    },
+    Update {
+        project: String,
+        name: String,
+    },
     Repository {
         #[command(subcommand)]
         command: RepositoryCommand,
@@ -176,6 +277,21 @@ enum ProjectCommand {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProjectKindArg {
+    Shared,
+    Independent,
+}
+
+impl ProjectKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Independent => "independent",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -480,6 +596,8 @@ where
             }
         },
         Command::Session { command } => run_session(command, &config_path).await?,
+        Command::Section { command } => run_section(command, &config_path).await?,
+        Command::Topic { command } => run_topic(command, &config_path).await?,
         Command::Project { command } => run_project(command, &config_path).await?,
         Command::ConfigShow => {
             let value = ipc::request_dwo(&config_path, "config.snapshot", json!({})).await?;
@@ -1026,7 +1144,7 @@ fn collect_skill_import_files(
                 .join("/");
             files.push(SkillImportFile {
                 path,
-                content: std::fs::read(&entry.path())
+                content: std::fs::read(entry.path())
                     .with_context(|| format!("read skill file {}", entry.path().display()))?,
             });
         }
@@ -1061,6 +1179,20 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                     "Session already persistent"
                 }
             ))?;
+        }
+        SessionCommand::Move { id, project, topic } => {
+            let value = ipc::request_dwo(
+                config_path,
+                "project.topic.session.assign",
+                json!({
+                    "project_id": project,
+                    "topic_id": topic,
+                    "session_id": id,
+                    "caller_session_id": current_session_id(),
+                }),
+            )
+            .await?;
+            render::write_value(&value)?;
         }
         SessionCommand::Set {
             id,
@@ -1110,6 +1242,8 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             message,
             title,
             cwd,
+            project,
+            topic,
             policy,
             model,
             reasoning,
@@ -1131,6 +1265,8 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                     "message": message,
                     "title": title,
                     "cwd": cwd,
+                    "project_id": project,
+                    "topic_id": topic,
                     "policy": policy,
                     "model": model,
                     "reasoning": reasoning,
@@ -1163,8 +1299,157 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
     Ok(())
 }
 
+async fn run_section(command: SectionCommand, config_path: &Path) -> Result<()> {
+    let (method, params) = match command {
+        SectionCommand::List { project } => {
+            let value =
+                ipc::request_dwo(config_path, "project.board", json!({"project_id": project}))
+                    .await?;
+            let sections = value
+                .get("board")
+                .and_then(|board| board.get("sections"))
+                .cloned()
+                .context("project board response is missing sections")?;
+            return render::write_value(&sections);
+        }
+        SectionCommand::Create { project, name } => (
+            "project.section.create",
+            json!({"project_id": project, "name": name}),
+        ),
+        SectionCommand::Update { project, id, name } => (
+            "project.section.update",
+            json!({"project_id": project, "section_id": id, "name": name}),
+        ),
+        SectionCommand::Delete { project, id } => (
+            "project.section.delete",
+            json!({"project_id": project, "section_id": id}),
+        ),
+        SectionCommand::Reorder {
+            project,
+            id,
+            position,
+        } => (
+            "project.section.reorder",
+            json!({"project_id": project, "section_id": id, "position": position}),
+        ),
+    };
+    let value = ipc::request_dwo(config_path, method, params).await?;
+    render::write_value(&value)
+}
+
+async fn run_topic(command: TopicCommand, config_path: &Path) -> Result<()> {
+    let (method, params) = match command {
+        TopicCommand::List { project } => {
+            let value =
+                ipc::request_dwo(config_path, "project.board", json!({"project_id": project}))
+                    .await?;
+            let topics = value
+                .get("board")
+                .and_then(|board| board.get("topics"))
+                .cloned()
+                .context("project board response is missing topics")?;
+            return render::write_value(&topics);
+        }
+        TopicCommand::Get { project, id } => (
+            "project.topic.get",
+            json!({"project_id": project, "topic_id": id}),
+        ),
+        TopicCommand::Create {
+            project,
+            section,
+            title,
+        } => (
+            "project.topic.create",
+            json!({"project_id": project, "section_id": section, "title": title}),
+        ),
+        TopicCommand::Update { project, id, title } => (
+            "project.topic.update",
+            json!({"project_id": project, "topic_id": id, "title": title}),
+        ),
+        TopicCommand::Delete { project, id } => (
+            "project.topic.delete",
+            json!({"project_id": project, "topic_id": id}),
+        ),
+        TopicCommand::Move {
+            project,
+            id,
+            section,
+            to_project,
+            position,
+        } => {
+            let target_project = to_project.unwrap_or_else(|| project.clone());
+            if target_project == project {
+                (
+                    "project.topic.move",
+                    json!({
+                        "project_id": project,
+                        "topic_id": id,
+                        "section_id": section,
+                        "position": position,
+                    }),
+                )
+            } else {
+                (
+                    "project.topic.move_to_project",
+                    json!({
+                        "source_project_id": project,
+                        "topic_id": id,
+                        "target_project_id": target_project,
+                        "target_section_id": section,
+                        "position": position,
+                    }),
+                )
+            }
+        }
+        TopicCommand::Reorder {
+            project,
+            id,
+            section,
+            position,
+        } => (
+            "project.topic.reorder",
+            json!({
+                "project_id": project,
+                "topic_id": id,
+                "section_id": section,
+                "position": position,
+            }),
+        ),
+    };
+    let value = ipc::request_dwo(config_path, method, params).await?;
+    render::write_value(&value)
+}
+
 async fn run_project(command: ProjectCommand, config_path: &Path) -> Result<()> {
     let (method, params) = match command {
+        ProjectCommand::List => ("project.list", json!({})),
+        ProjectCommand::Get { project } => ("project.get", json!({"project_id": project})),
+        ProjectCommand::Create {
+            name,
+            kind,
+            mut cwd,
+            from_session,
+        } => {
+            if kind == ProjectKindArg::Independent {
+                anyhow::ensure!(cwd.is_none(), "independent projects cannot define --cwd");
+            } else if cwd.is_none() && from_session.is_none() {
+                cwd = Some(std::env::current_dir()?);
+            }
+            (
+                "project.create",
+                json!({
+                    "name": name,
+                    "kind": kind.as_str(),
+                    "pwd": cwd,
+                    "from_session_id": from_session,
+                    "caller_session_id": current_session_id(),
+                }),
+            )
+        }
+        ProjectCommand::Update { project, name } => (
+            "project.update",
+            json!({"project_id": project, "name": name}),
+        ),
         ProjectCommand::Repository { command } => match command {
             RepositoryCommand::Get { project } => {
                 ("project.repository.get", json!({"project_id": project}))
@@ -2106,6 +2391,7 @@ mod tests {
                     ref policy,
                     ref model,
                     ref reasoning,
+                    ..
                 }
             } if id == "session-child"
                 && title.as_deref() == Some("renamed")
@@ -2147,6 +2433,42 @@ mod tests {
                 && model.as_deref() == Some("fast")
                 && reasoning.as_deref() == Some("high")
         ));
+
+        let project_prompt = Cli::try_parse_from([
+            "dwo",
+            "session",
+            "prompt",
+            "work here",
+            "--project",
+            "project-1",
+            "--topic",
+            "topic-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            project_prompt.command,
+            Command::Session {
+                command: SessionCommand::Prompt {
+                    project: Some(ref project),
+                    topic: Some(ref topic),
+                    cwd: None,
+                    ..
+                }
+            } if project == "project-1" && topic == "topic-1"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "dwo",
+                "session",
+                "prompt",
+                "invalid",
+                "--project",
+                "project-1",
+                "--cwd",
+                ".",
+            ])
+            .is_err()
+        );
 
         let fork = Cli::try_parse_from([
             "dwo",
@@ -2228,5 +2550,80 @@ mod tests {
             } if id == "session-child"
         ));
         assert!(Cli::try_parse_from(["dwo", "config-show"]).is_ok());
+    }
+
+    #[test]
+    fn parses_project_board_commands() {
+        let project = Cli::try_parse_from(["dwo", "project", "create", "DwoAgent"]).unwrap();
+        assert!(matches!(
+            project.command,
+            Command::Project {
+                command: ProjectCommand::Create {
+                    ref name,
+                    kind: ProjectKindArg::Shared,
+                    cwd: None,
+                    from_session: None,
+                }
+            } if name == "DwoAgent"
+        ));
+
+        let section =
+            Cli::try_parse_from(["dwo", "section", "create", "project-1", "Planning"]).unwrap();
+        assert!(matches!(
+            section.command,
+            Command::Section {
+                command: SectionCommand::Create { ref project, ref name }
+            } if project == "project-1" && name == "Planning"
+        ));
+
+        let topic = Cli::try_parse_from([
+            "dwo",
+            "topic",
+            "move",
+            "project-1",
+            "topic-1",
+            "section-2",
+            "--to-project",
+            "project-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            topic.command,
+            Command::Topic {
+                command: TopicCommand::Move {
+                    ref project,
+                    ref id,
+                    ref section,
+                    ref to_project,
+                    position,
+                }
+            } if project == "project-1"
+                && id == "topic-1"
+                && section == "section-2"
+                && to_project.as_deref() == Some("project-2")
+                && position == usize::MAX
+        ));
+
+        let session = Cli::try_parse_from([
+            "dwo",
+            "session",
+            "move",
+            "session-1",
+            "--project",
+            "project-2",
+            "--topic",
+            "topic-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            session.command,
+            Command::Session {
+                command: SessionCommand::Move {
+                    ref id,
+                    ref project,
+                    ref topic,
+                }
+            } if id == "session-1" && project == "project-2" && topic == "topic-2"
+        ));
     }
 }

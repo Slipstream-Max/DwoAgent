@@ -558,7 +558,7 @@ fn prompt_uses_and_watches_session_rule_files_with_their_pwd() {
     assert!(
         watcher
             .content
-            .contains(&canonical_cwd.to_string_lossy().to_string())
+            .contains(canonical_cwd.to_string_lossy().as_ref())
     );
 }
 

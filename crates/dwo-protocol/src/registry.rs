@@ -196,6 +196,11 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         Some("project.changed"),
     ),
     command(
+        "project.topic.move_to_project",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
+    command(
         "project.topic.reorder",
         MethodRoute::Dwo,
         Some("project.changed"),

@@ -26,8 +26,9 @@ use crate::permission::{PermissionRequestEnvelope, PermissionRequester, Permissi
 use crate::repository::SessionRepository;
 use crate::session_record::{
     ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionRecord, SessionUpdate,
-    title_from_user_content,
+    SessionWorkspace, title_from_user_content,
 };
+use crate::session_service::SessionDeletionHook;
 use crate::turn::{self, TurnExecution, TurnOutcome, TurnUpdate};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -137,7 +138,7 @@ pub(crate) enum ActorEvent {
     },
     CompactionFinished {
         compaction_id: String,
-        result: Result<CompactionResult, String>,
+        result: Box<Result<CompactionResult, String>>,
     },
     PermissionRequested(PermissionRequestEnvelope),
     TitleGenerated {
@@ -249,17 +250,17 @@ impl SessionHandle {
 
     pub(crate) async fn set_workspace(
         &self,
-        worktree_id: Option<String>,
+        workspace: SessionWorkspace,
         cwd: std::path::PathBuf,
         tools: Arc<ToolManager>,
         prompt_builder: SystemPromptBuilder,
     ) -> Result<(), SessionServiceError> {
         let (response, wait) = oneshot::channel();
         self.send(SessionRequest::SetWorkspace {
-            worktree_id,
+            workspace,
             cwd,
             tools,
-            prompt_builder,
+            prompt_builder: Box::new(prompt_builder),
             response,
         })
         .await?;
@@ -371,10 +372,10 @@ enum SessionRequest {
         response: oneshot::Sender<Result<(), SessionServiceError>>,
     },
     SetWorkspace {
-        worktree_id: Option<String>,
+        workspace: SessionWorkspace,
         cwd: std::path::PathBuf,
         tools: Arc<ToolManager>,
-        prompt_builder: SystemPromptBuilder,
+        prompt_builder: Box<SystemPromptBuilder>,
         response: oneshot::Sender<Result<(), SessionServiceError>>,
     },
     Keep {
@@ -435,19 +436,33 @@ pub(crate) struct SessionActor {
     closing_response: Option<oneshot::Sender<Result<(), SessionServiceError>>>,
     title_cancellation: Option<CancellationToken>,
     max_model_steps: Arc<AtomicUsize>,
+    deletion_hook: Option<SessionDeletionHook>,
     terminated: Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub(crate) struct SessionActorDependencies {
+    pub(crate) repository: Arc<dyn SessionRepository>,
+    pub(crate) model: Arc<dyn ModelClient>,
+    pub(crate) tools: Arc<ToolManager>,
+    pub(crate) prompt_builder: SystemPromptBuilder,
+    pub(crate) max_model_steps: Arc<AtomicUsize>,
+    pub(crate) deletion_hook: Option<SessionDeletionHook>,
 }
 
 impl SessionActor {
     pub(crate) fn spawn(
         record: SessionRecord,
         transcript: Vec<ClientTranscriptEvent>,
-        repository: Arc<dyn SessionRepository>,
-        model: Arc<dyn ModelClient>,
-        tools: Arc<ToolManager>,
-        prompt_builder: SystemPromptBuilder,
-        max_model_steps: Arc<AtomicUsize>,
+        dependencies: SessionActorDependencies,
     ) -> Arc<SessionHandle> {
+        let SessionActorDependencies {
+            repository,
+            model,
+            tools,
+            prompt_builder,
+            max_model_steps,
+            deletion_hook,
+        } = dependencies;
         let id = record.info.id.clone();
         let (request_tx, request_rx) = mpsc::channel(128);
         let (actor_tx, actor_rx) = mpsc::unbounded_channel();
@@ -462,6 +477,7 @@ impl SessionActor {
             tools,
             prompt_builder,
             max_model_steps,
+            deletion_hook,
             requests: request_rx,
             actor_tx,
             actor_events: actor_rx,
@@ -556,13 +572,21 @@ impl SessionActor {
         }
         self.phase = RuntimePhase::Closing;
         self.permission.reject("ephemeral session expired");
-        if let Err(error) = self.repository.delete(&self.record.info.id).await {
-            tracing::error!(
-                event = "session.ephemeral_delete_failed",
-                session_id = %self.record.info.id,
-                error = %error,
-                "delete expired ephemeral session failed"
-            );
+        match self.repository.delete(&self.record.info.id).await {
+            Ok(true) => {
+                if let Some(hook) = &self.deletion_hook {
+                    hook(&self.record.info.id, &self.record.info.workspace);
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    event = "session.ephemeral_delete_failed",
+                    session_id = %self.record.info.id,
+                    error = %error,
+                    "delete expired ephemeral session failed"
+                );
+            }
         }
         self.tools.shutdown().await;
         ActorControl::Stop
@@ -604,14 +628,14 @@ impl SessionActor {
                 let _ = response.send(self.set_session(update).await);
             }
             SessionRequest::SetWorkspace {
-                worktree_id,
+                workspace,
                 cwd,
                 tools,
                 prompt_builder,
                 response,
             } => {
                 let _ = response.send(
-                    self.set_workspace(worktree_id, cwd, tools, prompt_builder)
+                    self.set_workspace(workspace, cwd, tools, *prompt_builder)
                         .await,
                 );
             }
@@ -970,7 +994,7 @@ impl SessionActor {
 
     async fn set_workspace(
         &mut self,
-        worktree_id: Option<String>,
+        workspace: SessionWorkspace,
         cwd: std::path::PathBuf,
         tools: Arc<ToolManager>,
         prompt_builder: SystemPromptBuilder,
@@ -982,7 +1006,7 @@ impl SessionActor {
             ));
         }
         let old_cwd = self.record.info.cwd.clone();
-        let old_worktree_id = self.record.info.worktree_id.clone();
+        let old_worktree_id = self.record.info.workspace.worktree_id().map(str::to_string);
         let mut context = ContextManager::new(self.record.context.clone());
         let prompt = prompt_builder.rebuild().map_err(anyhow::Error::from)?;
         context.replace_system_prompt(prompt);
@@ -997,7 +1021,7 @@ impl SessionActor {
         context.refresh_usage(tools.schemas());
         let mut updated = self.record.clone();
         updated.info.cwd = cwd.clone();
-        updated.info.worktree_id = worktree_id.clone();
+        updated.info.workspace = workspace.clone();
         updated.context = context.into_context();
         updated.touch();
         self.repository.save(&updated).await?;
@@ -1010,7 +1034,7 @@ impl SessionActor {
             old_cwd,
             cwd,
             old_worktree_id,
-            worktree_id,
+            worktree_id: workspace.worktree_id().map(str::to_string),
         });
         Ok(())
     }
@@ -1183,7 +1207,7 @@ impl SessionActor {
             .map_err(|error| format!("{error:#}"));
             let _ = actor.send(ActorEvent::CompactionFinished {
                 compaction_id: id,
-                result,
+                result: Box::new(result),
             });
         });
         Ok(CompactionAccepted { compaction_id })
@@ -1597,7 +1621,7 @@ impl SessionActor {
             ActorEvent::CompactionFinished {
                 compaction_id,
                 result,
-            } => return self.apply_compaction_result(compaction_id, result).await,
+            } => return self.apply_compaction_result(compaction_id, *result).await,
             ActorEvent::PermissionRequested(request) => {
                 self.handle_permission_request(request);
             }

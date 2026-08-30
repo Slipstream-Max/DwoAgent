@@ -331,7 +331,7 @@ mod tests {
         let project: dwo_project::Project = serde_json::from_value(
             host.handle_method(
                 "project.create",
-                json!({"name": "Demo", "pwd": root.path()}),
+                json!({"name": "Demo", "kind": "shared", "pwd": root.path()}),
             )
             .await
             .unwrap(),
@@ -400,7 +400,7 @@ mod tests {
         let project: dwo_project::Project = serde_json::from_value(
             host.handle_method(
                 "project.create",
-                json!({"name": "Demo", "pwd": profile.path()}),
+                json!({"name": "Demo", "kind": "shared", "pwd": profile.path()}),
             )
             .await
             .unwrap(),

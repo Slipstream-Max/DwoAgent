@@ -51,8 +51,9 @@ jobs:
 ## Session 模式
 
 `new + every_time` 每次运行创建独立 Session；`new + once` 首次创建后持续复用，绑定记录在
-当前 Project 的 `history.yaml`。Automation 创建的 Session 固定使用 `Project.pwd`，加入 Job
-指定的 Topic，并加载该 Topic 的 `AGENTS.md`。Automation 不再单独接受 cwd。
+当前 Project 的 `history.yaml`。Automation 创建的 Session 在 Project 有显式 `pwd` 时使用该
+路径，否则分配独立的 DWO Workspace；随后加入 Job 指定的 Topic，并加载该 Topic 的
+`AGENTS.md`。Automation 不单独接受 cwd。
 
 ```yaml
 session:
@@ -61,8 +62,8 @@ session:
   title: Daily report
 ```
 
-`fixed` 投递到已有 Session。该 Session 的 cwd 必须与 `Project.pwd` 相同，执行时也会归入
-Job 指定的 Topic。Session 忙时，任务在 AutomationRuntime 内按 Session 串行排队。
+`fixed` 投递到已有 Session，执行时会归入 Job 指定的 Topic，并保留该 Session 的 Workspace。
+Session 忙时，任务在 AutomationRuntime 内按 Session 串行排队。
 
 ```yaml
 session:

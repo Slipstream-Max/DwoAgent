@@ -18,7 +18,7 @@
 | [Slash Commands 使用指南](slash-commands.md) | 查询所有 `/` 命令的用途、示例和入口对照 |
 | [Subsessions 使用指南](subsessions.md) | 了解父子 session、配置继承、结果回传和任务控制 |
 | [上下文压缩与 Handoff](context.md) | 了解长会话压缩、`/compact` 和 Agent 主动重建上下文 |
-| [Project 与看板](project-board.md) | 了解 Project workspace、分区、话题、标签及 Session/Task 关联 |
+| [Project 与看板](project-board.md) | 了解 Project、Session workspace、分区、话题、标签及 Session/Task 关联 |
 | [Automation 使用指南](automation.md) | 配置 cron、时区、新建/固定 session 和无人值守任务 |
 | [Model Client 与 Provider Catalog](model-client.md) | 添加/覆盖模型 provider、理解请求构造与重试策略 |
 | [Profile 配置指南](profile.md) | 修改模型、权限、资源、MCP、channel 和持久化目录 |

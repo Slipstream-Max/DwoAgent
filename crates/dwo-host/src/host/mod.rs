@@ -6,11 +6,11 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 use dwo_agent_service::{
     FsSessionRepository, LoadedAgentProfile, SessionConfig, SessionId, SessionLlmSettings,
-    SessionService,
+    SessionService, SessionWorkspace,
 };
 use dwo_context::ExternalRuleFile;
 use dwo_mcp::McpRuntime;
-use dwo_project::ProjectService;
+use dwo_project::{ProjectKind, ProjectService};
 use dwo_protocol::ReasoningOption;
 use dwo_tools::{PolicyConfig, SessionMode};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ mod mcp_api;
 mod model_api;
 mod project_api;
 mod prompt_api;
-mod session_api;
+pub(crate) mod session_api;
 mod skill_api;
 mod websocket_api;
 use config_manager::ConfigManager;
@@ -237,6 +237,14 @@ impl Host {
         let source = config_manager.fingerprint()?;
         let runtime_profile = RuntimeProfile::from_loaded(source, &profile);
         let (default_model, default_reasoning, default_mode) = runtime_profile.defaults();
+        let projects = Arc::new(ProjectService::open(profile_root.join("runtime/projects"))?);
+        let resolver_projects = projects.clone();
+        let resolver_root = profile_root.clone();
+        let workspace_resolver = Arc::new(
+            move |session_id: &SessionId, workspace: &SessionWorkspace| {
+                resolve_workspace_path(&resolver_root, &resolver_projects, session_id, workspace)
+            },
+        );
         let repository =
             Arc::new(FsSessionRepository::new(profile_root.join("runtime/sessions")).await?);
         let channels =
@@ -245,25 +253,54 @@ impl Host {
             repository,
             profile,
             PolicyConfig::default(),
+            workspace_resolver,
         )?);
         let shutdown = CancellationToken::new();
-        let projects = Arc::new(ProjectService::open(profile_root.join("runtime/projects"))?);
+        let cleanup_projects = projects.clone();
+        let cleanup_root = profile_root.clone();
+        service.set_deletion_hook(Arc::new(move |session_id, workspace| {
+            if let Err(error) = cleanup_projects.unassign_session_everywhere(session_id.as_str()) {
+                tracing::error!(
+                    event = "session.project_cleanup_failed",
+                    session_id = %session_id,
+                    error = %error,
+                    "remove deleted session from projects failed"
+                );
+            }
+            if matches!(workspace, SessionWorkspace::Managed) {
+                let path = managed_workspace_path(&cleanup_root, session_id);
+                if path.is_dir()
+                    && let Err(error) = std::fs::remove_dir_all(&path)
+                {
+                    tracing::error!(
+                        event = "session.workspace_cleanup_failed",
+                        session_id = %session_id,
+                        error = %error,
+                        "remove deleted session workspace failed"
+                    );
+                }
+            }
+        }));
         for project in projects.list() {
             for topic in &project.board.topics {
-                let rule_file = ExternalRuleFile::new(
-                    projects.agents_path(&project.id, &topic.id)?,
-                    project.pwd.clone(),
-                );
                 for session_id in &topic.session_ids {
                     let session_id =
                         SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
-                    service.set_external_rule_files(&session_id, vec![rule_file.clone()]);
+                    let Ok(snapshot) = service.snapshot(&session_id).await else {
+                        continue;
+                    };
+                    let rule_file = ExternalRuleFile::new(
+                        projects.agents_path(&project.id, &topic.id)?,
+                        snapshot.record.info.cwd,
+                    );
+                    service.set_external_rule_files(&session_id, vec![rule_file]);
                 }
             }
         }
         let automation = AutomationRuntime::new(
             service.clone(),
             projects.clone(),
+            profile_root.clone(),
             default_model.clone(),
             default_reasoning,
             default_mode,
@@ -566,6 +603,49 @@ impl Host {
         let replay = self.events.read(cursor, limit, event).await;
         (replay, receiver)
     }
+}
+
+fn resolve_workspace_path(
+    profile_root: &Path,
+    projects: &ProjectService,
+    session_id: &SessionId,
+    workspace: &SessionWorkspace,
+) -> Result<PathBuf> {
+    match workspace {
+        SessionWorkspace::ProjectDefault => {
+            let (project, _) = projects
+                .locate_session(session_id.as_str())
+                .with_context(|| format!("session {session_id} is not assigned to a project"))?;
+            anyhow::ensure!(
+                project.kind == ProjectKind::Shared,
+                "project_default workspace requires a shared project"
+            );
+            project.pwd.context("shared project is missing pwd")
+        }
+        SessionWorkspace::Worktree { worktree_id } => {
+            let (project, _) = projects
+                .locate_session(session_id.as_str())
+                .with_context(|| format!("session {session_id} is not assigned to a project"))?;
+            anyhow::ensure!(
+                project.kind == ProjectKind::Shared,
+                "worktree workspace requires a shared project"
+            );
+            project
+                .worktrees
+                .into_iter()
+                .find(|worktree| worktree.id == *worktree_id)
+                .map(|worktree| worktree.path)
+                .with_context(|| format!("worktree not found: {worktree_id}"))
+        }
+        SessionWorkspace::Managed => Ok(managed_workspace_path(profile_root, session_id)),
+        SessionWorkspace::External { pwd } => Ok(pwd.clone()),
+    }
+}
+
+pub(crate) fn managed_workspace_path(profile_root: &Path, session_id: &SessionId) -> PathBuf {
+    profile_root
+        .join("runtime/workspaces")
+        .join(session_id.as_str())
 }
 
 fn validate_resource_name(name: &str) -> Result<()> {

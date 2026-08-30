@@ -2,7 +2,7 @@
 
 Use a child session when a bounded task can run independently or needs a separate context. Do not create one for a trivial step that is faster to do directly. Run `dwo session` commands in the terminal. The daemon identifies you through `DWO_SESSION_ID`, so newly created sessions become your direct children and cannot receive a more permissive policy than yours.
 
-- Start a child: `dwo session prompt "instruction" [--title TITLE] [--cwd PATH] [--policy watch|confirm|full_access] [--model MODEL] [--reasoning MODE] [--ephemeral]`.
+- Start a child: `dwo session prompt "instruction" [--title TITLE] [--cwd PATH | --project PROJECT_ID [--topic TOPIC_ID]] [--policy watch|confirm|full_access] [--model MODEL] [--reasoning MODE] [--ephemeral]`.
 - Prefer `--ephemeral` for bounded child work that does not need a lasting transcript. It can receive follow-up prompts with `--to` until it completes. Completed, failed, or cancelled ephemeral sessions are deleted after five minutes; a normal daemon stop deletes them immediately.
 - Continue a child: `dwo session prompt "follow-up" --to SESSION_ID [--policy POLICY] [--model MODEL] [--reasoning MODE]`.
 - Fork an idle child and prompt the copy: `dwo session prompt "new direction" --from SESSION_ID [--title TITLE] [--policy POLICY] [--model MODEL] [--reasoning MODE]`. `--from`, `--to`, and `--ephemeral` are mutually exclusive; a fork is persistent and keeps the source cwd and parent.

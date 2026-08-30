@@ -26,10 +26,10 @@ use crate::events::{
 };
 use crate::profile::LoadedAgentProfile;
 use crate::repository::SessionRepository;
-use crate::session::{EndpointId, PromptAccepted, SessionHandle};
+use crate::session::{EndpointId, PromptAccepted, SessionActorDependencies, SessionHandle};
 use crate::session_record::{
     SessionConfigUpdate, SessionId, SessionLlmSettings, SessionRecord, SessionUpdate,
-    title_from_user_content,
+    SessionWorkspace, title_from_user_content,
 };
 use dwo_context::MessageContent;
 
@@ -38,13 +38,18 @@ pub struct NewSession {
     pub id: Option<SessionId>,
     pub parent_session_id: Option<SessionId>,
     pub title: Option<String>,
+    pub workspace: Option<SessionWorkspace>,
+    /// Resolved runtime path. The persisted source of truth is `workspace`.
     pub cwd: Option<PathBuf>,
-    pub worktree_id: Option<String>,
     pub external_rule_files: Vec<ExternalRuleFile>,
     pub mode: Option<SessionMode>,
     pub llm: Option<SessionLlmSettings>,
     pub ephemeral: bool,
 }
+
+pub type WorkspaceResolver =
+    Arc<dyn Fn(&SessionId, &SessionWorkspace) -> anyhow::Result<PathBuf> + Send + Sync>;
+pub type SessionDeletionHook = Arc<dyn Fn(&SessionId, &SessionWorkspace) + Send + Sync>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionListQuery {
@@ -84,20 +89,11 @@ pub struct SessionListItem {
     pub policy: dwo_tools::SessionMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListPage {
     pub sessions: Vec<SessionListItem>,
     pub next_cursor: Option<usize>,
-}
-
-impl Default for SessionListPage {
-    fn default() -> Self {
-        Self {
-            sessions: Vec::new(),
-            next_cursor: None,
-        }
-    }
 }
 
 pub struct SessionService {
@@ -112,6 +108,8 @@ pub struct SessionService {
     max_model_steps: Arc<AtomicUsize>,
     loaded: Mutex<LoadedSessionRegistry>,
     session_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
+    workspace_resolver: WorkspaceResolver,
+    deletion_hook: RwLock<Option<SessionDeletionHook>>,
 }
 
 struct ModelRuntime {
@@ -213,6 +211,7 @@ impl SessionService {
         repository: Arc<dyn SessionRepository>,
         profile: LoadedAgentProfile,
         policy: PolicyConfig,
+        workspace_resolver: WorkspaceResolver,
     ) -> Result<Self, SessionServiceError> {
         let model = ConfiguredModelClient::from_resolved(profile.models.clone())
             .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
@@ -228,7 +227,16 @@ impl SessionService {
             max_model_steps: Arc::new(AtomicUsize::new(profile.config.max_model_steps)),
             loaded: Mutex::new(LoadedSessionRegistry::default()),
             session_locks: Mutex::new(HashMap::new()),
+            workspace_resolver,
+            deletion_hook: RwLock::new(None),
         })
+    }
+
+    pub fn set_deletion_hook(&self, hook: SessionDeletionHook) {
+        *self
+            .deletion_hook
+            .write()
+            .expect("session deletion hook lock poisoned") = Some(hook);
     }
 
     pub fn apply_profile(&self, profile: LoadedAgentProfile) -> Result<(), SessionServiceError> {
@@ -254,73 +262,76 @@ impl SessionService {
     ) -> Result<Arc<SessionHandle>, SessionServiceError> {
         let id = new_session.id.clone().unwrap_or_default();
         self.set_external_rule_files(&id, new_session.external_rule_files.clone());
-        let (record, transcript, rollback_on_load_error) = if let Some(source_id) =
-            &new_session.from
-        {
-            let snapshot = self.load(source_id).await?.snapshot().await?;
-            if snapshot.phase != RuntimePhase::Idle {
-                return Err(SessionServiceError::SessionBusy(source_id.clone()));
-            }
-            let source = snapshot.record;
-            let title = new_session
-                .title
-                .map(|title| title.trim().to_string())
-                .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| source.info.title.clone());
-            let mut record = SessionRecord::new(
-                id.clone(),
-                title,
-                source.info.cwd.clone(),
-                new_session.mode.unwrap_or(source.info.mode),
-                new_session.llm.unwrap_or_else(|| source.llm.clone()),
-            );
-            record.set_parent_session_id(
-                new_session
-                    .parent_session_id
-                    .or_else(|| source.info.parent_session_id.clone()),
-            );
-            record.info.ephemeral = new_session.ephemeral;
-            record.info.worktree_id = new_session.worktree_id.or(source.info.worktree_id.clone());
-            record.context = source.context;
-            record.current_plan = source.current_plan;
-            (record, snapshot.transcript, true)
-        } else {
-            let cwd = new_session.cwd.ok_or_else(|| {
-                SessionServiceError::InvalidConfig("new session requires cwd".to_string())
-            })?;
-            let mode = new_session.mode.ok_or_else(|| {
-                SessionServiceError::InvalidConfig("new session requires mode".to_string())
-            })?;
-            let llm = new_session.llm.ok_or_else(|| {
-                SessionServiceError::InvalidConfig("new session requires llm".to_string())
-            })?;
-            self.model
-                .validate_selection(&ModelSelection {
-                    model: llm.model.clone(),
-                    reasoning: llm.reasoning.clone(),
-                })
-                .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
-            let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
-            let explicit_title = new_session
-                .title
-                .map(|title| title.trim().to_string())
-                .filter(|title| !title.is_empty());
-            let automatic_title = explicit_title.is_none();
-            let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
-            let prompt_builder = self.prompt_builder(&id, cwd.clone());
-            let context = ContextManager::initialize(&prompt_builder)
-                .map_err(anyhow::Error::from)?
-                .into_context();
-            let mut record = SessionRecord::new(id.clone(), title, cwd, mode, llm);
-            record.set_parent_session_id(new_session.parent_session_id);
-            record.info.worktree_id = new_session.worktree_id;
-            record.info.ephemeral = new_session.ephemeral;
-            if automatic_title {
-                record.enable_auto_title();
-            }
-            record.context = context;
-            (record, Vec::new(), false)
-        };
+        let (record, transcript, rollback_on_load_error) =
+            if let Some(source_id) = &new_session.from {
+                let snapshot = self.load(source_id).await?.snapshot().await?;
+                if snapshot.phase != RuntimePhase::Idle {
+                    return Err(SessionServiceError::SessionBusy(source_id.clone()));
+                }
+                let source = snapshot.record;
+                let title = new_session
+                    .title
+                    .map(|title| title.trim().to_string())
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| source.info.title.clone());
+                let mut record = SessionRecord::new(
+                    id.clone(),
+                    title,
+                    new_session
+                        .workspace
+                        .unwrap_or_else(|| source.info.workspace.clone()),
+                    new_session.cwd.unwrap_or_else(|| source.info.cwd.clone()),
+                    new_session.mode.unwrap_or(source.info.mode),
+                    new_session.llm.unwrap_or_else(|| source.llm.clone()),
+                );
+                record.set_parent_session_id(
+                    new_session
+                        .parent_session_id
+                        .or_else(|| source.info.parent_session_id.clone()),
+                );
+                record.info.ephemeral = new_session.ephemeral;
+                record.context = source.context;
+                record.current_plan = source.current_plan;
+                (record, snapshot.transcript, true)
+            } else {
+                let cwd = new_session.cwd.ok_or_else(|| {
+                    SessionServiceError::InvalidConfig("new session requires cwd".to_string())
+                })?;
+                let workspace = new_session.workspace.ok_or_else(|| {
+                    SessionServiceError::InvalidConfig("new session requires workspace".to_string())
+                })?;
+                let mode = new_session.mode.ok_or_else(|| {
+                    SessionServiceError::InvalidConfig("new session requires mode".to_string())
+                })?;
+                let llm = new_session.llm.ok_or_else(|| {
+                    SessionServiceError::InvalidConfig("new session requires llm".to_string())
+                })?;
+                self.model
+                    .validate_selection(&ModelSelection {
+                        model: llm.model.clone(),
+                        reasoning: llm.reasoning.clone(),
+                    })
+                    .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
+                let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
+                let explicit_title = new_session
+                    .title
+                    .map(|title| title.trim().to_string())
+                    .filter(|title| !title.is_empty());
+                let automatic_title = explicit_title.is_none();
+                let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
+                let prompt_builder = self.prompt_builder(&id, cwd.clone());
+                let context = ContextManager::initialize(&prompt_builder)
+                    .map_err(anyhow::Error::from)?
+                    .into_context();
+                let mut record = SessionRecord::new(id.clone(), title, workspace, cwd, mode, llm);
+                record.set_parent_session_id(new_session.parent_session_id);
+                record.info.ephemeral = new_session.ephemeral;
+                if automatic_title {
+                    record.enable_auto_title();
+                }
+                record.context = context;
+                (record, Vec::new(), false)
+            };
 
         let id = record.info.id.clone();
         let session_lock = {
@@ -349,7 +360,7 @@ impl SessionService {
             }
         }
 
-        match self.load(&id).await {
+        match self.load_resolved(&id, Some(record.info.cwd.clone())).await {
             Ok(handle) => Ok(handle),
             Err(error) if rollback_on_load_error => {
                 let _ = self.repository.delete(&id).await;
@@ -360,6 +371,14 @@ impl SessionService {
     }
 
     pub async fn load(&self, id: &SessionId) -> Result<Arc<SessionHandle>, SessionServiceError> {
+        self.load_resolved(id, None).await
+    }
+
+    async fn load_resolved(
+        &self,
+        id: &SessionId,
+        resolved_cwd: Option<PathBuf>,
+    ) -> Result<Arc<SessionHandle>, SessionServiceError> {
         {
             let loaded = self.loaded.lock().await;
             if loaded.deleting.contains(id) {
@@ -396,6 +415,10 @@ impl SessionService {
             .load(id)
             .await?
             .ok_or_else(|| SessionServiceError::SessionNotFound(id.clone()))?;
+        record.info.cwd = match resolved_cwd {
+            Some(cwd) => cwd,
+            None => self.resolve_workspace(&record.info.id, &record.info.workspace)?,
+        };
         let transcript = self.repository.load_transcript(id).await?;
         let prompt_builder = self.prompt_builder(id, record.info.cwd.clone());
         let mut record_changed = repair_empty_title(&mut record, &transcript);
@@ -434,11 +457,18 @@ impl SessionService {
         let handle = crate::session::SessionActor::spawn(
             record,
             transcript,
-            self.repository.clone(),
-            self.model.clone(),
-            tools,
-            prompt_builder,
-            self.max_model_steps.clone(),
+            SessionActorDependencies {
+                repository: self.repository.clone(),
+                model: self.model.clone(),
+                tools,
+                prompt_builder,
+                max_model_steps: self.max_model_steps.clone(),
+                deletion_hook: self
+                    .deletion_hook
+                    .read()
+                    .expect("session deletion hook lock poisoned")
+                    .clone(),
+            },
         );
         loaded.handles.insert(id.clone(), handle.clone());
         Ok(handle)
@@ -450,6 +480,9 @@ impl SessionService {
     ) -> Result<SessionListPage, SessionServiceError> {
         let deleting = self.loaded.lock().await.deleting.clone();
         let mut records = self.repository.list().await?;
+        for record in &mut records {
+            record.info.cwd = self.resolve_workspace(&record.info.id, &record.info.workspace)?;
+        }
         records.retain(|record| !deleting.contains(&record.info.id));
         for record in &mut records {
             if !record.info.title.trim().is_empty() {
@@ -569,11 +602,25 @@ impl SessionService {
             return Err(error);
         }
 
+        let workspace = self
+            .repository
+            .load(id)
+            .await?
+            .map(|record| record.info.workspace);
         let deleted = self.repository.delete(id).await;
         self.loaded.lock().await.deleting.remove(id);
         let deleted = deleted?;
         if !was_loaded && !deleted {
             return Err(SessionServiceError::SessionNotFound(id.clone()));
+        }
+        if let (Some(hook), Some(workspace)) = (
+            self.deletion_hook
+                .read()
+                .expect("session deletion hook lock poisoned")
+                .as_ref(),
+            workspace.as_ref(),
+        ) {
+            hook(id, workspace);
         }
         self.session_rule_files
             .write()
@@ -605,7 +652,7 @@ impl SessionService {
     pub async fn set_workspace(
         &self,
         id: &SessionId,
-        worktree_id: Option<String>,
+        workspace: SessionWorkspace,
         cwd: PathBuf,
         external_rule_files: Vec<ExternalRuleFile>,
     ) -> Result<(), SessionServiceError> {
@@ -628,12 +675,21 @@ impl SessionService {
         let result = self
             .load(id)
             .await?
-            .set_workspace(worktree_id, cwd, tools, prompt_builder)
+            .set_workspace(workspace, cwd, tools, prompt_builder)
             .await;
         if result.is_err() {
             self.set_external_rule_files(id, previous_rule_files);
         }
         result
+    }
+
+    fn resolve_workspace(
+        &self,
+        id: &SessionId,
+        workspace: &SessionWorkspace,
+    ) -> Result<PathBuf, SessionServiceError> {
+        let path = (self.workspace_resolver)(id, workspace)?;
+        Ok(std::fs::canonicalize(path).map_err(anyhow::Error::from)?)
     }
 
     pub fn set_external_rule_files(&self, id: &SessionId, files: Vec<ExternalRuleFile>) {

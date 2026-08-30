@@ -373,6 +373,7 @@ model:
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 impl WebsocketConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.port == 0 {

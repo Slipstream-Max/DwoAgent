@@ -784,6 +784,7 @@ impl ModelConfig {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolved_model(
     provider_id: &str,
     family: &str,

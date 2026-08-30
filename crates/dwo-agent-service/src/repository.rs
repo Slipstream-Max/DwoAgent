@@ -13,7 +13,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    ClientTranscriptEvent, ExecutionPlan, SessionId, SessionInfo, SessionLlmSettings, SessionRecord,
+    ClientTranscriptEvent, ExecutionPlan, SessionId, SessionInfo, SessionLlmSettings,
+    SessionRecord, SessionWorkspace,
 };
 
 pub const SESSION_META_FILE: &str = "session.json";
@@ -101,12 +102,64 @@ impl SessionRepository for MemorySessionRepository {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedSessionMetadata {
-    info: SessionInfo,
+    info: PersistedSessionInfo,
     llm: SessionLlmSettings,
     #[serde(default, skip_serializing_if = "is_false")]
     auto_title_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_plan: Option<ExecutionPlan>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedSessionInfo {
+    id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<SessionId>,
+    title: String,
+    workspace: SessionWorkspace,
+    mode: dwo_tools::SessionMode,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    ephemeral: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delete_after_ms: Option<u64>,
+}
+
+impl PersistedSessionInfo {
+    fn from_runtime(info: &SessionInfo) -> Self {
+        Self {
+            id: info.id.clone(),
+            parent_session_id: info.parent_session_id.clone(),
+            title: info.title.clone(),
+            workspace: info.workspace.clone(),
+            mode: info.mode,
+            created_at_ms: info.created_at_ms,
+            updated_at_ms: info.updated_at_ms,
+            ephemeral: info.ephemeral,
+            completed: info.completed,
+            delete_after_ms: info.delete_after_ms,
+        }
+    }
+
+    fn into_runtime(self) -> SessionInfo {
+        SessionInfo {
+            id: self.id,
+            parent_session_id: self.parent_session_id,
+            title: self.title,
+            cwd: PathBuf::new(),
+            workspace: self.workspace,
+            mode: self.mode,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            ephemeral: self.ephemeral,
+            completed: self.completed,
+            delete_after_ms: self.delete_after_ms,
+        }
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -116,7 +169,7 @@ fn is_false(value: &bool) -> bool {
 impl PersistedSessionMetadata {
     fn from_record(record: &SessionRecord) -> Self {
         Self {
-            info: record.info.clone(),
+            info: PersistedSessionInfo::from_runtime(&record.info),
             llm: record.llm.clone(),
             auto_title_pending: record.auto_title_pending(),
             current_plan: record.current_plan.clone(),
@@ -215,7 +268,7 @@ impl FsSessionRepository {
         let context: SessionContext =
             Self::read_json(&session_dir.join(SESSION_MODEL_CONTEXT_FILE)).await?;
         Ok(SessionRecord::from_persisted_parts(
-            metadata.info,
+            metadata.info.into_runtime(),
             metadata.llm,
             context,
             metadata.auto_title_pending,
@@ -419,6 +472,9 @@ mod tests {
         let mut record = SessionRecord::new(
             SessionId::new(),
             "dated".to_string(),
+            SessionWorkspace::External {
+                pwd: root.path().to_path_buf(),
+            },
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
             SessionLlmSettings::default(),
@@ -449,6 +505,14 @@ mod tests {
                 .unwrap();
         assert!(metadata.get("context").is_none());
         assert!(metadata.get("max_model_steps").is_none());
+        assert!(metadata["info"].get("cwd").is_none());
+        assert!(metadata["info"].get("workspaceId").is_none());
+        assert!(metadata["info"].get("worktreeId").is_none());
+        assert_eq!(metadata["info"]["workspace"]["kind"], "external");
+        assert_eq!(
+            metadata["info"]["workspace"]["pwd"],
+            root.path().to_string_lossy().as_ref()
+        );
         let model_context: serde_json::Value = serde_json::from_slice(
             &std::fs::read(session_dir.join(SESSION_MODEL_CONTEXT_FILE)).unwrap(),
         )
@@ -518,6 +582,9 @@ mod tests {
         let record = SessionRecord::new(
             SessionId::new(),
             "tail".to_string(),
+            SessionWorkspace::External {
+                pwd: root.path().to_path_buf(),
+            },
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
             SessionLlmSettings::default(),
@@ -560,6 +627,9 @@ mod tests {
         let record = SessionRecord::new(
             SessionId::new(),
             "middle".to_string(),
+            SessionWorkspace::External {
+                pwd: root.path().to_path_buf(),
+            },
             root.path().to_path_buf(),
             dwo_tools::SessionMode::Confirm,
             SessionLlmSettings::default(),

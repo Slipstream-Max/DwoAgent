@@ -10,7 +10,7 @@ shutdown 边界。IPC、WebSocket、ACP shim、CLI 和 Flutter 都是它外面�
 - 实现新的 transport/client，通过 `handle_request` 调用 Dwo Management RPC。
 
 配置方法及 JSON 参数见
-[Dwo Management RPC](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/management-api.md)，
+[Dwo API](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/api.md)，
 共享 envelope 和 registry 见
 [dwo-protocol API](https://github.com/Slipstream-Max/DwoAgent/blob/main/crates/dwo-protocol/README.md)。
 

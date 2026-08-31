@@ -51,5 +51,5 @@ Provider-native reasoning and hosted-tool items are owned by `provider/family`, 
 connection. Switching families behind one gateway removes incompatible native items while
 retaining visible messages and local function call/results.
 
-See [docs/model-client.md](../../docs/model-client.md) for the complete schema, merge rules,
-request construction, retry behavior, and custom Model List format.
+See [docs/models.md](../../docs/models.md) for supported models, deployment mapping,
+capability fields, and the custom Model List format.

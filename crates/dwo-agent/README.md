@@ -136,7 +136,7 @@ assigns a Session to a target Topic and rebinds its workspace when the target
 Project kind requires it, while preserving the Session's persisted data.
 `project create --from-session` creates a Project and moves the calling Session
 to its uncategorized Topic. The complete command reference is in
-[`docs/commands.md`](../../docs/commands.md).
+[`docs/cli.md`](../../docs/cli.md).
 
 Windows uses a named pipe and an on-login scheduled task whose generated VBS
 launcher keeps the daemon window hidden. macOS uses a Unix domain socket and a

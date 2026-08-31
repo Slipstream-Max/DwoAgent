@@ -1,34 +1,24 @@
 # 赤铎文档
 
-根目录 [README](../README.md) 用于快速认识和运行赤铎；这里保存部署、配置和行为细节。
+每个主题只有一个主文档。根目录 [README](../README.md) 只负责安装和最小配置；详细内容按下面
+的职责拆分。
 
-## 从这里开始
-
-1. 按 README 的[“五分钟跑起来”](../README.md#五分钟跑起来)编译、安装并启动 daemon。
-1. 在 [Profile 配置指南](profile.md) 中设置模型、权限和需要启用的 channel。
-1. 选择一种对话入口：IDE/编辑器使用 [ACP](acp.md)，聊天应用使用 [Channels](channels.md)，脚本或终端使用 [CLI](commands.md)。
-
-## 文档地图
-
-| 文档 | 适合什么时候读 |
+| 文档 | 内容 |
 | --- | --- |
-| [CLI 命令参考](commands.md) | 查询命令、参数和 session/MCP/automation 行为 |
-| [ACP 使用指南](acp.md) | 将支持 ACP 的 IDE 或客户端连接到已有 daemon |
-| [Channel 部署与使用](channels.md) | 部署微信、Telegram、飞书/Lark、QQ Bot |
-| [Slash Commands 使用指南](slash-commands.md) | 查询所有 `/` 命令的用途、示例和入口对照 |
-| [Subsessions 使用指南](subsessions.md) | 了解父子 session、配置继承、结果回传和任务控制 |
-| [上下文压缩与 Handoff](context.md) | 了解长会话压缩、`/compact` 和 Agent 主动重建上下文 |
-| [Project 与看板](project-board.md) | 了解 Project、Session workspace、分区、话题、标签及 Session/Task 关联 |
-| [Automation 使用指南](automation.md) | 配置 cron、时区、新建/固定 session 和无人值守任务 |
-| [Model Client 与 Provider Catalog](model-client.md) | 添加/覆盖模型 provider、理解请求构造与重试策略 |
-| [Profile 配置指南](profile.md) | 修改模型、权限、资源、MCP、channel 和持久化目录 |
-| [Dwo Management RPC](management-api.md) | 管理方法、事件 cursor、路由和错误契约 |
-| [dwo-protocol API](../crates/dwo-protocol/README.md) | Rust 协议类型、envelope、capabilities 和方法注册表 |
-| [dwo-host API](../crates/dwo-host/README.md) | Host 生命周期、直接 Session API、管理调用和事件订阅 |
-| [Flutter/Dart binding](../bindings/dart/README.md) | Flutter 管理面板复用 Dwo RPC 的客户端契约 |
+| [Profile 配置](profile.md) | profile.yaml 全部字段、默认值、Provider、Channel 字段和资源目录 |
+| [模型与 Provider](models.md) | Model List、新增模型、模型能力和支持范围 |
+| [Prompt、Skill 与 MCP](resources.md) | Prompt/Rule、Skill 目录、MCP JSON、优先级和资源热加载 |
+| [Channel 配置与行为](channels.md) | 微信、Telegram、飞书/Lark、QQ 的配置、绑定和消息行为 |
+| [CLI 命令参考](cli.md) | dwo 的全部命令，按资源分类 |
+| [Project 文件与行为](projects.md) | project.json、Board/Section/Topic/Label/Worktree 字段和 Workspace 规则 |
+| [Automation](automation.md) | config.yaml、history.yaml、Cron、Session 策略和无人值守行为 |
+| [Slash Commands](slash-commands.md) | ACP 和消息平台中的 / 命令 |
+| [ACP 连接](acp.md) | ACP Client 配置、v1/v2 和输入输出能力 |
+| [WebSocket 连接](websocket.md) | /acp、/dwo、Token、TLS 和远程连接 |
+| [Session 与子 Agent](session.md) | 创建、继续、Fork、临时子 Agent、队列和持久化 |
+| [Agent 工具](tools.md) | terminal、read_file、file_edit、plan、handoff 和权限 |
+| [API 说明](api.md) | ACP 与 Management RPC 的边界、方法和事件 |
 
-## 推荐阅读顺序
-
-- 首次部署：README -> Profile 配置 -> ACP 或 Channels。
-- 日常操作：CLI 命令参考 + 对应入口指南；需要拆分任务时阅读 Subsessions 使用指南。
-- 排查状态：先运行 `dwo daemon status`、`dwo config-show` 和 `dwo channel <name> status`，再检查 `~/.dwoagent/logs/`。
+源码级 Rust API 另见 [dwo-protocol](../crates/dwo-protocol/README.md)、
+[dwo-host](../crates/dwo-host/README.md) 和
+[dwo-agent-service](../crates/dwo-agent-service/README.md)。

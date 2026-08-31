@@ -66,7 +66,7 @@ assert_eq!(request.jsonrpc, "2.0");
 | `PromptDirectiveOptions` | 当前 Session 可用的 Skill/MCP directive |
 
 这些类型都从 crate 根导出。Management 各方法的业务参数和返回结构见
-[Dwo Management RPC](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/management-api.md)；
+[Dwo API](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/api.md)；
 ACP 的完整消息类型由 ACP crate/SDK 定义，不在这里重复维护。
 
 ## 方法注册与能力发现

@@ -1,0 +1,20 @@
+baseUrl: https://open.bigmodel.cn/api/v1
+models:
+  glm-5.3:
+    contextWindowTokens: 1048576
+    maxOutputTokens: 128000
+    capabilities:
+      imageInput: false
+      toolCalls: true
+    hostedTools: []
+    defaultReasoningEffort: max
+    reasoningEfforts: [low, high, max]
+  glm-5.3-flash:
+    contextWindowTokens: 1048576
+    maxOutputTokens: 128000
+    capabilities:
+      imageInput: true
+      toolCalls: true
+    hostedTools: []
+    defaultReasoningEffort: max
+    reasoningEfforts: [low, high, max]

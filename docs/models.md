@@ -23,6 +23,8 @@ Dwo 使用 Responses API。当前内置 Model List：
 | qwen | qwen3.8-max | 是 | web_search、web_extractor | auto、off、low、medium、xhigh |
 | qwen | qwen3.8-flash | 是 | web_search、web_extractor | auto、off、low、medium、xhigh |
 | qwen | qwen3.8-27b | 是 | web_search、web_extractor | auto、off、low、medium、xhigh |
+| zhipu | glm-5.3 | 否 | 无 | low、high、max |
+| zhipu | glm-5.3-flash | 是 | 无 | low、high、max |
 
 所有内置模型都声明支持本地 Tool Call。实际启用项以 dwo model list 为准。Provider 名称是模型
 引用的前缀，例如 deepseek/deepseek-v4-pro。能力来自 Model List，不根据模型名称推测。

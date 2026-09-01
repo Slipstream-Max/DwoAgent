@@ -596,6 +596,39 @@ providers:
 }
 
 #[test]
+fn official_zhipu_provider_expands_both_glm_models() {
+    let catalog = ModelCatalog::builtin().unwrap();
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: zhipu/glm-5.3
+  reasoning: max
+providers:
+  zhipu:
+    apiKeyEnv: ZHIPU_API_KEY
+"#,
+    )
+    .unwrap();
+    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
+
+    assert_eq!(resolved.providers.len(), 1);
+    assert_eq!(
+        resolved.providers["zhipu"].base_url,
+        "https://open.bigmodel.cn/api/v1"
+    );
+    assert_eq!(resolved.default_model, "zhipu/glm-5.3");
+    assert_eq!(resolved.default_reasoning.as_deref(), Some("max"));
+    let text = &resolved.models["zhipu/glm-5.3"];
+    assert!(!text.capabilities.image_input);
+    assert!(text.capabilities.tool_calls);
+    assert_eq!(text.default_reasoning_effort.as_str(), "max");
+    let vision = &resolved.models["zhipu/glm-5.3-flash"];
+    assert!(vision.capabilities.image_input);
+    assert!(vision.capabilities.tool_calls);
+    assert_eq!(resolved.models.len(), 2);
+}
+
+#[test]
 fn custom_provider_maps_display_names_and_multiple_families() {
     let catalog = ModelCatalog::builtin().unwrap();
     let agent = AgentModelConfig::from_yaml(

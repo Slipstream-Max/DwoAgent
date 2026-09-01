@@ -17,6 +17,7 @@ const BUILTIN_MODEL_YAMLS: &[(&str, &str)] = &[
     ("grok", include_str!("../resources/models/grok.yaml")),
     ("openai", include_str!("../resources/models/openai.yaml")),
     ("qwen", include_str!("../resources/models/qwen.yaml")),
+    ("zhipu", include_str!("../resources/models/zhipu.yaml")),
 ];
 const RESERVED_BODY_FIELDS: &[&str] = &[
     "model",

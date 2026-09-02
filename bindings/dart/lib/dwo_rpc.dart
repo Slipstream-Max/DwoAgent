@@ -446,25 +446,46 @@ final class DwoRpcClient {
         requestId: requestId,
       );
 
-  Future<List<JsonObject>> automations() async =>
-      _objectArray(await callValue('automation.list'));
+  Future<List<JsonObject>> automations(String projectId) async =>
+      _objectArray(
+        await callValue('automation.list', params: {'project_id': projectId}),
+      );
 
-  Future<JsonObject> addAutomation(JsonObject job, {String? requestId}) =>
-      call('automation.add', params: {'job': job}, requestId: requestId);
+  Future<JsonObject> addAutomation(
+    String projectId,
+    JsonObject job, {
+    String? requestId,
+  }) => call(
+    'automation.add',
+    params: {'project_id': projectId, 'job': job},
+    requestId: requestId,
+  );
 
   Future<JsonObject> updateAutomation(
+    String projectId,
     String name,
     JsonObject update, {
     String? requestId,
-  }) =>
-      call(
-        'automation.update',
-        params: {'name': name, ...update},
-        requestId: requestId,
-      );
+  }) => call(
+    'automation.update',
+    params: {'project_id': projectId, 'name': name, ...update},
+    requestId: requestId,
+  );
 
-  Future<JsonObject> runAutomation(String job, {String? requestId}) =>
-      call('automation.run', params: {'job': job}, requestId: requestId);
+  Future<JsonObject> runAutomation(
+    String projectId,
+    String job, {
+    String? callerSessionId,
+    String? requestId,
+  }) => call(
+    'automation.run',
+    params: {
+      'project_id': projectId,
+      'job': job,
+      if (callerSessionId != null) 'caller_session_id': callerSessionId,
+    },
+    requestId: requestId,
+  );
 
   Future<JsonObject> websocketStatus() => call('websocket.status');
 
@@ -473,8 +494,11 @@ final class DwoRpcClient {
   Future<JsonObject> updateWebsocketConfig(
     JsonObject config, {
     String? requestId,
-  }) =>
-      call('websocket.config', params: config, requestId: requestId);
+  }) => call(
+    'websocket.config',
+    params: {'config': config},
+    requestId: requestId,
+  );
 
   Future<JsonObject> setWebsocketEnabled(
     bool enabled, {

@@ -86,14 +86,36 @@ Future<void> main() async {
   assert(event.name == 'config.changed');
   assert(event.params['source'] == 'profile');
 
+  await client.addAutomation(
+    'project-dwoagent',
+    {'name': 'daily-brief'},
+    requestId: 'automation-add-1',
+  );
+  assert(transport.lastRequest?['method'] == 'automation.add');
+  final addParams = transport.lastRequest?['params'] as JsonObject;
+  assert(addParams['project_id'] == 'project-dwoagent');
+  assert((addParams['job'] as JsonObject)['name'] == 'daily-brief');
+
+  await client.runAutomation(
+    'project-dwoagent',
+    'daily-brief',
+    callerSessionId: 'session-1',
+    requestId: 'automation-run-1',
+  );
+  final runParams = transport.lastRequest?['params'] as JsonObject;
+  assert(runParams['project_id'] == 'project-dwoagent');
+  assert(runParams['job'] == 'daily-brief');
+  assert(runParams['caller_session_id'] == 'session-1');
+
   await client.updateWebsocketConfig(
     {'enabled': true, 'bind': '127.0.0.1', 'port': 8787},
     requestId: 'websocket-config-1',
   );
   assert(transport.lastRequest?['method'] == 'websocket.config');
   assert(transport.lastRequest?['id'] == 'websocket-config-1');
+  final websocketParams = transport.lastRequest?['params'] as JsonObject;
   assert(
-    (transport.lastRequest?['params'] as JsonObject)['port'] == 8787,
+    (websocketParams['config'] as JsonObject)['port'] == 8787,
   );
 
   await client.setWebsocketEnabled(false, requestId: 'websocket-disable-1');

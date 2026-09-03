@@ -51,4 +51,4 @@ A terminal is bound to the process started by its command — a channel for that
 - While the process is alive and interactive (a persistent shell, a REPL, a command waiting on stdin, or a long-running task), you can keep sending input and polling it.
 - One-shot commands (`cargo test`, `git status`) exit on their own. Once the process exits, the terminal is locked: further input fails with `terminal is not running`; results report a status (`completed`/`error`/`cancelled`) plus `exit_code`; after a short retention period (~5 minutes) the terminal is removed and later calls report `terminal not found`.
 - Never reuse a terminal to start a new command after its process has exited — create a new terminal instead.
-- For continuous use, start a persistent shell (e.g. `powershell`) and keep feeding it commands.
+- For continuous use, start a persistent shell (e.g. `bash`) and keep feeding it commands.

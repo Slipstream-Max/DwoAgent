@@ -5,6 +5,7 @@ pub mod env_watcher;
 mod manager;
 mod message;
 pub mod prompt;
+pub mod shell;
 mod token;
 
 pub use compaction::{
@@ -25,6 +26,7 @@ pub use prompt::{
     McpSnapshot, PromptBuildError, PromptSnapshot, RuleSnapshot, SkillSnapshot, SystemPromptBlock,
     SystemPromptBuilder,
 };
+pub use shell::Shell;
 pub use token::{
     estimate_content_tokens, estimate_context_tokens, estimate_message_tokens,
     estimate_text_tokens, estimate_tool_tokens,

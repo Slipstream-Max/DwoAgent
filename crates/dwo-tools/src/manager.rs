@@ -186,11 +186,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_file_edits_in_one_batch_are_all_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let terminal_command = if cfg!(windows) {
-            "Write-Output terminal-ok"
-        } else {
-            "printf terminal-ok"
-        };
+        let terminal_command = "printf terminal-ok";
         let outputs = manager(dir.path().to_path_buf())
             .execute_batch(
                 vec![
@@ -288,11 +284,7 @@ mod tests {
     async fn file_worker_runs_while_terminal_is_waiting() {
         let dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(manager(dir.path().to_path_buf()));
-        let terminal_command = if cfg!(windows) {
-            "Start-Sleep -Seconds 2"
-        } else {
-            "sleep 2"
-        };
+        let terminal_command = "sleep 2";
         let task = tokio::spawn({
             let manager = manager.clone();
             let context = ExecutionContext::new(SessionMode::FullAccess);

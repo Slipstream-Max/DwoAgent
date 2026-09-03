@@ -314,17 +314,29 @@ mod tests {
 
     use super::*;
     use crate::ToolEvent;
+    use dwo_context::shell::Shell;
 
     fn output_command() -> &'static str {
-        if cfg!(windows) {
-            "Write-Output done"
-        } else {
-            "printf 'done\\n'"
-        }
+        "printf 'done\\n'"
+    }
+
+    /// The tests below use POSIX syntax; only the cmd.exe fallback cannot run
+    /// them, and Git Bash is the supported Windows shell.
+    #[cfg(windows)]
+    fn windows_cmd_fallback() -> bool {
+        !matches!(Shell::detect(), Shell::GitBash(_))
+    }
+
+    #[cfg(not(windows))]
+    fn windows_cmd_fallback() -> bool {
+        false
     }
 
     #[tokio::test]
     async fn run_returns_output_and_status() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
             .run(output_command().to_string(), 5_000, 120_000)
@@ -336,14 +348,12 @@ mod tests {
 
     #[tokio::test]
     async fn exit_drains_output_without_a_trailing_newline() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        let command = if cfg!(windows) {
-            "[Console]::Out.Write('tail-without-newline')"
-        } else {
-            "printf 'tail-without-newline'"
-        };
         let snapshot = manager
-            .run(command.to_string(), 5_000, 120_000)
+            .run("printf 'tail-without-newline'".to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -352,14 +362,16 @@ mod tests {
 
     #[tokio::test]
     async fn output_larger_than_the_pty_channel_does_not_stall() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        let command = if cfg!(windows) {
-            "[Console]::Out.Write(('x' * 1200000) + 'END-MARKER')"
-        } else {
-            "head -c 1200000 /dev/zero | tr '\\0' x; printf 'END-MARKER'"
-        };
         let snapshot = manager
-            .run(command.to_string(), 15_000, 120_000)
+            .run(
+                "head -c 1200000 /dev/zero | tr '\\0' x; printf 'END-MARKER'".to_string(),
+                15_000,
+                120_000,
+            )
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -395,17 +407,20 @@ mod tests {
 
     #[tokio::test]
     async fn combined_commands_keep_all_output() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         // Table rendering (screen-buffer API) used to be dropped when the
         // shell wrapper appended `; exit`; every later command's output was
         // silently lost. Regression guard for the wrapper change.
-        let command = if cfg!(windows) {
-            "Write-Output 'TEST1'; Write-Output '===SEP==='; Get-ChildItem prompts | Select-Object Name; Write-Output '===SEP2==='; (Get-ChildItem prompts).Name; Write-Output '===SEP3==='; Get-Content prompts/terminal.md -TotalCount 3"
-        } else {
-            "printf 'TEST1\\nSEP\\n'; ls prompts; printf 'SEP2\\n'; ls prompts"
-        };
         let snapshot = manager
-            .run(command.to_string(), 10_000, 120_000)
+            .run(
+                "printf 'TEST1\\n===SEP===\\n'; ls prompts; printf '===SEP2===\\n'; ls prompts; printf '===SEP3===\\n'; head -3 prompts/terminal.md"
+                    .to_string(),
+                10_000,
+                120_000,
+            )
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -478,14 +493,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_input_polls_incrementally() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        let command = if cfg!(windows) {
-            "Write-Output first; Start-Sleep -Milliseconds 1500; Write-Output second"
-        } else {
-            "printf 'first\\n'; sleep 1.5; printf 'second\\n'"
-        };
         let first = manager
-            .run(command.to_string(), 5_000, 120_000)
+            .run("printf 'first\\n'; sleep 1.5; printf 'second\\n'".to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert!(first.output.contains("first"));
@@ -497,40 +510,54 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_terminal_initializes_every_encoding_as_utf8() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
             .run(
-                "Write-Output (([Console]::InputEncoding.WebName, [Console]::OutputEncoding.WebName, $OutputEncoding.WebName) -join '|'); Write-Output '中文🙂'".to_string(),
+                "printf '%s\\n' \"$LANG\"; printf '中文🙂'".to_string(),
                 5_000,
                 120_000,
             )
             .await
             .unwrap();
-        assert!(snapshot.output.contains("utf-8|utf-8|utf-8"));
+        assert!(
+            snapshot.output.contains("C.UTF-8"),
+            "locale not UTF-8: {:?}",
+            snapshot.output
+        );
         assert!(snapshot.output.contains("中文🙂"));
     }
 
     #[tokio::test]
     async fn pty_input_reaches_the_process() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        let command = if cfg!(windows) {
-            "powershell.exe -NoLogo -NoProfile -NoExit"
+        // The octal printf keeps the literal "PTY-OK" out of the tty echo of
+        // the input line, so only the child executing it can satisfy the
+        // assertion.
+        let (command, input) = if cfg!(windows) {
+            match Shell::detect() {
+                Shell::GitBash(program) => (
+                    format!("\"{}\" -i", program.to_string_lossy().replace('\\', "/")),
+                    "printf '\\120\\124\\131\\055\\117\\113\\n'\n".to_string(),
+                ),
+                _ => ("cmd.exe /q /k".to_string(), "echo PTY-OK\n".to_string()),
+            }
         } else {
-            "sh -i"
+            (
+                "sh -i".to_string(),
+                "printf '\\120\\124\\131\\055\\117\\113\\n'\n".to_string(),
+            )
         };
-        let started = manager.run(command.to_string(), 500, 10_000).await.unwrap();
+        let started = manager.run(command, 500, 10_000).await.unwrap();
         assert_eq!(
             started.status, "running",
             "exit={:?}, output={}",
             started.exit_code, started.output
         );
-        let input = if cfg!(windows) {
-            "Write-Output ([string][char]80 + [char]84 + [char]89 + '-' + [char]79 + [char]75)\n"
-        } else {
-            "printf '\\120\\124\\131\\055\\117\\113\\n'\n"
-        };
         let mut output = manager
-            .input(&started.terminal_id, input, 1_000)
+            .input(&started.terminal_id, &input, 1_000)
             .await
             .unwrap()
             .output;
@@ -552,14 +579,12 @@ mod tests {
 
     #[tokio::test]
     async fn kill_returns_cancelled_and_drains_output() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        let command = if cfg!(windows) {
-            "Write-Output before-kill; Start-Sleep -Seconds 30"
-        } else {
-            "printf 'before-kill\\n'; sleep 30"
-        };
         let started = manager
-            .run(command.to_string(), 5_000, 120_000)
+            .run("printf 'before-kill\\n'; sleep 30".to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert!(started.output.contains("before-kill"));
@@ -569,14 +594,12 @@ mod tests {
 
     #[tokio::test]
     async fn list_does_not_consume_unread_output() {
+        if windows_cmd_fallback() {
+            return;
+        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        let command = if cfg!(windows) {
-            "Start-Sleep -Milliseconds 500; Write-Output later"
-        } else {
-            "sleep 0.5; printf 'later\\n'"
-        };
         let started = manager
-            .run(command.to_string(), 100, 120_000)
+            .run("sleep 0.5; printf 'later\\n'".to_string(), 100, 120_000)
             .await
             .unwrap();
         let _ = manager.list().await;

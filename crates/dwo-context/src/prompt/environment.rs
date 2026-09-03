@@ -18,7 +18,7 @@ impl EnvironmentSnapshot {
     pub fn capture(cwd: &Path) -> Self {
         Self {
             cwd: cwd.display().to_string(),
-            shell: if cfg!(windows) { "powershell" } else { "sh" }.to_string(),
+            shell: crate::shell::Shell::detect().name().to_string(),
             current_date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
             timezone: Local::now().offset().to_string(),
             platform: std::env::consts::OS.to_string(),

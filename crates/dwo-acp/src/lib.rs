@@ -1182,7 +1182,27 @@ async fn session_config_options(
     build_session_config_options(snapshot)
 }
 
-fn build_session_config_options(snapshot: SessionOptions) -> Result<Vec<SessionConfigOption>> {
+fn build_session_config_options(mut snapshot: SessionOptions) -> Result<Vec<SessionConfigOption>> {
+    // Keep a stale selection visible so a catalog reload cannot prevent the
+    // client from displaying the new options and selecting a replacement.
+    if !snapshot
+        .models
+        .iter()
+        .any(|model| model.id == snapshot.config.model)
+    {
+        snapshot.models.push(ipc_schema::SessionModelOption {
+            id: snapshot.config.model.clone(),
+            name: format!("{} (unavailable)", snapshot.config.model),
+            provider: snapshot
+                .config
+                .model
+                .split_once('/')
+                .map_or("", |(provider, _)| provider)
+                .to_string(),
+            reasoning: Vec::new(),
+            default_reasoning: "auto".to_string(),
+        });
+    }
     let model = snapshot
         .models
         .iter()
@@ -1193,7 +1213,20 @@ fn build_session_config_options(snapshot: SessionOptions) -> Result<Vec<SessionC
         .reasoning
         .clone()
         .unwrap_or_else(|| model.default_reasoning.clone());
-    let reasoning_options = model.reasoning.clone();
+    let mut reasoning_options = model.reasoning.clone();
+    if !reasoning_options
+        .iter()
+        .any(|option| option.id == reasoning)
+    {
+        reasoning_options.push(ipc_schema::ReasoningOption {
+            id: reasoning.clone(),
+            name: if snapshot.config.reasoning.is_some() {
+                format!("{reasoning} (unavailable)")
+            } else {
+                reasoning.clone()
+            },
+        });
+    }
     let policy = snapshot.config.mode.as_str();
 
     // Group models by provider, preserving the catalog order.
@@ -2455,6 +2488,43 @@ mod tests {
             "optional prompt"
         );
         assert_eq!(json["availableCommands"][6]["name"], "mcp github");
+    }
+
+    #[test]
+    fn acp_keeps_options_accessible_after_model_or_reasoning_removal() {
+        for selected in ["deepseek/old", "deepseek/new"] {
+            let options = build_session_config_options(SessionOptions {
+                config: ipc_schema::SessionConfig {
+                    mode: ipc_schema::SessionMode::FullAccess,
+                    model: selected.to_string(),
+                    reasoning: Some("max".to_string()),
+                },
+                models: vec![ipc_schema::SessionModelOption {
+                    id: "deepseek/new".to_string(),
+                    name: "Updated model".to_string(),
+                    provider: "deepseek".to_string(),
+                    reasoning: vec![ipc_schema::ReasoningOption {
+                        id: "high".to_string(),
+                        name: "High".to_string(),
+                    }],
+                    default_reasoning: "high".to_string(),
+                }],
+            })
+            .unwrap();
+            let value = serde_json::to_value(options).unwrap();
+            assert_eq!(value[0]["currentValue"], selected);
+            assert_eq!(value[0]["options"][0]["value"], "deepseek/new");
+            assert_eq!(value[1]["currentValue"], "max");
+            assert_eq!(
+                value[1]["options"].as_array().unwrap().last().unwrap()["name"],
+                "max (unavailable)"
+            );
+            if selected.ends_with("old") {
+                assert_eq!(value[0]["options"][1]["name"], "deepseek/old (unavailable)");
+            } else {
+                assert_eq!(value[1]["options"][0]["value"], "high");
+            }
+        }
     }
 
     #[test]

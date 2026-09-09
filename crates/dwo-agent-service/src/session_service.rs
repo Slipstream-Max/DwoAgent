@@ -239,6 +239,15 @@ impl SessionService {
             .expect("session deletion hook lock poisoned") = Some(hook);
     }
 
+    /// Notify subscribers after the Host has published the new model options.
+    pub async fn refresh_config_options(&self) {
+        let handles = self.loaded.lock().await.handles.clone();
+        for handle in handles.values() {
+            // Sessions can close concurrently with a profile reload.
+            let _ = handle.refresh_config_options().await;
+        }
+    }
+
     pub fn apply_profile(&self, profile: LoadedAgentProfile) -> Result<(), SessionServiceError> {
         let model = ConfiguredModelClient::from_resolved(profile.models)
             .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;

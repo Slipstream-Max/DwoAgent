@@ -179,7 +179,7 @@ pub(crate) struct ConfigUpdateParam {
     external_rule_files: Option<Vec<PathBuf>>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionModelOption {
     id: String,
@@ -506,6 +506,12 @@ impl Host {
         let _reload = self.profile_reload.lock().await;
         let source = self.config_manager.fingerprint()?;
         let runtime_profile = RuntimeProfile::from_loaded(source, &loaded);
+        let model_options_changed = self
+            .profile
+            .read()
+            .expect("profile lock poisoned")
+            .model_options
+            != runtime_profile.model_options;
         let channels_changed = self
             .profile
             .read()
@@ -538,6 +544,9 @@ impl Host {
         }
 
         *self.profile.write().expect("profile lock poisoned") = runtime_profile;
+        if model_options_changed {
+            self.service.refresh_config_options().await;
+        }
         tracing::info!(event = "profile.reloaded", "profile configuration reloaded");
         tracing::info!(
             event = "config.changed",

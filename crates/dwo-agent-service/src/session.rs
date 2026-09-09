@@ -230,6 +230,10 @@ impl SessionHandle {
             .map_err(|_| SessionServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub(crate) async fn refresh_config_options(&self) -> Result<(), SessionServiceError> {
+        self.send(SessionRequest::RefreshConfigOptions).await
+    }
+
     pub(crate) async fn set_config(
         &self,
         update: SessionConfigUpdate,
@@ -344,6 +348,7 @@ impl SessionHandle {
 }
 
 enum SessionRequest {
+    RefreshConfigOptions,
     Subscribe {
         checkpoint_cursor: Option<usize>,
         response: oneshot::Sender<(SessionSnapshot, broadcast::Receiver<SessionEvent>)>,
@@ -620,6 +625,11 @@ impl SessionActor {
                 response,
             } => {
                 let _ = response.send(self.cancel(expected_turn_id));
+            }
+            SessionRequest::RefreshConfigOptions => {
+                self.broadcast_event(SessionEventPayload::ConfigChanged {
+                    config: self.record.config(),
+                });
             }
             SessionRequest::SetConfig { update, response } => {
                 let _ = response.send(self.set_config(update).await);

@@ -271,7 +271,7 @@ pub struct SessionModelOption {
     pub default_reasoning: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningOption {
     pub id: String,
     pub name: String,

@@ -8,7 +8,7 @@ models:
       toolCalls: true
     hostedTools: [web_search, web_extractor]
     defaultReasoningEffort: xhigh
-    reasoningEfforts: [auto, off, low, medium, xhigh]
+    reasoningEfforts: [low, medium, xhigh]
   qwen3.8-flash:
     contextWindowTokens: 1000000
     maxOutputTokens: 131072
@@ -17,7 +17,7 @@ models:
       toolCalls: true
     hostedTools: [web_search, web_extractor]
     defaultReasoningEffort: xhigh
-    reasoningEfforts: [auto, off, low, medium, xhigh]
+    reasoningEfforts: [low, medium, xhigh]
   qwen3.8-27b:
     contextWindowTokens: 1000000
     maxOutputTokens: 131072
@@ -26,4 +26,4 @@ models:
       toolCalls: true
     hostedTools: [web_search, web_extractor]
     defaultReasoningEffort: xhigh
-    reasoningEfforts: [auto, off, low, medium, xhigh]
+    reasoningEfforts: [low, medium, xhigh]

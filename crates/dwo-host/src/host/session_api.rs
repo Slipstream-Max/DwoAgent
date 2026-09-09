@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
-    EndpointId, ExternalRuleFile, NotificationLevel, PromptAccepted, SessionConfigUpdate,
+    EndpointId, NotificationLevel, PromptAccepted, SessionConfigUpdate,
     SessionEventPayload, SessionId, SessionListQuery, SessionLlmSettings, SessionNotification,
     SessionService, SessionSubscription, SessionUpdate, SessionWorkspace,
 };
@@ -120,6 +120,7 @@ struct SessionConfigOptionParam {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionSetParam {
     session_id: String,
     caller_session_id: Option<String>,
@@ -127,7 +128,6 @@ struct SessionSetParam {
     policy: Option<SessionMode>,
     model: Option<String>,
     reasoning: Option<String>,
-    worktree_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +141,7 @@ struct PermissionParam {
 
 impl Host {
     pub async fn create_session(&self, options: HostSessionOptions) -> Result<SessionId> {
+        let _lifecycle = self.automation.lifecycle.lock().await;
         anyhow::ensure!(
             options.project_id.is_none() || options.cwd.is_none(),
             "cwd cannot be supplied with project_id"
@@ -166,6 +167,7 @@ impl Host {
                 .topic_id
                 .clone()
                 .unwrap_or_else(|| project.board.uncategorized_topic_id.clone());
+            anyhow::ensure!(topic_id != dwo_project::ARCHIVE_TOPIC_ID, "cannot create a session in Archive");
             anyhow::ensure!(
                 project
                     .board
@@ -175,26 +177,24 @@ impl Host {
                 "topic not found in project: {topic_id}"
             );
             let (workspace, cwd) = match (project.kind, options.worktree_id.as_ref()) {
-                (ProjectKind::Shared, Some(worktree_id)) => {
+                (ProjectKind::Project, Some(worktree_id)) => {
                     let worktree = find_worktree(&project, worktree_id)?;
                     (
-                        SessionWorkspace::Worktree {
-                            worktree_id: worktree.id.clone(),
-                        },
+                        SessionWorkspace::External { pwd: worktree.path.clone() },
                         worktree.path.clone(),
                     )
                 }
-                (ProjectKind::Shared, None) => (
-                    SessionWorkspace::ProjectDefault,
+                (ProjectKind::Project, None) => (
+                    SessionWorkspace::External { pwd: project.pwd.clone().context("project is missing pwd")? },
                     project
                         .pwd
                         .clone()
                         .context("shared project is missing pwd")?,
                 ),
-                (ProjectKind::Independent, Some(_)) => {
+                (ProjectKind::Work, Some(_)) => {
                     anyhow::bail!("independent projects cannot use worktrees")
                 }
-                (ProjectKind::Independent, None) => (
+                (ProjectKind::Work, None) => (
                     SessionWorkspace::Managed,
                     managed_workspace_path(&self.profile_root, &id),
                 ),
@@ -209,11 +209,11 @@ impl Host {
                 .as_ref()
                 .context("fork source snapshot is unavailable")?;
             let (workspace, cwd) = match project.kind {
-                ProjectKind::Shared => (
+                ProjectKind::Project => (
                     source.record.info.workspace.clone(),
                     source.record.info.cwd.clone(),
                 ),
-                ProjectKind::Independent => match &source.record.info.workspace {
+                ProjectKind::Work => match &source.record.info.workspace {
                     SessionWorkspace::Managed => (
                         SessionWorkspace::Managed,
                         managed_workspace_path(&self.profile_root, &id),
@@ -221,7 +221,6 @@ impl Host {
                     SessionWorkspace::External { pwd } => {
                         (SessionWorkspace::External { pwd: pwd.clone() }, pwd.clone())
                     }
-                    _ => anyhow::bail!("independent project has an invalid session workspace"),
                 },
             };
             (project, topic.id, workspace, cwd)
@@ -259,6 +258,9 @@ impl Host {
             }
         }
         let external_rule_files = vec![dwo_context::ExternalRuleFile::new(
+            self.projects.project_rule_path(&project.id)?,
+            cwd.clone(),
+        ), dwo_context::ExternalRuleFile::new(
             self.projects.agents_path(&project.id, &topic_id)?,
             cwd.clone(),
         )];
@@ -296,6 +298,8 @@ impl Host {
     }
 
     pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
+        let _lifecycle = self.automation.lifecycle.lock().await;
+        anyhow::ensure!(self.projects.is_archived(id.as_str()), "archive the session before deleting it from Work Archive");
         self.service.delete(id).await?;
         cleanup_deleted_session_resources(&self.profile_root, id).await?;
         Ok(())
@@ -442,6 +446,8 @@ impl Host {
                 let params: PromptParam = serde_json::from_value(params)?;
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
                 let (session_id, parent_id) = self.resolve_prompt_session(&params, caller).await?;
+                let _lifecycle = self.automation.lifecycle.lock().await;
+                anyhow::ensure!(!self.projects.is_archived(session_id.as_str()), "archived sessions are read-only");
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
                 let subscription = self.service.subscribe(&session_id, None).await?;
                 let content = self
@@ -584,32 +590,15 @@ impl Host {
                     params.title.is_some()
                         || params.policy.is_some()
                         || params.model.is_some()
-                        || params.reasoning.is_some()
-                        || params.worktree_id.is_some(),
+                        || params.reasoning.is_some(),
                     "session.set requires at least one field"
                 );
-                if params.worktree_id.is_some() {
-                    anyhow::ensure!(
-                        params.title.is_none()
-                            && params.policy.is_none()
-                            && params.model.is_none()
-                            && params.reasoning.is_none(),
-                        "session.set --worktree cannot be combined with other fields"
-                    );
-                }
                 let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
                 let caller = parse_optional_session(params.caller_session_id)?;
                 let target = self.service.snapshot(&id).await?.record;
                 if let Some(caller) = &caller {
                     if caller == &id {
-                        anyhow::ensure!(
-                            params.worktree_id.is_some()
-                                && params.title.is_none()
-                                && params.policy.is_none()
-                                && params.model.is_none()
-                                && params.reasoning.is_none(),
-                            "a session can only bind its own worktree"
-                        );
+                        anyhow::bail!("a session cannot modify its own configuration");
                     } else {
                         anyhow::ensure!(
                             target.info.parent_session_id.as_ref() == Some(caller),
@@ -620,28 +609,6 @@ impl Host {
                             ensure_policy_ceiling(mode, parent.info.mode)?;
                         }
                     }
-                }
-                if let Some(worktree_id) = params.worktree_id {
-                    let (project, topic) = self
-                        .projects
-                        .locate_session(id.as_str())
-                        .context("session is not assigned to a project topic")?;
-                    let worktree = find_worktree(&project, &worktree_id)?;
-                    self.service
-                        .set_workspace(
-                            &id,
-                            SessionWorkspace::Worktree {
-                                worktree_id: worktree.id.clone(),
-                            },
-                            worktree.path.clone(),
-                            vec![ExternalRuleFile::new(
-                                self.projects.agents_path(&project.id, &topic.id)?,
-                                worktree.path.clone(),
-                            )],
-                        )
-                        .await?;
-                    let snapshot = self.service.snapshot(&id).await?;
-                    return Ok(json!({"updated": true, "session": snapshot.record}));
                 }
                 self.service
                     .set(
@@ -854,6 +821,8 @@ impl Host {
         endpoint: EndpointId,
         content: MessageContent,
     ) -> Result<PromptAccepted> {
+        let _lifecycle = self.automation.lifecycle.lock().await;
+        anyhow::ensure!(!self.projects.is_archived(id.as_str()), "archived sessions are read-only");
         let snapshot = self.service.snapshot(id).await?;
         let content = self
             .expand_prompt_directives(&snapshot.record.info.cwd, content)
@@ -1378,7 +1347,7 @@ mod tests {
         let project = host
             .handle_method(
                 "project.create",
-                json!({"name": "Target", "kind": "independent"}),
+                json!({"name": "Target", "pwd": root.path()}),
             )
             .await
             .unwrap();
@@ -1416,7 +1385,7 @@ mod tests {
                 .record
                 .info
                 .workspace,
-            SessionWorkspace::Managed
+            SessionWorkspace::External { pwd: std::fs::canonicalize(root.path()).unwrap() }
         );
         host.shutdown().await;
     }
@@ -1450,7 +1419,7 @@ mod tests {
             .locate_session(generated_id.as_str())
             .expect("generated session belongs to the uncategorized topic");
         assert_eq!(generated_project.id, dwo_project::UNASSIGNED_PROJECT_ID);
-        assert_eq!(generated_project.kind, ProjectKind::Independent);
+        assert_eq!(generated_project.kind, ProjectKind::Work);
         assert_eq!(generated_project.pwd, None);
         assert_ne!(generated_cwd, second_generated_cwd);
         assert_eq!(
@@ -1503,6 +1472,10 @@ mod tests {
             std::fs::write(attachment, b"image").unwrap();
         }
 
+        for id in [&generated_id, &custom_id, &second_custom_id, &second_generated_id] {
+            let (project, _) = host.projects.locate_session(id.as_str()).unwrap();
+            host.handle_method("project.session.archive", json!({"project_id": project.id, "session_id": id})).await.unwrap();
+        }
         host.delete_session(&generated_id).await.unwrap();
         assert!(
             !generated_cwd.exists(),
@@ -1539,7 +1512,7 @@ mod tests {
         let project = host
             .handle_method(
                 "project.create",
-                json!({"name": "Shared", "kind": "shared", "pwd": project_pwd}),
+                json!({"name": "Shared", "pwd": project_pwd}),
             )
             .await
             .unwrap();
@@ -1557,7 +1530,7 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(session_file).unwrap()).unwrap();
         assert!(metadata["info"].get("cwd").is_none());
-        assert_eq!(metadata["info"]["workspace"]["kind"], "project_default");
+        assert_eq!(metadata["info"]["workspace"]["kind"], "external");
 
         let reloaded = Host::build(&config).await.unwrap();
         let snapshot = reloaded.service.snapshot(&session_id).await.unwrap();

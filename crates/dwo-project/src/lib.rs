@@ -13,13 +13,22 @@ pub const AUTOMATION_DIR: &str = "automation";
 pub const AUTOMATION_CONFIG_FILE: &str = "config.yaml";
 pub const AUTOMATION_HISTORY_FILE: &str = "history.yaml";
 pub const UNASSIGNED_PROJECT_ID: &str = "project-unassigned";
-pub const UNASSIGNED_PROJECT_NAME: &str = "未分配会话";
+pub const UNASSIGNED_PROJECT_NAME: &str = "Work";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectKind {
-    Shared,
-    Independent,
+    Project,
+    Work,
+}
+
+pub const ARCHIVE_SECTION_ID: &str = "section-archive";
+pub const ARCHIVE_TOPIC_ID: &str = "topic-archive";
+
+#[derive(Serialize, Deserialize)]
+struct ArchiveTransaction {
+    projects: Vec<Project>,
+    removed: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -156,6 +165,7 @@ impl ProjectService {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         create_dir_all(&root)?;
+        recover_archive(&root)?;
         let mut projects = Vec::new();
         for entry in read_dir(&root)? {
             let entry = entry.map_err(|source| ProjectError::Io {
@@ -230,7 +240,7 @@ impl ProjectService {
         {
             return Ok(project.clone());
         }
-        self.create_locked(&mut projects, name, ProjectKind::Shared, Some(pwd))
+        self.create_locked(&mut projects, name, ProjectKind::Project, Some(pwd))
     }
 
     pub fn get_or_create_unassigned(&self) -> Result<Project> {
@@ -256,7 +266,7 @@ impl ProjectService {
             &mut projects,
             UNASSIGNED_PROJECT_ID.to_string(),
             UNASSIGNED_PROJECT_NAME.to_string(),
-            ProjectKind::Independent,
+            ProjectKind::Work,
             None,
         )
     }
@@ -314,6 +324,7 @@ impl ProjectService {
             updated_at_ms: now,
         };
         self.create_topic_files(&project.id, &topic_id)?;
+        atomic_write(&project_dir.join(AGENTS_FILE), b"")?;
         self.persist(&project)?;
         projects.push(project.clone());
         Ok(project)
@@ -334,12 +345,11 @@ impl ProjectService {
         primary: WorktreeRecord,
     ) -> Result<Project> {
         self.mutate(project_id, |project| {
-            if project.kind != ProjectKind::Shared {
+            if project.kind != ProjectKind::Project {
                 return Err(ProjectError::Invalid(
                     "independent projects cannot attach repositories".to_string(),
                 ));
             }
-            project.pwd = Some(primary.path.clone());
             project.repository = Some(repository);
             project.default_worktree_id = Some(primary.id.clone());
             project.worktrees = vec![primary];
@@ -349,7 +359,7 @@ impl ProjectService {
 
     pub fn add_worktree(&self, project_id: &str, worktree: WorktreeRecord) -> Result<Project> {
         self.mutate(project_id, |project| {
-            if project.kind != ProjectKind::Shared {
+            if project.kind != ProjectKind::Project {
                 return Err(ProjectError::Invalid(
                     "independent projects cannot register worktrees".to_string(),
                 ));
@@ -401,6 +411,9 @@ impl ProjectService {
     pub fn remove_worktree(&self, project_id: &str, worktree_id: &str) -> Result<Project> {
         let worktree_id = worktree_id.to_string();
         self.mutate(project_id, |project| {
+            if project.worktrees.iter().any(|w| w.id == worktree_id && w.source == WorktreeSource::Primary) {
+                return Err(ProjectError::Invalid("primary worktree cannot be removed".into()));
+            }
             let before = project.worktrees.len();
             project
                 .worktrees
@@ -476,45 +489,6 @@ impl ProjectService {
         Ok(project.board.sections)
     }
 
-    pub fn delete_section(&self, project_id: &str, section_id: &str) -> Result<Project> {
-        let section_id = section_id.to_string();
-        self.mutate(project_id, |project| {
-            if section_id == project.board.uncategorized_section_id {
-                return Err(ProjectError::Invalid(
-                    "the uncategorized section cannot be deleted".to_string(),
-                ));
-            }
-            let before = project.board.sections.len();
-            project
-                .board
-                .sections
-                .retain(|section| section.id != section_id);
-            if before == project.board.sections.len() {
-                return Err(ProjectError::SectionNotFound(section_id.clone()));
-            }
-            let uncategorized = project.board.uncategorized_section_id.clone();
-            let next_order = project
-                .board
-                .topics
-                .iter()
-                .filter(|topic| topic.section_id == uncategorized)
-                .count() as u32;
-            for (next_order, topic) in (next_order..).zip(
-                project
-                    .board
-                    .topics
-                    .iter_mut()
-                    .filter(|topic| topic.section_id == section_id),
-            ) {
-                topic.section_id = uncategorized.clone();
-                topic.order = next_order;
-            }
-            normalize_orders(&mut project.board.sections, |item, order| {
-                item.order = order
-            });
-            Ok(())
-        })
-    }
 
     pub fn create_topic(&self, project_id: &str, section_id: &str, title: String) -> Result<Topic> {
         let title = nonempty("topic title", title)?;
@@ -594,198 +568,13 @@ impl ProjectService {
         find_topic(&project, &topic_id).cloned()
     }
 
-    pub fn move_topic_to_project(
-        &self,
-        source_project_id: &str,
-        topic_id: &str,
-        target_project_id: &str,
-        target_section_id: &str,
-        position: usize,
-    ) -> Result<Topic> {
-        if source_project_id == target_project_id {
-            return self.move_topic(source_project_id, topic_id, target_section_id, position);
-        }
-
-        let topic_id = topic_id.to_string();
-        let target_section_id = target_section_id.to_string();
-        let mut projects = self.projects.write().expect("project lock poisoned");
-        let source_index = projects
-            .iter()
-            .position(|project| project.id == source_project_id)
-            .ok_or_else(|| ProjectError::ProjectNotFound(source_project_id.to_string()))?;
-        let target_index = projects
-            .iter()
-            .position(|project| project.id == target_project_id)
-            .ok_or_else(|| ProjectError::ProjectNotFound(target_project_id.to_string()))?;
-
-        let source_topic = projects[source_index]
-            .board
-            .topics
-            .iter()
-            .find(|topic| topic.id == topic_id)
-            .cloned()
-            .ok_or_else(|| ProjectError::TopicNotFound(topic_id.clone()))?;
-        if source_topic.id == projects[source_index].board.uncategorized_topic_id {
-            return Err(ProjectError::Invalid(
-                "the uncategorized topic cannot move across projects".to_string(),
-            ));
-        }
-        if projects[target_index]
-            .board
-            .topics
-            .iter()
-            .any(|topic| topic.id == topic_id)
-        {
-            return Err(ProjectError::Invalid(format!(
-                "topic is already registered in target project: {topic_id}"
-            )));
-        }
-        if !projects[target_index]
-            .board
-            .sections
-            .iter()
-            .any(|section| section.id == target_section_id)
-        {
-            return Err(ProjectError::SectionNotFound(target_section_id));
-        }
-        let (source, target) = if source_index < target_index {
-            let (left, right) = projects.split_at_mut(target_index);
-            (&mut left[source_index], &mut right[0])
-        } else {
-            let (left, right) = projects.split_at_mut(source_index);
-            (&mut right[0], &mut left[target_index])
-        };
-
-        let source_topic_index = source
-            .board
-            .topics
-            .iter()
-            .position(|topic| topic.id == topic_id)
-            .expect("source topic was checked above");
-        let mut topic = source.board.topics.remove(source_topic_index);
-        let old_section_id = topic.section_id.clone();
-        let label_ids = topic
-            .label_ids
-            .iter()
-            .filter_map(|label_id| {
-                source
-                    .board
-                    .labels
-                    .iter()
-                    .find(|label| &label.id == label_id)
-                    .cloned()
-            })
-            .map(|label| {
-                target
-                    .board
-                    .labels
-                    .iter()
-                    .find(|existing| {
-                        existing.name == label.name
-                            && existing.color == label.color
-                            && existing.description == label.description
-                    })
-                    .map(|existing| existing.id.clone())
-                    .unwrap_or_else(|| {
-                        let id = new_id("label");
-                        target.board.labels.push(Label {
-                            id: id.clone(),
-                            name: label.name,
-                            color: label.color,
-                            description: label.description,
-                        });
-                        id
-                    })
-            })
-            .collect::<Vec<_>>();
-        topic.section_id = target_section_id.clone();
-        topic.label_ids = label_ids;
-        topic.order = target
-            .board
-            .topics
-            .iter()
-            .filter(|candidate| candidate.section_id == target_section_id)
-            .count() as u32;
-        let target_indices = target
-            .board
-            .topics
-            .iter()
-            .enumerate()
-            .filter_map(|(index, candidate)| {
-                (candidate.section_id == target_section_id).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let insert = if position >= target_indices.len() {
-            target_indices
-                .last()
-                .map_or(target.board.topics.len(), |index| index + 1)
-        } else {
-            target_indices[position]
-        };
-        target.board.topics.insert(insert, topic.clone());
-        normalize_topic_orders(&mut source.board.topics, &old_section_id);
-        normalize_topic_orders(&mut target.board.topics, &target_section_id);
-        source.updated_at_ms = unix_time_ms();
-        target.updated_at_ms = unix_time_ms();
-        validate_project(source)?;
-        validate_project(target)?;
-
-        let source_topic_dir = self.topic_dir(source_project_id, &topic_id);
-        let target_topic_dir = self.topic_dir(target_project_id, &topic_id);
-        if source_topic_dir.is_dir() {
-            create_dir_all(
-                target_topic_dir
-                    .parent()
-                    .expect("topic directory has a project parent"),
-            )?;
-            fs::rename(&source_topic_dir, &target_topic_dir).map_err(|source| {
-                ProjectError::Io {
-                    path: target_topic_dir.clone(),
-                    source,
-                }
-            })?;
-        } else {
-            self.create_topic_files(target_project_id, &topic_id)?;
-        }
-        self.persist(source)?;
-        self.persist(target)?;
-        Ok(topic)
-    }
-
-    pub fn delete_topic(&self, project_id: &str, topic_id: &str) -> Result<Project> {
-        let topic_id = topic_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            if topic_id == project.board.uncategorized_topic_id {
-                return Err(ProjectError::Invalid(
-                    "the uncategorized topic cannot be deleted".to_string(),
-                ));
-            }
-            let index = project
-                .board
-                .topics
-                .iter()
-                .position(|topic| topic.id == topic_id)
-                .ok_or_else(|| ProjectError::TopicNotFound(topic_id.clone()))?;
-            let removed = project.board.topics.remove(index);
-            let uncategorized_id = project.board.uncategorized_topic_id.clone();
-            let uncategorized = find_topic_mut(project, &uncategorized_id)?;
-            append_unique(&mut uncategorized.session_ids, removed.session_ids);
-            normalize_topic_orders(&mut project.board.topics, &removed.section_id);
-            Ok(())
-        })?;
-        let topic_dir = self.topic_dir(project_id, &topic_id);
-        if topic_dir.is_dir() {
-            fs::remove_dir_all(&topic_dir).map_err(|source| ProjectError::Io {
-                path: topic_dir,
-                source,
-            })?;
-        }
-        Ok(project)
-    }
 
     pub fn assign_session(&self, project_id: &str, topic_id: &str, id: String) -> Result<Topic> {
         let id = nonempty("session id", id)?;
-        self.unassign_session_everywhere(&id)?;
+        if let Some((project, topic)) = self.locate_session(&id) {
+            if project.id == project_id && topic.id == topic_id { return Ok(topic); }
+            return Err(ProjectError::Invalid("session ownership is fixed".into()));
+        }
         let topic_id = topic_id.to_string();
         let project = self.mutate(project_id, |project| {
             let topic = find_topic_mut(project, &topic_id)?;
@@ -795,16 +584,6 @@ impl ProjectService {
         find_topic(&project, &topic_id).cloned()
     }
 
-    pub fn unassign_session(&self, project_id: &str, topic_id: &str, id: &str) -> Result<Topic> {
-        let topic_id = topic_id.to_string();
-        let id = id.to_string();
-        let project = self.mutate(project_id, |project| {
-            let topic = find_topic_mut(project, &topic_id)?;
-            topic.session_ids.retain(|value| value != &id);
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
 
     pub fn create_label(
         &self,
@@ -930,6 +709,68 @@ impl ProjectService {
         Ok(self.topic_dir(project_id, topic_id).join(AGENTS_FILE))
     }
 
+    pub fn project_rule_path(&self, project_id: &str) -> Result<PathBuf> {
+        self.ensure_project(project_id)?;
+        Ok(self.project_dir(project_id).join(AGENTS_FILE))
+    }
+
+    pub fn set_project_rule(&self, project_id: &str, content: &str) -> Result<()> {
+        atomic_write(&self.project_rule_path(project_id)?, content.as_bytes())
+    }
+
+    pub fn is_archived(&self, session_id: &str) -> bool {
+        self.locate_session(session_id).is_some_and(|(p, t)|
+            p.id == UNASSIGNED_PROJECT_ID && t.id == ARCHIVE_TOPIC_ID)
+    }
+
+    /// Commit the new ownership before removing containers; replay the journal on restart.
+    pub fn archive(&self, project_id: &str, section_id: Option<&str>, topic_id: Option<&str>, session_id: Option<&str>) -> Result<Vec<String>> {
+        self.get_or_create_unassigned()?;
+        let mut guard = self.projects.write().expect("project lock poisoned");
+        let mut projects = guard.clone();
+        let source = projects.iter_mut().find(|p| p.id == project_id)
+            .ok_or_else(|| ProjectError::ProjectNotFound(project_id.into()))?;
+        if let Some(id) = section_id { ensure_section(source, id)?; }
+        if let Some(id) = topic_id { find_topic(source, id)?; }
+        if project_id == UNASSIGNED_PROJECT_ID && session_id.is_none() {
+            return Err(ProjectError::Invalid("Work system containers cannot be archived".into()));
+        }
+        let selected = |t: &Topic| section_id.is_none_or(|id| t.section_id == id)
+            && topic_id.is_none_or(|id| t.id == id);
+        let ids: Vec<String> = source.board.topics.iter().filter(|t| selected(t))
+            .flat_map(|t| t.session_ids.iter()).filter(|id| session_id.is_none_or(|s| *id == s))
+            .cloned().collect();
+        if session_id.is_some() && ids.is_empty() {
+            return Err(ProjectError::Invalid("session does not belong to container".into()));
+        }
+        for topic in &mut source.board.topics { topic.session_ids.retain(|id| !ids.contains(id)); }
+        if session_id.is_none() {
+            source.board.topics.retain(|t| !selected(t) || t.id == source.board.uncategorized_topic_id);
+            if let Some(id) = section_id {
+                source.board.sections.retain(|s| s.id != id || s.id == source.board.uncategorized_section_id);
+            }
+        }
+        source.updated_at_ms = unix_time_ms();
+        let removed = (section_id.is_none() && topic_id.is_none() && session_id.is_none()).then(|| project_id.to_string());
+        if let Some(id) = &removed { projects.retain(|p| &p.id != id); }
+        let work = projects.iter_mut().find(|p| p.id == UNASSIGNED_PROJECT_ID).expect("Work exists");
+        if !work.board.sections.iter().any(|s| s.id == ARCHIVE_SECTION_ID) {
+            work.board.sections.push(Section { id: ARCHIVE_SECTION_ID.into(), name: "Archive".into(), order: work.board.sections.len() as u32 });
+            work.board.topics.push(Topic { id: ARCHIVE_TOPIC_ID.into(), section_id: ARCHIVE_SECTION_ID.into(), title: "Archive".into(), order: 0, session_ids: vec![], label_ids: vec![] });
+            self.create_topic_files(UNASSIGNED_PROJECT_ID, ARCHIVE_TOPIC_ID)?;
+        }
+        append_unique(&mut find_topic_mut(work, ARCHIVE_TOPIC_ID)?.session_ids, ids.clone());
+        work.updated_at_ms = unix_time_ms();
+        for p in &projects { validate_project(p)?; }
+        let path = self.root.join("archive-transaction.json");
+        let bytes = serde_json::to_vec(&ArchiveTransaction { projects: projects.clone(), removed })
+            .map_err(|source| ProjectError::Json { path: path.clone(), source })?;
+        atomic_write(&path, &bytes)?;
+        recover_archive(&self.root)?;
+        *guard = projects;
+        Ok(ids)
+    }
+
     fn project_automation_dir(&self, project_id: &str) -> Result<PathBuf> {
         self.ensure_project(project_id)?;
         Ok(self.project_dir(project_id).join(AUTOMATION_DIR))
@@ -996,15 +837,17 @@ impl ProjectService {
         apply: impl FnOnce(&mut Project) -> Result<()>,
     ) -> Result<Project> {
         let mut projects = self.projects.write().expect("project lock poisoned");
-        let project = projects
-            .iter_mut()
-            .find(|project| project.id == project_id)
+        let index = projects
+            .iter().position(|p| p.id == project_id)
             .ok_or_else(|| ProjectError::ProjectNotFound(project_id.to_string()))?;
+        let mut next = projects[index].clone();
+        let project = &mut next;
         apply(project)?;
         project.updated_at_ms = unix_time_ms();
         validate_project(project)?;
         self.persist(project)?;
-        Ok(project.clone())
+        projects[index] = next.clone();
+        Ok(next)
     }
 
     fn ensure_project(&self, project_id: &str) -> Result<()> {
@@ -1059,6 +902,25 @@ impl ProjectService {
     }
 }
 
+fn recover_archive(root: &Path) -> Result<()> {
+    let journal = root.join("archive-transaction.json");
+    if !journal.exists() { return Ok(()); }
+    let bytes = fs::read(&journal).map_err(|source| ProjectError::Io { path: journal.clone(), source })?;
+    let transaction: ArchiveTransaction = serde_json::from_slice(&bytes)
+        .map_err(|source| ProjectError::Json { path: journal.clone(), source })?;
+    for project in transaction.projects {
+        validate_project(&project)?;
+        let path = root.join(&project.id).join("project.json");
+        let bytes = serde_json::to_vec_pretty(&project).map_err(|source| ProjectError::Json { path: path.clone(), source })?;
+        atomic_write(&path, &bytes)?;
+    }
+    if let Some(id) = transaction.removed {
+        let path = root.join(id).join("project.json");
+        if path.exists() { fs::remove_file(&path).map_err(|source| ProjectError::Io { path, source })?; }
+    }
+    fs::remove_file(&journal).map_err(|source| ProjectError::Io { path: journal, source })
+}
+
 fn validate_project(project: &Project) -> Result<()> {
     if project.id.trim().is_empty() || project.name.trim().is_empty() {
         return Err(ProjectError::Invalid(
@@ -1066,7 +928,7 @@ fn validate_project(project: &Project) -> Result<()> {
         ));
     }
     validate_project_location(project.kind, project.pwd.as_deref())?;
-    if project.kind == ProjectKind::Independent
+    if project.kind == ProjectKind::Work
         && (project.repository.is_some()
             || !project.worktrees.is_empty()
             || project.default_worktree_id.is_some())
@@ -1161,12 +1023,12 @@ fn validate_project(project: &Project) -> Result<()> {
 
 fn validate_project_location(kind: ProjectKind, pwd: Option<&Path>) -> Result<()> {
     match (kind, pwd) {
-        (ProjectKind::Shared, Some(pwd)) if pwd.is_absolute() => Ok(()),
-        (ProjectKind::Shared, _) => Err(ProjectError::Invalid(
+        (ProjectKind::Project, Some(pwd)) if pwd.is_absolute() => Ok(()),
+        (ProjectKind::Project, _) => Err(ProjectError::Invalid(
             "shared projects require an absolute pwd".to_string(),
         )),
-        (ProjectKind::Independent, None) => Ok(()),
-        (ProjectKind::Independent, Some(_)) => Err(ProjectError::Invalid(
+        (ProjectKind::Work, None) => Ok(()),
+        (ProjectKind::Work, Some(_)) => Err(ProjectError::Invalid(
             "independent projects cannot define pwd".to_string(),
         )),
     }
@@ -1338,7 +1200,7 @@ mod tests {
         let project = service
             .create(CreateProject {
                 name: "Demo".to_string(),
-                kind: ProjectKind::Independent,
+                kind: ProjectKind::Work,
                 pwd: None,
             })
             .unwrap();
@@ -1370,7 +1232,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(stored["kind"], "independent");
+        assert_eq!(stored["kind"], "work");
         assert!(stored.get("pwd").is_none());
         assert!(stored.get("workspaces").is_none());
     }
@@ -1385,7 +1247,7 @@ mod tests {
         assert!(matches!(
             service.create(CreateProject {
                 name: "Missing pwd".to_string(),
-                kind: ProjectKind::Shared,
+                kind: ProjectKind::Project,
                 pwd: None,
             }),
             Err(ProjectError::Invalid(_))
@@ -1393,7 +1255,7 @@ mod tests {
         assert!(matches!(
             service.create(CreateProject {
                 name: "Unexpected pwd".to_string(),
-                kind: ProjectKind::Independent,
+                kind: ProjectKind::Work,
                 pwd: Some(workspace),
             }),
             Err(ProjectError::Invalid(_))
@@ -1411,7 +1273,7 @@ mod tests {
             serde_json::to_vec_pretty(&serde_json::json!({
                 "id": "project-invalid",
                 "name": "Invalid",
-                "kind": "independent",
+                "kind": "work",
                 "workspaces": [],
                 "board": {
                     "uncategorizedSectionId": "section-inbox",
@@ -1447,7 +1309,7 @@ mod tests {
         let project = service
             .create(CreateProject {
                 name: "Demo".to_string(),
-                kind: ProjectKind::Shared,
+                kind: ProjectKind::Project,
                 pwd: Some(workspace.clone()),
             })
             .unwrap();
@@ -1520,129 +1382,35 @@ mod tests {
     }
 
     #[test]
-    fn moves_topic_between_projects_and_preserves_resources() {
+    fn archive_preserves_sessions_and_replays_durable_ownership() {
         let root = tempfile::tempdir().unwrap();
-        let service = ProjectService::open(root.path().join("projects")).unwrap();
-        let source = service
-            .create(CreateProject {
-                name: "Source".to_string(),
-                kind: ProjectKind::Independent,
-                pwd: None,
-            })
-            .unwrap();
-        let target = service
-            .create(CreateProject {
-                name: "Target".to_string(),
-                kind: ProjectKind::Independent,
-                pwd: None,
-            })
-            .unwrap();
-        let source_section = service
-            .create_section(&source.id, "Doing".to_string())
-            .unwrap();
-        let target_section = service
-            .create_section(&target.id, "Inbox".to_string())
-            .unwrap();
-        let topic = service
-            .create_topic(&source.id, &source_section.id, "Move me".to_string())
-            .unwrap();
-        let label = service
-            .create_label(
-                &source.id,
-                "Backend".to_string(),
-                "#388E3C".to_string(),
-                Some("source label".to_string()),
-            )
-            .unwrap();
-        service
-            .assign_label(&source.id, &topic.id, &label.id)
-            .unwrap();
-        service
-            .assign_session(&source.id, &topic.id, "session-1".to_string())
-            .unwrap();
-        service
-            .set_overview(&source.id, &topic.id, "# Plan")
-            .unwrap();
-        service
-            .set_agents(&source.id, &topic.id, "Use backend rules")
-            .unwrap();
+        let workspace = root.path().join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("keep.txt"), "keep").unwrap();
+        let path = root.path().join("projects");
+        let service = ProjectService::open(&path).unwrap();
+        let project = service.create(CreateProject { name: "Demo".into(), kind: ProjectKind::Project, pwd: Some(workspace.clone()) }).unwrap();
+        let section = service.create_section(&project.id, "Active".into()).unwrap();
+        let topic = service.create_topic(&project.id, &section.id, "Task".into()).unwrap();
+        service.assign_session(&project.id, &topic.id, "session-1".into()).unwrap();
+        assert!(service.assign_session(&project.id, &project.board.uncategorized_topic_id, "session-1".into()).is_err());
+        service.move_topic(&project.id, &topic.id, &project.board.uncategorized_section_id, 0).unwrap();
+        service.archive(&project.id, None, Some(&topic.id), None).unwrap();
+        assert!(service.is_archived("session-1"));
+        let reloaded = ProjectService::open(&path).unwrap();
+        assert!(reloaded.is_archived("session-1"));
+        assert!(!reloaded.get(&project.id).unwrap().board.topics.iter().any(|t| t.id == topic.id));
+        reloaded.archive(&project.id, None, None, None).unwrap();
+        assert!(ProjectService::open(&path).unwrap().get(&project.id).is_err());
+        assert_eq!(fs::read_to_string(workspace.join("keep.txt")).unwrap(), "keep");
 
-        let moved = service
-            .move_topic_to_project(
-                &source.id,
-                &topic.id,
-                &target.id,
-                &target_section.id,
-                usize::MAX,
-            )
-            .unwrap();
-
-        assert_eq!(moved.id, topic.id);
-        assert_eq!(moved.section_id, target_section.id);
-        assert_eq!(moved.session_ids, ["session-1"]);
-        assert!(
-            service
-                .get(&source.id)
-                .unwrap()
-                .board
-                .topics
-                .iter()
-                .all(|candidate| candidate.id != topic.id)
-        );
-        assert_eq!(service.overview(&target.id, &topic.id).unwrap(), "# Plan");
-        assert_eq!(
-            service.agents(&target.id, &topic.id).unwrap(),
-            "Use backend rules"
-        );
-        let target_project = service.get(&target.id).unwrap();
-        let target_topic = target_project
-            .board
-            .topics
-            .iter()
-            .find(|candidate| candidate.id == topic.id)
-            .unwrap();
-        assert_eq!(target_topic.label_ids.len(), 1);
-        assert_eq!(target_project.board.labels.len(), 1);
-    }
-
-    #[test]
-    fn moving_reference_keeps_single_topic_owner() {
-        let root = tempfile::tempdir().unwrap();
-        let service = ProjectService::open(root.path()).unwrap();
-        let project = service
-            .create(CreateProject {
-                name: "Demo".to_string(),
-                kind: ProjectKind::Independent,
-                pwd: None,
-            })
-            .unwrap();
-        let section = service
-            .create_section(&project.id, "Work".to_string())
-            .unwrap();
-        let first = service
-            .create_topic(&project.id, &section.id, "One".to_string())
-            .unwrap();
-        let second = service
-            .create_topic(&project.id, &section.id, "Two".to_string())
-            .unwrap();
-        service
-            .assign_session(&project.id, &first.id, "session-1".to_string())
-            .unwrap();
-        service
-            .assign_session(&project.id, &second.id, "session-1".to_string())
-            .unwrap();
-
-        let project = service.get(&project.id).unwrap();
-        assert!(
-            find_topic(&project, &first.id)
-                .unwrap()
-                .session_ids
-                .is_empty()
-        );
-        assert_eq!(
-            find_topic(&project, &second.id).unwrap().session_ids,
-            ["session-1"]
-        );
+        let projects = reloaded.list();
+        let journal = ArchiveTransaction { projects: projects.clone(), removed: Some(project.id.clone()) };
+        fs::write(path.join("archive-transaction.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+        fs::remove_file(path.join(UNASSIGNED_PROJECT_ID).join("project.json")).unwrap();
+        let recovered = ProjectService::open(&path).unwrap();
+        assert!(recovered.is_archived("session-1"));
+        assert!(!path.join("archive-transaction.json").exists());
     }
 
     #[test]
@@ -1676,7 +1444,7 @@ mod tests {
 
         let duplicate = service.create(CreateProject {
             name: "Duplicate".to_string(),
-            kind: ProjectKind::Shared,
+            kind: ProjectKind::Project,
             pwd: Some(workspace),
         });
         assert!(matches!(duplicate, Err(ProjectError::Invalid(_))));

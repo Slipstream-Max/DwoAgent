@@ -11,6 +11,7 @@ base64.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 cron.workspace = true
+dunce = "1.0"
 dwo-agent-service = { path = "../dwo-agent-service" }
 dwo-channels = { path = "../dwo-channels" }
 dwo-command = { path = "../dwo-command" }

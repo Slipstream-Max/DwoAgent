@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use dwo_agent_service::{ExternalRuleFile, SessionId, SessionWorkspace};
+use dwo_agent_service::SessionId;
 use dwo_project::{
     CreateProject, Project, ProjectKind, RepositoryRecord, WorktreeRecord, WorktreeSource,
 };
@@ -10,8 +10,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::Host;
-use super::managed_workspace_path;
-use super::session_api::copy_workspace;
 
 #[derive(Deserialize)]
 struct ProjectIdParam {
@@ -19,13 +17,19 @@ struct ProjectIdParam {
 }
 
 #[derive(Deserialize)]
-struct CreateProjectParam {
-    name: String,
-    kind: ProjectKind,
-    pwd: Option<PathBuf>,
-    from_session_id: Option<String>,
-    caller_session_id: Option<String>,
+#[serde(deny_unknown_fields)]
+struct CreateProjectParam { name: Option<String>, pwd: PathBuf }
+
+#[derive(Deserialize)]
+struct ArchiveParam {
+    project_id: String,
+    section_id: Option<String>,
+    topic_id: Option<String>,
+    session_id: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct ProjectRuleParam { project_id: String, content: Option<String> }
 
 #[derive(Deserialize)]
 struct UpdateProjectParam {
@@ -33,13 +37,6 @@ struct UpdateProjectParam {
     name: String,
 }
 
-#[derive(Deserialize)]
-struct CloneRepositoryParam {
-    project_id: String,
-    url: String,
-    path: PathBuf,
-    branch: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct AttachRepositoryParam {
@@ -64,7 +61,7 @@ struct AttachWorktreeParam {
 #[derive(Deserialize)]
 struct CreateWorktreeParam {
     project_id: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
     branch: String,
     start_point: Option<String>,
     name: Option<String>,
@@ -75,12 +72,6 @@ struct UpdateWorktreeParam {
     project_id: String,
     worktree_id: String,
     name: String,
-}
-
-#[derive(Deserialize)]
-struct SectionParam {
-    project_id: String,
-    section_id: String,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +105,7 @@ struct CreateTopicParam {
     project_id: String,
     section_id: String,
     title: String,
+    overview: String,
 }
 
 #[derive(Deserialize)]
@@ -131,14 +123,6 @@ struct MoveTopicParam {
     position: usize,
 }
 
-#[derive(Deserialize)]
-struct MoveTopicToProjectParam {
-    source_project_id: String,
-    topic_id: String,
-    target_project_id: String,
-    target_section_id: String,
-    position: usize,
-}
 
 #[derive(Deserialize)]
 struct MarkdownParam {
@@ -147,13 +131,6 @@ struct MarkdownParam {
     content: String,
 }
 
-#[derive(Deserialize)]
-struct TopicSessionParam {
-    project_id: String,
-    topic_id: String,
-    session_id: String,
-    caller_session_id: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct LabelParam {
@@ -199,67 +176,15 @@ impl Host {
             }
             "project.create" => {
                 let params: CreateProjectParam = serde_json::from_value(params)?;
-                let source_session = params
-                    .from_session_id
-                    .as_deref()
-                    .map(|id| SessionId::parse(id.to_string()).map_err(anyhow::Error::msg))
-                    .transpose()?;
-                let caller_session = params
-                    .caller_session_id
-                    .as_deref()
-                    .map(|id| SessionId::parse(id.to_string()).map_err(anyhow::Error::msg))
-                    .transpose()?;
-                if let (Some(caller), Some(source)) = (&caller_session, &source_session) {
-                    anyhow::ensure!(
-                        caller == source,
-                        "a session can only create a project for itself"
-                    );
-                }
-                let source_cwd = if let Some(source) = &source_session {
-                    Some(self.service.snapshot(source).await?.record.info.cwd)
-                } else {
-                    None
-                };
-                let mut pwd = params.pwd.map(|pwd| {
-                    if pwd.is_absolute() {
-                        pwd
-                    } else {
-                        self.profile_root.join(pwd)
-                    }
-                });
-                if params.kind == ProjectKind::Shared && pwd.is_none() {
-                    pwd = source_cwd;
-                }
-                let project = self.projects.create(CreateProject {
-                    name: params.name,
-                    kind: params.kind,
-                    pwd,
-                })?;
+                anyhow::ensure!(params.pwd.is_absolute(), "project pwd must be absolute");
+                let name = params.name.filter(|n| !n.trim().is_empty())
+                    .or_else(|| params.pwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .context("project name is required for a filesystem root")?;
+                let info = super::git::inspect_repository(&params.pwd).await.ok();
+                let mut project = self.projects.create(CreateProject { name, kind: ProjectKind::Project, pwd: Some(params.pwd) })?;
+                if let Some(info) = info { project = self.register_repository(&project.id, info, "Local")?; }
                 self.project_changed(&project.id, "create").await;
-                if let Some(source) = source_session {
-                    let topic_id = project.board.uncategorized_topic_id.clone();
-                    let source_project_id = self
-                        .projects
-                        .locate_session(source.as_str())
-                        .map(|(project, _)| project.id);
-                    self.assign_session_to_topic(
-                        &project.id,
-                        &topic_id,
-                        source.as_str(),
-                        caller_session.as_ref().map(SessionId::as_str),
-                    )
-                    .await?;
-                    self.project_changed(&project.id, "session.move").await;
-                    if let Some(source_project_id) = source_project_id
-                        && source_project_id != project.id
-                    {
-                        self.project_changed(&source_project_id, "session.move")
-                            .await;
-                    }
-                    serde_json::to_value(self.projects.get(&project.id)?)?
-                } else {
-                    serde_json::to_value(project)?
-                }
+                serde_json::to_value(project)?
             }
             "project.update" => {
                 let params: UpdateProjectParam = serde_json::from_value(params)?;
@@ -272,19 +197,6 @@ impl Host {
             "project.repository.get" => {
                 let params: ProjectIdParam = serde_json::from_value(params)?;
                 serde_json::to_value(self.projects.get(&params.project_id)?.repository)?
-            }
-            "project.repository.clone" => {
-                let params: CloneRepositoryParam = serde_json::from_value(params)?;
-                let info = super::git::clone_repository(
-                    &params.url,
-                    &self.profile_path(params.path),
-                    params.branch.as_deref(),
-                )
-                .await?;
-                let project = self.register_repository(&params.project_id, info, "Local")?;
-                self.project_changed(&params.project_id, "repository.clone")
-                    .await;
-                serde_json::to_value(project)?
             }
             "project.repository.attach" => {
                 let params: AttachRepositoryParam = serde_json::from_value(params)?;
@@ -339,14 +251,18 @@ impl Host {
                     .repository
                     .as_ref()
                     .context("project has no attached repository")?;
+                let name = params.name.unwrap_or_else(|| params.branch.clone());
+                anyhow::ensure!(!name.trim().is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != "..", "worktree name must be a single directory name");
+                let path = project.pwd.as_ref().and_then(|p| p.parent()).context("project path has no parent")?.join(&name);
+                anyhow::ensure!(params.path.as_ref().is_none_or(|p| *p == path), "worktree path must be a sibling of project pwd named after the worktree");
+                anyhow::ensure!(!path.exists(), "worktree path already exists");
                 let status = super::git::create_worktree(
                     &repository.root,
-                    &self.profile_path(params.path),
+                    &path,
                     &params.branch,
                     params.start_point.as_deref(),
                 )
                 .await?;
-                let name = params.name.unwrap_or_else(|| params.branch.clone());
                 let project = self.projects.add_worktree(
                     &params.project_id,
                     worktree_record(name, status.path, WorktreeSource::Managed),
@@ -366,42 +282,12 @@ impl Host {
                     .await;
                 serde_json::to_value(worktree)?
             }
-            "project.worktree.detach" => {
+            "project.worktree.detach" | "project.worktree.remove" => {
                 let params: WorktreeParam = serde_json::from_value(params)?;
                 let project = self.projects.get(&params.project_id)?;
-                anyhow::ensure!(
-                    find_worktree(&project, &params.worktree_id)?.source != WorktreeSource::Primary,
-                    "the primary worktree cannot be detached"
-                );
-                self.ensure_worktree_unused(&project, &params.worktree_id)
-                    .await?;
-                let project = self
-                    .projects
-                    .remove_worktree(&params.project_id, &params.worktree_id)?;
-                self.project_changed(&params.project_id, "worktree.detach")
-                    .await;
-                serde_json::to_value(project)?
-            }
-            "project.worktree.remove" => {
-                let params: WorktreeParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
-                let repository = project
-                    .repository
-                    .as_ref()
-                    .context("project has no attached repository")?;
-                let worktree = find_worktree(&project, &params.worktree_id)?;
-                anyhow::ensure!(
-                    worktree.source == WorktreeSource::Managed,
-                    "only DWO-managed worktrees can be removed"
-                );
-                self.ensure_worktree_unused(&project, &params.worktree_id)
-                    .await?;
-                super::git::remove_worktree(&repository.root, &worktree.path).await?;
-                let project = self
-                    .projects
-                    .remove_worktree(&params.project_id, &params.worktree_id)?;
-                self.project_changed(&params.project_id, "worktree.remove")
-                    .await;
+                anyhow::ensure!(find_worktree(&project, &params.worktree_id)?.source != WorktreeSource::Primary, "the primary worktree cannot be detached");
+                let project = self.projects.remove_worktree(&params.project_id, &params.worktree_id)?;
+                self.project_changed(&params.project_id, "worktree.detach").await;
                 serde_json::to_value(project)?
             }
             "project.section.create" => {
@@ -424,14 +310,22 @@ impl Host {
                     .await;
                 serde_json::to_value(section)?
             }
-            "project.section.delete" => {
-                let params: SectionParam = serde_json::from_value(params)?;
-                let project = self
-                    .projects
-                    .delete_section(&params.project_id, &params.section_id)?;
-                self.project_changed(&params.project_id, "section.delete")
-                    .await;
-                serde_json::to_value(project)?
+            "project.archive" | "project.section.archive" | "project.topic.archive" | "project.session.archive" => {
+                let params: ArchiveParam = serde_json::from_value(params)?;
+                anyhow::ensure!((method == "project.archive" && params.section_id.is_none() && params.topic_id.is_none() && params.session_id.is_none())
+                    || (method == "project.section.archive" && params.section_id.is_some() && params.topic_id.is_none() && params.session_id.is_none())
+                    || (method == "project.topic.archive" && params.topic_id.is_some() && params.section_id.is_none() && params.session_id.is_none())
+                    || (method == "project.session.archive" && params.session_id.is_some() && params.section_id.is_none() && params.topic_id.is_none()), "archive requires exactly the target ID for this operation");
+                let ids = self.archive_container(params).await?;
+                json!({"archived": ids})
+            }
+            "project.agents.get" | "project.agents.set" => {
+                let params: ProjectRuleParam = serde_json::from_value(params)?;
+                if method.ends_with(".set") {
+                    self.projects.set_project_rule(&params.project_id, params.content.as_deref().context("content is required")?)?;
+                    self.project_changed(&params.project_id, "agents.set").await;
+                }
+                json!({"content": std::fs::read_to_string(self.projects.project_rule_path(&params.project_id)?).unwrap_or_default()})
             }
             "project.section.reorder" => {
                 let params: ReorderSectionParam = serde_json::from_value(params)?;
@@ -451,11 +345,13 @@ impl Host {
             }
             "project.topic.create" => {
                 let params: CreateTopicParam = serde_json::from_value(params)?;
+                anyhow::ensure!(!params.overview.trim().is_empty(), "topic overview is required");
                 let topic = self.projects.create_topic(
                     &params.project_id,
                     &params.section_id,
                     params.title,
                 )?;
+                self.projects.set_overview(&params.project_id, &topic.id, &params.overview)?;
                 self.project_changed(&params.project_id, "topic.create")
                     .await;
                 serde_json::to_value(topic)?
@@ -481,110 +377,6 @@ impl Host {
                 )?;
                 self.project_changed(&params.project_id, "topic.move").await;
                 serde_json::to_value(topic)?
-            }
-            "project.topic.move_to_project" => {
-                let params: MoveTopicToProjectParam = serde_json::from_value(params)?;
-                let source_project = self.projects.get(&params.source_project_id)?;
-                let source_topic = source_project
-                    .board
-                    .topics
-                    .iter()
-                    .find(|topic| topic.id == params.topic_id)
-                    .cloned()
-                    .with_context(|| format!("topic not found: {}", params.topic_id))?;
-                let target_project = self.projects.get(&params.target_project_id)?;
-                anyhow::ensure!(
-                    !self
-                        .automation
-                        .list(Some(&params.source_project_id))
-                        .await
-                        .iter()
-                        .any(|status| status.job.topic_id.as_deref() == Some(&params.topic_id)),
-                    "topic has automation jobs; move or remove them before moving the topic"
-                );
-                let mut session_moves = Vec::new();
-                for session_id in &source_topic.session_ids {
-                    let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
-                    let snapshot = self.service.snapshot(&id).await?;
-                    anyhow::ensure!(
-                        snapshot.phase == dwo_agent_service::RuntimePhase::Idle,
-                        "topic session {id} must be idle before moving across projects"
-                    );
-                    let old_workspace = snapshot.record.info.workspace.clone();
-                    let old_cwd = snapshot.record.info.cwd.clone();
-                    let (workspace, cwd) = match target_project.kind {
-                        ProjectKind::Shared => (
-                            SessionWorkspace::ProjectDefault,
-                            target_project
-                                .pwd
-                                .clone()
-                                .context("shared project is missing pwd")?,
-                        ),
-                        ProjectKind::Independent
-                            if source_project.kind == ProjectKind::Independent =>
-                        {
-                            (old_workspace.clone(), old_cwd.clone())
-                        }
-                        ProjectKind::Independent => {
-                            let cwd = managed_workspace_path(&self.profile_root, &id);
-                            copy_workspace(&old_cwd, &cwd)?;
-                            (SessionWorkspace::Managed, cwd)
-                        }
-                    };
-                    session_moves.push((id, old_workspace, old_cwd, workspace, cwd));
-                }
-                let topic = self.projects.move_topic_to_project(
-                    &params.source_project_id,
-                    &params.topic_id,
-                    &params.target_project_id,
-                    &params.target_section_id,
-                    params.position,
-                )?;
-                let agents_path = self
-                    .projects
-                    .agents_path(&params.target_project_id, &topic.id)?;
-                for (id, old_workspace, old_cwd, workspace, cwd) in session_moves {
-                    self.service
-                        .set_workspace(
-                            &id,
-                            workspace,
-                            cwd.clone(),
-                            vec![ExternalRuleFile::new(agents_path.clone(), cwd.clone())],
-                        )
-                        .await?;
-                    if old_workspace == SessionWorkspace::Managed
-                        && old_cwd != cwd
-                        && old_cwd.is_dir()
-                    {
-                        std::fs::remove_dir_all(old_cwd)?;
-                    }
-                }
-                self.project_changed(&params.source_project_id, "topic.move")
-                    .await;
-                if params.source_project_id != params.target_project_id {
-                    self.project_changed(&params.target_project_id, "topic.move")
-                        .await;
-                }
-                serde_json::to_value(topic)?
-            }
-            "project.topic.delete" => {
-                let params: TopicParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
-                self.move_topic_sessions_to_uncategorized(&params.project_id, &params.topic_id)
-                    .await?;
-                self.automation
-                    .move_topic_jobs(
-                        &params.project_id,
-                        &params.topic_id,
-                        &project.board.uncategorized_topic_id,
-                    )
-                    .await?;
-                let project = self
-                    .projects
-                    .delete_topic(&params.project_id, &params.topic_id)?;
-                self.project_changed(&params.project_id, "topic.delete")
-                    .await;
-                serde_json::to_value(project)?
             }
             "project.topic.overview.get" => {
                 let params: TopicParam = serde_json::from_value(params)?;
@@ -612,45 +404,6 @@ impl Host {
                 self.project_changed(&params.project_id, "topic.agents.set")
                     .await;
                 json!({"updated": true})
-            }
-            "project.topic.session.assign" => {
-                let params: TopicSessionParam = serde_json::from_value(params)?;
-                let source_project_id = self
-                    .projects
-                    .locate_session(&params.session_id)
-                    .map(|(project, _)| project.id);
-                let topic = self
-                    .assign_session_to_topic(
-                        &params.project_id,
-                        &params.topic_id,
-                        &params.session_id,
-                        params.caller_session_id.as_deref(),
-                    )
-                    .await?;
-                self.project_changed(&params.project_id, "topic.session.assign")
-                    .await;
-                if source_project_id.as_deref() != Some(params.project_id.as_str())
-                    && let Some(source_project_id) = source_project_id
-                {
-                    self.project_changed(&source_project_id, "topic.session.move")
-                        .await;
-                }
-                serde_json::to_value(topic)?
-            }
-            "project.topic.session.unassign" => {
-                let params: TopicSessionParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
-                let topic = self
-                    .assign_session_to_topic(
-                        &params.project_id,
-                        &project.board.uncategorized_topic_id,
-                        &params.session_id,
-                        params.caller_session_id.as_deref(),
-                    )
-                    .await?;
-                self.project_changed(&params.project_id, "topic.session.unassign")
-                    .await;
-                serde_json::to_value(topic)?
             }
             "project.label.create" => {
                 let params: CreateLabelParam = serde_json::from_value(params)?;
@@ -803,8 +556,7 @@ impl Host {
                 for session_id in &topic.session_ids {
                     let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
                     if let Ok(snapshot) = self.service.status(&id).await
-                        && snapshot.record.info.workspace.worktree_id()
-                            == Some(worktree.id.as_str())
+                        && snapshot.record.info.cwd == worktree.path
                     {
                         sessions.push(snapshot);
                     }
@@ -823,134 +575,41 @@ impl Host {
         Ok(views)
     }
 
-    async fn ensure_worktree_unused(&self, project: &Project, worktree_id: &str) -> Result<()> {
-        for session_id in project
-            .board
-            .topics
-            .iter()
-            .flat_map(|topic| &topic.session_ids)
-        {
-            let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
-            if let Ok(snapshot) = self.service.snapshot(&id).await
-                && snapshot.record.info.workspace.worktree_id() == Some(worktree_id)
-            {
-                anyhow::bail!("worktree is still used by session {id}");
-            }
-        }
-        Ok(())
-    }
 
-    async fn assign_session_to_topic(
-        &self,
-        project_id: &str,
-        topic_id: &str,
-        session_id: &str,
-        caller_session_id: Option<&str>,
-    ) -> Result<dwo_project::Topic> {
-        if let Some(caller_session_id) = caller_session_id {
-            anyhow::ensure!(
-                caller_session_id == session_id,
-                "a session can only move itself"
-            );
+    async fn archive_container(&self, params: ArchiveParam) -> Result<Vec<String>> {
+        let _lifecycle = self.automation.lifecycle.lock().await;
+        let project = self.projects.get(&params.project_id)?;
+        let topics: Vec<String> = project.board.topics.iter()
+            .filter(|t| params.section_id.as_ref().is_none_or(|id| &t.section_id == id)
+                && params.topic_id.as_ref().is_none_or(|id| &t.id == id))
+            .map(|t| t.id.clone()).collect();
+        let ids: Vec<String> = project.board.topics.iter().filter(|t| topics.contains(&t.id))
+            .flat_map(|t| t.session_ids.iter())
+            .filter(|id| params.session_id.as_ref().is_none_or(|s| *id == s)).cloned().collect();
+        for value in &ids {
+            let id = SessionId::parse(value.clone()).map_err(anyhow::Error::msg)?;
+            let snapshot = self.service.snapshot(&id).await?;
+            anyhow::ensure!(snapshot.phase == dwo_agent_service::RuntimePhase::Idle, "stop session {id} before archiving");
         }
-        let target_project = self.projects.get(project_id)?;
-        let agents_path = self.projects.agents_path(project_id, topic_id)?;
-        let session_id = SessionId::parse(session_id.to_string()).map_err(anyhow::Error::msg)?;
-        let snapshot = self.service.snapshot(&session_id).await?;
-        let old_workspace = snapshot.record.info.workspace.clone();
-        let old_cwd = snapshot.record.info.cwd.clone();
-        let source_assignment = self
-            .projects
-            .locate_session(session_id.as_str())
-            .context("session is not assigned to a project topic")?;
-        let crosses_project = source_assignment.0.id != project_id;
-        let (workspace, cwd, created_managed) = if crosses_project {
-            match target_project.kind {
-                ProjectKind::Shared => (
-                    SessionWorkspace::ProjectDefault,
-                    target_project
-                        .pwd
-                        .clone()
-                        .context("shared project is missing pwd")?,
-                    false,
-                ),
-                ProjectKind::Independent
-                    if source_assignment.0.kind == ProjectKind::Independent =>
-                {
-                    (old_workspace.clone(), old_cwd.clone(), false)
+        let jobs = self.automation.list(Some(&project.id)).await;
+        anyhow::ensure!(jobs.iter().all(|j| j.active_runs.is_empty()), "stop project automation runs before archiving");
+        self.automation.update_project_config(&project.id, |config| {
+                for job in &mut config.jobs {
+                    let fixed_selected = matches!(&job.session, crate::automation::AutomationSession::Fixed { session_id } if ids.contains(session_id));
+                    if fixed_selected || (params.session_id.is_none() && topics.contains(&job.topic_id.clone().unwrap_or_else(|| project.board.uncategorized_topic_id.clone()))) {
+                        job.enabled = false;
+                    }
                 }
-                ProjectKind::Independent => {
-                    let cwd = managed_workspace_path(&self.profile_root, &session_id);
-                    copy_workspace(&old_cwd, &cwd)?;
-                    (SessionWorkspace::Managed, cwd, true)
-                }
-            }
-        } else {
-            (old_workspace.clone(), old_cwd.clone(), false)
-        };
-        let topic = self
-            .projects
-            .assign_session(project_id, topic_id, session_id.to_string())?;
-        if crosses_project {
-            if let Err(error) = self
-                .service
-                .set_workspace(
-                    &session_id,
-                    workspace,
-                    cwd.clone(),
-                    vec![ExternalRuleFile::new(agents_path, cwd.clone())],
-                )
-                .await
-            {
-                let _ = self.projects.assign_session(
-                    &source_assignment.0.id,
-                    &source_assignment.1.id,
-                    session_id.to_string(),
-                );
-                if created_managed && cwd.is_dir() {
-                    let _ = std::fs::remove_dir_all(&cwd);
-                }
-                return Err(error.into());
-            }
-            if old_workspace == SessionWorkspace::Managed && old_cwd != cwd && old_cwd.is_dir() {
-                std::fs::remove_dir_all(&old_cwd)?;
-            }
-        } else {
-            self.service.set_external_rule_files(
-                &session_id,
-                vec![ExternalRuleFile::new(agents_path, cwd)],
-            );
+                Ok(())
+            }).await?;
+        let ids = self.projects.archive(&project.id, params.section_id.as_deref(), params.topic_id.as_deref(), params.session_id.as_deref())?;
+        for value in &ids {
+            let id = SessionId::parse(value.clone()).map_err(anyhow::Error::msg)?;
+            self.service.set_external_rule_files(&id, vec![]);
         }
-        Ok(topic)
-    }
-
-    async fn move_topic_sessions_to_uncategorized(
-        &self,
-        project_id: &str,
-        topic_id: &str,
-    ) -> Result<()> {
-        let project = self.projects.get(project_id)?;
-        let Some(topic) = project
-            .board
-            .topics
-            .iter()
-            .find(|topic| topic.id == topic_id)
-        else {
-            anyhow::bail!("topic not found: {topic_id}");
-        };
-        if topic.id == project.board.uncategorized_topic_id {
-            anyhow::bail!("the uncategorized topic cannot be deleted");
-        }
-        for session_id in topic.session_ids.clone() {
-            self.assign_session_to_topic(
-                project_id,
-                &project.board.uncategorized_topic_id,
-                &session_id,
-                None,
-            )
-            .await?;
-        }
-        Ok(())
+        self.project_changed(&project.id, "archive").await;
+        self.project_changed(dwo_project::UNASSIGNED_PROJECT_ID, "archive").await;
+        Ok(ids)
     }
 
     async fn project_changed(&self, project_id: &str, action: &str) {
@@ -999,357 +658,68 @@ mod tests {
     use crate::host::tests::write_test_profile;
 
     #[tokio::test]
-    async fn topic_sessions_inherit_the_project_workspace_and_rules() {
+    async fn project_archive_preserves_cwd_and_requires_archive_for_deletion() {
         let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
+        let workspace = root.path().join("demo");
         std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("keep.txt"), "keep").unwrap();
         let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-
-        let project = host
-            .handle_method(
-                "project.create",
-                json!({"name": "Demo", "kind": "shared", "pwd": workspace}),
-            )
-            .await
-            .unwrap();
-        let project_id = project["id"].as_str().unwrap();
-        let section_id = project["board"]["uncategorizedSectionId"].as_str().unwrap();
-        let topic = host
-            .handle_method(
-                "project.topic.create",
-                json!({
-                    "project_id": project_id,
-                    "section_id": section_id,
-                    "title": "Project API"
-                }),
-            )
-            .await
-            .unwrap();
-        let topic_id = topic["id"].as_str().unwrap();
-        host.handle_method(
-            "project.topic.agents.set",
-            json!({
-                "project_id": project_id,
-                "topic_id": topic_id,
-                "content": "Keep changes inside the project API."
-            }),
-        )
-        .await
-        .unwrap();
-
-        let created = host
-            .handle_method(
-                "session.new",
-                json!({"project_id": project_id, "topic_id": topic_id}),
-            )
-            .await
-            .unwrap();
-        let session_id =
-            SessionId::parse(created["session_id"].as_str().unwrap().to_string()).unwrap();
-        let snapshot = host.service.snapshot(&session_id).await.unwrap();
-        assert_eq!(
-            snapshot.record.info.cwd,
-            std::fs::canonicalize(workspace).unwrap()
-        );
-        assert!(
-            snapshot
-                .record
-                .context
-                .system_prompt
-                .content
-                .contains("Keep changes inside the project API.")
-        );
-        let (_, assigned_topic) = host.projects.locate_session(session_id.as_str()).unwrap();
-        assert_eq!(assigned_topic.id, topic_id);
-
-        host.handle_method(
-            "automation.add",
-            json!({
-                "project_id": project_id,
-                "job": {
-                    "name": "topic-review",
-                    "enabled": true,
-                    "schedule": {"cron": "0 9 * * *", "timezone": "Asia/Shanghai"},
-                    "session": {"mode": "new", "behavior": "every_time"},
-                    "topicId": topic_id,
-                    "prompt": "Review now"
-                }
-            }),
-        )
-        .await
-        .unwrap();
-        let run = host
-            .handle_method(
-                "automation.run",
-                json!({"project_id": project_id, "job": "topic-review", "caller_session_id": null}),
-            )
-            .await
-            .unwrap();
-        let automation_session_id = run["sessionId"].as_str().unwrap();
-        let (_, automation_topic) = host
-            .projects
-            .locate_session(automation_session_id)
-            .expect("topic automation session is assigned to its topic");
-        assert_eq!(automation_topic.id, topic_id);
-        let automation_snapshot = host
-            .service
-            .snapshot(&SessionId::parse(automation_session_id.to_string()).unwrap())
-            .await
-            .unwrap();
-        assert!(
-            automation_snapshot
-                .record
-                .context
-                .system_prompt
-                .content
-                .contains("Keep changes inside the project API.")
-        );
-
+        let project = host.handle_method("project.create", json!({"pwd": workspace})).await.unwrap();
+        assert_eq!(project["name"], "demo");
+        assert_eq!(project["kind"], "project");
+        let pid = project["id"].as_str().unwrap();
+        let section = project["board"]["uncategorizedSectionId"].as_str().unwrap();
+        assert!(host.handle_method("project.topic.create", json!({"project_id": pid, "section_id": section, "title": "Task", "overview": ""})).await.is_err());
+        let topic = host.handle_method("project.topic.create", json!({"project_id": pid, "section_id": section, "title": "Task", "overview": "Implement feature"})).await.unwrap();
+        let tid = topic["id"].as_str().unwrap();
+        host.handle_method("project.agents.set", json!({"project_id": pid, "content": "Project rule sentinel"})).await.unwrap();
+        host.handle_method("project.topic.agents.set", json!({"project_id": pid, "topic_id": tid, "content": "Topic rule sentinel"})).await.unwrap();
+        let created = host.handle_method("session.new", json!({"project_id": pid, "topic_id": tid})).await.unwrap();
+        let id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+        let snapshot = host.service.snapshot(&id).await.unwrap();
+        let cwd = snapshot.record.info.cwd;
+        let prompt = serde_json::to_string(&snapshot.record.context).unwrap();
+        assert!(prompt.contains("Project rule sentinel"));
+        assert!(prompt.contains("Topic rule sentinel"));
+        assert!(host.delete_session(&id).await.is_err());
+        assert!(host.handle_method("session.set", json!({"session_id": id, "worktree_id": "other"})).await.is_err());
+        host.handle_method("project.archive", json!({"project_id": pid})).await.unwrap();
+        assert!(host.projects.is_archived(id.as_str()));
+        host.service.unload(&id).await.unwrap();
+        assert_eq!(host.service.snapshot(&id).await.unwrap().record.info.cwd, cwd);
+        assert!(host.projects.get(pid).is_err());
+        assert!(host.prompt_session(&id, dwo_agent_service::EndpointId::parse("test").unwrap(), dwo_context::MessageContent::text("run")).await.is_err());
+        host.delete_session(&id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(workspace.join("keep.txt")).unwrap(), "keep");
         host.shutdown().await;
     }
 
     #[tokio::test]
-    async fn sessions_can_move_across_projects_and_create_a_project_for_themselves() {
+    async fn worktree_is_a_sibling_and_detach_preserves_checkout_and_session() {
         let root = tempfile::tempdir().unwrap();
-        let source_workspace = root.path().join("source");
-        let target_workspace = root.path().join("target");
-        std::fs::create_dir_all(&source_workspace).unwrap();
-        std::fs::create_dir_all(&target_workspace).unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [vec!["init"], vec!["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-m", "initial"]] {
+            assert!(std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap().status.success());
+        }
         let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-
-        let source = host
-            .handle_method(
-                "project.create",
-                json!({"name": "Source", "kind": "shared", "pwd": source_workspace}),
-            )
-            .await
-            .unwrap();
-        let source_id = source["id"].as_str().unwrap();
-        let source_topic_id = source["board"]["uncategorizedTopicId"].as_str().unwrap();
-        let created = host
-            .handle_method(
-                "session.new",
-                json!({"project_id": source_id, "topic_id": source_topic_id}),
-            )
-            .await
-            .unwrap();
-        let session_id = created["session_id"].as_str().unwrap().to_string();
-        let target = host
-            .handle_method(
-                "project.create",
-                json!({"name": "Target", "kind": "shared", "pwd": target_workspace}),
-            )
-            .await
-            .unwrap();
-        let target_id = target["id"].as_str().unwrap();
-        let target_topic_id = target["board"]["uncategorizedTopicId"].as_str().unwrap();
-        host.handle_method(
-            "project.topic.session.assign",
-            json!({
-                "project_id": target_id,
-                "topic_id": target_topic_id,
-                "session_id": session_id.clone(),
-                "caller_session_id": session_id.clone(),
-            }),
-        )
-        .await
-        .unwrap();
-        let (project, topic) = host.projects.locate_session(&session_id).unwrap();
-        assert_eq!(project.id, target_id);
-        assert_eq!(topic.id, target_topic_id);
-        let moved_snapshot = host
-            .service
-            .snapshot(&SessionId::parse(session_id.clone()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            moved_snapshot.record.info.workspace,
-            SessionWorkspace::ProjectDefault
-        );
-        assert_eq!(
-            moved_snapshot.record.info.cwd,
-            std::fs::canonicalize(root.path().join("target")).unwrap()
-        );
-
-        let created_workspace = root.path().join("created");
-        std::fs::create_dir_all(&created_workspace).unwrap();
-        let created_project = host
-            .handle_method(
-                "project.create",
-                json!({
-                    "name": "From session",
-                    "kind": "shared",
-                    "pwd": created_workspace,
-                    "from_session_id": session_id.clone(),
-                    "caller_session_id": session_id.clone(),
-                }),
-            )
-            .await
-            .unwrap();
-        let created_project_id = created_project["id"].as_str().unwrap();
-        let (project, topic) = host.projects.locate_session(&session_id).unwrap();
-        assert_eq!(project.id, created_project_id);
-        assert_eq!(
-            host.service
-                .snapshot(&SessionId::parse(session_id.clone()).unwrap())
-                .await
-                .unwrap()
-                .record
-                .info
-                .workspace,
-            SessionWorkspace::ProjectDefault
-        );
-        assert_eq!(
-            topic.id,
-            created_project["board"]["uncategorizedTopicId"]
-                .as_str()
-                .unwrap()
-        );
-
-        let error = host
-            .handle_method(
-                "project.topic.session.assign",
-                json!({
-                    "project_id": target_id,
-                    "topic_id": target_topic_id,
-                    "session_id": session_id.clone(),
-                    "caller_session_id": "session-other",
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("only move itself"));
-        host.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn topics_can_move_between_projects() {
-        let root = tempfile::tempdir().unwrap();
-        let source_workspace = root.path().join("source");
-        let target_workspace = root.path().join("target");
-        std::fs::create_dir_all(&source_workspace).unwrap();
-        std::fs::create_dir_all(&target_workspace).unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-        let source = host
-            .handle_method(
-                "project.create",
-                json!({"name": "Source", "kind": "shared", "pwd": source_workspace}),
-            )
-            .await
-            .unwrap();
-        let target = host
-            .handle_method(
-                "project.create",
-                json!({"name": "Target", "kind": "shared", "pwd": target_workspace}),
-            )
-            .await
-            .unwrap();
-        let source_id = source["id"].as_str().unwrap();
-        let target_id = target["id"].as_str().unwrap();
-        let source_section_id = source["board"]["uncategorizedSectionId"].as_str().unwrap();
-        let target_section_id = target["board"]["uncategorizedSectionId"].as_str().unwrap();
-        let topic = host
-            .handle_method(
-                "project.topic.create",
-                json!({
-                    "project_id": source_id,
-                    "section_id": source_section_id,
-                    "title": "Portable topic"
-                }),
-            )
-            .await
-            .unwrap();
-        let topic_id = topic["id"].as_str().unwrap();
-        host.handle_method(
-            "project.topic.overview.set",
-            json!({
-                "project_id": source_id,
-                "topic_id": topic_id,
-                "content": "Keep the context"
-            }),
-        )
-        .await
-        .unwrap();
-
-        host.handle_method(
-            "project.topic.move_to_project",
-            json!({
-                "source_project_id": source_id,
-                "topic_id": topic_id,
-                "target_project_id": target_id,
-                "target_section_id": target_section_id,
-                "position": usize::MAX,
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(
-            host.projects
-                .get(source_id)
-                .unwrap()
-                .board
-                .topics
-                .iter()
-                .all(|topic| topic.id != topic_id)
-        );
-        assert_eq!(
-            host.projects.overview(target_id, topic_id).unwrap(),
-            "Keep the context"
-        );
-        host.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn deleting_a_topic_moves_its_jobs_to_uncategorized() {
-        let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-        let project = host
-            .handle_method(
-                "project.create",
-                json!({"name": "Demo", "kind": "shared", "pwd": root.path()}),
-            )
-            .await
-            .unwrap();
-        let project_id = project["id"].as_str().unwrap();
-        let uncategorized_topic_id = project["board"]["uncategorizedTopicId"].as_str().unwrap();
-        let section_id = project["board"]["uncategorizedSectionId"].as_str().unwrap();
-        let topic = host
-            .handle_method(
-                "project.topic.create",
-                json!({"project_id": project_id, "section_id": section_id, "title": "Review"}),
-            )
-            .await
-            .unwrap();
-        let topic_id = topic["id"].as_str().unwrap();
-        host.handle_method(
-            "automation.add",
-            json!({
-                "project_id": project_id,
-                "job": {
-                    "name": "topic-review",
-                    "schedule": {"cron": "0 9 * * *"},
-                    "session": {"mode": "new", "behavior": "every_time"},
-                    "topicId": topic_id,
-                    "prompt": "Review now"
-                }
-            }),
-        )
-        .await
-        .unwrap();
-
-        host.handle_method(
-            "project.topic.delete",
-            json!({"project_id": project_id, "topic_id": topic_id}),
-        )
-        .await
-        .unwrap();
-
-        let status = host
-            .automation
-            .status(project_id, "topic-review")
-            .await
-            .unwrap();
-        assert_eq!(status.job.topic_id.as_deref(), Some(uncategorized_topic_id));
+        let project = host.handle_method("project.create", json!({"pwd": repo})).await.unwrap();
+        let pid = project["id"].as_str().unwrap();
+        assert!(!project["repository"].is_null());
+        let project = host.handle_method("project.worktree.create", json!({"project_id": pid, "branch": "feature-a", "name": "feature-a"})).await.unwrap();
+        let tree = project["worktrees"].as_array().unwrap().last().unwrap();
+        let wid = tree["id"].as_str().unwrap();
+        let cwd = std::fs::canonicalize(root.path().join("feature-a")).unwrap();
+        let created = host.handle_method("session.new", json!({"project_id": pid, "worktree_id": wid})).await.unwrap();
+        let id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+        host.handle_method("project.worktree.remove", json!({"project_id": pid, "worktree_id": wid})).await.unwrap();
+        host.service.unload(&id).await.unwrap();
+        assert_eq!(host.service.snapshot(&id).await.unwrap().record.info.cwd, cwd);
+        assert!(cwd.join(".git").exists());
+        assert!(host.handle_method("project.worktree.create", json!({"project_id": pid, "branch": "bad", "name": "../escape"})).await.is_err());
+        assert!(host.handle_method("project.worktree.create", json!({"project_id": pid, "branch": "other", "name": "feature-a"})).await.is_err());
+        assert!(host.handle_method("project.repository.clone", json!({})).await.is_err());
+        assert!(host.handle_method("project.topic.move_to_project", json!({})).await.is_err());
         host.shutdown().await;
     }
 }

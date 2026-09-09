@@ -1006,7 +1006,6 @@ impl SessionActor {
             ));
         }
         let old_cwd = self.record.info.cwd.clone();
-        let old_worktree_id = self.record.info.workspace.worktree_id().map(str::to_string);
         let mut context = ContextManager::new(self.record.context.clone());
         let prompt = prompt_builder.rebuild().map_err(anyhow::Error::from)?;
         context.replace_system_prompt(prompt);
@@ -1033,8 +1032,6 @@ impl SessionActor {
         self.broadcast_event(SessionEventPayload::WorkspaceChanged {
             old_cwd,
             cwd,
-            old_worktree_id,
-            worktree_id: workspace.worktree_id().map(str::to_string),
         });
         Ok(())
     }

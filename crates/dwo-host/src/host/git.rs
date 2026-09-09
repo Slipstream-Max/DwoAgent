@@ -80,19 +80,6 @@ pub async fn worktree_status(path: &Path) -> Result<WorktreeStatus> {
     })
 }
 
-pub async fn clone_repository(
-    url: &str,
-    path: &Path,
-    branch: Option<&str>,
-) -> Result<RepositoryInfo> {
-    let mut args = vec![OsString::from("clone")];
-    if let Some(branch) = branch {
-        args.extend([OsString::from("--branch"), OsString::from(branch)]);
-    }
-    args.extend([OsString::from(url), path.as_os_str().to_owned()]);
-    run(None, args).await?;
-    inspect_repository(path).await
-}
 
 pub async fn create_worktree(
     repository: &Path,
@@ -105,7 +92,7 @@ pub async fn create_worktree(
         OsString::from("add"),
         OsString::from("-b"),
         OsString::from(branch),
-        path.as_os_str().to_owned(),
+        dunce::simplified(path).as_os_str().to_owned(),
     ];
     if let Some(start_point) = start_point {
         args.push(OsString::from(start_point));
@@ -114,18 +101,6 @@ pub async fn create_worktree(
     worktree_status(path).await
 }
 
-pub async fn remove_worktree(repository: &Path, path: &Path) -> Result<()> {
-    run(
-        Some(repository),
-        vec![
-            OsString::from("worktree"),
-            OsString::from("remove"),
-            path.as_os_str().to_owned(),
-        ],
-    )
-    .await
-    .map(|_| ())
-}
 
 async fn text<const N: usize>(path: &Path, args: [&str; N]) -> Result<String> {
     let output = bytes(path, args).await?;
@@ -143,7 +118,7 @@ async fn bytes<const N: usize>(path: &Path, args: [&str; N]) -> Result<Vec<u8>> 
 async fn run(cwd: Option<&Path>, args: Vec<OsString>) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     if let Some(cwd) = cwd {
-        command.arg("-C").arg(cwd);
+        command.arg("-C").arg(dunce::simplified(cwd));
     }
     let output = command.args(&args).output().await?;
     if !output.status.success() {

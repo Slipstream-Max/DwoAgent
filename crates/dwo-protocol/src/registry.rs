@@ -117,25 +117,10 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     command("project.create", MethodRoute::Dwo, Some("project.changed")),
     command("project.update", MethodRoute::Dwo, Some("project.changed")),
     query("project.repository.get", MethodRoute::Dwo),
-    command(
-        "project.repository.clone",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.repository.attach",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
     query("project.worktree.list", MethodRoute::Dwo),
     query("project.worktree.get", MethodRoute::Dwo),
     command(
         "project.worktree.create",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.worktree.attach",
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
@@ -165,7 +150,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         Some("project.changed"),
     ),
     command(
-        "project.section.delete",
+        "project.section.archive",
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
@@ -186,17 +171,12 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         Some("project.changed"),
     ),
     command(
-        "project.topic.delete",
+        "project.topic.archive",
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
     command(
         "project.topic.move",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.topic.move_to_project",
         MethodRoute::Dwo,
         Some("project.changed"),
     ),

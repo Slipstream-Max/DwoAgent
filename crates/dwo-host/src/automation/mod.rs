@@ -169,6 +169,7 @@ struct AutomationDefaults {
 }
 
 pub struct AutomationRuntime {
+    pub(crate) lifecycle: Mutex<()>,
     service: Arc<SessionService>,
     projects: Arc<ProjectService>,
     profile_root: PathBuf,
@@ -205,6 +206,7 @@ impl AutomationRuntime {
             );
         }
         Ok(Arc::new(Self {
+            lifecycle: Mutex::new(()),
             service,
             projects,
             profile_root,
@@ -509,6 +511,17 @@ impl AutomationRuntime {
         scheduled: bool,
         caller: Option<SessionId>,
     ) -> Result<AutomationRunRecord> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let project = self.projects.get(&project_id)?;
+        let topic_id = job.topic_id.as_deref().unwrap_or(&project.board.uncategorized_topic_id);
+        anyhow::ensure!(topic_id != dwo_project::ARCHIVE_TOPIC_ID && project.board.topics.iter().any(|t| t.id == topic_id), "task topic is archived or missing");
+        if let AutomationSession::Fixed { session_id } = &job.session {
+            anyhow::ensure!(!self.projects.is_archived(session_id), "task session is archived");
+        }
+        if scheduled {
+            let state = self.state.lock().await;
+            anyhow::ensure!(state.projects.get(&project_id).is_some_and(|p| p.config.enabled && p.config.jobs.iter().any(|j| j.name == job.name && j.enabled)), "scheduled task was disabled");
+        }
         let run_id = format!("run-{}", Uuid::new_v4().simple());
         let record = AutomationRunRecord {
             run_id,
@@ -671,20 +684,22 @@ impl AutomationRuntime {
             .unwrap_or(&project.board.uncategorized_topic_id);
         let id = SessionId::new();
         let (workspace, cwd) = match project.kind {
-            ProjectKind::Shared => (
-                SessionWorkspace::ProjectDefault,
+            ProjectKind::Project => (
+                SessionWorkspace::External { pwd: project.pwd.clone().context("project is missing pwd")? },
                 project
                     .pwd
                     .clone()
                     .context("shared project is missing pwd")?,
             ),
-            ProjectKind::Independent => {
+            ProjectKind::Work => {
                 let path = crate::host::managed_workspace_path(&self.profile_root, &id);
                 std::fs::create_dir_all(&path)?;
                 (SessionWorkspace::Managed, path)
             }
         };
         let external_rule_files = vec![ExternalRuleFile::new(
+            self.projects.project_rule_path(project_id)?, cwd.clone(),
+        ), ExternalRuleFile::new(
             self.projects.agents_path(project_id, topic_id)?,
             cwd.clone(),
         )];
@@ -750,6 +765,7 @@ impl AutomationRuntime {
             );
             return Ok(());
         };
+        anyhow::ensure!(source_assignment.0.id == project_id && source_assignment.1.id == topic_id, "automation cannot move a session between topics");
         if source_assignment.0.id == project_id {
             self.service.set_external_rule_files(
                 session_id,
@@ -761,51 +777,6 @@ impl AutomationRuntime {
             self.projects
                 .assign_session(project_id, topic_id, session_id.to_string())?;
             return Ok(());
-        }
-        let old_workspace = snapshot.record.info.workspace;
-        let old_cwd = snapshot.record.info.cwd;
-        let (workspace, cwd, created_managed) = match project.kind {
-            ProjectKind::Shared => (
-                SessionWorkspace::ProjectDefault,
-                project.pwd.context("shared project is missing pwd")?,
-                false,
-            ),
-            ProjectKind::Independent if source_assignment.0.kind == ProjectKind::Independent => {
-                (old_workspace.clone(), old_cwd.clone(), false)
-            }
-            ProjectKind::Independent => {
-                let cwd = crate::host::managed_workspace_path(&self.profile_root, session_id);
-                crate::host::session_api::copy_workspace(&old_cwd, &cwd)?;
-                (SessionWorkspace::Managed, cwd, true)
-            }
-        };
-        self.projects
-            .assign_session(project_id, topic_id, session_id.to_string())?;
-        if let Err(error) = self
-            .service
-            .set_workspace(
-                session_id,
-                workspace,
-                cwd.clone(),
-                vec![ExternalRuleFile::new(
-                    self.projects.agents_path(project_id, topic_id)?,
-                    cwd.clone(),
-                )],
-            )
-            .await
-        {
-            let _ = self.projects.assign_session(
-                &source_assignment.0.id,
-                &source_assignment.1.id,
-                session_id.to_string(),
-            );
-            if created_managed && cwd.is_dir() {
-                let _ = std::fs::remove_dir_all(cwd);
-            }
-            return Err(error.into());
-        }
-        if old_workspace == SessionWorkspace::Managed && old_cwd != cwd && old_cwd.is_dir() {
-            std::fs::remove_dir_all(old_cwd)?;
         }
         Ok(())
     }
@@ -1147,7 +1118,7 @@ fn validate_project_config(
     for job in &config.jobs {
         if let Some(topic_id) = &job.topic_id {
             anyhow::ensure!(
-                project
+                !job.enabled || project
                     .board
                     .topics
                     .iter()

@@ -10,7 +10,7 @@ use dwo_agent_service::{
 };
 use dwo_context::ExternalRuleFile;
 use dwo_mcp::McpRuntime;
-use dwo_project::{ProjectKind, ProjectService};
+use dwo_project::ProjectService;
 use dwo_protocol::ReasoningOption;
 use dwo_tools::{PolicyConfig, SessionMode};
 use serde::{Deserialize, Serialize};
@@ -291,9 +291,9 @@ impl Host {
                     };
                     let rule_file = ExternalRuleFile::new(
                         projects.agents_path(&project.id, &topic.id)?,
-                        snapshot.record.info.cwd,
+                        snapshot.record.info.cwd.clone(),
                     );
-                    service.set_external_rule_files(&session_id, vec![rule_file]);
+                    service.set_external_rule_files(&session_id, vec![ExternalRuleFile::new(projects.project_rule_path(&project.id)?, snapshot.record.info.cwd), rule_file]);
                 }
             }
         }
@@ -607,36 +607,11 @@ impl Host {
 
 fn resolve_workspace_path(
     profile_root: &Path,
-    projects: &ProjectService,
+    _projects: &ProjectService,
     session_id: &SessionId,
     workspace: &SessionWorkspace,
 ) -> Result<PathBuf> {
     match workspace {
-        SessionWorkspace::ProjectDefault => {
-            let (project, _) = projects
-                .locate_session(session_id.as_str())
-                .with_context(|| format!("session {session_id} is not assigned to a project"))?;
-            anyhow::ensure!(
-                project.kind == ProjectKind::Shared,
-                "project_default workspace requires a shared project"
-            );
-            project.pwd.context("shared project is missing pwd")
-        }
-        SessionWorkspace::Worktree { worktree_id } => {
-            let (project, _) = projects
-                .locate_session(session_id.as_str())
-                .with_context(|| format!("session {session_id} is not assigned to a project"))?;
-            anyhow::ensure!(
-                project.kind == ProjectKind::Shared,
-                "worktree workspace requires a shared project"
-            );
-            project
-                .worktrees
-                .into_iter()
-                .find(|worktree| worktree.id == *worktree_id)
-                .map(|worktree| worktree.path)
-                .with_context(|| format!("worktree not found: {worktree_id}"))
-        }
         SessionWorkspace::Managed => Ok(managed_workspace_path(profile_root, session_id)),
         SessionWorkspace::External { pwd } => Ok(pwd.clone()),
     }

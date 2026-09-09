@@ -238,8 +238,6 @@ pub enum SessionEventPayload {
     WorkspaceChanged {
         old_cwd: PathBuf,
         cwd: PathBuf,
-        old_worktree_id: Option<String>,
-        worktree_id: Option<String>,
     },
     Closing,
 }

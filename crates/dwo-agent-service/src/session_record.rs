@@ -139,20 +139,10 @@ pub struct SessionConfig {
     rename_all_fields = "camelCase"
 )]
 pub enum SessionWorkspace {
-    ProjectDefault,
-    Worktree { worktree_id: String },
     Managed,
     External { pwd: PathBuf },
 }
 
-impl SessionWorkspace {
-    pub fn worktree_id(&self) -> Option<&str> {
-        match self {
-            Self::Worktree { worktree_id } => Some(worktree_id),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUpdate {

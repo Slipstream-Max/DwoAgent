@@ -9,25 +9,7 @@ models:
     hostedTools: [web_search]
     defaultReasoningEffort: high
     reasoningEfforts: [low, high, max]
-  deepseek-v4-flash:
-    contextWindowTokens: 1000000
-    maxOutputTokens: 384000
-    capabilities:
-      imageInput: false
-      toolCalls: true
-    hostedTools: [web_search]
-    defaultReasoningEffort: high
-    reasoningEfforts: [low, high, max]
-  deepseek-v4-flash-vision-exp:
-    contextWindowTokens: 1000000
-    maxOutputTokens: 384000
-    capabilities:
-      imageInput: true
-      toolCalls: true
-    hostedTools: [web_search]
-    defaultReasoningEffort: high
-    reasoningEfforts: [low, high, max]
-  deepseek-v4.1-flash-expires-on-0910:
+  deepseek-flash:
     contextWindowTokens: 1000000
     maxOutputTokens: 384000
     capabilities:

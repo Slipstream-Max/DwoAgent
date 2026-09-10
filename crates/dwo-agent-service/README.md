@@ -147,12 +147,11 @@ uses the last successfully used model for that summary, preserves the session's
 current reasoning mode, and records the target as `last_model` only after its
 first successful turn request.
 
-Manual, automatic, recovery, and handoff compaction use the same executor.
-Automatic and recovery compaction ask the selected model for a summary when
-history must be removed. Handoff supplies `handoff_text` as the summary and
-therefore does not issue another summary-model request. Manual compaction is a
-session context operation with its own `compaction_id`; it does not create a
-turn, user message, or assistant response.
+Manual, automatic, and recovery compaction use the same executor. Automatic
+and recovery compaction ask the selected model for a summary when history must
+be removed. Manual compaction is a session context operation with its own
+`compaction_id`; it does not create a turn, user message, or assistant
+response.
 
 Image capability downgrades use a stricter plan: the summary request retains
 all image blocks so the source model can describe them, while the rebuilt model

@@ -1,6 +1,6 @@
 # Agent 工具
 
-这些工具由 daemon 直接执行，不需要为基础能力单独配置 MCP。模型能看到的工具只有下面五个；
+这些工具由 daemon 直接执行，不需要为基础能力单独配置 MCP。模型能看到的工具只有下面四个；
 MCP Server 的配置见 [Prompt、Skill 与 MCP](resources.md#mcp)。
 
 ## terminal
@@ -44,15 +44,6 @@ cmd.exe（`chcp 65001`）；Unix 使用 `sh`。环境快照中的 `shell` 字段
 
 计划条目包含 content、priority 和 status。status 可为 pending、in_progress、completed 或
 cancelled；清空 entries 就是清除计划。
-
-## handoff
-
-Agent 认为当前上下文不适合继续时，用 handoff_text 写下目标、已完成工作、决定、未解决问题
-和下一步。daemon 会重建当前模型上下文，然后在同一个 turn 继续。
-
-handoff 必须是 tool batch 中唯一的工具调用，文本不能为空且不超过 32,000 UTF-8 字节；它不
-执行外部操作，始终不需要权限确认。需要独立并行工作的任务请创建子 Session，见 [Session 与子
-Agent](session.md)。
 
 ## 权限
 

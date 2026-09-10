@@ -100,7 +100,6 @@ impl ToolPolicyEngine {
                     Authorization::Deny("file_edit is unavailable in watch mode.".to_string())
                 }
             },
-            ToolIntent::Handoff => Authorization::Allow,
             ToolIntent::Plan => Authorization::Allow,
         }
     }

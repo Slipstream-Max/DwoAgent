@@ -16,7 +16,7 @@
 | [ACP 连接](acp.md) | ACP Client 配置、v1/v2 和输入输出能力 |
 | [WebSocket 连接](websocket.md) | /acp、/dwo、Token、TLS 和远程连接 |
 | [Session 与子 Agent](session.md) | 创建、继续、Fork、临时子 Agent、队列和持久化 |
-| [Agent 工具](tools.md) | terminal、read_file、file_edit、plan、handoff 和权限 |
+| [Agent 工具](tools.md) | terminal、read_file、file_edit、plan 和权限 |
 | [API 说明](api.md) | ACP 与 Management RPC 的边界、方法和事件 |
 
 源码级 Rust API 另见 [dwo-protocol](../crates/dwo-protocol/README.md)、

@@ -66,8 +66,7 @@ dwo session prompt "临时验证这个修复，只返回测试结果" --ephemera
 Ephemeral Session 的 Turn 结束后保留 5 分钟再自动删除，期间可查看结果。需要保留时运行
 dwo session keep <session-id>；完成后的 Ephemeral Session 在 keep 之前不再接受新 Prompt。
 
-子 Session 适合代码检查、资料整理、运行测试等边界明确的任务。需要当前 Agent 压缩自己并在
-同一 turn 继续时，用 handoff，而不是创建子 Session；见 [Agent 工具](tools.md#handoff)。
+子 Session 适合代码检查、资料整理、运行测试等边界明确的任务。
 
 --to 和 --from 互斥，Fork 来源必须 idle。Fork 会复制来源的 context、transcript、父子关系和
 配置，但返回的新 Session 不会自动成为当前入口所选 Session。

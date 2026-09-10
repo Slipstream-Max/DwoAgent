@@ -7,7 +7,6 @@ pub fn tool_schemas() -> Vec<Value> {
         terminal_schema(),
         read_file_schema(),
         file_edit_schema(),
-        handoff_schema(),
         plan_schema(),
     ]
 }
@@ -38,22 +37,6 @@ pub fn plan_schema() -> Value {
                 },
                 "required":["action", "entries"],
                 "additionalProperties":false
-            }
-        }
-    })
-}
-
-pub fn handoff_schema() -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "handoff",
-            "description": "Write a precise handoff summary, then end this turn and rebuild the model context around it. Include the goal, completed work, decisions, unresolved issues, and next steps.",
-            "parameters": {
-                "type": "object",
-                "properties": { "handoff_text": { "type": "string", "minLength": 1 } },
-                "required": ["handoff_text"],
-                "additionalProperties": false
             }
         }
     })
@@ -175,13 +158,6 @@ mod tests {
         assert_eq!(parameters["properties"]["line_count"]["default"], 500);
         assert_eq!(parameters["properties"]["offset"]["minimum"], 0);
         assert_eq!(parameters["properties"]["offset"]["default"], 0);
-    }
-
-    #[test]
-    fn handoff_schema_requires_handoff_text() {
-        let parameters = &handoff_schema()["function"]["parameters"];
-        assert_eq!(parameters["required"], json!(["handoff_text"]));
-        assert_eq!(parameters["additionalProperties"], false);
     }
 
     #[test]

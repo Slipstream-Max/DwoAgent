@@ -11,7 +11,6 @@ use crate::events::CompactionTrigger;
 pub(crate) struct CompactionRequest {
     pub selection: ModelSelection,
     pub trigger: CompactionTrigger,
-    pub supplied_summary: Option<String>,
 }
 
 pub(crate) struct CompactionResult {
@@ -33,7 +32,7 @@ pub(crate) async fn execute(
         CompactionTrigger::Recovery => planner.build_recovery(context.context()),
         _ => planner.build(context.context()),
     };
-    let should_apply = request.supplied_summary.is_some() || plan.needs_replacement();
+    let should_apply = plan.needs_replacement();
     if !should_apply {
         return Ok(CompactionResult {
             context,
@@ -42,25 +41,23 @@ pub(crate) async fn execute(
         });
     }
 
-    let summary = match request.supplied_summary {
-        Some(summary) => summary,
-        None if plan.has_compactable_history() => {
-            let selection = ModelSelection {
-                model: context
-                    .context()
-                    .usage
-                    .last_model
-                    .clone()
-                    .unwrap_or(request.selection.model),
-                reasoning: request.selection.reasoning,
-            };
-            request_with_retry(cancellation, || {
-                model.summarize(selection.clone(), plan.view.clone(), cancellation.clone())
-            })
-            .await?
-            .summary
-        }
-        None => String::new(),
+    let summary = if plan.has_compactable_history() {
+        let selection = ModelSelection {
+            model: context
+                .context()
+                .usage
+                .last_model
+                .clone()
+                .unwrap_or(request.selection.model),
+            reasoning: request.selection.reasoning,
+        };
+        request_with_retry(cancellation, || {
+            model.summarize(selection.clone(), plan.view.clone(), cancellation.clone())
+        })
+        .await?
+        .summary
+    } else {
+        String::new()
     };
     let display_summary = (!summary.is_empty()).then_some(summary.clone());
     context.apply_compaction(plan, summary, prompt_builder, tools)?;

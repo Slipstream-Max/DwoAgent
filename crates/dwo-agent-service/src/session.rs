@@ -1207,7 +1207,6 @@ impl SessionActor {
                 CompactionRequest {
                     selection,
                     trigger: CompactionTrigger::Manual,
-                    supplied_summary: None,
                 },
             )
             .await

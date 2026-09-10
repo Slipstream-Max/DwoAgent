@@ -50,7 +50,6 @@ pub enum CompactionTrigger {
     Manual,
     Automatic,
     Recovery,
-    Handoff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -533,7 +533,7 @@ mod tests {
                 ContextMessage::system("system"),
                 ContextMessage::user("question"),
                 ContextMessage::assistant("answer", Vec::new()),
-                ContextMessage::summary("handoff summary"),
+                ContextMessage::summary("compaction summary"),
             ],
             false,
         )

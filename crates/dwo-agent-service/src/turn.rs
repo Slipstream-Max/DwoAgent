@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dwo_context::{
-    ContextManager, MessageKind, PendingContextMessage, PendingMessageBatch, SessionContext,
+    ContextManager, PendingContextMessage, PendingMessageBatch, SessionContext,
     SystemPromptBuilder, TurnId,
 };
 use dwo_model_client::{
@@ -19,8 +19,6 @@ use crate::events::{ActiveToolCall, CompactionTrigger, NotificationLevel};
 use crate::permission::PermissionRequester;
 use crate::session::ActorEvent;
 use crate::session_record::{SessionConfig, SessionId};
-
-const HANDOFF_CONTINUATION: &str = "<handoff_continuation>The handoff has already been completed and the model context has been rebuilt from the handoff summary. Continue the user's original task from this context. Do not call handoff again unless a genuinely new context rebuild is necessary.</handoff_continuation>";
 
 pub(crate) enum TurnUpdate {
     AssistantDelta {
@@ -255,7 +253,6 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
             && let Err(error) = compact(
                 turn,
                 model_step.selection.clone(),
-                None,
                 CompactionTrigger::Automatic,
             )
             .await
@@ -397,14 +394,8 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
             results = turn.tools.execute_batch(calls.clone(), &execution) => results,
         };
 
-        let handoff_ids = tool_results
-            .iter()
-            .filter(|result| handoff_text(result).is_some())
-            .map(|result| result.tool_call_id.clone())
-            .collect::<Vec<_>>();
         let context_results = tool_results
             .iter()
-            .filter(|result| handoff_text(result).is_none())
             .map(ToolResult::context_record)
             .collect::<Vec<_>>();
         for result in &tool_results {
@@ -435,33 +426,6 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
         turn.context.append_tool_batch(context_results);
         let pending = turn.take_steer_messages();
         turn.context.append_pending(pending);
-        if let Some(handoff_text) = tool_results.iter().find_map(handoff_text) {
-            for tool_call_id in handoff_ids {
-                turn.context.remove_tool_call(&tool_call_id);
-            }
-            if let Err(error) = compact(
-                turn,
-                model_step.selection.clone(),
-                Some(handoff_text.to_string()),
-                CompactionTrigger::Handoff,
-            )
-            .await
-            {
-                return TurnOutcome::Failed(format!("apply handoff context: {error:#}"));
-            }
-            turn.context
-                .append_internal(MessageKind::Runtime, HANDOFF_CONTINUATION);
-            if let Err(error) = turn.checkpoint().await {
-                return TurnOutcome::Failed(format!("persist handoff continuation: {error:#}"));
-            }
-            tracing::info!(
-                event = "context.handoff_continuing",
-                session_id = %turn.session_id,
-                turn_id = %turn.turn_id,
-                "handoff context rebuilt; continuing turn"
-            );
-            continue;
-        }
         if let Err(error) = turn.checkpoint().await {
             return TurnOutcome::Failed(format!("persist tool checkpoint: {error:#}"));
         }
@@ -482,7 +446,7 @@ async fn request_with_context_recovery(
                 .downcast_ref::<ModelClientError>()
                 .is_some_and(ModelClientError::is_context_length_exceeded) =>
         {
-            if !compact(turn, selection.clone(), None, CompactionTrigger::Recovery).await? {
+            if !compact(turn, selection.clone(), CompactionTrigger::Recovery).await? {
                 return Err(error);
             }
             request_model(turn, selection).await
@@ -709,7 +673,6 @@ fn human_error_kind(error: &ModelClientError) -> &'static str {
 async fn compact(
     turn: &mut TurnExecution,
     selection: ModelSelection,
-    supplied_summary: Option<String>,
     trigger: CompactionTrigger,
 ) -> anyhow::Result<bool> {
     let compaction_id = format!("cmp_{}", uuid::Uuid::new_v4().simple());
@@ -745,7 +708,6 @@ async fn compact(
             CompactionRequest {
                 selection: selection.clone(),
                 trigger,
-                supplied_summary,
             },
         )
         .await?;
@@ -801,13 +763,6 @@ async fn compact(
         "context compaction completed"
     );
     Ok(compacted)
-}
-
-fn handoff_text(result: &ToolResult) -> Option<&str> {
-    (result.tool_name == "handoff"
-        && result.output.get("status").and_then(Value::as_str) == Some("completed"))
-    .then(|| result.output.get("handoff_text").and_then(Value::as_str))
-    .flatten()
 }
 
 fn cancelled_results(calls: &[Value]) -> Vec<ToolResult> {

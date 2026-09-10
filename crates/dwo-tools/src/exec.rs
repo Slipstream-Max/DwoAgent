@@ -119,12 +119,6 @@ pub(crate) async fn execute(
                     result.output
                 })
         }
-        ToolCall::Handoff(args) => Ok(json!({
-            "tool": "handoff",
-            "kind": "other",
-            "status": "completed",
-            "handoff_text": args.text,
-        })),
         ToolCall::Plan(request) => {
             let Some(handler) = &context.plan else {
                 return result_error(&id, &name, "plan handler is not available");
@@ -164,24 +158,6 @@ pub(crate) async fn execute_batch(
         .into_iter()
         .map(ParsedToolCall::parse)
         .collect::<Vec<_>>();
-    let handoff_count = parsed_calls
-        .iter()
-        .filter(|parsed| matches!(parsed, Ok(call) if matches!(call.call, ToolCall::Handoff(_))))
-        .count();
-    if handoff_count > 0 && parsed_calls.len() > 1 {
-        return parsed_calls
-            .into_iter()
-            .map(|parsed| match parsed {
-                Ok(call) => result_error_with_code(
-                    &call.id,
-                    call.call.name(),
-                    "handoff_must_be_only_tool",
-                    "handoff must be the only tool call in a batch.",
-                ),
-                Err(error) => result_error(&error.id, &error.name, error.message),
-            })
-            .collect();
-    }
     let file_edit_count = parsed_calls
         .iter()
         .filter(|parsed| match parsed {

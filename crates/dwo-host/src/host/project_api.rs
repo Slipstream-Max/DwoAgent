@@ -18,7 +18,10 @@ struct ProjectIdParam {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreateProjectParam { name: Option<String>, pwd: PathBuf }
+struct CreateProjectParam {
+    name: Option<String>,
+    pwd: PathBuf,
+}
 
 #[derive(Deserialize)]
 struct ArchiveParam {
@@ -29,14 +32,16 @@ struct ArchiveParam {
 }
 
 #[derive(Deserialize)]
-struct ProjectRuleParam { project_id: String, content: Option<String> }
+struct ProjectRuleParam {
+    project_id: String,
+    content: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct UpdateProjectParam {
     project_id: String,
     name: String,
 }
-
 
 #[derive(Deserialize)]
 struct AttachRepositoryParam {
@@ -123,14 +128,12 @@ struct MoveTopicParam {
     position: usize,
 }
 
-
 #[derive(Deserialize)]
 struct MarkdownParam {
     project_id: String,
     topic_id: String,
     content: String,
 }
-
 
 #[derive(Deserialize)]
 struct LabelParam {
@@ -177,12 +180,25 @@ impl Host {
             "project.create" => {
                 let params: CreateProjectParam = serde_json::from_value(params)?;
                 anyhow::ensure!(params.pwd.is_absolute(), "project pwd must be absolute");
-                let name = params.name.filter(|n| !n.trim().is_empty())
-                    .or_else(|| params.pwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+                let name = params
+                    .name
+                    .filter(|n| !n.trim().is_empty())
+                    .or_else(|| {
+                        params
+                            .pwd
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                    })
                     .context("project name is required for a filesystem root")?;
                 let info = super::git::inspect_repository(&params.pwd).await.ok();
-                let mut project = self.projects.create(CreateProject { name, kind: ProjectKind::Project, pwd: Some(params.pwd) })?;
-                if let Some(info) = info { project = self.register_repository(&project.id, info, "Local")?; }
+                let mut project = self.projects.create(CreateProject {
+                    name,
+                    kind: ProjectKind::Project,
+                    pwd: Some(params.pwd),
+                })?;
+                if let Some(info) = info {
+                    project = self.register_repository(&project.id, info, "Local")?;
+                }
                 self.project_changed(&project.id, "create").await;
                 serde_json::to_value(project)?
             }
@@ -252,9 +268,23 @@ impl Host {
                     .as_ref()
                     .context("project has no attached repository")?;
                 let name = params.name.unwrap_or_else(|| params.branch.clone());
-                anyhow::ensure!(!name.trim().is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != "..", "worktree name must be a single directory name");
-                let path = project.pwd.as_ref().and_then(|p| p.parent()).context("project path has no parent")?.join(&name);
-                anyhow::ensure!(params.path.as_ref().is_none_or(|p| *p == path), "worktree path must be a sibling of project pwd named after the worktree");
+                anyhow::ensure!(
+                    !name.trim().is_empty()
+                        && !name.contains(['/', '\\', ':'])
+                        && name != "."
+                        && name != "..",
+                    "worktree name must be a single directory name"
+                );
+                let path = project
+                    .pwd
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .context("project path has no parent")?
+                    .join(&name);
+                anyhow::ensure!(
+                    params.path.as_ref().is_none_or(|p| *p == path),
+                    "worktree path must be a sibling of project pwd named after the worktree"
+                );
                 anyhow::ensure!(!path.exists(), "worktree path already exists");
                 let status = super::git::create_worktree(
                     &repository.root,
@@ -285,9 +315,15 @@ impl Host {
             "project.worktree.detach" | "project.worktree.remove" => {
                 let params: WorktreeParam = serde_json::from_value(params)?;
                 let project = self.projects.get(&params.project_id)?;
-                anyhow::ensure!(find_worktree(&project, &params.worktree_id)?.source != WorktreeSource::Primary, "the primary worktree cannot be detached");
-                let project = self.projects.remove_worktree(&params.project_id, &params.worktree_id)?;
-                self.project_changed(&params.project_id, "worktree.detach").await;
+                anyhow::ensure!(
+                    find_worktree(&project, &params.worktree_id)?.source != WorktreeSource::Primary,
+                    "the primary worktree cannot be detached"
+                );
+                let project = self
+                    .projects
+                    .remove_worktree(&params.project_id, &params.worktree_id)?;
+                self.project_changed(&params.project_id, "worktree.detach")
+                    .await;
                 serde_json::to_value(project)?
             }
             "project.section.create" => {
@@ -310,19 +346,40 @@ impl Host {
                     .await;
                 serde_json::to_value(section)?
             }
-            "project.archive" | "project.section.archive" | "project.topic.archive" | "project.session.archive" => {
+            "project.archive"
+            | "project.section.archive"
+            | "project.topic.archive"
+            | "project.session.archive" => {
                 let params: ArchiveParam = serde_json::from_value(params)?;
-                anyhow::ensure!((method == "project.archive" && params.section_id.is_none() && params.topic_id.is_none() && params.session_id.is_none())
-                    || (method == "project.section.archive" && params.section_id.is_some() && params.topic_id.is_none() && params.session_id.is_none())
-                    || (method == "project.topic.archive" && params.topic_id.is_some() && params.section_id.is_none() && params.session_id.is_none())
-                    || (method == "project.session.archive" && params.session_id.is_some() && params.section_id.is_none() && params.topic_id.is_none()), "archive requires exactly the target ID for this operation");
+                anyhow::ensure!(
+                    (method == "project.archive"
+                        && params.section_id.is_none()
+                        && params.topic_id.is_none()
+                        && params.session_id.is_none())
+                        || (method == "project.section.archive"
+                            && params.section_id.is_some()
+                            && params.topic_id.is_none()
+                            && params.session_id.is_none())
+                        || (method == "project.topic.archive"
+                            && params.topic_id.is_some()
+                            && params.section_id.is_none()
+                            && params.session_id.is_none())
+                        || (method == "project.session.archive"
+                            && params.session_id.is_some()
+                            && params.section_id.is_none()
+                            && params.topic_id.is_none()),
+                    "archive requires exactly the target ID for this operation"
+                );
                 let ids = self.archive_container(params).await?;
                 json!({"archived": ids})
             }
             "project.agents.get" | "project.agents.set" => {
                 let params: ProjectRuleParam = serde_json::from_value(params)?;
                 if method.ends_with(".set") {
-                    self.projects.set_project_rule(&params.project_id, params.content.as_deref().context("content is required")?)?;
+                    self.projects.set_project_rule(
+                        &params.project_id,
+                        params.content.as_deref().context("content is required")?,
+                    )?;
                     self.project_changed(&params.project_id, "agents.set").await;
                 }
                 json!({"content": std::fs::read_to_string(self.projects.project_rule_path(&params.project_id)?).unwrap_or_default()})
@@ -345,13 +402,17 @@ impl Host {
             }
             "project.topic.create" => {
                 let params: CreateTopicParam = serde_json::from_value(params)?;
-                anyhow::ensure!(!params.overview.trim().is_empty(), "topic overview is required");
+                anyhow::ensure!(
+                    !params.overview.trim().is_empty(),
+                    "topic overview is required"
+                );
                 let topic = self.projects.create_topic(
                     &params.project_id,
                     &params.section_id,
                     params.title,
                 )?;
-                self.projects.set_overview(&params.project_id, &topic.id, &params.overview)?;
+                self.projects
+                    .set_overview(&params.project_id, &topic.id, &params.overview)?;
                 self.project_changed(&params.project_id, "topic.create")
                     .await;
                 serde_json::to_value(topic)?
@@ -575,24 +636,44 @@ impl Host {
         Ok(views)
     }
 
-
     async fn archive_container(&self, params: ArchiveParam) -> Result<Vec<String>> {
         let _lifecycle = self.automation.lifecycle.lock().await;
         let project = self.projects.get(&params.project_id)?;
-        let topics: Vec<String> = project.board.topics.iter()
-            .filter(|t| params.section_id.as_ref().is_none_or(|id| &t.section_id == id)
-                && params.topic_id.as_ref().is_none_or(|id| &t.id == id))
-            .map(|t| t.id.clone()).collect();
-        let ids: Vec<String> = project.board.topics.iter().filter(|t| topics.contains(&t.id))
+        let topics: Vec<String> = project
+            .board
+            .topics
+            .iter()
+            .filter(|t| {
+                params
+                    .section_id
+                    .as_ref()
+                    .is_none_or(|id| &t.section_id == id)
+                    && params.topic_id.as_ref().is_none_or(|id| &t.id == id)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        let ids: Vec<String> = project
+            .board
+            .topics
+            .iter()
+            .filter(|t| topics.contains(&t.id))
             .flat_map(|t| t.session_ids.iter())
-            .filter(|id| params.session_id.as_ref().is_none_or(|s| *id == s)).cloned().collect();
+            .filter(|id| params.session_id.as_ref().is_none_or(|s| *id == s))
+            .cloned()
+            .collect();
         for value in &ids {
             let id = SessionId::parse(value.clone()).map_err(anyhow::Error::msg)?;
             let snapshot = self.service.snapshot(&id).await?;
-            anyhow::ensure!(snapshot.phase == dwo_agent_service::RuntimePhase::Idle, "stop session {id} before archiving");
+            anyhow::ensure!(
+                snapshot.phase == dwo_agent_service::RuntimePhase::Idle,
+                "stop session {id} before archiving"
+            );
         }
         let jobs = self.automation.list(Some(&project.id)).await;
-        anyhow::ensure!(jobs.iter().all(|j| j.active_runs.is_empty()), "stop project automation runs before archiving");
+        anyhow::ensure!(
+            jobs.iter().all(|j| j.active_runs.is_empty()),
+            "stop project automation runs before archiving"
+        );
         self.automation.update_project_config(&project.id, |config| {
                 for job in &mut config.jobs {
                     let fixed_selected = matches!(&job.session, crate::automation::AutomationSession::Fixed { session_id } if ids.contains(session_id));
@@ -602,13 +683,19 @@ impl Host {
                 }
                 Ok(())
             }).await?;
-        let ids = self.projects.archive(&project.id, params.section_id.as_deref(), params.topic_id.as_deref(), params.session_id.as_deref())?;
+        let ids = self.projects.archive(
+            &project.id,
+            params.section_id.as_deref(),
+            params.topic_id.as_deref(),
+            params.session_id.as_deref(),
+        )?;
         for value in &ids {
             let id = SessionId::parse(value.clone()).map_err(anyhow::Error::msg)?;
             self.service.set_external_rule_files(&id, vec![]);
         }
         self.project_changed(&project.id, "archive").await;
-        self.project_changed(dwo_project::UNASSIGNED_PROJECT_ID, "archive").await;
+        self.project_changed(dwo_project::UNASSIGNED_PROJECT_ID, "archive")
+            .await;
         Ok(ids)
     }
 
@@ -664,17 +751,40 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("keep.txt"), "keep").unwrap();
         let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-        let project = host.handle_method("project.create", json!({"pwd": workspace})).await.unwrap();
+        let project = host
+            .handle_method("project.create", json!({"pwd": workspace}))
+            .await
+            .unwrap();
         assert_eq!(project["name"], "demo");
         assert_eq!(project["kind"], "project");
         let pid = project["id"].as_str().unwrap();
         let section = project["board"]["uncategorizedSectionId"].as_str().unwrap();
-        assert!(host.handle_method("project.topic.create", json!({"project_id": pid, "section_id": section, "title": "Task", "overview": ""})).await.is_err());
+        assert!(
+            host.handle_method(
+                "project.topic.create",
+                json!({"project_id": pid, "section_id": section, "title": "Task", "overview": ""})
+            )
+            .await
+            .is_err()
+        );
         let topic = host.handle_method("project.topic.create", json!({"project_id": pid, "section_id": section, "title": "Task", "overview": "Implement feature"})).await.unwrap();
         let tid = topic["id"].as_str().unwrap();
-        host.handle_method("project.agents.set", json!({"project_id": pid, "content": "Project rule sentinel"})).await.unwrap();
-        host.handle_method("project.topic.agents.set", json!({"project_id": pid, "topic_id": tid, "content": "Topic rule sentinel"})).await.unwrap();
-        let created = host.handle_method("session.new", json!({"project_id": pid, "topic_id": tid})).await.unwrap();
+        host.handle_method(
+            "project.agents.set",
+            json!({"project_id": pid, "content": "Project rule sentinel"}),
+        )
+        .await
+        .unwrap();
+        host.handle_method(
+            "project.topic.agents.set",
+            json!({"project_id": pid, "topic_id": tid, "content": "Topic rule sentinel"}),
+        )
+        .await
+        .unwrap();
+        let created = host
+            .handle_method("session.new", json!({"project_id": pid, "topic_id": tid}))
+            .await
+            .unwrap();
         let id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
         let snapshot = host.service.snapshot(&id).await.unwrap();
         let cwd = snapshot.record.info.cwd;
@@ -682,15 +792,38 @@ mod tests {
         assert!(prompt.contains("Project rule sentinel"));
         assert!(prompt.contains("Topic rule sentinel"));
         assert!(host.delete_session(&id).await.is_err());
-        assert!(host.handle_method("session.set", json!({"session_id": id, "worktree_id": "other"})).await.is_err());
-        host.handle_method("project.archive", json!({"project_id": pid})).await.unwrap();
+        assert!(
+            host.handle_method(
+                "session.set",
+                json!({"session_id": id, "worktree_id": "other"})
+            )
+            .await
+            .is_err()
+        );
+        host.handle_method("project.archive", json!({"project_id": pid}))
+            .await
+            .unwrap();
         assert!(host.projects.is_archived(id.as_str()));
         host.service.unload(&id).await.unwrap();
-        assert_eq!(host.service.snapshot(&id).await.unwrap().record.info.cwd, cwd);
+        assert_eq!(
+            host.service.snapshot(&id).await.unwrap().record.info.cwd,
+            cwd
+        );
         assert!(host.projects.get(pid).is_err());
-        assert!(host.prompt_session(&id, dwo_agent_service::EndpointId::parse("test").unwrap(), dwo_context::MessageContent::text("run")).await.is_err());
+        assert!(
+            host.prompt_session(
+                &id,
+                dwo_agent_service::EndpointId::parse("test").unwrap(),
+                dwo_context::MessageContent::text("run")
+            )
+            .await
+            .is_err()
+        );
         host.delete_session(&id).await.unwrap();
-        assert_eq!(std::fs::read_to_string(workspace.join("keep.txt")).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("keep.txt")).unwrap(),
+            "keep"
+        );
         host.shutdown().await;
     }
 
@@ -699,27 +832,92 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        for args in [vec!["init"], vec!["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-m", "initial"]] {
-            assert!(std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap().status.success());
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&repo)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
         }
         let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-        let project = host.handle_method("project.create", json!({"pwd": repo})).await.unwrap();
+        let project = host
+            .handle_method("project.create", json!({"pwd": repo}))
+            .await
+            .unwrap();
         let pid = project["id"].as_str().unwrap();
         assert!(!project["repository"].is_null());
-        let project = host.handle_method("project.worktree.create", json!({"project_id": pid, "branch": "feature-a", "name": "feature-a"})).await.unwrap();
+        let project = host
+            .handle_method(
+                "project.worktree.create",
+                json!({"project_id": pid, "branch": "feature-a", "name": "feature-a"}),
+            )
+            .await
+            .unwrap();
         let tree = project["worktrees"].as_array().unwrap().last().unwrap();
         let wid = tree["id"].as_str().unwrap();
         let cwd = std::fs::canonicalize(root.path().join("feature-a")).unwrap();
-        let created = host.handle_method("session.new", json!({"project_id": pid, "worktree_id": wid})).await.unwrap();
+        let created = host
+            .handle_method(
+                "session.new",
+                json!({"project_id": pid, "worktree_id": wid}),
+            )
+            .await
+            .unwrap();
         let id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
-        host.handle_method("project.worktree.remove", json!({"project_id": pid, "worktree_id": wid})).await.unwrap();
+        host.handle_method(
+            "project.worktree.remove",
+            json!({"project_id": pid, "worktree_id": wid}),
+        )
+        .await
+        .unwrap();
         host.service.unload(&id).await.unwrap();
-        assert_eq!(host.service.snapshot(&id).await.unwrap().record.info.cwd, cwd);
+        assert_eq!(
+            host.service.snapshot(&id).await.unwrap().record.info.cwd,
+            cwd
+        );
         assert!(cwd.join(".git").exists());
-        assert!(host.handle_method("project.worktree.create", json!({"project_id": pid, "branch": "bad", "name": "../escape"})).await.is_err());
-        assert!(host.handle_method("project.worktree.create", json!({"project_id": pid, "branch": "other", "name": "feature-a"})).await.is_err());
-        assert!(host.handle_method("project.repository.clone", json!({})).await.is_err());
-        assert!(host.handle_method("project.topic.move_to_project", json!({})).await.is_err());
+        assert!(
+            host.handle_method(
+                "project.worktree.create",
+                json!({"project_id": pid, "branch": "bad", "name": "../escape"})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            host.handle_method(
+                "project.worktree.create",
+                json!({"project_id": pid, "branch": "other", "name": "feature-a"})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            host.handle_method("project.repository.clone", json!({}))
+                .await
+                .is_err()
+        );
+        assert!(
+            host.handle_method("project.topic.move_to_project", json!({}))
+                .await
+                .is_err()
+        );
         host.shutdown().await;
     }
 }

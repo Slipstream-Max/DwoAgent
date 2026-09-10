@@ -80,7 +80,6 @@ pub async fn worktree_status(path: &Path) -> Result<WorktreeStatus> {
     })
 }
 
-
 pub async fn create_worktree(
     repository: &Path,
     path: &Path,
@@ -100,7 +99,6 @@ pub async fn create_worktree(
     run(Some(repository), args).await?;
     worktree_status(path).await
 }
-
 
 async fn text<const N: usize>(path: &Path, args: [&str; N]) -> Result<String> {
     let output = bytes(path, args).await?;

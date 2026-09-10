@@ -411,8 +411,14 @@ impl ProjectService {
     pub fn remove_worktree(&self, project_id: &str, worktree_id: &str) -> Result<Project> {
         let worktree_id = worktree_id.to_string();
         self.mutate(project_id, |project| {
-            if project.worktrees.iter().any(|w| w.id == worktree_id && w.source == WorktreeSource::Primary) {
-                return Err(ProjectError::Invalid("primary worktree cannot be removed".into()));
+            if project
+                .worktrees
+                .iter()
+                .any(|w| w.id == worktree_id && w.source == WorktreeSource::Primary)
+            {
+                return Err(ProjectError::Invalid(
+                    "primary worktree cannot be removed".into(),
+                ));
             }
             let before = project.worktrees.len();
             project
@@ -488,7 +494,6 @@ impl ProjectService {
         })?;
         Ok(project.board.sections)
     }
-
 
     pub fn create_topic(&self, project_id: &str, section_id: &str, title: String) -> Result<Topic> {
         let title = nonempty("topic title", title)?;
@@ -568,11 +573,12 @@ impl ProjectService {
         find_topic(&project, &topic_id).cloned()
     }
 
-
     pub fn assign_session(&self, project_id: &str, topic_id: &str, id: String) -> Result<Topic> {
         let id = nonempty("session id", id)?;
         if let Some((project, topic)) = self.locate_session(&id) {
-            if project.id == project_id && topic.id == topic_id { return Ok(topic); }
+            if project.id == project_id && topic.id == topic_id {
+                return Ok(topic);
+            }
             return Err(ProjectError::Invalid("session ownership is fixed".into()));
         }
         let topic_id = topic_id.to_string();
@@ -583,7 +589,6 @@ impl ProjectService {
         })?;
         find_topic(&project, &topic_id).cloned()
     }
-
 
     pub fn create_label(
         &self,
@@ -719,52 +724,116 @@ impl ProjectService {
     }
 
     pub fn is_archived(&self, session_id: &str) -> bool {
-        self.locate_session(session_id).is_some_and(|(p, t)|
-            p.id == UNASSIGNED_PROJECT_ID && t.id == ARCHIVE_TOPIC_ID)
+        self.locate_session(session_id)
+            .is_some_and(|(p, t)| p.id == UNASSIGNED_PROJECT_ID && t.id == ARCHIVE_TOPIC_ID)
     }
 
     /// Commit the new ownership before removing containers; replay the journal on restart.
-    pub fn archive(&self, project_id: &str, section_id: Option<&str>, topic_id: Option<&str>, session_id: Option<&str>) -> Result<Vec<String>> {
+    pub fn archive(
+        &self,
+        project_id: &str,
+        section_id: Option<&str>,
+        topic_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<String>> {
         self.get_or_create_unassigned()?;
         let mut guard = self.projects.write().expect("project lock poisoned");
         let mut projects = guard.clone();
-        let source = projects.iter_mut().find(|p| p.id == project_id)
+        let source = projects
+            .iter_mut()
+            .find(|p| p.id == project_id)
             .ok_or_else(|| ProjectError::ProjectNotFound(project_id.into()))?;
-        if let Some(id) = section_id { ensure_section(source, id)?; }
-        if let Some(id) = topic_id { find_topic(source, id)?; }
+        if let Some(id) = section_id {
+            ensure_section(source, id)?;
+        }
+        if let Some(id) = topic_id {
+            find_topic(source, id)?;
+        }
         if project_id == UNASSIGNED_PROJECT_ID && session_id.is_none() {
-            return Err(ProjectError::Invalid("Work system containers cannot be archived".into()));
+            return Err(ProjectError::Invalid(
+                "Work system containers cannot be archived".into(),
+            ));
         }
-        let selected = |t: &Topic| section_id.is_none_or(|id| t.section_id == id)
-            && topic_id.is_none_or(|id| t.id == id);
-        let ids: Vec<String> = source.board.topics.iter().filter(|t| selected(t))
-            .flat_map(|t| t.session_ids.iter()).filter(|id| session_id.is_none_or(|s| *id == s))
-            .cloned().collect();
+        let selected = |t: &Topic| {
+            section_id.is_none_or(|id| t.section_id == id) && topic_id.is_none_or(|id| t.id == id)
+        };
+        let ids: Vec<String> = source
+            .board
+            .topics
+            .iter()
+            .filter(|t| selected(t))
+            .flat_map(|t| t.session_ids.iter())
+            .filter(|id| session_id.is_none_or(|s| *id == s))
+            .cloned()
+            .collect();
         if session_id.is_some() && ids.is_empty() {
-            return Err(ProjectError::Invalid("session does not belong to container".into()));
+            return Err(ProjectError::Invalid(
+                "session does not belong to container".into(),
+            ));
         }
-        for topic in &mut source.board.topics { topic.session_ids.retain(|id| !ids.contains(id)); }
+        for topic in &mut source.board.topics {
+            topic.session_ids.retain(|id| !ids.contains(id));
+        }
         if session_id.is_none() {
-            source.board.topics.retain(|t| !selected(t) || t.id == source.board.uncategorized_topic_id);
+            source
+                .board
+                .topics
+                .retain(|t| !selected(t) || t.id == source.board.uncategorized_topic_id);
             if let Some(id) = section_id {
-                source.board.sections.retain(|s| s.id != id || s.id == source.board.uncategorized_section_id);
+                source
+                    .board
+                    .sections
+                    .retain(|s| s.id != id || s.id == source.board.uncategorized_section_id);
             }
         }
         source.updated_at_ms = unix_time_ms();
-        let removed = (section_id.is_none() && topic_id.is_none() && session_id.is_none()).then(|| project_id.to_string());
-        if let Some(id) = &removed { projects.retain(|p| &p.id != id); }
-        let work = projects.iter_mut().find(|p| p.id == UNASSIGNED_PROJECT_ID).expect("Work exists");
-        if !work.board.sections.iter().any(|s| s.id == ARCHIVE_SECTION_ID) {
-            work.board.sections.push(Section { id: ARCHIVE_SECTION_ID.into(), name: "Archive".into(), order: work.board.sections.len() as u32 });
-            work.board.topics.push(Topic { id: ARCHIVE_TOPIC_ID.into(), section_id: ARCHIVE_SECTION_ID.into(), title: "Archive".into(), order: 0, session_ids: vec![], label_ids: vec![] });
+        let removed = (section_id.is_none() && topic_id.is_none() && session_id.is_none())
+            .then(|| project_id.to_string());
+        if let Some(id) = &removed {
+            projects.retain(|p| &p.id != id);
+        }
+        let work = projects
+            .iter_mut()
+            .find(|p| p.id == UNASSIGNED_PROJECT_ID)
+            .expect("Work exists");
+        if !work
+            .board
+            .sections
+            .iter()
+            .any(|s| s.id == ARCHIVE_SECTION_ID)
+        {
+            work.board.sections.push(Section {
+                id: ARCHIVE_SECTION_ID.into(),
+                name: "Archive".into(),
+                order: work.board.sections.len() as u32,
+            });
+            work.board.topics.push(Topic {
+                id: ARCHIVE_TOPIC_ID.into(),
+                section_id: ARCHIVE_SECTION_ID.into(),
+                title: "Archive".into(),
+                order: 0,
+                session_ids: vec![],
+                label_ids: vec![],
+            });
             self.create_topic_files(UNASSIGNED_PROJECT_ID, ARCHIVE_TOPIC_ID)?;
         }
-        append_unique(&mut find_topic_mut(work, ARCHIVE_TOPIC_ID)?.session_ids, ids.clone());
+        append_unique(
+            &mut find_topic_mut(work, ARCHIVE_TOPIC_ID)?.session_ids,
+            ids.clone(),
+        );
         work.updated_at_ms = unix_time_ms();
-        for p in &projects { validate_project(p)?; }
+        for p in &projects {
+            validate_project(p)?;
+        }
         let path = self.root.join("archive-transaction.json");
-        let bytes = serde_json::to_vec(&ArchiveTransaction { projects: projects.clone(), removed })
-            .map_err(|source| ProjectError::Json { path: path.clone(), source })?;
+        let bytes = serde_json::to_vec(&ArchiveTransaction {
+            projects: projects.clone(),
+            removed,
+        })
+        .map_err(|source| ProjectError::Json {
+            path: path.clone(),
+            source,
+        })?;
         atomic_write(&path, &bytes)?;
         recover_archive(&self.root)?;
         *guard = projects;
@@ -838,7 +907,8 @@ impl ProjectService {
     ) -> Result<Project> {
         let mut projects = self.projects.write().expect("project lock poisoned");
         let index = projects
-            .iter().position(|p| p.id == project_id)
+            .iter()
+            .position(|p| p.id == project_id)
             .ok_or_else(|| ProjectError::ProjectNotFound(project_id.to_string()))?;
         let mut next = projects[index].clone();
         let project = &mut next;
@@ -904,21 +974,37 @@ impl ProjectService {
 
 fn recover_archive(root: &Path) -> Result<()> {
     let journal = root.join("archive-transaction.json");
-    if !journal.exists() { return Ok(()); }
-    let bytes = fs::read(&journal).map_err(|source| ProjectError::Io { path: journal.clone(), source })?;
-    let transaction: ArchiveTransaction = serde_json::from_slice(&bytes)
-        .map_err(|source| ProjectError::Json { path: journal.clone(), source })?;
+    if !journal.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(&journal).map_err(|source| ProjectError::Io {
+        path: journal.clone(),
+        source,
+    })?;
+    let transaction: ArchiveTransaction =
+        serde_json::from_slice(&bytes).map_err(|source| ProjectError::Json {
+            path: journal.clone(),
+            source,
+        })?;
     for project in transaction.projects {
         validate_project(&project)?;
         let path = root.join(&project.id).join("project.json");
-        let bytes = serde_json::to_vec_pretty(&project).map_err(|source| ProjectError::Json { path: path.clone(), source })?;
+        let bytes = serde_json::to_vec_pretty(&project).map_err(|source| ProjectError::Json {
+            path: path.clone(),
+            source,
+        })?;
         atomic_write(&path, &bytes)?;
     }
     if let Some(id) = transaction.removed {
         let path = root.join(id).join("project.json");
-        if path.exists() { fs::remove_file(&path).map_err(|source| ProjectError::Io { path, source })?; }
+        if path.exists() {
+            fs::remove_file(&path).map_err(|source| ProjectError::Io { path, source })?;
+        }
     }
-    fs::remove_file(&journal).map_err(|source| ProjectError::Io { path: journal, source })
+    fs::remove_file(&journal).map_err(|source| ProjectError::Io {
+        path: journal,
+        source,
+    })
 }
 
 fn validate_project(project: &Project) -> Result<()> {
@@ -1389,24 +1475,76 @@ mod tests {
         fs::write(workspace.join("keep.txt"), "keep").unwrap();
         let path = root.path().join("projects");
         let service = ProjectService::open(&path).unwrap();
-        let project = service.create(CreateProject { name: "Demo".into(), kind: ProjectKind::Project, pwd: Some(workspace.clone()) }).unwrap();
-        let section = service.create_section(&project.id, "Active".into()).unwrap();
-        let topic = service.create_topic(&project.id, &section.id, "Task".into()).unwrap();
-        service.assign_session(&project.id, &topic.id, "session-1".into()).unwrap();
-        assert!(service.assign_session(&project.id, &project.board.uncategorized_topic_id, "session-1".into()).is_err());
-        service.move_topic(&project.id, &topic.id, &project.board.uncategorized_section_id, 0).unwrap();
-        service.archive(&project.id, None, Some(&topic.id), None).unwrap();
+        let project = service
+            .create(CreateProject {
+                name: "Demo".into(),
+                kind: ProjectKind::Project,
+                pwd: Some(workspace.clone()),
+            })
+            .unwrap();
+        let section = service
+            .create_section(&project.id, "Active".into())
+            .unwrap();
+        let topic = service
+            .create_topic(&project.id, &section.id, "Task".into())
+            .unwrap();
+        service
+            .assign_session(&project.id, &topic.id, "session-1".into())
+            .unwrap();
+        assert!(
+            service
+                .assign_session(
+                    &project.id,
+                    &project.board.uncategorized_topic_id,
+                    "session-1".into()
+                )
+                .is_err()
+        );
+        service
+            .move_topic(
+                &project.id,
+                &topic.id,
+                &project.board.uncategorized_section_id,
+                0,
+            )
+            .unwrap();
+        service
+            .archive(&project.id, None, Some(&topic.id), None)
+            .unwrap();
         assert!(service.is_archived("session-1"));
         let reloaded = ProjectService::open(&path).unwrap();
         assert!(reloaded.is_archived("session-1"));
-        assert!(!reloaded.get(&project.id).unwrap().board.topics.iter().any(|t| t.id == topic.id));
+        assert!(
+            !reloaded
+                .get(&project.id)
+                .unwrap()
+                .board
+                .topics
+                .iter()
+                .any(|t| t.id == topic.id)
+        );
         reloaded.archive(&project.id, None, None, None).unwrap();
-        assert!(ProjectService::open(&path).unwrap().get(&project.id).is_err());
-        assert_eq!(fs::read_to_string(workspace.join("keep.txt")).unwrap(), "keep");
+        assert!(
+            ProjectService::open(&path)
+                .unwrap()
+                .get(&project.id)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.txt")).unwrap(),
+            "keep"
+        );
 
         let projects = reloaded.list();
-        let journal = ArchiveTransaction { projects: projects.clone(), removed: Some(project.id.clone()) };
-        fs::write(path.join("archive-transaction.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+        let journal = ArchiveTransaction {
+            projects: projects.clone(),
+            removed: Some(project.id.clone()),
+        };
+        fs::write(
+            path.join("archive-transaction.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
         fs::remove_file(path.join(UNASSIGNED_PROJECT_ID).join("project.json")).unwrap();
         let recovered = ProjectService::open(&path).unwrap();
         assert!(recovered.is_archived("session-1"));

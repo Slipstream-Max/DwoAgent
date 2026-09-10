@@ -1039,10 +1039,7 @@ impl SessionActor {
         self.tools = tools;
         self.prompt_builder = prompt_builder;
         self.emit_usage_changed();
-        self.broadcast_event(SessionEventPayload::WorkspaceChanged {
-            old_cwd,
-            cwd,
-        });
+        self.broadcast_event(SessionEventPayload::WorkspaceChanged { old_cwd, cwd });
         Ok(())
     }
 

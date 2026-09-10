@@ -117,7 +117,11 @@ enum SessionCommand {
     Keep {
         id: String,
     },
-    Archive { id: String, #[arg(long)] project: String },
+    Archive {
+        id: String,
+        #[arg(long)]
+        project: String,
+    },
     Set {
         id: String,
         #[arg(long)]
@@ -191,7 +195,10 @@ enum SectionCommand {
         id: String,
         name: String,
     },
-    Archive { project: String, id: String },
+    Archive {
+        project: String,
+        id: String,
+    },
     Reorder {
         project: String,
         id: String,
@@ -220,7 +227,10 @@ enum TopicCommand {
         id: String,
         title: String,
     },
-    Archive { project: String, id: String },
+    Archive {
+        project: String,
+        id: String,
+    },
     Move {
         project: String,
         id: String,
@@ -247,7 +257,9 @@ enum ProjectCommand {
         #[arg(long)]
         cwd: PathBuf,
     },
-    Archive { project: String },
+    Archive {
+        project: String,
+    },
     Update {
         project: String,
         name: String,
@@ -261,7 +273,6 @@ enum ProjectCommand {
         command: WorktreeCommand,
     },
 }
-
 
 #[derive(Subcommand)]
 enum RepositoryCommand {
@@ -1142,7 +1153,12 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             ))?;
         }
         SessionCommand::Archive { id, project } => {
-            let value = ipc::request_dwo(config_path, "project.session.archive", json!({"project_id": project, "session_id": id})).await?;
+            let value = ipc::request_dwo(
+                config_path,
+                "project.session.archive",
+                json!({"project_id": project, "session_id": id}),
+            )
+            .await?;
             render::write_value(&value)?;
         }
         SessionCommand::Set {
@@ -1153,10 +1169,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             reasoning,
         } => {
             anyhow::ensure!(
-                title.is_some()
-                    || policy.is_some()
-                    || model.is_some()
-                    || reasoning.is_some(),
+                title.is_some() || policy.is_some() || model.is_some() || reasoning.is_some(),
                 "session set requires at least one field"
             );
             let policy = policy
@@ -1319,7 +1332,12 @@ async fn run_topic(command: TopicCommand, config_path: &Path) -> Result<()> {
             "project.topic.archive",
             json!({"project_id": project, "topic_id": id}),
         ),
-        TopicCommand::Move { project, id, section, position } => (
+        TopicCommand::Move {
+            project,
+            id,
+            section,
+            position,
+        } => (
             "project.topic.move",
             json!({"project_id": project, "topic_id": id, "section_id": section, "position": position}),
         ),
@@ -1346,9 +1364,9 @@ async fn run_project(command: ProjectCommand, config_path: &Path) -> Result<()> 
     let (method, params) = match command {
         ProjectCommand::List => ("project.list", json!({})),
         ProjectCommand::Get { project } => ("project.get", json!({"project_id": project})),
-        ProjectCommand::Create { name, cwd } => (
-            "project.create", json!({"name": name, "pwd": cwd}),
-        ),
+        ProjectCommand::Create { name, cwd } => {
+            ("project.create", json!({"name": name, "pwd": cwd}))
+        }
         ProjectCommand::Archive { project } => ("project.archive", json!({"project_id": project})),
         ProjectCommand::Update { project, name } => (
             "project.update",
@@ -2448,7 +2466,9 @@ mod tests {
 
     #[test]
     fn parses_project_board_commands() {
-        let project = Cli::try_parse_from(["dwo", "project", "create", "DwoAgent", "--cwd", "C:/repo"]).unwrap();
+        let project =
+            Cli::try_parse_from(["dwo", "project", "create", "DwoAgent", "--cwd", "C:/repo"])
+                .unwrap();
         assert!(matches!(
             project.command,
             Command::Project {
@@ -2468,9 +2488,27 @@ mod tests {
             } if project == "project-1" && name == "Planning"
         ));
 
-        let topic = Cli::try_parse_from(["dwo", "topic", "move", "project-1", "topic-1", "section-2"]).unwrap();
-        assert!(matches!(topic.command, Command::Topic { command: TopicCommand::Move { .. } }));
+        let topic =
+            Cli::try_parse_from(["dwo", "topic", "move", "project-1", "topic-1", "section-2"])
+                .unwrap();
+        assert!(matches!(
+            topic.command,
+            Command::Topic {
+                command: TopicCommand::Move { .. }
+            }
+        ));
         assert!(Cli::try_parse_from(["dwo", "session", "move", "session-1"]).is_err());
-        assert!(Cli::try_parse_from(["dwo", "project", "repository", "clone", "project-1", "url", "path"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "dwo",
+                "project",
+                "repository",
+                "clone",
+                "project-1",
+                "url",
+                "path"
+            ])
+            .is_err()
+        );
     }
 }

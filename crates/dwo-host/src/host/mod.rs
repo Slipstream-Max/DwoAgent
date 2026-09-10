@@ -293,7 +293,16 @@ impl Host {
                         projects.agents_path(&project.id, &topic.id)?,
                         snapshot.record.info.cwd.clone(),
                     );
-                    service.set_external_rule_files(&session_id, vec![ExternalRuleFile::new(projects.project_rule_path(&project.id)?, snapshot.record.info.cwd), rule_file]);
+                    service.set_external_rule_files(
+                        &session_id,
+                        vec![
+                            ExternalRuleFile::new(
+                                projects.project_rule_path(&project.id)?,
+                                snapshot.record.info.cwd,
+                            ),
+                            rule_file,
+                        ],
+                    );
                 }
             }
         }

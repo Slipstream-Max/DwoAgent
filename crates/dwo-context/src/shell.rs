@@ -66,8 +66,7 @@ fn candidate_bash_programs() -> Vec<PathBuf> {
             winreg::enums::HKEY_LOCAL_MACHINE,
             winreg::enums::HKEY_CURRENT_USER,
         ] {
-            if let Some(install_root) =
-                registry_install_root(winreg::RegKey::predef(hive), subkey)
+            if let Some(install_root) = registry_install_root(winreg::RegKey::predef(hive), subkey)
             {
                 push_bash_variants(&mut candidates, &install_root);
             }
@@ -91,7 +90,10 @@ fn candidate_bash_programs() -> Vec<PathBuf> {
         ("LocalAppData", r"Programs\Git"),
     ] {
         if let Some(base) = std::env::var_os(variable) {
-            push_bash_variants(&mut candidates, &std::path::PathBuf::from(base).join(suffix));
+            push_bash_variants(
+                &mut candidates,
+                &std::path::PathBuf::from(base).join(suffix),
+            );
         }
     }
     dedup_paths(candidates)
@@ -147,8 +149,12 @@ mod tests {
     #[test]
     fn git_bash_candidates_include_common_install_roots() {
         let candidates = candidate_bash_programs();
-        let program_files = std::env::var_os("ProgramFiles")
-            .map(|base| std::path::PathBuf::from(base).join("Git").join("bin").join("bash.exe"));
+        let program_files = std::env::var_os("ProgramFiles").map(|base| {
+            std::path::PathBuf::from(base)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe")
+        });
         if let Some(expected) = program_files {
             assert!(
                 candidates.contains(&expected),

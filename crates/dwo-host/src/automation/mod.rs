@@ -513,14 +513,34 @@ impl AutomationRuntime {
     ) -> Result<AutomationRunRecord> {
         let _lifecycle = self.lifecycle.lock().await;
         let project = self.projects.get(&project_id)?;
-        let topic_id = job.topic_id.as_deref().unwrap_or(&project.board.uncategorized_topic_id);
-        anyhow::ensure!(topic_id != dwo_project::ARCHIVE_TOPIC_ID && project.board.topics.iter().any(|t| t.id == topic_id), "task topic is archived or missing");
+        let topic_id = job
+            .topic_id
+            .as_deref()
+            .unwrap_or(&project.board.uncategorized_topic_id);
+        anyhow::ensure!(
+            topic_id != dwo_project::ARCHIVE_TOPIC_ID
+                && project.board.topics.iter().any(|t| t.id == topic_id),
+            "task topic is archived or missing"
+        );
         if let AutomationSession::Fixed { session_id } = &job.session {
-            anyhow::ensure!(!self.projects.is_archived(session_id), "task session is archived");
+            anyhow::ensure!(
+                !self.projects.is_archived(session_id),
+                "task session is archived"
+            );
         }
         if scheduled {
             let state = self.state.lock().await;
-            anyhow::ensure!(state.projects.get(&project_id).is_some_and(|p| p.config.enabled && p.config.jobs.iter().any(|j| j.name == job.name && j.enabled)), "scheduled task was disabled");
+            anyhow::ensure!(
+                state
+                    .projects
+                    .get(&project_id)
+                    .is_some_and(|p| p.config.enabled
+                        && p.config
+                            .jobs
+                            .iter()
+                            .any(|j| j.name == job.name && j.enabled)),
+                "scheduled task was disabled"
+            );
         }
         let run_id = format!("run-{}", Uuid::new_v4().simple());
         let record = AutomationRunRecord {
@@ -685,7 +705,9 @@ impl AutomationRuntime {
         let id = SessionId::new();
         let (workspace, cwd) = match project.kind {
             ProjectKind::Project => (
-                SessionWorkspace::External { pwd: project.pwd.clone().context("project is missing pwd")? },
+                SessionWorkspace::External {
+                    pwd: project.pwd.clone().context("project is missing pwd")?,
+                },
                 project
                     .pwd
                     .clone()
@@ -697,12 +719,13 @@ impl AutomationRuntime {
                 (SessionWorkspace::Managed, path)
             }
         };
-        let external_rule_files = vec![ExternalRuleFile::new(
-            self.projects.project_rule_path(project_id)?, cwd.clone(),
-        ), ExternalRuleFile::new(
-            self.projects.agents_path(project_id, topic_id)?,
-            cwd.clone(),
-        )];
+        let external_rule_files = vec![
+            ExternalRuleFile::new(self.projects.project_rule_path(project_id)?, cwd.clone()),
+            ExternalRuleFile::new(
+                self.projects.agents_path(project_id, topic_id)?,
+                cwd.clone(),
+            ),
+        ];
         let defaults = self.defaults.lock().await.clone();
         let model = job.model.clone().unwrap_or_else(|| defaults.model.clone());
         let reasoning = job.reasoning.clone().or_else(|| {
@@ -765,7 +788,10 @@ impl AutomationRuntime {
             );
             return Ok(());
         };
-        anyhow::ensure!(source_assignment.0.id == project_id && source_assignment.1.id == topic_id, "automation cannot move a session between topics");
+        anyhow::ensure!(
+            source_assignment.0.id == project_id && source_assignment.1.id == topic_id,
+            "automation cannot move a session between topics"
+        );
         if source_assignment.0.id == project_id {
             self.service.set_external_rule_files(
                 session_id,
@@ -1118,11 +1144,12 @@ fn validate_project_config(
     for job in &config.jobs {
         if let Some(topic_id) = &job.topic_id {
             anyhow::ensure!(
-                !job.enabled || project
-                    .board
-                    .topics
-                    .iter()
-                    .any(|topic| &topic.id == topic_id),
+                !job.enabled
+                    || project
+                        .board
+                        .topics
+                        .iter()
+                        .any(|topic| &topic.id == topic_id),
                 "automation job {} refers to an unknown topic: {topic_id}",
                 job.name
             );

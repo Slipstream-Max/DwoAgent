@@ -498,7 +498,11 @@ mod tests {
         }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let first = manager
-            .run("printf 'first\\n'; sleep 1.5; printf 'second\\n'".to_string(), 5_000, 120_000)
+            .run(
+                "printf 'first\\n'; sleep 1.5; printf 'second\\n'".to_string(),
+                5_000,
+                120_000,
+            )
             .await
             .unwrap();
         assert!(first.output.contains("first"));
@@ -584,7 +588,11 @@ mod tests {
         }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let started = manager
-            .run("printf 'before-kill\\n'; sleep 30".to_string(), 5_000, 120_000)
+            .run(
+                "printf 'before-kill\\n'; sleep 30".to_string(),
+                5_000,
+                120_000,
+            )
             .await
             .unwrap();
         assert!(started.output.contains("before-kill"));

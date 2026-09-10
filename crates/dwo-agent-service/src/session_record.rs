@@ -143,7 +143,6 @@ pub enum SessionWorkspace {
     External { pwd: PathBuf },
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUpdate {
     pub title: Option<String>,

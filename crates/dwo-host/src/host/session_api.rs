@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dwo_agent_service::{
-    EndpointId, NotificationLevel, PromptAccepted, SessionConfigUpdate,
-    SessionEventPayload, SessionId, SessionListQuery, SessionLlmSettings, SessionNotification,
-    SessionService, SessionSubscription, SessionUpdate, SessionWorkspace,
+    EndpointId, NotificationLevel, PromptAccepted, SessionConfigUpdate, SessionEventPayload,
+    SessionId, SessionListQuery, SessionLlmSettings, SessionNotification, SessionService,
+    SessionSubscription, SessionUpdate, SessionWorkspace,
 };
 use dwo_context::MessageContent;
 use dwo_tools::{ConfirmationDecision, SessionMode};
@@ -167,7 +167,10 @@ impl Host {
                 .topic_id
                 .clone()
                 .unwrap_or_else(|| project.board.uncategorized_topic_id.clone());
-            anyhow::ensure!(topic_id != dwo_project::ARCHIVE_TOPIC_ID, "cannot create a session in Archive");
+            anyhow::ensure!(
+                topic_id != dwo_project::ARCHIVE_TOPIC_ID,
+                "cannot create a session in Archive"
+            );
             anyhow::ensure!(
                 project
                     .board
@@ -180,12 +183,16 @@ impl Host {
                 (ProjectKind::Project, Some(worktree_id)) => {
                     let worktree = find_worktree(&project, worktree_id)?;
                     (
-                        SessionWorkspace::External { pwd: worktree.path.clone() },
+                        SessionWorkspace::External {
+                            pwd: worktree.path.clone(),
+                        },
                         worktree.path.clone(),
                     )
                 }
                 (ProjectKind::Project, None) => (
-                    SessionWorkspace::External { pwd: project.pwd.clone().context("project is missing pwd")? },
+                    SessionWorkspace::External {
+                        pwd: project.pwd.clone().context("project is missing pwd")?,
+                    },
                     project
                         .pwd
                         .clone()
@@ -257,13 +264,16 @@ impl Host {
                 std::fs::create_dir_all(&cwd)?;
             }
         }
-        let external_rule_files = vec![dwo_context::ExternalRuleFile::new(
-            self.projects.project_rule_path(&project.id)?,
-            cwd.clone(),
-        ), dwo_context::ExternalRuleFile::new(
-            self.projects.agents_path(&project.id, &topic_id)?,
-            cwd.clone(),
-        )];
+        let external_rule_files = vec![
+            dwo_context::ExternalRuleFile::new(
+                self.projects.project_rule_path(&project.id)?,
+                cwd.clone(),
+            ),
+            dwo_context::ExternalRuleFile::new(
+                self.projects.agents_path(&project.id, &topic_id)?,
+                cwd.clone(),
+            ),
+        ];
         let create_result = self
             .service
             .create(dwo_agent_service::NewSession {
@@ -299,7 +309,10 @@ impl Host {
 
     pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
         let _lifecycle = self.automation.lifecycle.lock().await;
-        anyhow::ensure!(self.projects.is_archived(id.as_str()), "archive the session before deleting it from Work Archive");
+        anyhow::ensure!(
+            self.projects.is_archived(id.as_str()),
+            "archive the session before deleting it from Work Archive"
+        );
         self.service.delete(id).await?;
         cleanup_deleted_session_resources(&self.profile_root, id).await?;
         Ok(())
@@ -447,7 +460,10 @@ impl Host {
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
                 let (session_id, parent_id) = self.resolve_prompt_session(&params, caller).await?;
                 let _lifecycle = self.automation.lifecycle.lock().await;
-                anyhow::ensure!(!self.projects.is_archived(session_id.as_str()), "archived sessions are read-only");
+                anyhow::ensure!(
+                    !self.projects.is_archived(session_id.as_str()),
+                    "archived sessions are read-only"
+                );
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
                 let subscription = self.service.subscribe(&session_id, None).await?;
                 let content = self
@@ -822,7 +838,10 @@ impl Host {
         content: MessageContent,
     ) -> Result<PromptAccepted> {
         let _lifecycle = self.automation.lifecycle.lock().await;
-        anyhow::ensure!(!self.projects.is_archived(id.as_str()), "archived sessions are read-only");
+        anyhow::ensure!(
+            !self.projects.is_archived(id.as_str()),
+            "archived sessions are read-only"
+        );
         let snapshot = self.service.snapshot(id).await?;
         let content = self
             .expand_prompt_directives(&snapshot.record.info.cwd, content)
@@ -1385,7 +1404,9 @@ mod tests {
                 .record
                 .info
                 .workspace,
-            SessionWorkspace::External { pwd: std::fs::canonicalize(root.path()).unwrap() }
+            SessionWorkspace::External {
+                pwd: std::fs::canonicalize(root.path()).unwrap()
+            }
         );
         host.shutdown().await;
     }
@@ -1472,9 +1493,19 @@ mod tests {
             std::fs::write(attachment, b"image").unwrap();
         }
 
-        for id in [&generated_id, &custom_id, &second_custom_id, &second_generated_id] {
+        for id in [
+            &generated_id,
+            &custom_id,
+            &second_custom_id,
+            &second_generated_id,
+        ] {
             let (project, _) = host.projects.locate_session(id.as_str()).unwrap();
-            host.handle_method("project.session.archive", json!({"project_id": project.id, "session_id": id})).await.unwrap();
+            host.handle_method(
+                "project.session.archive",
+                json!({"project_id": project.id, "session_id": id}),
+            )
+            .await
+            .unwrap();
         }
         host.delete_session(&generated_id).await.unwrap();
         assert!(

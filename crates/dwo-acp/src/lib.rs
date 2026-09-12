@@ -1053,7 +1053,12 @@ async fn handle_session_event(
         }
         "assistant_completed" => send_assistant_completed(cx, session_id, payload),
         "assistant_interrupted" => send_assistant_interrupted(cx, session_id, payload),
-        "notification" => send_notification(cx, session_id, payload),
+        "notification" => {
+            send_notification(cx, session_id, payload);
+            if let Some(completion) = compaction_prompt_completion(payload) {
+                complete_prompt(runtime, session_id, completion).await;
+            }
+        }
         "turn_started" => send_state(
             cx,
             session_id,
@@ -1168,6 +1173,22 @@ async fn handle_session_event(
 async fn complete_prompt(runtime: &AcpRuntime, session_id: &str, completion: PromptCompletion) {
     if let Some(waiter) = runtime.prompt_waiters.lock().await.remove(session_id) {
         let _ = waiter.send(completion);
+    }
+}
+
+/// Complete the ACP prompt waiting on a manual compaction when the session
+/// reports a terminal compaction state (completed, cancelled, or failed).
+fn compaction_prompt_completion(payload: &Value) -> Option<PromptCompletion> {
+    match payload.get("category").and_then(Value::as_str) {
+        Some("compaction_completed") => Some(Ok(StopReason::EndTurn)),
+        Some("compaction_cancelled") => Some(Ok(StopReason::Cancelled)),
+        Some("compaction_failed") => Some(Err(payload
+            .get("data")
+            .and_then(|data| data.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("context compaction failed")
+            .to_string())),
+        _ => None,
     }
 }
 
@@ -2690,6 +2711,31 @@ mod tests {
         assert_eq!(value["_meta"]["dwo"]["category"], "compaction_completed");
         assert_eq!(value["_meta"]["dwo"]["level"], "success");
         assert_eq!(value["_meta"]["dwo"]["data"]["compactionId"], "cmp_001");
+    }
+
+    #[test]
+    fn terminal_compaction_notifications_complete_a_waiting_prompt() {
+        let completed = json!({"kind": "notification", "category": "compaction_completed"});
+        assert!(matches!(
+            compaction_prompt_completion(&completed),
+            Some(Ok(StopReason::EndTurn))
+        ));
+        let cancelled = json!({"kind": "notification", "category": "compaction_cancelled"});
+        assert!(matches!(
+            compaction_prompt_completion(&cancelled),
+            Some(Ok(StopReason::Cancelled))
+        ));
+        let failed = json!({
+            "kind": "notification",
+            "category": "compaction_failed",
+            "data": {"error": "provider exploded"},
+        });
+        match compaction_prompt_completion(&failed) {
+            Some(Err(error)) => assert_eq!(error, "provider exploded"),
+            _ => panic!("compaction failure must complete the prompt with an error"),
+        }
+        let started = json!({"kind": "notification", "category": "compaction_started"});
+        assert!(compaction_prompt_completion(&started).is_none());
     }
 
     #[test]

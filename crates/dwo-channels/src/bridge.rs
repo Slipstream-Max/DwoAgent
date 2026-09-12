@@ -14,8 +14,8 @@ use dwo_command::{ChannelCommand, render_command_help};
 
 use super::manager::ChannelOutputMode;
 use super::render::{
-    OutputSegment, SessionStreamState, display_path, policy_name, render_live_user_prompt,
-    render_output_segment, render_session_replay, render_status, render_tool_call,
+    OutputSegment, SessionStreamState, display_path, policy_name, render_output_segment,
+    render_session_replay, render_status, render_tool_call, render_user_prompt_segments,
     short_session_id, short_session_id_str,
 };
 
@@ -599,9 +599,7 @@ async fn stream_session_with_mode(
                 if origin == endpoint {
                     continue;
                 }
-                if let Some(prompt) = render_live_user_prompt(&content) {
-                    send(&transport, &prompt).await;
-                }
+                send_user_prompt(&transport, &content).await;
             }
             SessionEventPayload::AssistantCompleted {
                 reasoning,
@@ -751,6 +749,19 @@ async fn send(transport: &Arc<dyn ConversationTransport>, text: &str) {
     }
 }
 
+async fn send_user_prompt(transport: &Arc<dyn ConversationTransport>, content: &MessageContent) {
+    let mut first = true;
+    for segment in render_user_prompt_segments(content) {
+        let message = if first {
+            first = false;
+            format!("User: {segment}")
+        } else {
+            segment
+        };
+        send(transport, &message).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +769,7 @@ mod tests {
         ClientTranscriptEvent, MessageId, RuntimePhase, SessionLlmSettings, SessionRecord,
         SessionSnapshot, SessionSubscription, SessionUsageSnapshot, TurnId,
     };
+    use dwo_context::ContentBlock;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -903,6 +915,38 @@ mod tests {
             *transport.messages.lock().await,
             ["User: question", "answer"]
         );
+    }
+
+    #[tokio::test]
+    async fn multimodal_prompt_broadcast_keeps_block_order_with_placeholders() {
+        let transport = Arc::new(FakeTransport::default());
+        let content = MessageContent::blocks(vec![
+            ContentBlock::text("look at this"),
+            ContentBlock::image("image/png", "SECRETBYTES"),
+            ContentBlock::text("done"),
+        ]);
+
+        let prompt_transport: Arc<dyn ConversationTransport> = transport.clone();
+        send_user_prompt(&prompt_transport, &content).await;
+
+        let messages = transport.messages.lock().await.clone();
+        assert_eq!(messages, ["User: look at this", "[图片]", "done"]);
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("SECRETBYTES"))
+        );
+    }
+
+    #[tokio::test]
+    async fn image_only_prompt_broadcast_renders_a_placeholder() {
+        let transport = Arc::new(FakeTransport::default());
+        let content = MessageContent::blocks(vec![ContentBlock::image("image/png", "SECRETBYTES")]);
+
+        let prompt_transport: Arc<dyn ConversationTransport> = transport.clone();
+        send_user_prompt(&prompt_transport, &content).await;
+
+        assert_eq!(*transport.messages.lock().await, ["User: [图片]"]);
     }
 
     #[tokio::test]

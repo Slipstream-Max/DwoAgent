@@ -3,6 +3,7 @@ use dwo_agent_service::{
 };
 pub use dwo_command::session_status::{display_path, policy_name};
 pub use dwo_command::session_status::{short_session_id, short_session_id_str};
+use dwo_context::ContentBlock;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Debug)]
@@ -51,10 +52,55 @@ pub fn render_status(snapshot: &SessionSnapshot) -> String {
     )
 }
 
-pub fn render_live_user_prompt(content: &MessageContent) -> Option<String> {
-    let content = content.to_string();
-    let content = content.trim();
-    (!content.is_empty()).then(|| format!("User: {content}"))
+/// Render a user prompt as ordered text segments for a channel broadcast.
+/// Text blocks pass through and every other block becomes a visible
+/// placeholder; images are never forwarded as real media.
+pub fn render_user_prompt_segments(content: &MessageContent) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut text = String::new();
+    for block in content.as_blocks() {
+        match block {
+            ContentBlock::Text {
+                text: block_text, ..
+            } => append_prompt_text(&mut text, block_text),
+            ContentBlock::Image { .. } => {
+                flush_prompt_text(&mut segments, &mut text);
+                segments.push("[图片]".to_string());
+            }
+            ContentBlock::Audio { .. } => append_prompt_text(&mut text, "[音频]"),
+            ContentBlock::Resource { .. } => append_prompt_text(&mut text, "[附件]"),
+            ContentBlock::ResourceLink { name, .. } => {
+                append_prompt_text(&mut text, &format!("[附件: {name}]"))
+            }
+        }
+    }
+    flush_prompt_text(&mut segments, &mut text);
+    segments
+}
+
+/// Render a user prompt as plain text with placeholders for non-text blocks.
+pub fn render_user_prompt_text(content: &MessageContent) -> Option<String> {
+    let mut text = String::new();
+    for segment in render_user_prompt_segments(content) {
+        append_prompt_text(&mut text, &segment);
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn append_prompt_text(text: &mut String, piece: &str) {
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(piece);
+}
+
+fn flush_prompt_text(segments: &mut Vec<String>, text: &mut String) {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    text.clear();
 }
 
 pub fn render_session_replay(snapshot: &SessionSnapshot, turns: usize) -> Vec<String> {
@@ -85,7 +131,7 @@ fn render_running_turn_replay(snapshot: &SessionSnapshot) -> Option<String> {
             SessionEventPayload::UserPromptSubmitted {
                 turn_id, content, ..
             } if turn_id == active_turn_id && prompt.is_none() => {
-                prompt = Some(content.to_string());
+                prompt = render_user_prompt_text(content);
             }
             SessionEventPayload::AssistantReasoningDelta { turn_id, delta, .. }
                 if turn_id == active_turn_id =>
@@ -158,7 +204,9 @@ fn render_replay_turns(
         let turn = grouped.last_mut().expect("replay turn was just inserted");
         match &event.payload {
             SessionEventPayload::UserPromptSubmitted { content, .. } => {
-                turn.prompts.push(content.to_string())
+                if let Some(text) = render_user_prompt_text(content) {
+                    turn.prompts.push(text);
+                }
             }
             SessionEventPayload::AssistantCompleted { content, .. }
                 if !content.trim().is_empty() =>
@@ -426,16 +474,48 @@ mod tests {
     }
 
     #[test]
-    fn live_user_prompt_is_labeled_for_channel_observers() {
-        assert_eq!(
-            render_live_user_prompt(&MessageContent::text("  inspect the project  ")).as_deref(),
-            Some("User: inspect the project")
+    fn user_prompt_segments_keep_block_order_with_placeholders() {
+        let content = MessageContent::blocks(vec![
+            ContentBlock::text("look at this"),
+            ContentBlock::image("image/png", "SECRETBYTES"),
+            ContentBlock::text("thanks"),
+        ]);
+        let segments = render_user_prompt_segments(&content);
+        assert_eq!(segments, ["look at this", "[图片]", "thanks"]);
+        assert!(
+            segments
+                .iter()
+                .all(|segment| !segment.contains("SECRETBYTES"))
         );
+    }
+
+    #[test]
+    fn user_prompt_text_uses_placeholders_instead_of_base64() {
+        let content = MessageContent::blocks(vec![
+            ContentBlock::text("before"),
+            ContentBlock::image("image/png", "!!not-base64!!"),
+            ContentBlock::text("after"),
+        ]);
+
         assert_eq!(
-            render_live_user_prompt(&MessageContent::text("first line\nsecond line")).as_deref(),
-            Some("User: first line\nsecond line")
+            render_user_prompt_text(&content).as_deref(),
+            Some("before\n[图片]\nafter")
         );
-        assert_eq!(render_live_user_prompt(&MessageContent::text("  ")), None);
+    }
+
+    #[test]
+    fn prompt_image_blocks_stay_placeholders_even_if_undecodable() {
+        let content = MessageContent::blocks(vec![ContentBlock::image("image/png", "!!bad!!")]);
+        assert_eq!(render_user_prompt_segments(&content), ["[图片]"]);
+    }
+
+    #[test]
+    fn user_prompt_text_still_renders_plain_text() {
+        assert_eq!(
+            render_user_prompt_text(&MessageContent::text("  inspect the project  ")).as_deref(),
+            Some("inspect the project")
+        );
+        assert_eq!(render_user_prompt_text(&MessageContent::text("  ")), None);
     }
 
     #[test]

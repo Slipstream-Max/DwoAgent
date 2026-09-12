@@ -308,7 +308,11 @@ mod tests {
     #[tokio::test]
     async fn read_file_only_adds_images_for_capable_models() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("image.bin"), b"\x89PNG\r\n\x1a\nimage").unwrap();
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([9, 9, 9, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(dir.path().join("image.bin"), &png).unwrap();
         let call = || {
             ParsedToolCall::parse(json!({
                 "id":"image",
@@ -328,16 +332,14 @@ mod tests {
         let mut capable = ExecutionContext::new(SessionMode::FullAccess);
         capable.allow_image_input = true;
         let allowed = manager.execute(call(), &capable).await;
-        assert_eq!(allowed.output, json!({"status":"completed"}));
+        assert_eq!(allowed.output["status"], "completed");
+        assert_eq!(allowed.output["image"]["mime_type"], "image/webp");
+        assert_eq!(allowed.output["image"]["resized"], false);
         assert_eq!(allowed.model_context.len(), 1);
         assert!(allowed.model_context[0].contains_images());
-        assert_eq!(
-            serde_json::to_value(&allowed).unwrap(),
-            json!({
-                "tool_call_id":"image",
-                "tool_name":"read_file",
-                "output":{"status":"completed"}
-            })
-        );
+        let serialized = serde_json::to_value(&allowed).unwrap();
+        assert_eq!(serialized["tool_call_id"], "image");
+        assert_eq!(serialized["tool_name"], "read_file");
+        assert_eq!(serialized["output"]["status"], "completed");
     }
 }

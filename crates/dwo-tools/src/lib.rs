@@ -3,6 +3,7 @@
 pub mod call;
 mod exec;
 pub mod file_edit;
+pub mod images;
 pub mod manager;
 pub mod plan;
 pub mod policy;

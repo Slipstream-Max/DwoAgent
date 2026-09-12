@@ -14,6 +14,8 @@ dwo-context = { path = "../dwo-context" }
 dwo-pty = { path = "../dwo-pty" }
 encoding_rs = "0.8"
 futures.workspace = true
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+image-webp = "0.2"
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

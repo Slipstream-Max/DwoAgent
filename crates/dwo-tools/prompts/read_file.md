@@ -6,4 +6,4 @@
 - Text results contain `content`, `start_line`, `start_offset`, `end_line`, `end_offset`, and `total_lines`. Non-default decoding also returns the detected `encoding`.
 - If more text remains, the result also contains `next_cursor` and `next_offset`. Pass both values back unchanged on the next `read_file` call. This works for ordinary line paging and for a single line longer than the byte limit.
 - Do not guess a continuation position from `end_line` or from the content length; only use `next_cursor` and `next_offset` when they are present.
-- Image results only report completion. When the selected model supports image input, the tool adds supported image data directly to model context; otherwise the call returns an error. Do not use terminal commands to encode or print it.
+- Image results report the normalized size and byte counts. When the selected model supports image input, the tool downscales the image to about 1300x1300 pixels and re-encodes it as lossless WebP before adding it to model context; otherwise the call returns an error. Do not use terminal commands to encode or print it.

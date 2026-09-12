@@ -27,7 +27,7 @@ pub(crate) async fn execute(
         .await
         .with_context(|| format!("read {}", path.display()))?;
 
-    if let Some(mime_type) = image_mime_type(&bytes) {
+    if image_mime_type(&bytes).is_some() {
         if !allow_image_input {
             bail!("the selected model does not support image input");
         }
@@ -40,11 +40,25 @@ pub(crate) async fn execute(
         if args.offset != 0 {
             bail!("offset is only valid when reading text files");
         }
-        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let normalized = crate::images::normalize_image(&bytes)?;
+        let data = base64::engine::general_purpose::STANDARD.encode(&normalized.data);
         return Ok(ReadFileOutput {
-            output: json!({"status": "completed"}),
+            output: json!({
+                "status": "completed",
+                "image": {
+                    "mime_type": normalized.mime_type,
+                    "width": normalized.width,
+                    "height": normalized.height,
+                    "original_width": normalized.original_width,
+                    "original_height": normalized.original_height,
+                    "resized": normalized.resized,
+                    "bytes": normalized.data.len(),
+                    "original_bytes": bytes.len(),
+                }
+            }),
             model_context: vec![MessageContent::blocks(vec![ContentBlock::image(
-                mime_type, data,
+                normalized.mime_type,
+                data,
             )])],
         });
     }
@@ -354,6 +368,49 @@ mod tests {
         .err()
         .expect("image offset should fail");
         assert!(error.to_string().contains("offset is only valid"));
+    }
+
+    #[tokio::test]
+    async fn images_are_normalized_to_lossless_webp_in_model_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = image::RgbaImage::from_pixel(2000, 1500, image::Rgba([30, 60, 90, 255]));
+        let mut png = Vec::new();
+        source
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(directory.path().join("shot.png"), &png).unwrap();
+
+        let rendered = execute(
+            ReadFileArgs {
+                path: PathBuf::from("shot.png"),
+                cursor: 1,
+                line_count: DEFAULT_READ_FILE_LINES,
+                offset: 0,
+            },
+            directory.path(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rendered.output["status"], "completed");
+        assert_eq!(rendered.output["image"]["mime_type"], "image/webp");
+        assert_eq!(rendered.output["image"]["resized"], true);
+        assert_eq!(rendered.output["image"]["original_width"], 2000);
+        assert_eq!(rendered.output["image"]["original_height"], 1500);
+
+        let ContentBlock::Image {
+            mime_type, data, ..
+        } = &rendered.model_context[0].as_blocks()[0]
+        else {
+            panic!("expected an image block in model context");
+        };
+        assert_eq!(mime_type, "image/webp");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
     }
 
     #[tokio::test]

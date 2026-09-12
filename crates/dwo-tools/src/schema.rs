@@ -47,7 +47,7 @@ pub fn read_file_schema() -> Value {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read UTF-8 text or add a PNG, JPEG, GIF, or WebP image to model context. Text output is contiguous and capped at 20000 UTF-8 bytes across the entire result. Start at a 1-based line with cursor and an optional 0-based Unicode character offset. If more text remains, pass the returned next_cursor and next_offset unchanged to continue.",
+            "description": "Read UTF-8 text or add a PNG, JPEG, GIF, or WebP image to model context. Images are downscaled to about 1300x1300 pixels and re-encoded as lossless WebP before entering model context. Text output is contiguous and capped at 20000 UTF-8 bytes across the entire result. Start at a 1-based line with cursor and an optional 0-based Unicode character offset. If more text remains, pass the returned next_cursor and next_offset unchanged to continue.",
             "parameters": {
                 "type": "object",
                 "properties": {

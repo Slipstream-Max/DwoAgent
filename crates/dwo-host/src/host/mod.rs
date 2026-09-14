@@ -178,6 +178,8 @@ pub(crate) struct ConfigUpdateParam {
     external_skills_dirs: Option<Vec<PathBuf>>,
     #[serde(default)]
     external_rule_files: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    project_ops: Option<dwo_agent_service::ProjectOpPolicy>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -224,6 +226,7 @@ pub(crate) struct ConfigSnapshot {
     default_reasoning: Option<String>,
     models: Vec<SessionModelOption>,
     max_model_steps: usize,
+    project_ops: dwo_agent_service::ProjectOpPolicy,
     session_count: usize,
 }
 

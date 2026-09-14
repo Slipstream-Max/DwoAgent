@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use thiserror::Error;
 
 pub const OVERVIEW_FILE: &str = "overview.md";
 pub const AGENTS_FILE: &str = "AGENTS.md";
+pub const PROPOSALS_FILE: &str = "proposals.json";
 pub const AUTOMATION_DIR: &str = "automation";
 pub const AUTOMATION_CONFIG_FILE: &str = "config.yaml";
 pub const AUTOMATION_HISTORY_FILE: &str = "history.yaml";
@@ -148,6 +149,44 @@ pub struct Label {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Proposal {
+    pub id: String,
+    pub project_id: String,
+    pub method: String,
+    pub payload: serde_json::Value,
+    pub source_session_id: String,
+    pub status: ProposalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Pending,
+    Accepted,
+    Rejected,
+    Failed,
+}
+
+impl ProposalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateProject {
     pub name: String,
@@ -159,6 +198,7 @@ pub struct CreateProject {
 pub struct ProjectService {
     root: PathBuf,
     projects: RwLock<Vec<Project>>,
+    proposal_lock: Mutex<()>,
 }
 
 impl ProjectService {
@@ -195,6 +235,7 @@ impl ProjectService {
         Ok(Self {
             root,
             projects: RwLock::new(projects),
+            proposal_lock: Mutex::new(()),
         })
     }
 
@@ -590,6 +631,36 @@ impl ProjectService {
         find_topic(&project, &topic_id).cloned()
     }
 
+    pub fn move_session(&self, project_id: &str, topic_id: &str, id: String) -> Result<Topic> {
+        let id = nonempty("session id", id)?;
+        if let Some((project, topic)) = self.locate_session(&id) {
+            if project.id != project_id {
+                return Err(ProjectError::Invalid(
+                    "session belongs to a different project".to_string(),
+                ));
+            }
+            if topic.id == topic_id {
+                return Ok(topic);
+            }
+        }
+        if topic_id == ARCHIVE_TOPIC_ID {
+            return Err(ProjectError::Invalid(
+                "cannot move a session into Archive".to_string(),
+            ));
+        }
+        let session = id;
+        let target = topic_id.to_string();
+        let project = self.mutate(project_id, |project| {
+            for topic in &mut project.board.topics {
+                topic.session_ids.retain(|existing| existing != &session);
+            }
+            let topic = find_topic_mut(project, &target)?;
+            push_unique(&mut topic.session_ids, session.clone());
+            Ok(())
+        })?;
+        find_topic(&project, &topic_id).cloned()
+    }
+
     pub fn create_label(
         &self,
         project_id: &str,
@@ -838,6 +909,48 @@ impl ProjectService {
         recover_archive(&self.root)?;
         *guard = projects;
         Ok(ids)
+    }
+
+    pub fn list_proposals(&self, project_id: &str) -> Result<Vec<Proposal>> {
+        self.ensure_project(project_id)?;
+        let path = self.project_dir(project_id).join(PROPOSALS_FILE);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&path).map_err(|source| ProjectError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        serde_json::from_slice(&bytes).map_err(|source| ProjectError::Json { path, source })
+    }
+
+    pub fn append_proposal(&self, project_id: &str, proposal: Proposal) -> Result<()> {
+        let _guard = self.proposal_lock.lock().expect("proposal lock poisoned");
+        let mut proposals = self.list_proposals(project_id)?;
+        proposals.push(proposal);
+        self.write_proposals(project_id, &proposals)
+    }
+
+    pub fn update_proposals(
+        &self,
+        project_id: &str,
+        update: impl FnOnce(&mut Vec<Proposal>) -> Result<()>,
+    ) -> Result<Vec<Proposal>> {
+        let _guard = self.proposal_lock.lock().expect("proposal lock poisoned");
+        let mut proposals = self.list_proposals(project_id)?;
+        update(&mut proposals)?;
+        self.write_proposals(project_id, &proposals)?;
+        Ok(proposals)
+    }
+
+    fn write_proposals(&self, project_id: &str, proposals: &[Proposal]) -> Result<()> {
+        self.ensure_project(project_id)?;
+        let path = self.project_dir(project_id).join(PROPOSALS_FILE);
+        let bytes = serde_json::to_vec_pretty(proposals).map_err(|source| ProjectError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        atomic_write(&path, &bytes)
     }
 
     fn project_automation_dir(&self, project_id: &str) -> Result<PathBuf> {
@@ -1589,5 +1702,48 @@ mod tests {
             pwd: Some(workspace),
         });
         assert!(matches!(duplicate, Err(ProjectError::Invalid(_))));
+    }
+
+    #[test]
+    fn proposals_roundtrip_and_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let service = ProjectService::open(root.path().join("projects")).unwrap();
+        let project = service
+            .create(CreateProject {
+                name: "Demo".to_string(),
+                kind: ProjectKind::Work,
+                pwd: None,
+            })
+            .unwrap();
+        assert!(service.list_proposals(&project.id).unwrap().is_empty());
+        service
+            .append_proposal(
+                &project.id,
+                Proposal {
+                    id: "proposal-test".to_string(),
+                    project_id: project.id.clone(),
+                    method: "project.topic.create".to_string(),
+                    payload: serde_json::json!({"project_id": project.id}),
+                    source_session_id: "session-1".to_string(),
+                    status: ProposalStatus::Pending,
+                    error: None,
+                    result: None,
+                    created_at_ms: 1,
+                    resolved_at_ms: None,
+                },
+            )
+            .unwrap();
+        let listed = service.list_proposals(&project.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, ProposalStatus::Pending);
+        let updated = service
+            .update_proposals(&project.id, |proposals| {
+                proposals[0].status = ProposalStatus::Accepted;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(updated[0].status, ProposalStatus::Accepted);
+        let stored = service.list_proposals(&project.id).unwrap();
+        assert_eq!(stored[0].status, ProposalStatus::Accepted);
     }
 }

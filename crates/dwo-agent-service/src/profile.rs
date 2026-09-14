@@ -27,6 +27,8 @@ pub struct AgentProfileConfig {
     pub channels: BTreeMap<String, serde_yaml::Value>,
     #[serde(default)]
     pub websocket: WebsocketConfig,
+    #[serde(default)]
+    pub project_ops: ProjectOpPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +107,18 @@ fn default_retention_days() -> usize {
 
 fn default_max_model_steps() -> usize {
     DEFAULT_MAX_MODEL_STEPS
+}
+
+/// How session agents may edit project boards.
+///
+/// - `Confirm`: every board edit becomes a proposal waiting for approval.
+/// - `Direct`: agents may apply board edits immediately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectOpPolicy {
+    #[default]
+    Confirm,
+    Direct,
 }
 
 #[derive(Debug, Clone)]

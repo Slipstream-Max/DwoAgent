@@ -75,11 +75,17 @@ capabilities 返回：
 | project.topic.agents.* | 读写 Topic Knowledge |
 | project.topic.session.assign / unassign | 归类或移出 Session |
 | project.label.* | 管理和分配标签 |
+| project.proposal.list / accept / reject | 查看和处理 Session 看板提案 |
 | session.list / status / snapshot / read | 查询 Session |
 | session.new / fork / delete / keep / close / set | 管理 Session 生命周期和配置 |
 
 Project、Topic、Workspace 和跨 Project 移动规则见 [projects.md](projects.md)。Session 的 prompt、
 cancel、permission、watch 属于 ACP，不属于 Management RPC。
+
+Session Agent 通过 CLI 调用管理方法时会附加 caller_session_id。带这个字段的写入按
+[projects.md](projects.md) 的提案规则处理：返回 {proposed: true, proposalId} 表示已记录为
+提案，被禁止的方法直接报错。project.proposal.* 拒绝带 caller_session_id 的调用，只能由
+用户在界面或外部 Shell 确认。
 
 ### Prompt、Skill 和 MCP
 
@@ -125,7 +131,7 @@ event.subscribe  # replay 后继续接收 live event
 
 不传 event 时接收全部管理事件；传入事件名时 replay 和 live 都过滤。常见事件有
 config.changed、config.apply_failed、mcp.status、skill.changed、channel.status、
-project.changed、automation.changed 和 automation.run。
+project.changed、project.proposal.changed、automation.changed 和 automation.run。
 
 事件 cursor 只属于管理事件流；Session 事件由 ACP 的 session/update 或 state_update 传递。
 客户端断开不会停止 Host、已接受的 Session turn 或 Automation run。重连后先调用

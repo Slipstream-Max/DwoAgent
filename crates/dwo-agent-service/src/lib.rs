@@ -34,7 +34,8 @@ pub use events::{
     SessionUsageSnapshot, TerminalTurnStatus,
 };
 pub use profile::{
-    AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, WebsocketConfig, load_profile,
+    AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, ProjectOpPolicy,
+    WebsocketConfig, load_profile,
 };
 pub use repository::{FsSessionRepository, MemorySessionRepository, SessionRepository};
 pub use session::{CompactionAccepted, EndpointId, MessageId, PromptAccepted, SessionHandle};

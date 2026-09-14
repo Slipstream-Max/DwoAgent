@@ -232,6 +232,17 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
+    query("project.proposal.list", MethodRoute::Dwo),
+    command(
+        "project.proposal.accept",
+        MethodRoute::Dwo,
+        Some("project.proposal.changed"),
+    ),
+    command(
+        "project.proposal.reject",
+        MethodRoute::Dwo,
+        Some("project.proposal.changed"),
+    ),
     query("automation.list", MethodRoute::Dwo),
     query("automation.status", MethodRoute::Dwo),
     command(
@@ -382,6 +393,7 @@ pub const EVENTS: &[&str] = &[
     "websocket.status",
     "skill.changed",
     "project.changed",
+    "project.proposal.changed",
 ];
 
 const CHANNEL_KINDS: &[&str] = &["weixin", "telegram", "feishu", "qq"];
@@ -411,6 +423,53 @@ pub fn method_allowed(route: &str, method: &str) -> bool {
 
 pub fn is_side_effect_method(method: &str) -> bool {
     method_spec(method).is_some_and(|spec| spec.side_effect)
+}
+
+/// Session agents may never call these project methods; the daemon rejects them.
+pub const SESSION_BLOCKED_METHODS: &[&str] = &[
+    "project.create",
+    "project.repository.attach",
+    "project.worktree.create",
+    "project.worktree.attach",
+    "project.worktree.update",
+    "project.worktree.detach",
+    "project.worktree.remove",
+];
+
+/// Session calls to these project methods always become proposals.
+pub const ALWAYS_PROPOSAL_METHODS: &[&str] = &[
+    "project.section.create",
+    "project.section.archive",
+    "project.agents.set",
+    "project.update",
+    "project.archive",
+];
+
+/// Session calls to these project methods become proposals unless the profile
+/// sets `projectOps: direct`.
+pub const CONFIRM_PROPOSAL_METHODS: &[&str] = &[
+    "project.section.update",
+    "project.section.reorder",
+    "project.topic.create",
+    "project.topic.update",
+    "project.topic.move",
+    "project.topic.reorder",
+    "project.topic.archive",
+    "project.topic.agents.set",
+    "project.topic.session.assign",
+    "project.topic.session.unassign",
+];
+
+pub fn is_session_blocked(method: &str) -> bool {
+    SESSION_BLOCKED_METHODS.contains(&method)
+}
+
+pub fn is_always_proposal(method: &str) -> bool {
+    ALWAYS_PROPOSAL_METHODS.contains(&method)
+}
+
+pub fn is_confirm_proposal(method: &str) -> bool {
+    CONFIRM_PROPOSAL_METHODS.contains(&method)
 }
 
 pub fn capabilities() -> ManagementCapabilities {
@@ -449,6 +508,17 @@ mod tests {
         assert!(is_side_effect_method("session.prompt"));
         assert!(is_side_effect_method("mcp.call"));
         assert!(!is_side_effect_method("dwo.capabilities"));
+    }
+
+    #[test]
+    fn session_policy_covers_board_methods() {
+        assert!(is_session_blocked("project.create"));
+        assert!(is_always_proposal("project.section.create"));
+        assert!(is_confirm_proposal("project.topic.create"));
+        assert!(!is_confirm_proposal("project.label.create"));
+        assert!(method_allowed("dwo", "project.proposal.accept"));
+        assert!(is_side_effect_method("project.proposal.accept"));
+        assert!(EVENTS.contains(&"project.proposal.changed"));
     }
 
     #[test]

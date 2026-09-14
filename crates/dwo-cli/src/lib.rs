@@ -65,6 +65,10 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    Proposal {
+        #[command(subcommand)]
+        command: ProposalCommand,
+    },
     ConfigShow,
     Channel {
         #[command(subcommand)]
@@ -121,6 +125,13 @@ enum SessionCommand {
         id: String,
         #[arg(long)]
         project: String,
+    },
+    Move {
+        id: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        topic: String,
     },
     Set {
         id: String,
@@ -271,6 +282,29 @@ enum ProjectCommand {
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProposalCommand {
+    List {
+        project: String,
+        #[arg(long)]
+        status: Option<String>,
+    },
+    Accept {
+        project: String,
+        #[arg(long = "id")]
+        id: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    Reject {
+        project: String,
+        #[arg(long = "id")]
+        id: Vec<String>,
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -576,6 +610,7 @@ where
         Command::Section { command } => run_section(command, &config_path).await?,
         Command::Topic { command } => run_topic(command, &config_path).await?,
         Command::Project { command } => run_project(command, &config_path).await?,
+        Command::Proposal { command } => run_proposal(command, &config_path).await?,
         Command::ConfigShow => {
             let value = ipc::request_dwo(&config_path, "config.snapshot", json!({})).await?;
             render::write_value(&value)?;
@@ -1161,7 +1196,16 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             let value = ipc::request_dwo(
                 config_path,
                 "project.session.archive",
-                json!({"project_id": project, "session_id": id}),
+                attach_caller(json!({"project_id": project, "session_id": id})),
+            )
+            .await?;
+            render::write_value(&value)?;
+        }
+        SessionCommand::Move { id, project, topic } => {
+            let value = ipc::request_dwo(
+                config_path,
+                "project.topic.session.assign",
+                attach_caller(json!({"project_id": project, "topic_id": topic, "session_id": id})),
             )
             .await?;
             render::write_value(&value)?;
@@ -1265,6 +1309,36 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
     Ok(())
 }
 
+async fn run_proposal(command: ProposalCommand, config_path: &Path) -> Result<()> {
+    let value = match command {
+        ProposalCommand::List { project, status } => {
+            ipc::request_dwo(
+                config_path,
+                "project.proposal.list",
+                attach_caller(json!({"project_id": project, "status": status})),
+            )
+            .await?
+        }
+        ProposalCommand::Accept { project, id, all } => {
+            ipc::request_dwo(
+                config_path,
+                "project.proposal.accept",
+                attach_caller(json!({"project_id": project, "proposal_ids": id, "all": all})),
+            )
+            .await?
+        }
+        ProposalCommand::Reject { project, id, all } => {
+            ipc::request_dwo(
+                config_path,
+                "project.proposal.reject",
+                attach_caller(json!({"project_id": project, "proposal_ids": id, "all": all})),
+            )
+            .await?
+        }
+    };
+    render::write_value(&value)
+}
+
 async fn run_section(command: SectionCommand, config_path: &Path) -> Result<()> {
     let (method, params) = match command {
         SectionCommand::List { project } => {
@@ -1299,7 +1373,7 @@ async fn run_section(command: SectionCommand, config_path: &Path) -> Result<()> 
             json!({"project_id": project, "section_id": id, "position": position}),
         ),
     };
-    let value = ipc::request_dwo(config_path, method, params).await?;
+    let value = ipc::request_dwo(config_path, method, attach_caller(params)).await?;
     render::write_value(&value)
 }
 
@@ -1361,7 +1435,7 @@ async fn run_topic(command: TopicCommand, config_path: &Path) -> Result<()> {
             }),
         ),
     };
-    let value = ipc::request_dwo(config_path, method, params).await?;
+    let value = ipc::request_dwo(config_path, method, attach_caller(params)).await?;
     render::write_value(&value)
 }
 
@@ -1429,7 +1503,7 @@ async fn run_project(command: ProjectCommand, config_path: &Path) -> Result<()> 
             ),
         },
     };
-    let value = ipc::request_dwo(config_path, method, params).await?;
+    let value = ipc::request_dwo(config_path, method, attach_caller(params)).await?;
     render::write_value(&value)
 }
 
@@ -1437,6 +1511,15 @@ fn current_session_id() -> Option<String> {
     std::env::var("DWO_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn attach_caller(mut params: Value) -> Value {
+    if let Some(id) = current_session_id()
+        && let Some(object) = params.as_object_mut()
+    {
+        object.insert("caller_session_id".to_string(), Value::String(id));
+    }
+    params
 }
 
 async fn permission(
@@ -2539,5 +2622,58 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_proposal_commands() {
+        let list = Cli::try_parse_from([
+            "dwo",
+            "proposal",
+            "list",
+            "project-1",
+            "--status",
+            "pending",
+        ])
+        .unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Proposal {
+                command: ProposalCommand::List {
+                    ref project,
+                    ref status,
+                }
+            } if project == "project-1" && status.as_deref() == Some("pending")
+        ));
+
+        let accept = Cli::try_parse_from([
+            "dwo",
+            "proposal",
+            "accept",
+            "project-1",
+            "--id",
+            "p1",
+            "--id",
+            "p2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            accept.command,
+            Command::Proposal {
+                command: ProposalCommand::Accept {
+                    ref id,
+                    all: false,
+                    ..
+                }
+            } if id.len() == 2 && id[0] == "p1"
+        ));
+
+        let reject =
+            Cli::try_parse_from(["dwo", "proposal", "reject", "project-1", "--all"]).unwrap();
+        assert!(matches!(
+            reject.command,
+            Command::Proposal {
+                command: ProposalCommand::Reject { all: true, .. }
+            }
+        ));
     }
 }

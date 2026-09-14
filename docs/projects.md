@@ -272,6 +272,42 @@ Host 加载时解析实际 cwd：
 复制当前工作内容到 Managed workspace；两个 independent Project 之间保留原有 Managed 或
 External 绑定。Session repository 目录不会搬迁。
 
+## Session 提案和权限边界
+
+Agent Session 对看板的写入默认不直接生效：Client 调用管理方法时附加 caller_session_id，
+Host 会按下面的规则把写入记录为提案（proposal），等待用户在客户端确认。提案保存在：
+
+~~~text
+runtime/projects/<project-id>/proposals.json
+~~~
+
+每条提案：
+
+| 字段 | 含义 |
+| --- | --- |
+| id | 提案 ID |
+| projectId | 目标 Project |
+| method | 原始管理方法，例如 project.topic.create |
+| payload | 调用参数，已移除 caller_session_id |
+| sourceSessionId | 发起提案的 Session |
+| status | pending、accepted、rejected 或 failed |
+| error / result | 重放失败原因或成功返回值 |
+| createdAtMs / resolvedAtMs | 创建与解决时间，Unix 毫秒 |
+
+Session 对看板方法分四档：
+
+| 行为 | 方法 |
+| --- | --- |
+| 禁止，直接报错 | project.create、project.repository.attach、project.worktree.create/attach/update/detach/remove |
+| 永远提案 | project.section.create/archive、project.agents.set、project.update/archive |
+| 按 projectOps 提案 | project.section.update/reorder、project.topic.create/update/move/reorder/archive、project.topic.agents.set、project.topic.session.assign/unassign |
+| 直接生效 | project.label.* 和所有读取 |
+
+用户接受后 Host 用原方法、原参数重放，失败记录为 failed 并保留错误；拒绝仅更新状态。
+接受或拒绝只能由用户通过界面或外部 Shell 的 dwo proposal 命令发起，Session 不能确认
+提案。状态变化通过 project.proposal.changed 事件广播（action 为 proposed、accepted、
+rejected 或 failed）。
+
 ## CLI
 
 ~~~text
@@ -283,6 +319,10 @@ dwo project worktree list|get|create|attach|rename|detach|remove ...
 dwo section list|create|update|delete|reorder ...
 dwo topic list|get|create|update|delete|move|reorder ...
 dwo session move <session-id> --project <project-id> --topic <topic-id>
+dwo proposal list <project-id> [--status <status>]
+dwo proposal accept|reject <project-id> --id <proposal-id>... | --all
 ~~~
 
-完整参数见 [CLI 命令参考](cli.md)。桌面客户端的 project.* API 见 [API 说明](api.md)。
+Session 内执行这些写命令时，label 直接生效，其余看板写入按 projectOps 转为提案，
+结构性操作永远需要确认。完整参数见 [CLI 命令参考](cli.md)。桌面客户端的 project.* API
+见 [API 说明](api.md)。

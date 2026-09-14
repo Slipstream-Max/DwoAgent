@@ -31,6 +31,7 @@ struct NewSessionParam {
     project_id: Option<String>,
     topic_id: Option<String>,
     worktree_id: Option<String>,
+    caller_session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +232,26 @@ impl Host {
                 },
             };
             (project, topic.id, workspace, cwd)
+        } else if options.cwd.is_none()
+            && let Some(parent_id) = &options.parent_session_id
+        {
+            let (project, topic) = self
+                .projects
+                .locate_session(parent_id.as_str())
+                .context("parent session is not assigned to a project")?;
+            let (workspace, cwd) = match project.kind {
+                ProjectKind::Project => (
+                    SessionWorkspace::External {
+                        pwd: project.pwd.clone().context("project is missing pwd")?,
+                    },
+                    project.pwd.clone().context("project is missing pwd")?,
+                ),
+                ProjectKind::Work => (
+                    SessionWorkspace::Managed,
+                    managed_workspace_path(&self.profile_root, &id),
+                ),
+            };
+            (project, topic.id, workspace, cwd)
         } else {
             let cwd = options.cwd.clone().map(|cwd| {
                 if cwd.is_absolute() {
@@ -394,6 +415,7 @@ impl Host {
             }
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
+                let caller = parse_optional_session(params.caller_session_id.clone())?;
                 let id = self
                     .create_session(HostSessionOptions {
                         title: params.title,
@@ -401,6 +423,7 @@ impl Host {
                         project_id: params.project_id,
                         topic_id: params.topic_id,
                         worktree_id: params.worktree_id,
+                        parent_session_id: caller,
                         ..HostSessionOptions::default()
                     })
                     .await?;

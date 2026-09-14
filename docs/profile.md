@@ -9,6 +9,7 @@ Profile 是 daemon 的运行配置，默认位置是 ~/.dwoagent/profile.yaml。
 ~~~yaml
 policyMode: confirm
 maxModelSteps: 100
+projectOps: confirm
 externalSkillsDirs: []
 externalRuleFiles: []
 
@@ -68,6 +69,7 @@ Profile 使用 camelCase 字段名并拒绝未知字段。daemon 修改配置时
 | --- | --- | --- | --- |
 | policyMode | 是 | 无 | 新 Session 的权限：full_access、confirm 或 watch |
 | maxModelSteps | 否 | 100 | 单个 turn 最多执行的 model step；0 表示不限，或使用 5..=200 |
+| projectOps | 否 | confirm | Session Agent 编辑 Project 看板的策略：confirm 或 direct |
 | logging | 否 | info / 14 天 | JSONL 日志配置 |
 | externalSkillsDirs | 否 | [] | 额外 Skill 目录；相对路径相对 Profile 根目录 |
 | externalRuleFiles | 否 | [] | 额外规则文件；相对路径相对 Profile 根目录 |
@@ -77,6 +79,10 @@ Profile 使用 camelCase 字段名并拒绝未知字段。daemon 修改配置时
 
 policyMode 只影响新 Session。已有 Session 的权限可独立修改。权限如何控制工具见
 [Agent 工具](tools.md)。
+
+projectOps 只约束 Agent Session（含子 Agent）对 Project 看板的写入。confirm 时按规则转为
+提案等待确认，direct 时普通改动立即生效；新建或归档 Section、修改 Project 本身等结构性
+操作在两种取值下都不允许 Session 直接执行。提案机制见 [Project 文件与行为](projects.md)。
 
 ## logging
 

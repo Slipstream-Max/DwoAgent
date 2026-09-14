@@ -120,6 +120,19 @@ dwo topic reorder <project-id> <topic-id> <section-id> <position>
 
 Section、Topic、Label、Session 归属和跨 Project 移动规则见 [Project 文件与行为](projects.md)。
 
+## Proposal
+
+~~~text
+dwo proposal list <project-id> [--status <pending|accepted|rejected|failed>]
+dwo proposal accept <project-id> [--id <proposal-id> ...] [--all]
+dwo proposal reject <project-id> [--id <proposal-id> ...] [--all]
+~~~
+
+Agent Session 对看板的写入默认记录为提案。接受和拒绝只能在外部 Shell 执行；被禁止的
+方法（新建 Project、Repository 变更、Worktree 管理）在 Session 内运行会直接报错。原有
+section、topic 和 session move 等命令在 Session 内运行时按同一策略转为提案。规则见
+[Project 文件与行为](projects.md)。
+
 ## Model
 
 ~~~text

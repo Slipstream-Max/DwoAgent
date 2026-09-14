@@ -11,6 +11,12 @@ policyMode: confirm
 # Maximum model steps in one agent turn. 0 means unlimited; valid finite range is 5..=200.
 maxModelSteps: 100
 
+# How session agents may edit project boards: confirm | direct.
+# confirm = board edits become proposals you approve in the app.
+# direct = agents may apply board edits immediately.
+# Section create/archive and project rule changes always require your confirmation.
+projectOps: confirm
+
 # Additional skills directories. Relative paths are resolved from this profile root.
 externalSkillsDirs: []
 

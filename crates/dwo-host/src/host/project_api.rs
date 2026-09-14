@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use dwo_agent_service::SessionId;
+use dwo_agent_service::{ProjectOpPolicy, SessionId};
 use dwo_project::{
-    CreateProject, Project, ProjectKind, RepositoryRecord, WorktreeRecord, WorktreeSource,
+    CreateProject, Project, ProjectKind, Proposal, ProposalStatus, RepositoryRecord,
+    WorktreeRecord, WorktreeSource,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -165,12 +166,63 @@ struct TopicLabelParam {
     label_id: String,
 }
 
+#[derive(Deserialize)]
+struct ProposalListParam {
+    project_id: String,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResolveProposalsParam {
+    project_id: String,
+    proposal_ids: Option<Vec<String>>,
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Deserialize)]
+struct AssignSessionParam {
+    project_id: String,
+    topic_id: String,
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+struct UnassignSessionParam {
+    project_id: String,
+    session_id: String,
+}
+
 impl Host {
     pub(crate) async fn dispatch_project(
         self: &Arc<Self>,
         method: &str,
         params: Value,
     ) -> Result<Value> {
+        let (caller_session_id, params) = split_caller_session(params);
+        if let Some(caller) = caller_session_id.as_deref() {
+            if dwo_protocol::is_session_blocked(method) {
+                if method == "project.create" {
+                    anyhow::bail!("会话不能创建项目，请在界面中新建项目");
+                }
+                anyhow::bail!("该操作不面向会话代理：{method}");
+            }
+            let needs_proposal = dwo_protocol::is_always_proposal(method)
+                || (dwo_protocol::is_confirm_proposal(method)
+                    && self.project_ops_policy() == ProjectOpPolicy::Confirm);
+            if needs_proposal {
+                return self.queue_project_proposal(method, params, caller).await;
+            }
+        }
+        if matches!(
+            method,
+            "project.proposal.accept" | "project.proposal.reject"
+        ) {
+            anyhow::ensure!(
+                caller_session_id.is_none(),
+                "提案需要由用户在桌面端或命令行中确认"
+            );
+        }
         let result = match method {
             "project.list" => serde_json::to_value(self.projects.list())?,
             "project.get" | "project.board" => {
@@ -522,6 +574,58 @@ impl Host {
                     .await;
                 serde_json::to_value(topic)?
             }
+            "project.proposal.list" => {
+                let params: ProposalListParam = serde_json::from_value(params)?;
+                let proposals = self.projects.list_proposals(&params.project_id)?;
+                let pending = proposals
+                    .iter()
+                    .filter(|proposal| proposal.status == ProposalStatus::Pending)
+                    .count();
+                let proposals = match params.status.as_deref() {
+                    Some(status) => proposals
+                        .into_iter()
+                        .filter(|proposal| proposal.status.as_str() == status)
+                        .collect::<Vec<_>>(),
+                    None => proposals,
+                };
+                json!({"proposals": proposals, "pending": pending})
+            }
+            "project.proposal.accept" | "project.proposal.reject" => {
+                let params: ResolveProposalsParam = serde_json::from_value(params)?;
+                let resolved = self
+                    .resolve_project_proposals(&params, method.ends_with("accept"))
+                    .await?;
+                json!({"resolved": resolved})
+            }
+            "project.topic.session.assign" => {
+                let params: AssignSessionParam = serde_json::from_value(params)?;
+                let topic = self.projects.move_session(
+                    &params.project_id,
+                    &params.topic_id,
+                    params.session_id,
+                )?;
+                self.project_changed(&params.project_id, "session.assign")
+                    .await;
+                serde_json::to_value(topic)?
+            }
+            "project.topic.session.unassign" => {
+                let params: UnassignSessionParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&params.project_id)?;
+                anyhow::ensure!(
+                    project.board.topics.iter().any(|topic| {
+                        topic
+                            .session_ids
+                            .iter()
+                            .any(|session| session == &params.session_id)
+                    }),
+                    "session is not assigned to this project"
+                );
+                self.projects
+                    .unassign_session_everywhere(&params.session_id)?;
+                self.project_changed(&params.project_id, "session.unassign")
+                    .await;
+                json!({"unassigned": true})
+            }
             _ => anyhow::bail!("unknown project method: {method}"),
         };
         Ok(result)
@@ -707,6 +811,141 @@ impl Host {
             )
             .await;
     }
+
+    fn project_ops_policy(&self) -> ProjectOpPolicy {
+        self.profile
+            .read()
+            .expect("profile lock poisoned")
+            .config
+            .project_ops
+    }
+
+    async fn queue_project_proposal(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+        caller_session_id: &str,
+    ) -> Result<Value> {
+        let project_id = params
+            .get("project_id")
+            .and_then(Value::as_str)
+            .context("project_id is required")?
+            .to_string();
+        match self.projects.locate_session(caller_session_id) {
+            Some((project, _)) if project.id == project_id => {}
+            Some((project, _)) => anyhow::bail!(
+                "会话 {caller_session_id} 只能修改自己所在的项目（{}）",
+                project.id
+            ),
+            None => anyhow::bail!("会话 {caller_session_id} 尚未分配到项目看板"),
+        }
+        let proposal = Proposal {
+            id: format!("proposal-{}", uuid::Uuid::new_v4()),
+            project_id: project_id.clone(),
+            method: method.to_string(),
+            payload: params,
+            source_session_id: caller_session_id.to_string(),
+            status: ProposalStatus::Pending,
+            error: None,
+            result: None,
+            created_at_ms: unix_now_ms(),
+            resolved_at_ms: None,
+        };
+        let proposal_id = proposal.id.clone();
+        self.projects.append_proposal(&project_id, proposal)?;
+        self.events
+            .publish(
+                "project.proposal.changed",
+                json!({"projectId": project_id, "action": "proposed", "proposalId": proposal_id}),
+            )
+            .await;
+        Ok(json!({"proposed": true, "proposalId": proposal_id, "projectId": project_id}))
+    }
+
+    async fn resolve_project_proposals(
+        self: &Arc<Self>,
+        params: &ResolveProposalsParam,
+        accepted: bool,
+    ) -> Result<Vec<Value>> {
+        let proposals = self.projects.list_proposals(&params.project_id)?;
+        let targets = if params.all {
+            proposals
+                .iter()
+                .filter(|proposal| proposal.status == ProposalStatus::Pending)
+                .map(|proposal| proposal.id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            params.proposal_ids.clone().unwrap_or_default()
+        };
+        anyhow::ensure!(!targets.is_empty(), "no proposals selected");
+        let mut outcomes = Vec::new();
+        for id in targets {
+            let Some(proposal) = proposals.iter().find(|proposal| proposal.id == id).cloned()
+            else {
+                outcomes.push(json!({"proposalId": id, "status": "missing"}));
+                continue;
+            };
+            if proposal.status != ProposalStatus::Pending {
+                outcomes.push(json!({"proposalId": id, "status": proposal.status.as_str()}));
+                continue;
+            }
+            let (status, error, result) = if accepted {
+                match Box::pin(self.handle_method(&proposal.method, proposal.payload.clone())).await
+                {
+                    Ok(result) => (ProposalStatus::Accepted, None, Some(result)),
+                    Err(error) => (ProposalStatus::Failed, Some(format!("{error:#}")), None),
+                }
+            } else {
+                (ProposalStatus::Rejected, None, None)
+            };
+            let error_for_store = error.clone();
+            let result_for_store = result.clone();
+            self.projects
+                .update_proposals(&params.project_id, |proposals| {
+                    if let Some(entry) = proposals.iter_mut().find(|entry| entry.id == id) {
+                        entry.status = status;
+                        entry.error = error_for_store;
+                        entry.result = result_for_store;
+                        entry.resolved_at_ms = Some(unix_now_ms());
+                    }
+                    Ok(())
+                })?;
+            self.events
+                .publish(
+                    "project.proposal.changed",
+                    json!({
+                        "projectId": params.project_id,
+                        "action": status.as_str(),
+                        "proposalId": id,
+                    }),
+                )
+                .await;
+            outcomes.push(json!({
+                "proposalId": id,
+                "status": status.as_str(),
+                "error": error,
+            }));
+        }
+        Ok(outcomes)
+    }
+}
+
+fn split_caller_session(mut params: Value) -> (Option<String>, Value) {
+    let caller_session_id = params
+        .get("caller_session_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    if let Some(object) = params.as_object_mut() {
+        object.remove("caller_session_id");
+    }
+    (caller_session_id, params)
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn worktree_record(name: String, path: PathBuf, source: WorktreeSource) -> WorktreeRecord {
@@ -917,6 +1156,124 @@ mod tests {
             host.handle_method("project.topic.move_to_project", json!({}))
                 .await
                 .is_err()
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_project_edits_become_proposals_until_confirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let project = host
+            .handle_method("project.create", json!({"pwd": workspace}))
+            .await
+            .unwrap();
+        let pid = project["id"].as_str().unwrap().to_string();
+        let section = project["board"]["uncategorizedSectionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let topic = host
+            .handle_method(
+                "project.topic.create",
+                json!({"project_id": &pid, "section_id": &section, "title": "Task", "overview": "seed"}),
+            )
+            .await
+            .unwrap();
+        let tid = topic["id"].as_str().unwrap().to_string();
+        let created = host
+            .handle_method("session.new", json!({"project_id": &pid, "topic_id": &tid}))
+            .await
+            .unwrap();
+        let sid = created["session_id"].as_str().unwrap().to_string();
+
+        let response = host
+            .handle_method(
+                "project.topic.create",
+                json!({
+                    "project_id": &pid,
+                    "section_id": &section,
+                    "title": "Proposed",
+                    "overview": "from session",
+                    "caller_session_id": &sid,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["proposed"], true);
+        let proposal_id = response["proposalId"].as_str().unwrap().to_string();
+        let listed = host
+            .handle_method("project.proposal.list", json!({"project_id": &pid}))
+            .await
+            .unwrap();
+        assert_eq!(listed["pending"], 1);
+
+        assert!(
+            host.handle_method(
+                "project.proposal.accept",
+                json!({"project_id": &pid, "proposal_ids": [&proposal_id], "caller_session_id": &sid}),
+            )
+            .await
+            .is_err()
+        );
+
+        let resolved = host
+            .handle_method(
+                "project.proposal.accept",
+                json!({"project_id": &pid, "all": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved["resolved"][0]["status"], "accepted");
+        let board = host
+            .handle_method("project.board", json!({"project_id": &pid}))
+            .await
+            .unwrap();
+        assert!(
+            board["board"]["topics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|topic| topic["title"] == "Proposed")
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_cannot_create_projects_or_touch_worktrees() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let project = host
+            .handle_method("project.create", json!({"pwd": workspace}))
+            .await
+            .unwrap();
+        let pid = project["id"].as_str().unwrap().to_string();
+        let created = host
+            .handle_method("session.new", json!({"project_id": &pid}))
+            .await
+            .unwrap();
+        let sid = created["session_id"].as_str().unwrap().to_string();
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(
+            host.handle_method(
+                "project.create",
+                json!({"pwd": other, "caller_session_id": &sid}),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            host.handle_method(
+                "project.worktree.create",
+                json!({"project_id": &pid, "branch": "x", "caller_session_id": &sid}),
+            )
+            .await
+            .is_err()
         );
         host.shutdown().await;
     }

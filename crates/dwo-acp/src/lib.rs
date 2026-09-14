@@ -1178,7 +1178,16 @@ async fn complete_prompt(runtime: &AcpRuntime, session_id: &str, completion: Pro
 
 /// Complete the ACP prompt waiting on a manual compaction when the session
 /// reports a terminal compaction state (completed, cancelled, or failed).
+///
+/// Automatic compactions run inside a turn and their notifications carry the
+/// turn's id; those must never resolve that turn's in-flight prompt request
+/// (the client would otherwise render the turn as finished while it is still
+/// running). Only session-level (manual `/compact`) notifications may complete
+/// a prompt.
 fn compaction_prompt_completion(payload: &Value) -> Option<PromptCompletion> {
+    if payload.get("turn_id").is_some_and(|turn_id| !turn_id.is_null()) {
+        return None;
+    }
     match payload.get("category").and_then(Value::as_str) {
         Some("compaction_completed") => Some(Ok(StopReason::EndTurn)),
         Some("compaction_cancelled") => Some(Ok(StopReason::Cancelled)),
@@ -2736,6 +2745,34 @@ mod tests {
         }
         let started = json!({"kind": "notification", "category": "compaction_started"});
         assert!(compaction_prompt_completion(&started).is_none());
+    }
+
+    #[test]
+    fn turn_scoped_compaction_notifications_do_not_complete_a_prompt() {
+        // Automatic compactions run inside a turn; their notifications carry the
+        // turn's id and must never resolve the running turn's prompt request.
+        for category in ["compaction_completed", "compaction_cancelled", "compaction_failed"] {
+            let automatic = json!({
+                "kind": "notification",
+                "turn_id": "turn-auto-compaction",
+                "category": category,
+            });
+            assert!(
+                compaction_prompt_completion(&automatic).is_none(),
+                "automatic {category} must not complete the turn's prompt"
+            );
+        }
+        // Manual /compact notifications are session-level and may serialize a
+        // null turn id; they still complete the waiting prompt.
+        let manual = json!({
+            "kind": "notification",
+            "turn_id": null,
+            "category": "compaction_completed",
+        });
+        assert!(matches!(
+            compaction_prompt_completion(&manual),
+            Some(Ok(StopReason::EndTurn))
+        ));
     }
 
     #[test]

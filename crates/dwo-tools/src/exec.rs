@@ -84,20 +84,59 @@ pub(crate) async fn execute(
             .execute(args.patch, manager.cwd.clone())
             .await
             .map(|result| {
-                emit(
-                    context,
-                    ToolEvent::FileChanged {
-                        tool_call_id: id.clone(),
-                        changes: result.changes.clone(),
-                        patch: result.patch,
-                    },
-                );
-                json!({
-                    "tool": "file_edit",
-                    "kind": "other",
-                    "status": "completed",
-                    "changes": result.changes,
-                })
+                if !result.changes.is_empty() {
+                    emit(
+                        context,
+                        ToolEvent::FileChanged {
+                            tool_call_id: id.clone(),
+                            changes: result.changes.clone(),
+                            patch: result.patch,
+                        },
+                    );
+                }
+                match result.failure {
+                    None => json!({
+                        "tool": "file_edit",
+                        "kind": "other",
+                        "status": "completed",
+                        "changes": result.changes,
+                    }),
+                    Some(failure) => {
+                        let applied = result.changes.len();
+                        let total = applied + 1 + result.skipped.len();
+                        let skipped_note = if result.skipped.is_empty() {
+                            String::new()
+                        } else if result.skipped.len() == 1 {
+                            format!(" Operation {} was skipped and not applied.", failure.step + 1)
+                        } else {
+                            format!(
+                                " Operations {}-{total} were skipped and not applied.",
+                                failure.step + 1
+                            )
+                        };
+                        let summary = format!(
+                            "Applied {applied} of {total} operations. Operation {} ({}) failed: {}{skipped_note}",
+                            failure.step, failure.operation, failure.error
+                        );
+                        let mut output = json!({
+                            "tool": "file_edit",
+                            "kind": "other",
+                            "status": if applied == 0 { "error" } else { "partial" },
+                            "summary": summary,
+                            "changes": result.changes,
+                            "failed": {
+                                "step": failure.step,
+                                "operation": failure.operation,
+                                "error": failure.error.clone(),
+                            },
+                            "skipped": result.skipped,
+                        });
+                        if applied == 0 {
+                            output["error"] = json!(failure.error);
+                        }
+                        output
+                    }
+                }
             }),
         ToolCall::ReadFile(args) => {
             let path = if args.path.is_absolute() {

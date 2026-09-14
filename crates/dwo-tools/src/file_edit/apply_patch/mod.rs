@@ -24,6 +24,15 @@ pub struct PatchChange {
 pub struct PatchApplication {
     pub changes: Vec<PatchChange>,
     pub git_patch: String,
+    pub failure: Option<PatchFailure>,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PatchFailure {
+    pub step: usize,
+    pub operation: String,
+    pub error: String,
 }
 
 struct AppliedTextChange {
@@ -44,114 +53,24 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
 
     let mut changes = Vec::with_capacity(hunks.len());
     let mut applied_text = Vec::with_capacity(hunks.len());
+    let labels = hunks.iter().map(hunk_label).collect::<Vec<_>>();
+    let mut failure = None;
+    let mut skipped = Vec::new();
 
-    for hunk in hunks {
-        match hunk {
-            Hunk::Add { path, contents } => {
-                let path = resolve_path(cwd, &path);
-                let old_bytes = fs::read(&path).unwrap_or_default();
-                let old = decode_text(&old_bytes, &path)
-                    .map(|decoded| decoded.text.into_bytes())
-                    .unwrap_or(old_bytes);
-                write_text_file(&path, &contents)?;
-                let new = contents.into_bytes();
-                applied_text.push(AppliedTextChange {
-                    source: path.clone(),
-                    destination: path.clone(),
-                    old,
-                    new,
-                });
-                changes.push(PatchChange {
-                    path,
-                    kind: "add",
-                    moved_to: None,
-                });
+    for (index, hunk) in hunks.into_iter().enumerate() {
+        match apply_hunk(hunk, cwd) {
+            Ok((text_change, change)) => {
+                applied_text.push(text_change);
+                changes.push(change);
             }
-            Hunk::Delete { path } => {
-                let path = resolve_path(cwd, &path);
-                let old_bytes = fs::read(&path).unwrap_or_default();
-                let old = decode_text(&old_bytes, &path)
-                    .map(|decoded| decoded.text.into_bytes())
-                    .unwrap_or(old_bytes);
-                fs::remove_file(&path)
-                    .with_context(|| format!("Failed to delete file {}", path.display()))?;
-                applied_text.push(AppliedTextChange {
-                    source: path.clone(),
-                    destination: path.clone(),
-                    old,
-                    new: Vec::new(),
+            Err(error) => {
+                failure = Some(PatchFailure {
+                    step: index + 1,
+                    operation: labels[index].clone(),
+                    error: format!("{error:#}"),
                 });
-                changes.push(PatchChange {
-                    path,
-                    kind: "delete",
-                    moved_to: None,
-                });
-            }
-            Hunk::Update {
-                path,
-                move_path,
-                chunks,
-            } => {
-                let source = resolve_path(cwd, &path);
-                let is_move = move_path.is_some();
-                let destination = move_path
-                    .as_ref()
-                    .map(|path| resolve_path(cwd, path))
-                    .unwrap_or_else(|| source.clone());
-                let original_bytes = fs::read(&source).with_context(|| {
-                    format!("Failed to read file to update {}", source.display())
-                })?;
-                let original = decode_text(&original_bytes, &source)?.text;
-                let updated = derive_new_contents(&original, &source, &chunks)?;
-                write_text_file(&destination, &updated)?;
-                if is_move {
-                    fs::remove_file(&source).with_context(|| {
-                        format!("Failed to remove original {}", source.display())
-                    })?;
-                }
-                applied_text.push(AppliedTextChange {
-                    source: source.clone(),
-                    destination: destination.clone(),
-                    old: original.into_bytes(),
-                    new: updated.into_bytes(),
-                });
-                changes.push(PatchChange {
-                    path: source,
-                    kind: if is_move { "move" } else { "update" },
-                    moved_to: is_move.then_some(destination),
-                });
-            }
-            Hunk::Replace {
-                path,
-                expected,
-                old,
-                new,
-            } => {
-                let path = resolve_path(cwd, &path);
-                let original_bytes = fs::read(&path).with_context(|| {
-                    format!("Failed to read file to replace {}", path.display())
-                })?;
-                let original = decode_text(&original_bytes, &path)?.text;
-                let actual = original.matches(&old).count();
-                if actual != expected {
-                    bail!(
-                        "Replace File expected {expected} matches in {}, found {actual}",
-                        path.display()
-                    );
-                }
-                let updated = original.replace(&old, &new);
-                write_text_file(&path, &updated)?;
-                applied_text.push(AppliedTextChange {
-                    source: path.clone(),
-                    destination: path.clone(),
-                    old: original.into_bytes(),
-                    new: updated.into_bytes(),
-                });
-                changes.push(PatchChange {
-                    path,
-                    kind: "update",
-                    moved_to: None,
-                });
+                skipped = labels[index + 1..].to_vec();
+                break;
             }
         }
     }
@@ -159,7 +78,143 @@ pub fn apply_patch(patch: &str, cwd: &Path) -> Result<PatchApplication> {
     Ok(PatchApplication {
         changes,
         git_patch: render_git_patch(&applied_text),
+        failure,
+        skipped,
     })
+}
+
+fn apply_hunk(hunk: Hunk, cwd: &Path) -> Result<(AppliedTextChange, PatchChange)> {
+    match hunk {
+        Hunk::Add { path, contents } => {
+            let path = resolve_path(cwd, &path);
+            let old_bytes = fs::read(&path).unwrap_or_default();
+            let old = decode_text(&old_bytes, &path)
+                .map(|decoded| decoded.text.into_bytes())
+                .unwrap_or(old_bytes);
+            write_text_file(&path, &contents)?;
+            let new = contents.into_bytes();
+            Ok((
+                AppliedTextChange {
+                    source: path.clone(),
+                    destination: path.clone(),
+                    old,
+                    new,
+                },
+                PatchChange {
+                    path,
+                    kind: "add",
+                    moved_to: None,
+                },
+            ))
+        }
+        Hunk::Delete { path } => {
+            let path = resolve_path(cwd, &path);
+            let old_bytes = fs::read(&path).unwrap_or_default();
+            let old = decode_text(&old_bytes, &path)
+                .map(|decoded| decoded.text.into_bytes())
+                .unwrap_or(old_bytes);
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete file {}", path.display()))?;
+            Ok((
+                AppliedTextChange {
+                    source: path.clone(),
+                    destination: path.clone(),
+                    old,
+                    new: Vec::new(),
+                },
+                PatchChange {
+                    path,
+                    kind: "delete",
+                    moved_to: None,
+                },
+            ))
+        }
+        Hunk::Update {
+            path,
+            move_path,
+            chunks,
+        } => {
+            let source = resolve_path(cwd, &path);
+            let is_move = move_path.is_some();
+            let destination = move_path
+                .as_ref()
+                .map(|path| resolve_path(cwd, path))
+                .unwrap_or_else(|| source.clone());
+            let original_bytes = fs::read(&source)
+                .with_context(|| format!("Failed to read file to update {}", source.display()))?;
+            let original = decode_text(&original_bytes, &source)?.text;
+            let updated = derive_new_contents(&original, &source, &chunks)?;
+            write_text_file(&destination, &updated)?;
+            if is_move {
+                fs::remove_file(&source)
+                    .with_context(|| format!("Failed to remove original {}", source.display()))?;
+            }
+            Ok((
+                AppliedTextChange {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    old: original.into_bytes(),
+                    new: updated.into_bytes(),
+                },
+                PatchChange {
+                    path: source,
+                    kind: if is_move { "move" } else { "update" },
+                    moved_to: is_move.then_some(destination),
+                },
+            ))
+        }
+        Hunk::Replace {
+            path,
+            expected,
+            old,
+            new,
+        } => {
+            let path = resolve_path(cwd, &path);
+            let original_bytes = fs::read(&path)
+                .with_context(|| format!("Failed to read file to replace {}", path.display()))?;
+            let original = decode_text(&original_bytes, &path)?.text;
+            let actual = original.matches(&old).count();
+            if actual != expected {
+                bail!(
+                    "Replace File expected {expected} matches in {}, found {actual}",
+                    path.display()
+                );
+            }
+            let updated = original.replace(&old, &new);
+            write_text_file(&path, &updated)?;
+            Ok((
+                AppliedTextChange {
+                    source: path.clone(),
+                    destination: path.clone(),
+                    old: original.into_bytes(),
+                    new: updated.into_bytes(),
+                },
+                PatchChange {
+                    path,
+                    kind: "update",
+                    moved_to: None,
+                },
+            ))
+        }
+    }
+}
+
+fn hunk_label(hunk: &Hunk) -> String {
+    match hunk {
+        Hunk::Add { path, .. } => format!("Add File: {}", path.display()),
+        Hunk::Delete { path } => format!("Delete File: {}", path.display()),
+        Hunk::Update {
+            path, move_path, ..
+        } => match move_path {
+            Some(target) => format!(
+                "Update File: {} (Move to: {})",
+                path.display(),
+                target.display()
+            ),
+            None => format!("Update File: {}", path.display()),
+        },
+        Hunk::Replace { path, .. } => format!("Replace File: {}", path.display()),
+    }
 }
 
 fn derive_new_contents(original: &str, path: &Path, chunks: &[UpdateChunk]) -> Result<String> {
@@ -356,12 +411,39 @@ mod tests {
     #[test]
     fn later_failure_preserves_earlier_changes() {
         let dir = tempfile::tempdir().unwrap();
-        let error = apply_patch(
+        let applied = apply_patch(
             "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch",
             dir.path(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("Failed to read file to update"));
+        .unwrap();
+        let failure = applied.failure.expect("failure is reported");
+        assert_eq!(failure.step, 2);
+        assert!(failure.operation.contains("Update File: missing.txt"));
+        assert!(failure.error.contains("Failed to read file to update"));
+        assert_eq!(applied.changes.len(), 1);
+        assert_eq!(applied.changes[0].kind, "add");
+        assert!(applied.skipped.is_empty());
+        assert_eq!(read_written_text(dir.path().join("created.txt")), "hello\n");
+    }
+
+    #[test]
+    fn failure_reports_skipped_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("keep.txt"), "keep\n").unwrap();
+        let applied = apply_patch(
+            "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** Update File: missing.txt\n@@\n-old\n+new\n*** Delete File: keep.txt\n*** Add File: later.txt\n+later\n*** End Patch",
+            dir.path(),
+        )
+        .unwrap();
+        let failure = applied.failure.expect("failure is reported");
+        assert_eq!(failure.step, 2);
+        assert_eq!(
+            applied.skipped,
+            ["Delete File: keep.txt", "Add File: later.txt"]
+        );
+        assert_eq!(applied.changes.len(), 1);
+        assert!(dir.path().join("keep.txt").exists());
+        assert!(!dir.path().join("later.txt").exists());
         assert_eq!(read_written_text(dir.path().join("created.txt")), "hello\n");
     }
 
@@ -408,12 +490,14 @@ mod tests {
     fn end_of_file_marker_requires_tail_match() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "first\nsecond\nthird\n").unwrap();
-        let error = apply_patch(
+        let applied = apply_patch(
             "*** Begin Patch\n*** Update File: a.txt\n@@\n-first\n+FIRST\n*** End of File\n*** End Patch",
             dir.path(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("did not match target file"));
+        .unwrap();
+        let failure = applied.failure.expect("failure is reported");
+        assert!(failure.error.contains("did not match target file"));
+        assert!(applied.changes.is_empty());
     }
 
     #[test]
@@ -456,12 +540,14 @@ mod tests {
     fn replace_file_count_mismatch_does_not_write_the_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "old\nold\n").unwrap();
-        let error = apply_patch(
+        let applied = apply_patch(
             "*** Begin Patch\n*** Replace File: a.txt\n*** Expected: 1\n@@\n-old\n+new\n*** End Patch",
             dir.path(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("expected 1 matches"));
+        .unwrap();
+        let failure = applied.failure.expect("failure is reported");
+        assert!(failure.error.contains("expected 1 matches"));
+        assert!(applied.changes.is_empty());
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "old\nold\n"

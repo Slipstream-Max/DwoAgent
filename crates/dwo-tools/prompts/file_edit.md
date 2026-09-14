@@ -112,7 +112,11 @@ Delete an existing file.
 
 # Results
 
-A successful result lists each changed path and whether it was added, updated, moved, or deleted. A parse error, unmatched hunk, invalid target, or filesystem error returns an error result for this tool call.
+A successful result lists each changed path and whether it was added, updated, moved, or deleted.
+
+Operations apply in patch order. If an operation fails, earlier operations remain applied and later operations are not applied. The result then reports `summary`, `failed` (operation number, file, and error), and `skipped` (operations that were not applied); `status` is `partial` when some operations applied, or `error` when none did. After a partial failure, re-inspect the affected files and send a follow-up patch with only the missing operations.
+
+A parse error, invalid target, or filesystem error returns an error result for this tool call.
 
 # Notes
 

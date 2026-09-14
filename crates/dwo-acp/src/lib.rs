@@ -199,6 +199,10 @@ impl AcpRuntime {
 
 struct SessionObserver {
     endpoint_id: String,
+    /// Cancelled when the client detaches its view of the session. It only
+    /// stops event forwarding on this connection; the daemon session itself
+    /// is never cancelled or unloaded by a client-side close.
+    shutdown: CancellationToken,
 }
 
 struct PreparedObserver {
@@ -543,17 +547,8 @@ where
                         responder: Responder<CloseSessionResponse>,
                         _cx: ConnectionTo<Client>| {
                 let runtime = close_runtime.clone();
-                let session_id = request.session_id.to_string();
-                match runtime
-                    .request("session.close", json!({"session_id": session_id}))
-                    .await
-                {
-                    Ok(_) => {
-                        runtime.observers.lock().await.remove(&session_id);
-                        responder.respond(CloseSessionResponse::new())
-                    }
-                    Err(error) => responder.respond_with_error(internal_error(error)),
-                }
+                detach_session(&runtime, &request.session_id.to_string()).await;
+                responder.respond(CloseSessionResponse::new())
             },
             on_receive_request!(),
         )
@@ -899,6 +894,7 @@ async fn prepare_observer(
     let (snapshot, events) = runtime.subscribe(session_id, &endpoint_id).await?;
     let observer = Arc::new(SessionObserver {
         endpoint_id: endpoint_id.clone(),
+        shutdown: CancellationToken::new(),
     });
     observers.insert(session_id.to_string(), observer.clone());
 
@@ -910,7 +906,7 @@ async fn prepare_observer(
     })
 }
 
-async fn defer_cancel_v1(runtime: &AcpRuntime, session_id: String) {
+async fn defer_cancel_v1(runtime: &AcpRuntime, session_id: String, cx: &ConnectionTo<Client>) {
     let Some(cancellation) = runtime.pending_cancels.schedule(session_id.clone()) else {
         complete_prompt(runtime, &session_id, Ok(StopReason::Cancelled)).await;
         return;
@@ -918,25 +914,39 @@ async fn defer_cancel_v1(runtime: &AcpRuntime, session_id: String) {
     // v1 clients wait for the active prompt response before sending Send Now's
     // replacement prompt, so complete that response before the grace window.
     complete_prompt(runtime, &session_id, Ok(StopReason::Cancelled)).await;
-    spawn_deferred_cancel(runtime.clone(), session_id, cancellation);
+    spawn_deferred_cancel(runtime.clone(), session_id, cancellation, cx);
 }
 
+/// The deferred cancel pairs with a possible Send-now replacement prompt on the
+/// same connection. Spawning it on the connection means a client that goes away
+/// during the grace window (closing a window or the whole client) takes the
+/// pending cancel with it instead of stopping a daemon turn it no longer owns.
 fn spawn_deferred_cancel(
     runtime: AcpRuntime,
     session_id: String,
     cancellation: Arc<CancellationToken>,
+    cx: &ConnectionTo<Client>,
 ) {
-    let runtime = runtime.clone();
-    tokio::spawn(async move {
+    let task_runtime = runtime.clone();
+    let task_session_id = session_id.clone();
+    let task_cancellation = cancellation.clone();
+    let spawned = cx.spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(SEND_NOW_GRACE_PERIOD) => {
-                if runtime.pending_cancels.finish(&session_id, &cancellation) {
-                    cancel_session_now(&runtime, &session_id).await;
+                if task_runtime
+                    .pending_cancels
+                    .finish(&task_session_id, &task_cancellation)
+                {
+                    cancel_session_now(&task_runtime, &task_session_id).await;
                 }
             }
-            _ = cancellation.cancelled() => {}
+            _ = task_cancellation.cancelled() => {}
         }
+        Ok::<(), AcpError>(())
     });
+    if spawned.is_err() {
+        runtime.pending_cancels.finish(&session_id, &cancellation);
+    }
 }
 
 fn spawn_cancel_now(runtime: AcpRuntime, session_id: String) {
@@ -949,6 +959,20 @@ async fn cancel_session_now(runtime: &AcpRuntime, session_id: &str) {
     let _ = runtime
         .request("session.cancel", json!({"session_id": session_id}))
         .await;
+}
+
+/// Detach a session view from this ACP connection without touching the daemon.
+///
+/// Clients deliver `session/close` when a chat, a window, or the whole client
+/// shuts down. Sessions belong to the daemon, so closing a view must never
+/// cancel running work or unload a session: only the event forwarding for this
+/// connection stops, and the client can pick the session back up later with
+/// `session/load`. Stop work with `session/cancel`; remove sessions with
+/// `session/delete`.
+async fn detach_session(runtime: &AcpRuntime, session_id: &str) {
+    if let Some(observer) = runtime.observers.lock().await.remove(session_id) {
+        observer.shutdown.cancel();
+    }
 }
 
 async fn activate_observer(
@@ -971,17 +995,26 @@ async fn activate_observer(
     let observer_runtime = runtime.clone();
     let observer_session_id = session_id.to_string();
     let observer_endpoint_id = prepared.observer.endpoint_id.clone();
+    let observer_shutdown = prepared.observer.shutdown.clone();
     let observer_cx = cx.clone();
     if let Err(error) = cx.inner.spawn(async move {
-        while let Some(frame) = events.recv().await {
-            handle_session_event(
-                &observer_runtime,
-                &observer_cx,
-                &observer_session_id,
-                &observer_endpoint_id,
-                frame,
-            )
-            .await;
+        {
+            let forwarding = async {
+                while let Some(frame) = events.recv().await {
+                    handle_session_event(
+                        &observer_runtime,
+                        &observer_cx,
+                        &observer_session_id,
+                        &observer_endpoint_id,
+                        frame,
+                    )
+                    .await;
+                }
+            };
+            tokio::select! {
+                _ = observer_shutdown.cancelled() => {}
+                _ = forwarding => {}
+            }
         }
         let mut observers = observer_runtime.observers.lock().await;
         if observers
@@ -2347,6 +2380,64 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), task)
                 .await
                 .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn session_close_only_detaches_the_client_view() {
+        for (protocol, params) in [
+            (
+                AcpProtocol::V1,
+                json!({"protocolVersion":1, "clientCapabilities":{}}),
+            ),
+            (
+                AcpProtocol::V2,
+                json!({
+                    "protocolVersion":2,
+                    "info":{"name":"test-client", "version":"1"},
+                    "capabilities":{}
+                }),
+            ),
+        ] {
+            let (mut client_input, agent_input) = tokio::io::duplex(16 * 1024);
+            let (agent_output, client_output) = tokio::io::duplex(16 * 1024);
+            let task = tokio::spawn(run_with_protocol_io(
+                PathBuf::from("unused-profile.yaml"),
+                protocol,
+                agent_input,
+                agent_output,
+            ));
+            let mut client_output = BufReader::new(client_output);
+
+            for request in [
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":params}),
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":2,
+                    "method":"session/close",
+                    "params":{"sessionId":"session-00000000-0000-0000-0000-000000000000"},
+                }),
+            ] {
+                client_input
+                    .write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .unwrap();
+                client_input.flush().await.unwrap();
+                let mut response = String::new();
+                client_output.read_line(&mut response).await.unwrap();
+                let response: Value = serde_json::from_str(&response).unwrap();
+                assert!(
+                    response.get("error").is_none(),
+                    "session/close must not reach the daemon: {response}"
+                );
+            }
+
+            drop(client_input);
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("ACP runner should stop after stdin EOF")
                 .unwrap()
                 .unwrap();
         }

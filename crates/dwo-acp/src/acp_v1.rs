@@ -203,10 +203,9 @@ where
             async move |request: v1::CloseSessionRequest,
                         responder: Responder<v1::CloseSessionResponse>,
                         _cx: ConnectionTo<Client>| {
-                match close_session(&close_runtime, request.session_id.to_string()).await {
-                    Ok(()) => responder.respond(v1::CloseSessionResponse::new()),
-                    Err(error) => responder.respond_with_error(internal_error(error)),
-                }
+                let runtime = close_runtime.clone();
+                detach_session(&runtime, &request.session_id.to_string()).await;
+                responder.respond(v1::CloseSessionResponse::new())
             },
             on_receive_request!(),
         )
@@ -247,8 +246,8 @@ where
             on_receive_request!(),
         )
         .on_receive_notification(
-            async move |notification: v1::CancelNotification, _cx: ConnectionTo<Client>| {
-                defer_cancel_v1(&cancel_runtime, notification.session_id.to_string()).await;
+            async move |notification: v1::CancelNotification, cx: ConnectionTo<Client>| {
+                defer_cancel_v1(&cancel_runtime, notification.session_id.to_string(), &cx).await;
                 Ok(())
             },
             on_receive_notification!(),
@@ -608,17 +607,6 @@ async fn set_config_option(
         );
     }
     result
-}
-
-async fn close_session(runtime: &AcpRuntime, session_id: String) -> Result<()> {
-    ipc::request_acp(
-        &runtime.config_path,
-        "session.close",
-        json!({"session_id": session_id}),
-    )
-    .await?;
-    runtime.observers.lock().await.remove(&session_id);
-    Ok(())
 }
 
 async fn delete_session(runtime: &AcpRuntime, session_id: String) -> Result<()> {

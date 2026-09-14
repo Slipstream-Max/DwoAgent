@@ -53,13 +53,19 @@ macOS/Linux: /home/<user>/.dwoagent/bin/dwo
 
 Zed 的旧 v1 Send now 会先发送 cancel 再发送替代 Prompt。Adapter 提供 500ms 配对窗口：同一
 连接和 Session 在窗口内收到新 Prompt 时，把它作为排队消息，不真正取消底层 Turn；没有后续
-Prompt 时，cancel 正常生效。这是唯一的 Zed 时序兼容行为。
+Prompt 时，cancel 正常生效；如果连接在窗口内断开（关闭窗口或客户端），待生效的 cancel 会随
+连接一起丢弃，不会中断 daemon 中仍在运行的 Turn。这是唯一的 Zed 时序兼容行为。
 
 ## Session
 
-ACP 可以新建、列出、加载、继续、关闭和删除 daemon 中的 Session。Client 创建 Session 时提供
-的 cwd 会成为 External Workspace，并归入固定的“未分配会话” Project。完整的 Project/Topic
-归类和 Workspace 类型见 [Project 文件与行为](projects.md)。
+ACP 可以新建、列出、加载、继续和删除 daemon 中的 Session；`session/close` 用于关闭客户端
+侧的对话视图。Client 创建 Session 时提供的 cwd 会成为 External Workspace，并归入固定的
+“未分配会话” Project。完整的 Project/Topic 归类和 Workspace 类型见
+[Project 文件与行为](projects.md)。
+
+`session/close` 只断开当前连接对该 Session 的事件订阅，不会取消正在运行的 turn，也不会卸载
+daemon 中的 Session。关闭对话、窗口或整个客户端后，Session 保持原样继续运行，之后可以随时
+重新 load。中断运行用 `session/cancel`，删除用 `session/delete`。
 
 加载 Session 后，ACP 会持续接收其他入口提交的 Prompt、Tool Event、权限请求和状态变化。
 Model、Reasoning 和 Policy 作为 Config Option 显示，客户端修改后会写回 Session。

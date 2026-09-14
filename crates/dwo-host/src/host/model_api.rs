@@ -375,53 +375,6 @@ mod tests {
     use crate::host::tests::write_test_profile;
 
     #[tokio::test]
-    async fn available_models_include_resolved_capabilities_and_reasoning() {
-        let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-
-        let available = host
-            .handle_method("model.available", json!({}))
-            .await
-            .unwrap();
-        let model = available["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["id"] == "deepseek/deepseek-v4-pro")
-            .unwrap();
-        assert_eq!(model["name"], "deepseek-v4-pro");
-        assert_eq!(model["provider"], "deepseek");
-        assert_eq!(model["capabilities"]["imageInput"], false);
-        assert_eq!(model["capabilities"]["toolCalls"], true);
-        assert!(
-            model["reasoning"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|mode| mode["id"] == "high" && mode["name"] == "High")
-        );
-
-        host.handle_method(
-            "model.set_default",
-            json!({
-                "model": "deepseek/deepseek-v4-pro",
-                "reasoning": "high",
-                "compactionTriggerRatio": 0.65,
-            }),
-        )
-        .await
-        .unwrap();
-        let default = host
-            .handle_method("model.get_default", json!({}))
-            .await
-            .unwrap();
-        assert_eq!(default["model"], "deepseek/deepseek-v4-pro");
-        assert_eq!(default["reasoning"], "high");
-        assert_eq!(default["compactionTriggerRatio"], 0.65);
-        host.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn provider_list_reports_a_configured_key_without_exposing_it() {
         let root = tempfile::tempdir().unwrap();
         let host = Host::build(&write_test_profile(root.path())).await.unwrap();

@@ -21,11 +21,85 @@ pub fn endpoint(_config_path: &Path) -> String {
     }
     #[cfg(unix)]
     {
-        let base = std::env::var_os("TMPDIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        base.join("dwoagent.sock").to_string_lossy().into_owned()
+        daemon_base()
+            .join("dwoagent.sock")
+            .to_string_lossy()
+            .into_owned()
     }
+}
+
+#[cfg(unix)]
+fn daemon_base() -> std::path::PathBuf {
+    std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Lock file that keeps a single daemon per user, on the endpoint's base.
+pub fn instance_lock_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::temp_dir().join("dwoagent.lock")
+    }
+    #[cfg(unix)]
+    {
+        daemon_base().join("dwoagent.lock")
+    }
+}
+
+/// Kernel lock: released on process exit, so it never goes stale.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    pub fn acquire() -> Result<Self> {
+        Self::acquire_at(&instance_lock_path())
+    }
+
+    pub fn acquire_at(path: &Path) -> Result<Self> {
+        let file = open_lock_file(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => bail!(
+                "another dwoagent daemon is already running (lock {}); stop it with `dwo daemon stop` or terminate that process",
+                path.display()
+            ),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("lock daemon instance {}", path.display()))
+            }
+        }
+    }
+
+    pub fn held() -> bool {
+        Self::held_at(&instance_lock_path())
+    }
+
+    pub fn held_at(path: &Path) -> bool {
+        let Ok(file) = open_lock_file(path) else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(_)) => false,
+        }
+    }
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
 }
 
 pub async fn serve(host: Arc<Host>, config_path: &Path) -> Result<()> {
@@ -615,5 +689,26 @@ model:
         let _ = server_task.await;
         host.shutdown_token().cancel();
         host.shutdown().await;
+    }
+
+    #[test]
+    fn instance_lock_rejects_a_second_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dwoagent.lock");
+
+        let first = InstanceLock::acquire_at(&path).unwrap();
+        assert!(InstanceLock::held_at(&path));
+        let error = InstanceLock::acquire_at(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("already running"),
+            "unexpected error: {error}"
+        );
+
+        drop(first);
+        assert!(!InstanceLock::held_at(&path));
+        let second = InstanceLock::acquire_at(&path).unwrap();
+        assert!(InstanceLock::held_at(&path));
+        drop(second);
+        assert!(!InstanceLock::held_at(&path));
     }
 }

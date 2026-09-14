@@ -45,6 +45,7 @@ pub struct Host {
     projects: Arc<ProjectService>,
     channels: RwLock<Arc<ChannelManager>>,
     profile_root: PathBuf,
+    runtime_protection: dwo_file_guard::Protection,
     config_manager: ConfigManager,
     profile: RwLock<RuntimeProfile>,
     profile_reload: tokio::sync::Mutex<()>,
@@ -229,6 +230,26 @@ pub(crate) struct ConfigSnapshot {
 impl Host {
     pub async fn build(config_path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let profile_root = profile_root(config_path.as_ref())?;
+        let runtime_protection = dwo_file_guard::Protection::install(
+            &profile_root,
+            &["runtime"],
+            &[
+                dwo_file_guard::Skip::Directory("workspaces"),
+                dwo_file_guard::Skip::Directory("workspace"),
+                dwo_file_guard::Skip::File("AGENTS.md"),
+                dwo_file_guard::Skip::File("overview.md"),
+                dwo_file_guard::Skip::Extension("log"),
+                dwo_file_guard::Skip::Extension("tmp"),
+            ],
+        );
+        let protection = runtime_protection.report();
+        tracing::info!(
+            event = "runtime.protection_installed",
+            capability = ?dwo_file_guard::capability(),
+            guarded = protection.guarded,
+            failed = protection.failed,
+            "runtime file protection installed"
+        );
         let config_manager = ConfigManager::new(profile_root.clone());
         let mcp = Arc::new(McpRuntime::new(&profile_root));
         mcp.sync_and_start().await?;
@@ -323,6 +344,7 @@ impl Host {
             projects,
             channels: RwLock::new(channels),
             profile_root: profile_root.clone(),
+            runtime_protection,
             config_manager,
             profile: RwLock::new(runtime_profile),
             profile_reload: tokio::sync::Mutex::new(()),
@@ -348,6 +370,7 @@ impl Host {
             self.mcp.shutdown(),
             self.service.shutdown()
         );
+        self.runtime_protection.release();
     }
 
     async fn handle_method(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {

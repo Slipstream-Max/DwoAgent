@@ -15,6 +15,8 @@ pub async fn write(path: &Path, contents: impl Into<Vec<u8>>) -> Result<()> {
 }
 
 pub fn write_sync(path: &Path, contents: &[u8]) -> Result<()> {
+    // Release the guard for the replace; the permit re-arms it when it drops.
+    let _permit = dwo_file_guard::permit_file(path);
     let parent = path
         .parent()
         .with_context(|| format!("{} has no parent directory", path.display()))?;

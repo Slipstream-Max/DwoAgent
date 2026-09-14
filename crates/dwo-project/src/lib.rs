@@ -998,9 +998,11 @@ fn recover_archive(root: &Path) -> Result<()> {
     if let Some(id) = transaction.removed {
         let path = root.join(id).join("project.json");
         if path.exists() {
+            let _permit = dwo_file_guard::permit_file(&path);
             fs::remove_file(&path).map_err(|source| ProjectError::Io { path, source })?;
         }
     }
+    let _permit = dwo_file_guard::permit_file(&journal);
     fs::remove_file(&journal).map_err(|source| ProjectError::Io {
         path: journal,
         source,
@@ -1258,6 +1260,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
+    let _permit = dwo_file_guard::permit_file(path);
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, bytes).map_err(|source| ProjectError::Io {
         path: temporary.clone(),

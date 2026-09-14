@@ -12,6 +12,18 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         config_path = %config_path.display(),
         "daemon starting"
     );
+    // Take the daemon lock before anything touches profile state.
+    let _instance = match dwo_ipc::InstanceLock::acquire() {
+        Ok(instance) => instance,
+        Err(error) => {
+            tracing::error!(
+                event = "daemon.instance_locked",
+                error = %format!("{error:#}"),
+                "another daemon already owns this profile"
+            );
+            return Err(error);
+        }
+    };
     let result = async {
         let host = dwo_host::Host::build(&config_path).await?;
         tracing::info!(

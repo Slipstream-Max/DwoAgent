@@ -247,6 +247,39 @@ Project 和 Session 文件的完整字段见 [Project 文件与行为](projects.
 [Session 与子 Agent](session.md)。上下文压缩只重建 model_context.json，不会删除完整
 client_transcript.jsonl。
 
+## 运行期保护与单实例
+
+daemon 运行期间会锁住 runtime 目录里的状态文件：外部程序可以读，但对这些文件的写入、删除和改名
+会被拒绝（Windows 报 "file in use"，os error 32）。要修改它们先停服务（`dwo daemon stop`）。
+锁由内核在进程退出时释放，不会残留，崩溃后也不用手动清理。
+
+可以随时修改的路径：
+
+| 路径 | 说明 |
+| --- | --- |
+| profile.yaml、resource/** | Profile、Prompt、Skill、Model List、MCP 配置 |
+| runtime/projects/<id>/AGENTS.md、topics/<id>/AGENTS.md、topics/<id>/overview.md | Project 与 Topic 规则文件，保持运行期可编辑 |
+| runtime/workspaces/**、runtime/projects/<id>/workspace/** | Session 与 Project 的工作目录 |
+| runtime/*.log、*.tmp | 部署脚本日志与崩溃残留的临时文件 |
+
+其余 runtime 状态（sessions/**、projects 下的 project.json 与 automation、websocket/secret.yaml、
+attachments/**）在运行期受保护。daemon 自己的写入通过临时释放句柄完成，不受影响；本次运行新建的
+会话文件在第一次写入后自动纳入保护。
+
+平台差异：只有 Windows 提供内核级强制（共享模式句柄）。Linux 和 macOS 没有等价机制（`flock` 只是
+咨询锁，rename 可以覆盖只读文件），保护在那些平台是显式空操作；daemon 在那里本来也不会因为文件被
+外部打开而失败。
+
+### 单实例
+
+IPC 端点是用户级的（`\\.\pipe\dwoagent` 或 `$TMPDIR/dwoagent.sock`），daemon 因此按用户单实例：
+
+- 启动时在 `<临时目录>/dwoagent.lock` 上取内核锁；已有 daemon 时新进程直接报错退出，不读写任何状态。
+- 锁随进程退出、崩溃或被杀自动释放，没有需要手动清理的陈旧锁。
+- `dwo daemon start` 会先探测：已有 daemon 时提示 already running；旧进程不响应 IPC 时提示用
+  `dwo daemon stop` 或结束该进程。
+- `dwo daemon stop` 与 `dwo uninstall --purge` 会等到锁释放（进程退出）后再返回或删除 profile。
+
 ## 热加载与校验
 
 daemon 监视 Profile、Prompt、Skill、Model List、MCP 和规则文件。可热加载的配置会在完整校验

@@ -8,6 +8,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+dwo-file-guard = { path = "../dwo-file-guard" }
 dwo-tools = { path = "../dwo-tools" }
 dwo-context = { path = "../dwo-context" }
 dwo-model-client = { path = "../dwo-model-client" }

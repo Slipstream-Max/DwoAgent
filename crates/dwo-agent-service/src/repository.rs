@@ -278,6 +278,7 @@ impl FsSessionRepository {
 
     async fn ensure_transcript(session_dir: &Path) -> Result<()> {
         let path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
+        let _permit = dwo_file_guard::permit_file(&path);
         if !tokio::fs::try_exists(&path).await? {
             tokio::fs::write(path, []).await?;
         }
@@ -351,6 +352,7 @@ impl SessionRepository for FsSessionRepository {
         let Some(session_dir) = self.find_dir(id).await else {
             return Ok(false);
         };
+        dwo_file_guard::release_tree(&session_dir);
         tokio::fs::remove_dir_all(&session_dir).await?;
         self.remove_empty_date_directories(&session_dir).await?;
         self.paths.write().await.remove(id);
@@ -371,6 +373,7 @@ impl SessionRepository for FsSessionRepository {
         let path = session_dir.join(SESSION_CLIENT_TRANSCRIPT_FILE);
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
+        let _permit = dwo_file_guard::permit_file(&path);
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -417,6 +420,7 @@ impl SessionRepository for FsSessionRepository {
                         error = %error,
                         "truncate incomplete final transcript record"
                     );
+                    let _permit = dwo_file_guard::permit_file(&path);
                     tokio::fs::OpenOptions::new()
                         .write(true)
                         .open(&path)

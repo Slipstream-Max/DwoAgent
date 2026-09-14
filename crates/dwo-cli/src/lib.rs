@@ -545,6 +545,7 @@ where
             if purge {
                 let root = config_path.parent().context("config path has no parent")?;
                 if root.exists() {
+                    wait_for_daemon_exit().await?;
                     std::fs::remove_dir_all(root)?;
                 }
             }
@@ -561,6 +562,10 @@ where
             DaemonCommand::Stop => {
                 ipc::request_dwo(&config_path, "daemon.shutdown", json!({})).await?;
                 output::line(format_args!("Stopping dwoagent daemon"))?;
+                wait_for_daemon_exit().await?;
+                output::line(format_args!(
+                    "dwoagent daemon stopped, runtime files unlocked"
+                ))?;
             }
             DaemonCommand::Status => {
                 let status = ipc::request_dwo(&config_path, "daemon.status", json!({})).await?;
@@ -1581,6 +1586,12 @@ async fn daemon_start(config_path: &Path) -> Result<()> {
         output::line(format_args!("dwoagent daemon is already running"))?;
         return Ok(());
     }
+    if ipc::InstanceLock::held() {
+        bail!(
+            "another dwoagent daemon process is already running (lock {}); stop it with `dwo daemon stop` or terminate it, then retry",
+            ipc::instance_lock_path().display()
+        );
+    }
     if !start_registered_service()? {
         let executable = std::env::current_exe()?;
         let mut command = ProcessCommand::new(executable);
@@ -1610,6 +1621,23 @@ async fn daemon_start(config_path: &Path) -> Result<()> {
     bail!("daemon process started but did not become healthy")
 }
 
+const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits until the daemon process exits and releases its instance lock.
+async fn wait_for_daemon_exit() -> Result<()> {
+    let deadline = tokio::time::Instant::now() + DAEMON_STOP_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if !ipc::InstanceLock::held() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!(
+        "the dwoagent daemon did not stop within {}s; runtime files stay locked",
+        DAEMON_STOP_TIMEOUT.as_secs()
+    )
+}
+
 async fn stop_daemon_for_upgrade(config_path: &Path) -> Result<bool> {
     if ipc::request_dwo(config_path, "daemon.status", json!({}))
         .await
@@ -1623,6 +1651,7 @@ async fn stop_daemon_for_upgrade(config_path: &Path) -> Result<bool> {
         if ipc::request_dwo(config_path, "daemon.status", json!({}))
             .await
             .is_err()
+            && !ipc::InstanceLock::held()
         {
             return Ok(true);
         }

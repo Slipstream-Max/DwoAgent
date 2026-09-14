@@ -345,10 +345,14 @@ mod tests {
     #[tokio::test]
     async fn output_larger_than_the_pty_channel_does_not_stall() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        // niubash/winuxcmd does not emulate /dev/zero, and the failing open
+        // used to leave the pipeline hanging inside a live PTY; build the
+        // burst with printf padding instead. It still far exceeds the PTY
+        // channel, the output hard cap, and the model-facing cap.
         let snapshot = manager
             .run(
-                "head -c 1200000 /dev/zero | tr '\\0' x; printf 'END-MARKER'".to_string(),
-                15_000,
+                "printf '%1200000s' '' | tr ' ' x; printf 'END-MARKER'".to_string(),
+                30_000,
                 120_000,
             )
             .await
@@ -506,7 +510,24 @@ mod tests {
 
     #[tokio::test]
     async fn pty_input_reaches_the_process() {
-        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        // Niubash shows a first-start setup wizard when $HOME/.niubashrc is
+        // missing; the wizard would swallow the interactive input below, so
+        // give the shell a throwaway home that already has an rc file.
+        #[cfg(windows)]
+        let (_home, environment) = {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join(".niubashrc"), "").unwrap();
+            let path = home.path().to_string_lossy().into_owned();
+            let mut environment = std::collections::HashMap::new();
+            environment.insert("HOME".to_string(), path.clone());
+            environment.insert("USERPROFILE".to_string(), path);
+            (home, environment)
+        };
+        #[cfg(not(windows))]
+        let environment = std::collections::HashMap::new();
+        let manager =
+            TerminalManager::new_with_environment(std::env::current_dir().unwrap(), environment)
+                .unwrap();
         // The octal printf keeps the literal "PTY-OK" out of the tty echo of
         // the input line, so only the child executing it can satisfy the
         // assertion.

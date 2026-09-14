@@ -28,6 +28,11 @@ model:
             if cfg!(windows) { "USERPROFILE" } else { "HOME" },
             profile.path(),
         )
+        // The daemon instance lock lives in the platform temp directory on
+        // Windows; keep it inside the throwaway profile as well so a daemon
+        // that is already running for the real user cannot fail this test.
+        .env("TMP", profile.path())
+        .env("TEMP", profile.path())
         .env_remove("DWO_LOG")
         .output()
         .unwrap();

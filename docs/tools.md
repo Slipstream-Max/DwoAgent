@@ -18,9 +18,8 @@ MCP Server 的配置见 [Prompt、Skill 与 MCP](resources.md#mcp)。
 返回给模型的结果最多 20,000 UTF-8 字节。timeout_ms 限制新终端的总时长，yield_ms 限制每次
 等待输出的时间。
 
-命令由统一的 shell 包装执行并强制 UTF-8 输出：Windows 上优先使用检测到的 Git Bash
-（注册表 `GitForWindows\InstallPath`、PATH 上的 git.exe、常见安装目录），未安装时回退
-cmd.exe（`chcp 65001`）；Unix 使用 `sh`。环境快照中的 `shell` 字段与实际使用的 shell 一致。
+命令由统一的 shell 包装执行并强制 UTF-8 输出：Windows 只使用安装阶段准备好的
+niubash（`niu.exe`）；Unix 使用 `sh`。环境快照中的 `shell` 字段与实际使用的 shell 一致。
 
 ## read_file
 

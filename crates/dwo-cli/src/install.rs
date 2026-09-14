@@ -12,12 +12,17 @@ use super::home_dir;
 pub(super) fn install(config_path: &Path) -> Result<()> {
     let root = config_path.parent().context("config path has no parent")?;
     let executable = install_executable(root)?;
+    #[cfg(windows)]
+    install_windows_self_tools(root)?;
     expose_executable(root.join("bin"))?;
     std::fs::create_dir_all(root.join("resource/prompts"))?;
     std::fs::create_dir_all(root.join("resource/skills"))?;
     std::fs::create_dir_all(root.join("runtime/sessions"))?;
     std::fs::create_dir_all(root.join("resource/mcp"))?;
     std::fs::create_dir_all(root.join("channels"))?;
+    // Bundled runtime dependencies (niubash and Git) live here, separate
+    // from dwo's own executable and resource directories.
+    std::fs::create_dir_all(root.join("self-tools"))?;
     write_if_missing(config_path, DEFAULT_PROFILE)?;
     write_if_missing(
         &root.join("resource/prompts/System.md"),
@@ -29,6 +34,94 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
         "{\n  \"mcpServers\": {}\n}\n",
     )?;
     register_service(config_path, &executable)
+}
+
+#[cfg(windows)]
+fn install_windows_self_tools(root: &Path) -> Result<()> {
+    let tools = root.join("self-tools");
+    std::fs::create_dir_all(&tools)?;
+    let (niu_asset, niu_hash, git_asset, git_hash) = if cfg!(target_arch = "aarch64") {
+        (
+            "niubash-win-arm64.zip",
+            "44736de66acdd4daaab21c64a3f4f09d7ed7d69a780acea7d8364e5a0a307eb8",
+            "MinGit-2.55.0.5-arm64.zip",
+            "05843f9d6e60306c3ab886799e2c67200caab921571f10512df3493049179ddb",
+        )
+    } else {
+        (
+            "niubash-win-x64.zip",
+            "d08b525f17251792bba0e6ad82b3829084cf158774072573029dd89344992d71",
+            "MinGit-2.55.0.5-64-bit.zip",
+            "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e",
+        )
+    };
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$tools = $env:DWO_SELF_TOOLS
+$niuDir = Join-Path $tools 'niubash'
+$gitDir = Join-Path $tools 'git'
+$niuZip = Join-Path $env:TEMP 'dwo-niubash.zip'
+$gitZip = Join-Path $env:TEMP 'dwo-mingit.zip'
+
+function Install-Zip($url, $hash, $zip, $destination, $required) {
+  $existing = Get-ChildItem -LiteralPath $destination -Recurse -Filter $required -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -ne $existing) {
+    if ($existing.DirectoryName -ne $destination) {
+      Get-ChildItem -LiteralPath $existing.DirectoryName -Force | Move-Item -Destination $destination -Force
+      Remove-Item -LiteralPath $existing.DirectoryName -Recurse -Force
+    }
+    return
+  }
+  New-Item -ItemType Directory -Force -Path $destination | Out-Null
+  & curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 --silent --show-error $url --output $zip
+  if ($LASTEXITCODE -ne 0) { throw "download failed for $url" }
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try { $actual = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($zip)))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+  if ($actual -ne $hash) {
+    Remove-Item -Force -LiteralPath $zip
+    throw "checksum mismatch for $url"
+  }
+  Expand-Archive -LiteralPath $zip -DestinationPath $destination -Force
+  Remove-Item -Force -LiteralPath $zip
+  # GitHub archives contain one versioned top-level directory. Flatten it so
+  # runtime PATH entries remain stable across upgrades.
+  $top = Get-ChildItem -LiteralPath $destination -Directory | Select-Object -First 1
+  if ($null -ne $top -and $null -eq (Get-ChildItem -LiteralPath $destination -Filter $required -File -ErrorAction SilentlyContinue)) {
+    Get-ChildItem -LiteralPath $top.FullName -Force | Move-Item -Destination $destination -Force
+    Remove-Item -LiteralPath $top.FullName -Recurse -Force
+  }
+  $installed = Get-ChildItem -LiteralPath $destination -Recurse -Filter $required -File | Select-Object -First 1
+  if ($null -eq $installed) { throw "archive did not contain $required" }
+}
+
+# Reuse applications already installed on the user's PATH. Bundled copies
+# are only needed when the host machine has no usable dependency.
+if ($null -eq (Get-Command niu.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+  Install-Zip $env:DWO_NIU_URL $env:DWO_NIU_HASH $niuZip $niuDir 'niu.exe'
+}
+if ($null -eq (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+  Install-Zip $env:DWO_GIT_URL $env:DWO_GIT_HASH $gitZip $gitDir 'git.exe'
+}
+"#;
+    let status = ProcessCommand::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .env("DWO_SELF_TOOLS", &tools)
+        .env(
+            "DWO_NIU_URL",
+            format!("https://github.com/unixwin/niubash/releases/download/v1.1.0/{niu_asset}"),
+        )
+        .env("DWO_NIU_HASH", niu_hash)
+        .env(
+            "DWO_GIT_URL",
+            format!("https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/{git_asset}"),
+        )
+        .env("DWO_GIT_HASH", git_hash)
+        .status()
+        .context("download Windows self-tools")?;
+    if !status.success() {
+        bail!("failed to install niubash and Git into {}", tools.display());
+    }
+    Ok(())
 }
 
 fn install_executable(root: &Path) -> Result<PathBuf> {

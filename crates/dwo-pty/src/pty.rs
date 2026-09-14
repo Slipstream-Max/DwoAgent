@@ -159,8 +159,11 @@ async fn spawn_process_portable(
     let killer = child.clone_killer();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
+    // The reader must never block behind the session/model consumer. A
+    // bounded queue can stall the blocking PTY read during output bursts,
+    // which is especially easy to hit with ConPTY at process exit.
+    let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (_stderr_tx, stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut reader = pair.master.try_clone_reader()?;
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
@@ -168,7 +171,7 @@ async fn spawn_process_portable(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+                    let _ = stdout_tx.send(buf[..n].to_vec());
                 }
                 Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
@@ -314,8 +317,10 @@ async fn spawn_process_unix(
     let process_group_id = child.id();
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
-    let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
+    // Keep the PTY reader independent from downstream output processing so a
+    // large burst cannot apply backpressure and lose the tail on exit.
+    let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (_stderr_tx, stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut reader = master.try_clone()?;
     let reader_cancel = Arc::new(AtomicBool::new(false));
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking({
@@ -347,7 +352,7 @@ async fn spawn_process_unix(
                 match std::io::Read::read(&mut reader, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let _ = stdout_tx.blocking_send(buf[..n].to_vec());
+                        let _ = stdout_tx.send(buf[..n].to_vec());
                     }
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,

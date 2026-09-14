@@ -24,7 +24,19 @@ fn merge_windows_path(environment: &mut HashMap<String, String>) {
         .map(|path| expand_windows_percent_variables(&path, environment));
     let machine = registry_path(RegKey::predef(HKEY_LOCAL_MACHINE))
         .map(|path| expand_windows_percent_variables(&path, environment));
-    if let Some(path) = merge_path_values([current, user, machine]) {
+    let self_tools = std::env::var_os("USERPROFILE")
+        .map(|profile| {
+            let root = std::path::PathBuf::from(profile)
+                .join(".dwoagent")
+                .join("self-tools");
+            let niubash = root.join("niubash");
+            let git = root.join("git").join("cmd");
+            std::env::join_paths([niubash, git])
+                .ok()
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .flatten();
+    if let Some(path) = merge_path_values([current, user, machine, self_tools]) {
         set_environment_value(environment, "PATH", path);
     }
 }

@@ -114,7 +114,7 @@ async fn bytes<const N: usize>(path: &Path, args: [&str; N]) -> Result<Vec<u8>> 
 }
 
 async fn run(cwd: Option<&Path>, args: Vec<OsString>) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_program());
     if let Some(cwd) = cwd {
         command.arg("-C").arg(dunce::simplified(cwd));
     }
@@ -131,4 +131,22 @@ async fn run(cwd: Option<&Path>, args: Vec<OsString>) -> Result<Vec<u8>> {
         );
     }
     Ok(output.stdout)
+}
+
+fn git_program() -> OsString {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let bundled = PathBuf::from(profile)
+                .join(".dwoagent")
+                .join("self-tools")
+                .join("git")
+                .join("cmd")
+                .join("git.exe");
+            if bundled.is_file() {
+                return bundled.into_os_string();
+            }
+        }
+    }
+    OsString::from("git")
 }

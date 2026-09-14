@@ -13,8 +13,8 @@ pub(crate) struct PtyProcess {
 
 pub(crate) struct SpawnedPty {
     pub process: PtyProcess,
-    pub stdout_rx: mpsc::Receiver<Vec<u8>>,
-    pub stderr_rx: mpsc::Receiver<Vec<u8>>,
+    pub stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub stderr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub exit_rx: oneshot::Receiver<i32>,
 }
 
@@ -106,32 +106,18 @@ fn shell_invocation(command: &str) -> ShellInvocation {
 
 #[cfg(windows)]
 fn windows_shell_invocation(command: &str) -> ShellInvocation {
-    // UTF-8 end to end: chcp switches the console codepage so native
-    // children's byte output decodes correctly through ConPTY, and the locale
-    // variables keep MSYS tools on UTF-8 even when the daemon inherited none.
+    // Keep the shell and native children on UTF-8 even when the daemon
+    // inherited no locale settings.
     let utf8_environment = vec![
         ("LANG".to_string(), "C.UTF-8".to_string()),
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
     ];
     match dwo_context::shell::Shell::detect() {
-        dwo_context::shell::Shell::GitBash(program) => ShellInvocation {
+        dwo_context::shell::Shell::NiuBash(program) => ShellInvocation {
             program: program.display().to_string(),
-            args: vec![
-                "-c".to_string(),
-                format!("chcp.com 65001 >/dev/null 2>&1;{command}"),
-            ],
+            args: vec!["-c".to_string(), command.to_string()],
             environment: utf8_environment,
         },
-        // Fallback when Git Bash is not installed.
-        _ => ShellInvocation {
-            program: "cmd.exe".to_string(),
-            args: vec![
-                "/d".to_string(),
-                "/s".to_string(),
-                "/c".to_string(),
-                format!("chcp 65001 >nul & {command}"),
-            ],
-            environment: utf8_environment,
-        },
+        dwo_context::shell::Shell::Sh => unreachable!("Windows shell detection returned sh"),
     }
 }

@@ -303,7 +303,7 @@ fn resize_raw_pty(raw_fd: RawFd, size: TerminalSize) -> anyhow::Result<()> {
 #[derive(Debug)]
 pub struct SpawnedProcess {
     pub session: ProcessHandle,
-    pub stdout_rx: mpsc::Receiver<Vec<u8>>,
-    pub stderr_rx: mpsc::Receiver<Vec<u8>>,
+    pub stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub stderr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     pub exit_rx: oneshot::Receiver<i32>,
 }

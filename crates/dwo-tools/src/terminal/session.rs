@@ -243,8 +243,8 @@ impl TerminalSession {
 
 fn spawn_pump(
     session: Arc<TerminalSession>,
-    mut stdout_rx: mpsc::Receiver<Vec<u8>>,
-    mut stderr_rx: mpsc::Receiver<Vec<u8>>,
+    mut stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut stderr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut exit_rx: oneshot::Receiver<i32>,
 ) {
     tokio::spawn(async move {

@@ -110,8 +110,8 @@ impl TerminalManager {
         environment: HashMap<String, String>,
     ) -> Result<Self> {
         // dunce strips the Windows verbatim prefix (`\\?\`) that
-        // std::fs::canonicalize always adds; children (notably cmd.exe)
-        // cannot use verbatim/UNC paths as their working directory.
+        // std::fs::canonicalize always adds; native Windows children cannot
+        // use verbatim/UNC paths as their working directory.
         let base_cwd = dunce::canonicalize(base_cwd.into())?;
         Ok(Self {
             base_cwd,
@@ -320,23 +320,8 @@ mod tests {
         "printf 'done\\n'"
     }
 
-    /// The tests below use POSIX syntax; only the cmd.exe fallback cannot run
-    /// them, and Git Bash is the supported Windows shell.
-    #[cfg(windows)]
-    fn windows_cmd_fallback() -> bool {
-        !matches!(Shell::detect(), Shell::GitBash(_))
-    }
-
-    #[cfg(not(windows))]
-    fn windows_cmd_fallback() -> bool {
-        false
-    }
-
     #[tokio::test]
     async fn run_returns_output_and_status() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
             .run(output_command().to_string(), 5_000, 120_000)
@@ -348,9 +333,6 @@ mod tests {
 
     #[tokio::test]
     async fn exit_drains_output_without_a_trailing_newline() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
             .run("printf 'tail-without-newline'".to_string(), 5_000, 120_000)
@@ -362,9 +344,6 @@ mod tests {
 
     #[tokio::test]
     async fn output_larger_than_the_pty_channel_does_not_stall() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
             .run(
@@ -407,9 +386,6 @@ mod tests {
 
     #[tokio::test]
     async fn combined_commands_keep_all_output() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         // Table rendering (screen-buffer API) used to be dropped when the
         // shell wrapper appended `; exit`; every later command's output was
@@ -493,9 +469,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_input_polls_incrementally() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let first = manager
             .run(
@@ -514,9 +487,6 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_terminal_initializes_every_encoding_as_utf8() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
             .run(
@@ -542,11 +512,11 @@ mod tests {
         // assertion.
         let (command, input) = if cfg!(windows) {
             match Shell::detect() {
-                Shell::GitBash(program) => (
+                Shell::NiuBash(program) => (
                     format!("\"{}\" -i", program.to_string_lossy().replace('\\', "/")),
                     "printf '\\120\\124\\131\\055\\117\\113\\n'\n".to_string(),
                 ),
-                _ => ("cmd.exe /q /k".to_string(), "echo PTY-OK\n".to_string()),
+                Shell::Sh => unreachable!("Windows shell detection returned sh"),
             }
         } else {
             (
@@ -583,9 +553,6 @@ mod tests {
 
     #[tokio::test]
     async fn kill_returns_cancelled_and_drains_output() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let started = manager
             .run(
@@ -602,9 +569,6 @@ mod tests {
 
     #[tokio::test]
     async fn list_does_not_consume_unread_output() {
-        if windows_cmd_fallback() {
-            return;
-        }
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let started = manager
             .run("sleep 0.5; printf 'later\\n'".to_string(), 100, 120_000)

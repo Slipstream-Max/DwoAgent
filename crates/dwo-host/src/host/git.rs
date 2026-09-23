@@ -100,6 +100,19 @@ pub async fn create_worktree(
     worktree_status(path).await
 }
 
+pub async fn remove_worktree(repository: &Path, path: &Path) -> Result<()> {
+    run(
+        Some(repository),
+        vec![
+            "worktree".into(),
+            "remove".into(),
+            dunce::simplified(path).as_os_str().to_owned(),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn text<const N: usize>(path: &Path, args: [&str; N]) -> Result<String> {
     let output = bytes(path, args).await?;
     Ok(String::from_utf8(output)?.trim().to_string())

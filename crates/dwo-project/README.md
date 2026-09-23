@@ -1,21 +1,11 @@
 # dwo-project
 
-Filesystem-backed Project and Board domain for DwoAgent.
+Project metadata storage. A project has an absolute `pwd`, a name, sections with stable IDs and colors, session assignments, and optional Git repository/worktree registrations.
 
-The crate owns Project metadata, Sections, Topics, Labels, Topic Markdown, and
-opaque Session/Task ID associations. A shared Project has one required `pwd`
-and optional repository/worktrees; an independent Project has none of those.
-Session workspace bindings belong to SessionService, not ProjectService. The
-Project directory contains metadata rather than working files. This crate does
-not depend on SessionService, Automation, Host, or transport types.
+Every project starts with a default section. Sessions assigned to a project always belong to a section. `session.json` does not contain project, section, or worktree IDs.
 
-```text
-ProjectService
-|- Project { id, name, kind, optional pwd/repository/worktrees, board }
-|- Section CRUD and ordering
-|- Topic CRUD, movement, Markdown, and ordering
-|- Label CRUD and assignment
-`- Topic-owned Session and Task references
-```
+`ProjectService` persists `runtime/projects/<project-id>/project.json`. It does not create sessions, execute Git commands, or run automations. The host coordinates those operations.
 
-Cross-domain validation and detail composition remain in `dwo-host`.
+Project rules read and write `<pwd>/AGENTS.md`; the session's normal rule discovery loads that file. There is no separate project rule injection.
+
+Automation configuration is owned by the host automation module in `runtime/automations/<project-id>/config.yaml`, or `runtime/automations/global/config.yaml` for jobs without a project.

@@ -8,7 +8,6 @@ use dwo_agent_service::{
     FsSessionRepository, LoadedAgentProfile, SessionConfig, SessionId, SessionLlmSettings,
     SessionService, SessionWorkspace,
 };
-use dwo_context::ExternalRuleFile;
 use dwo_mcp::McpRuntime;
 use dwo_project::ProjectService;
 use dwo_protocol::ReasoningOption;
@@ -31,6 +30,7 @@ mod model_api;
 mod project_api;
 mod prompt_api;
 pub(crate) mod session_api;
+pub(crate) mod session_manager;
 mod skill_api;
 mod websocket_api;
 use config_manager::ConfigManager;
@@ -39,6 +39,7 @@ pub use websocket_api::WebsocketRuntime;
 
 pub struct Host {
     service: Arc<SessionService>,
+    sessions: Arc<session_manager::SessionManager>,
     pub channel_gateway: Arc<ChannelGateway>,
     pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
@@ -60,12 +61,13 @@ pub struct HostSessionOptions {
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,
     pub project_id: Option<String>,
-    pub topic_id: Option<String>,
+    pub section_id: Option<String>,
     pub worktree_id: Option<String>,
     pub from: Option<SessionId>,
     pub parent_session_id: Option<SessionId>,
     pub mode: Option<SessionMode>,
-    pub llm: Option<SessionLlmSettings>,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
     pub ephemeral: bool,
 }
 
@@ -178,8 +180,6 @@ pub(crate) struct ConfigUpdateParam {
     external_skills_dirs: Option<Vec<PathBuf>>,
     #[serde(default)]
     external_rule_files: Option<Vec<PathBuf>>,
-    #[serde(default)]
-    project_ops: Option<dwo_agent_service::ProjectOpPolicy>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -226,7 +226,6 @@ pub(crate) struct ConfigSnapshot {
     default_reasoning: Option<String>,
     models: Vec<SessionModelOption>,
     max_model_steps: usize,
-    project_ops: dwo_agent_service::ProjectOpPolicy,
     session_count: usize,
 }
 
@@ -262,11 +261,10 @@ impl Host {
         let runtime_profile = RuntimeProfile::from_loaded(source, &profile);
         let (default_model, default_reasoning, default_mode) = runtime_profile.defaults();
         let projects = Arc::new(ProjectService::open(profile_root.join("runtime/projects"))?);
-        let resolver_projects = projects.clone();
         let resolver_root = profile_root.clone();
         let workspace_resolver = Arc::new(
             move |session_id: &SessionId, workspace: &SessionWorkspace| {
-                resolve_workspace_path(&resolver_root, &resolver_projects, session_id, workspace)
+                resolve_workspace_path(&resolver_root, session_id, workspace)
             },
         );
         let repository =
@@ -283,7 +281,7 @@ impl Host {
         let cleanup_projects = projects.clone();
         let cleanup_root = profile_root.clone();
         service.set_deletion_hook(Arc::new(move |session_id, workspace| {
-            if let Err(error) = cleanup_projects.unassign_session_everywhere(session_id.as_str()) {
+            if let Err(error) = cleanup_projects.unassign_session(session_id.as_str()) {
                 tracing::error!(
                     event = "session.project_cleanup_failed",
                     session_id = %session_id,
@@ -305,42 +303,23 @@ impl Host {
                 }
             }
         }));
-        for project in projects.list() {
-            for topic in &project.board.topics {
-                for session_id in &topic.session_ids {
-                    let session_id =
-                        SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
-                    let Ok(snapshot) = service.snapshot(&session_id).await else {
-                        continue;
-                    };
-                    let rule_file = ExternalRuleFile::new(
-                        projects.agents_path(&project.id, &topic.id)?,
-                        snapshot.record.info.cwd.clone(),
-                    );
-                    service.set_external_rule_files(
-                        &session_id,
-                        vec![
-                            ExternalRuleFile::new(
-                                projects.project_rule_path(&project.id)?,
-                                snapshot.record.info.cwd,
-                            ),
-                            rule_file,
-                        ],
-                    );
-                }
-            }
-        }
-        let automation = AutomationRuntime::new(
+        let sessions = Arc::new(session_manager::SessionManager::new(
             service.clone(),
             projects.clone(),
             profile_root.clone(),
-            default_model.clone(),
-            default_reasoning,
+            SessionLlmSettings::new(default_model, default_reasoning),
             default_mode,
+        ));
+        let automation = AutomationRuntime::new(
+            service.clone(),
+            projects.clone(),
+            sessions.clone(),
+            profile_root.clone(),
             shutdown.clone(),
         )?;
         let host = Arc::new(Self {
             service,
+            sessions,
             channel_gateway: Arc::new(ChannelGateway::new()),
             mcp,
             automation,
@@ -421,7 +400,7 @@ impl Host {
                     "profile_root": self.profile_root,
                     "sessions": session_count,
                     "channels": self.channels().list().await?.len(),
-                    "automationJobs": self.automation.list(None).await.len(),
+                    "automationJobs": self.automation.job_count().await,
                 }))
             }
             "daemon.shutdown" => {
@@ -564,9 +543,10 @@ impl Host {
         let (default_model, default_reasoning, default_mode) = runtime_profile.defaults();
 
         self.service.apply_profile(loaded)?;
-        self.automation
-            .apply_defaults(default_model, default_reasoning, default_mode)
-            .await;
+        self.sessions.apply_defaults(
+            SessionLlmSettings::new(default_model, default_reasoning),
+            default_mode,
+        );
         crate::logging::reload(&runtime_profile.config.logging)?;
 
         if let Some(channels) = replacement_channels {
@@ -651,7 +631,6 @@ impl Host {
 
 fn resolve_workspace_path(
     profile_root: &Path,
-    _projects: &ProjectService,
     session_id: &SessionId,
     workspace: &SessionWorkspace,
 ) -> Result<PathBuf> {
@@ -757,4 +736,4 @@ pub fn profile_root(config_path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

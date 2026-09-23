@@ -14,6 +14,8 @@ pub enum SessionServiceError {
     PermissionNotFound(String),
     #[error("session is closed: {0}")]
     SessionClosed(SessionId),
+    #[error("archived session is read-only: {0}")]
+    SessionArchived(SessionId),
     #[error("session is being deleted: {0}")]
     SessionDeleting(SessionId),
     #[error("invalid session configuration: {0}")]

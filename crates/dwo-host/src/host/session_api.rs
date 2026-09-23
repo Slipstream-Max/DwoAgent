@@ -4,20 +4,18 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use dwo_agent_service::{
     EndpointId, NotificationLevel, PromptAccepted, SessionConfigUpdate, SessionEventPayload,
-    SessionId, SessionListQuery, SessionLlmSettings, SessionNotification, SessionService,
-    SessionSubscription, SessionUpdate, SessionWorkspace,
+    SessionId, SessionListQuery, SessionNotification, SessionService, SessionSubscription,
+    SessionUpdate,
 };
 use dwo_context::MessageContent;
 use dwo_tools::{ConfirmationDecision, SessionMode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::project_api::find_worktree;
-use super::{Host, HostSessionOptions, managed_workspace_path};
+use super::{Host, HostSessionOptions, session_manager::ensure_policy_ceiling};
 use dwo_command::{
     AvailableSkill, DirectiveKinds, directive_kinds, expand as expand_prompt_directives,
 };
-use dwo_project::ProjectKind;
 
 #[derive(Deserialize)]
 struct SessionIdParam {
@@ -29,7 +27,7 @@ struct NewSessionParam {
     title: Option<String>,
     cwd: Option<PathBuf>,
     project_id: Option<String>,
-    topic_id: Option<String>,
+    section_id: Option<String>,
     worktree_id: Option<String>,
     caller_session_id: Option<String>,
 }
@@ -42,6 +40,12 @@ struct ListSessionParam {
     cursor: Option<String>,
     limit: Option<usize>,
     cwd: Option<PathBuf>,
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    forked: bool,
+    #[serde(default)]
+    include_archived: bool,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +58,7 @@ pub(super) struct PromptParam {
     pub(super) title: Option<String>,
     pub(super) cwd: Option<PathBuf>,
     pub(super) project_id: Option<String>,
-    pub(super) topic_id: Option<String>,
+    pub(super) section_id: Option<String>,
     pub(super) policy: Option<SessionMode>,
     pub(super) model: Option<String>,
     pub(super) reasoning: Option<String>,
@@ -142,200 +146,24 @@ struct PermissionParam {
 
 impl Host {
     pub async fn create_session(&self, options: HostSessionOptions) -> Result<SessionId> {
-        let _lifecycle = self.automation.lifecycle.lock().await;
-        anyhow::ensure!(
-            options.project_id.is_none() || options.cwd.is_none(),
-            "cwd cannot be supplied with project_id"
-        );
-        anyhow::ensure!(
-            options.topic_id.is_none() || options.project_id.is_some(),
-            "topic_id requires project_id"
-        );
-        anyhow::ensure!(
-            options.from.is_none() || options.project_id.is_none(),
-            "project_id cannot be supplied when forking a session"
-        );
-        let is_fork = options.from.is_some();
-        let id = SessionId::new();
-        let source_snapshot = if let Some(source_id) = &options.from {
-            Some(self.service.snapshot(source_id).await?)
-        } else {
-            None
-        };
-        let (project, topic_id, workspace, cwd) = if let Some(project_id) = &options.project_id {
-            let project = self.projects.get(project_id)?;
-            let topic_id = options
-                .topic_id
-                .clone()
-                .unwrap_or_else(|| project.board.uncategorized_topic_id.clone());
-            anyhow::ensure!(
-                topic_id != dwo_project::ARCHIVE_TOPIC_ID,
-                "cannot create a session in Archive"
-            );
-            anyhow::ensure!(
-                project
-                    .board
-                    .topics
-                    .iter()
-                    .any(|topic| topic.id == topic_id),
-                "topic not found in project: {topic_id}"
-            );
-            let (workspace, cwd) = match (project.kind, options.worktree_id.as_ref()) {
-                (ProjectKind::Project, Some(worktree_id)) => {
-                    let worktree = find_worktree(&project, worktree_id)?;
-                    (
-                        SessionWorkspace::External {
-                            pwd: worktree.path.clone(),
-                        },
-                        worktree.path.clone(),
-                    )
-                }
-                (ProjectKind::Project, None) => (
-                    SessionWorkspace::External {
-                        pwd: project.pwd.clone().context("project is missing pwd")?,
-                    },
-                    project
-                        .pwd
-                        .clone()
-                        .context("shared project is missing pwd")?,
-                ),
-                (ProjectKind::Work, Some(_)) => {
-                    anyhow::bail!("independent projects cannot use worktrees")
-                }
-                (ProjectKind::Work, None) => (
-                    SessionWorkspace::Managed,
-                    managed_workspace_path(&self.profile_root, &id),
-                ),
-            };
-            (project, topic_id, workspace, cwd)
-        } else if let Some(source_id) = &options.from {
-            let (project, topic) = self
-                .projects
-                .locate_session(source_id.as_str())
-                .context("fork source is not assigned to a project")?;
-            let source = source_snapshot
-                .as_ref()
-                .context("fork source snapshot is unavailable")?;
-            let (workspace, cwd) = match project.kind {
-                ProjectKind::Project => (
-                    source.record.info.workspace.clone(),
-                    source.record.info.cwd.clone(),
-                ),
-                ProjectKind::Work => match &source.record.info.workspace {
-                    SessionWorkspace::Managed => (
-                        SessionWorkspace::Managed,
-                        managed_workspace_path(&self.profile_root, &id),
-                    ),
-                    SessionWorkspace::External { pwd } => {
-                        (SessionWorkspace::External { pwd: pwd.clone() }, pwd.clone())
-                    }
-                },
-            };
-            (project, topic.id, workspace, cwd)
-        } else if options.cwd.is_none()
-            && let Some(parent_id) = &options.parent_session_id
-        {
-            let (project, topic) = self
-                .projects
-                .locate_session(parent_id.as_str())
-                .context("parent session is not assigned to a project")?;
-            let (workspace, cwd) = match project.kind {
-                ProjectKind::Project => (
-                    SessionWorkspace::External {
-                        pwd: project.pwd.clone().context("project is missing pwd")?,
-                    },
-                    project.pwd.clone().context("project is missing pwd")?,
-                ),
-                ProjectKind::Work => (
-                    SessionWorkspace::Managed,
-                    managed_workspace_path(&self.profile_root, &id),
-                ),
-            };
-            (project, topic.id, workspace, cwd)
-        } else {
-            let cwd = options.cwd.clone().map(|cwd| {
-                if cwd.is_absolute() {
-                    cwd
-                } else {
-                    self.profile_root.join(cwd)
-                }
-            });
-            let project = self.projects.get_or_create_unassigned()?;
-            let topic_id = project.board.uncategorized_topic_id.clone();
-            let (workspace, cwd) = match cwd {
-                Some(pwd) => (SessionWorkspace::External { pwd: pwd.clone() }, pwd),
-                None => (
-                    SessionWorkspace::Managed,
-                    managed_workspace_path(&self.profile_root, &id),
-                ),
-            };
-            (project, topic_id, workspace, cwd)
-        };
-        let (default_model, default_reasoning, default_mode) = self
-            .profile
-            .read()
-            .expect("profile lock poisoned")
-            .defaults();
-        if workspace == SessionWorkspace::Managed {
-            if let Some(source) = &source_snapshot
-                && source.record.info.workspace == SessionWorkspace::Managed
-            {
-                copy_workspace(&source.record.info.cwd, &cwd)?;
-            } else {
-                std::fs::create_dir_all(&cwd)?;
-            }
-        }
-        let external_rule_files = vec![
-            dwo_context::ExternalRuleFile::new(
-                self.projects.project_rule_path(&project.id)?,
-                cwd.clone(),
-            ),
-            dwo_context::ExternalRuleFile::new(
-                self.projects.agents_path(&project.id, &topic_id)?,
-                cwd.clone(),
-            ),
-        ];
-        let create_result = self
-            .service
-            .create(dwo_agent_service::NewSession {
-                from: options.from,
-                id: Some(id.clone()),
-                parent_session_id: options.parent_session_id,
-                title: options.title,
-                workspace: Some(workspace.clone()),
-                cwd: Some(cwd.clone()),
-                external_rule_files,
-                mode: options.mode.or((!is_fork).then_some(default_mode)),
-                llm: options.llm.or_else(|| {
-                    (!is_fork).then(|| SessionLlmSettings::new(default_model, default_reasoning))
-                }),
-                ephemeral: options.ephemeral,
-            })
-            .await;
-        if let Err(error) = create_result {
-            if workspace == SessionWorkspace::Managed && cwd.is_dir() {
-                let _ = std::fs::remove_dir_all(&cwd);
-            }
-            return Err(error.into());
-        }
-        if let Err(error) = self
-            .projects
-            .assign_session(&project.id, &topic_id, id.to_string())
-        {
-            let _ = self.service.delete(&id).await;
-            return Err(error.into());
-        }
-        Ok(id)
+        self.sessions.create(options).await
     }
 
     pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
-        let _lifecycle = self.automation.lifecycle.lock().await;
+        let _lifecycle = self.sessions.lifecycle.lock().await;
         anyhow::ensure!(
-            self.projects.is_archived(id.as_str()),
-            "archive the session before deleting it from Work Archive"
+            self.service.is_archived(id).await?,
+            "archive the session before deleting it"
         );
         self.service.delete(id).await?;
         cleanup_deleted_session_resources(&self.profile_root, id).await?;
+        Ok(())
+    }
+
+    pub async fn archive_session(&self, id: &SessionId) -> Result<()> {
+        let _lifecycle = self.sessions.lifecycle.lock().await;
+        self.service.archive(id).await?;
+        self.projects.unassign_session(id.as_str())?;
         Ok(())
     }
 
@@ -371,6 +199,9 @@ impl Host {
                     .context("session list cursor must be a non-negative integer")?;
                 let mut query = SessionListQuery::new(cursor, params.limit);
                 query.cwd = params.cwd;
+                query.archived = params.archived;
+                query.forked_only = params.forked;
+                query.include_archived = params.include_archived;
                 if !params.all {
                     query.parent_session_id =
                         parse_optional_session(params.caller_session_id.clone())?;
@@ -421,7 +252,7 @@ impl Host {
                         title: params.title,
                         cwd: params.cwd,
                         project_id: params.project_id,
-                        topic_id: params.topic_id,
+                        section_id: params.section_id,
                         worktree_id: params.worktree_id,
                         parent_session_id: caller,
                         ..HostSessionOptions::default()
@@ -468,6 +299,11 @@ impl Host {
                 self.delete_session(&id).await?;
                 Ok(json!({"deleted": true}))
             }
+            "session.archive" => {
+                let id = parse_session(params)?;
+                self.archive_session(&id).await?;
+                Ok(json!({"archived": true}))
+            }
             "session.keep" => {
                 let id = parse_session(params)?;
                 let changed = self.service.keep(&id).await?;
@@ -482,11 +318,7 @@ impl Host {
                 let params: PromptParam = serde_json::from_value(params)?;
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
                 let (session_id, parent_id) = self.resolve_prompt_session(&params, caller).await?;
-                let _lifecycle = self.automation.lifecycle.lock().await;
-                anyhow::ensure!(
-                    !self.projects.is_archived(session_id.as_str()),
-                    "archived sessions are read-only"
-                );
+                let _lifecycle = self.sessions.lifecycle.lock().await;
                 let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
                 let subscription = self.service.subscribe(&session_id, None).await?;
                 let content = self
@@ -711,27 +543,16 @@ impl Host {
             "--project cannot be used with --cwd"
         );
         anyhow::ensure!(
-            params.topic_id.is_none() || params.project_id.is_some(),
-            "--topic requires --project"
+            params.section_id.is_none() || params.project_id.is_some(),
+            "--section requires --project"
         );
-        let (default_model, default_reasoning, default_mode) = self
-            .profile
-            .read()
-            .expect("profile lock poisoned")
-            .defaults();
-        let caller_record = if let Some(id) = &caller {
-            Some(self.service.snapshot(id).await?.record)
-        } else {
-            None
-        };
-
         if let Some(target) = &params.session_id {
             anyhow::ensure!(
                 params.title.is_none()
                     && params.cwd.is_none()
                     && params.project_id.is_none()
-                    && params.topic_id.is_none(),
-                "--title, --cwd, --project and --topic can only be used when creating a subsession"
+                    && params.section_id.is_none(),
+                "--title, --cwd, --project and --section can only be used when creating a subsession"
             );
             anyhow::ensure!(
                 !params.ephemeral,
@@ -745,8 +566,8 @@ impl Host {
                     "session {id} is not a direct subsession of {caller}"
                 );
             }
-            if let (Some(parent), Some(mode)) = (&caller_record, params.policy) {
-                ensure_policy_ceiling(mode, parent.info.mode)?;
+            if let (Some(parent), Some(mode)) = (&caller, params.policy) {
+                ensure_policy_ceiling(mode, self.service.snapshot(parent).await?.record.info.mode)?;
             }
             apply_prompt_config(&self.service, &id, params).await?;
             return Ok((id, record.info.parent_session_id.clone()));
@@ -754,8 +575,8 @@ impl Host {
 
         if let Some(source) = &params.from_session_id {
             anyhow::ensure!(
-                params.cwd.is_none() && params.project_id.is_none() && params.topic_id.is_none(),
-                "--cwd, --project and --topic cannot be used when forking a session"
+                params.cwd.is_none() && params.project_id.is_none() && params.section_id.is_none(),
+                "--cwd, --project and --section cannot be used when forking a session"
             );
             anyhow::ensure!(
                 !params.ephemeral,
@@ -769,76 +590,31 @@ impl Host {
                     "session {source_id} is not a direct subsession of {caller}"
                 );
             }
-            let mode = params.policy.unwrap_or(source_record.info.mode);
-            if let Some(parent) = &caller_record {
-                ensure_policy_ceiling(mode, parent.info.mode)?;
-            }
             let parent_id = source_record.info.parent_session_id.clone();
             let id = self
                 .create_session(HostSessionOptions {
                     from: Some(source_id),
                     parent_session_id: caller,
                     title: params.title.clone(),
+                    mode: params.policy,
+                    model: params.model.clone(),
+                    reasoning: params.reasoning.clone(),
                     ..HostSessionOptions::default()
                 })
                 .await?;
-            if let Err(error) = apply_prompt_config(&self.service, &id, params).await {
-                let _ = self.service.delete(&id).await;
-                return Err(error.into());
-            }
             return Ok((id, parent_id));
         }
 
-        let inherited_mode = caller_record
-            .as_ref()
-            .map_or(default_mode, |record| record.info.mode);
-        let mode = params.policy.unwrap_or(inherited_mode);
-        if let Some(parent) = &caller_record {
-            ensure_policy_ceiling(mode, parent.info.mode)?;
-        }
-        let model = params.model.clone().unwrap_or_else(|| {
-            caller_record
-                .as_ref()
-                .map_or_else(|| default_model.clone(), |record| record.llm.model.clone())
-        });
-        let reasoning = params
-            .reasoning
-            .clone()
-            .or_else(|| {
-                caller_record
-                    .as_ref()
-                    .and_then(|record| record.llm.reasoning.clone())
-            })
-            .or_else(|| {
-                (caller_record.is_none() && params.model.is_none())
-                    .then(|| default_reasoning.clone())
-                    .flatten()
-            });
-        let requested_cwd = params
-            .cwd
-            .clone()
-            .or_else(|| caller_record.as_ref().map(|record| record.info.cwd.clone()));
-        let inherited_topic = if params.cwd.is_none() && params.project_id.is_none() {
-            caller
-                .as_ref()
-                .and_then(|id| self.projects.locate_session(id.as_str()))
-        } else {
-            None
-        };
-        let (project_id, topic_id, cwd) = match (&params.project_id, inherited_topic) {
-            (Some(project_id), _) => (Some(project_id.clone()), params.topic_id.clone(), None),
-            (None, Some((project, topic))) => (Some(project.id), Some(topic.id), None),
-            (None, None) => (None, None, requested_cwd),
-        };
         let id = self
             .create_session(HostSessionOptions {
                 title: params.title.clone(),
-                cwd,
-                project_id,
-                topic_id,
+                cwd: params.cwd.clone(),
+                project_id: params.project_id.clone(),
+                section_id: params.section_id.clone(),
                 parent_session_id: caller.clone(),
-                mode: Some(mode),
-                llm: Some(SessionLlmSettings::new(model, reasoning)),
+                mode: params.policy,
+                model: params.model.clone(),
+                reasoning: params.reasoning.clone(),
                 ephemeral: params.ephemeral,
                 ..HostSessionOptions::default()
             })
@@ -860,11 +636,7 @@ impl Host {
         endpoint: EndpointId,
         content: MessageContent,
     ) -> Result<PromptAccepted> {
-        let _lifecycle = self.automation.lifecycle.lock().await;
-        anyhow::ensure!(
-            !self.projects.is_archived(id.as_str()),
-            "archived sessions are read-only"
-        );
+        let _lifecycle = self.sessions.lifecycle.lock().await;
         let snapshot = self.service.snapshot(id).await?;
         let content = self
             .expand_prompt_directives(&snapshot.record.info.cwd, content)
@@ -992,19 +764,6 @@ async fn apply_prompt_config(
     Ok(())
 }
 
-pub(super) fn ensure_policy_ceiling(requested: SessionMode, parent: SessionMode) -> Result<()> {
-    let rank = |mode| match mode {
-        SessionMode::Watch => 0,
-        SessionMode::Confirm => 1,
-        SessionMode::FullAccess => 2,
-    };
-    anyhow::ensure!(
-        rank(requested) <= rank(parent),
-        "subsession policy {requested:?} exceeds parent policy {parent:?}"
-    );
-    Ok(())
-}
-
 fn is_content_event(payload: &SessionEventPayload) -> bool {
     matches!(
         payload,
@@ -1121,21 +880,6 @@ async fn cleanup_deleted_session_resources(profile_root: &Path, id: &SessionId) 
     Ok(())
 }
 
-pub(crate) fn copy_workspace(source: &Path, target: &Path) -> Result<()> {
-    std::fs::create_dir_all(target)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_workspace(&source_path, &target_path)?;
-        } else {
-            std::fs::copy(&source_path, &target_path)?;
-        }
-    }
-    Ok(())
-}
-
 async fn remove_session_attachment_dirs(root: &Path, session_id: &str) -> Result<()> {
     if !root.is_dir() {
         return Ok(());
@@ -1163,6 +907,7 @@ async fn remove_session_attachment_dirs(root: &Path, session_id: &str) -> Result
 mod tests {
     use super::*;
     use crate::host::tests::write_test_profile;
+    use dwo_agent_service::SessionWorkspace;
 
     #[test]
     fn prompt_message_accepts_text_and_structured_content() {
@@ -1257,7 +1002,7 @@ mod tests {
             title: Some("child".to_string()),
             cwd: None,
             project_id: None,
-            topic_id: None,
+            section_id: None,
             policy: None,
             model: None,
             reasoning: None,
@@ -1313,7 +1058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_can_create_a_session_directly_in_a_project_topic() {
+    async fn prompt_can_create_a_session_directly_in_a_project_section() {
         let root = tempfile::tempdir().unwrap();
         let host = Host::build(&write_test_profile(root.path())).await.unwrap();
         let project = host
@@ -1324,10 +1069,7 @@ mod tests {
             .await
             .unwrap();
         let project_id = project["id"].as_str().unwrap().to_string();
-        let topic_id = project["board"]["uncategorizedTopicId"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let section_id = project["defaultSectionId"].as_str().unwrap().to_string();
         let params = PromptParam {
             session_id: None,
             from_session_id: None,
@@ -1337,7 +1079,7 @@ mod tests {
             title: Some("target child".to_string()),
             cwd: None,
             project_id: Some(project_id.clone()),
-            topic_id: Some(topic_id.clone()),
+            section_id: Some(section_id.clone()),
             policy: None,
             model: None,
             reasoning: None,
@@ -1345,10 +1087,10 @@ mod tests {
         };
 
         let (session_id, _) = host.resolve_prompt_session(&params, None).await.unwrap();
-        let (assigned_project, assigned_topic) =
+        let (assigned_project, assignment) =
             host.projects.locate_session(session_id.as_str()).unwrap();
         assert_eq!(assigned_project.id, project_id);
-        assert_eq!(assigned_topic.id, topic_id);
+        assert_eq!(assignment.section_id, section_id);
         assert_eq!(
             host.service
                 .snapshot(&session_id)
@@ -1388,21 +1130,16 @@ mod tests {
             .record
             .info
             .cwd;
-        let (generated_project, generated_topic) = host
-            .projects
-            .locate_session(generated_id.as_str())
-            .expect("generated session belongs to the uncategorized topic");
-        assert_eq!(generated_project.id, dwo_project::UNASSIGNED_PROJECT_ID);
-        assert_eq!(generated_project.kind, ProjectKind::Work);
-        assert_eq!(generated_project.pwd, None);
+        assert!(
+            host.projects
+                .locate_session(generated_id.as_str())
+                .is_none()
+        );
+        assert!(host.projects.list().is_empty());
         assert_ne!(generated_cwd, second_generated_cwd);
         assert_eq!(
             generated_snapshot.record.info.workspace,
             SessionWorkspace::Managed
-        );
-        assert_eq!(
-            generated_topic.id,
-            generated_project.board.uncategorized_topic_id
         );
         assert!(generated_cwd.is_dir());
 
@@ -1423,17 +1160,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let (custom_project, custom_topic) =
-            host.projects.locate_session(custom_id.as_str()).unwrap();
-        let (second_project, second_topic) = host
-            .projects
-            .locate_session(second_custom_id.as_str())
-            .unwrap();
-        assert_eq!(custom_project.pwd, None);
-        assert_eq!(custom_project.id, second_project.id);
-        assert_eq!(custom_project.id, generated_project.id);
-        assert_eq!(custom_topic.id, second_topic.id);
-        assert_eq!(second_topic.session_ids.len(), 4);
+        assert!(host.projects.locate_session(custom_id.as_str()).is_none());
+        assert!(
+            host.projects
+                .locate_session(second_custom_id.as_str())
+                .is_none()
+        );
+        assert!(host.projects.list().is_empty());
 
         for date in ["2026/07/15", "2026/07/16"] {
             let attachment = profile
@@ -1452,13 +1185,9 @@ mod tests {
             &second_custom_id,
             &second_generated_id,
         ] {
-            let (project, _) = host.projects.locate_session(id.as_str()).unwrap();
-            host.handle_method(
-                "project.session.archive",
-                json!({"project_id": project.id, "session_id": id}),
-            )
-            .await
-            .unwrap();
+            host.handle_method("session.archive", json!({"session_id": id}))
+                .await
+                .unwrap();
         }
         host.delete_session(&generated_id).await.unwrap();
         assert!(
@@ -1540,5 +1269,185 @@ mod tests {
             }
         }
         panic!("session metadata not found: {session_id}");
+    }
+    #[tokio::test]
+    async fn prompt_children_inherit_worktree_and_managed_parent_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let project = host
+            .projects
+            .create(dwo_project::CreateProject {
+                name: None,
+                pwd: root.path().into(),
+            })
+            .unwrap();
+        let worktree_dir = root.path().join("worktree");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        let pwd = std::fs::canonicalize(worktree_dir).unwrap();
+        host.projects
+            .add_worktree(
+                &project.id,
+                dwo_project::WorktreeRecord {
+                    id: "worktree-test".into(),
+                    name: "test".into(),
+                    path: pwd.clone(),
+                    source: dwo_project::WorktreeSource::External,
+                    created_at_ms: 0,
+                },
+            )
+            .unwrap();
+        let parent = host
+            .create_session(HostSessionOptions {
+                project_id: Some(project.id.clone()),
+                worktree_id: Some("worktree-test".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let params: PromptParam =
+            serde_json::from_value(json!({"endpoint_id": "test", "message": "inspect"})).unwrap();
+        let (child, _) = host
+            .resolve_prompt_session(&params, Some(parent.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            host.service.snapshot(&child).await.unwrap().record.info.cwd,
+            pwd
+        );
+        let (_, assignment) = host.projects.locate_session(child.as_str()).unwrap();
+        assert_eq!(assignment.worktree_id.as_deref(), Some("worktree-test"));
+        let managed = host.create_session(Default::default()).await.unwrap();
+        let (child, _) = host
+            .resolve_prompt_session(&params, Some(managed.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            host.service.snapshot(&child).await.unwrap().record.info.cwd,
+            host.service
+                .snapshot(&managed)
+                .await
+                .unwrap()
+                .record
+                .info
+                .cwd
+        );
+        assert!(host.projects.locate_session(child.as_str()).is_none());
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn archive_survives_reload_and_blocks_service_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        let host = Host::build(&config).await.unwrap();
+        let id = host.create_session(Default::default()).await.unwrap();
+        let cwd = host.service.snapshot(&id).await.unwrap().record.info.cwd;
+        assert!(host.delete_session(&id).await.is_err());
+        host.archive_session(&id).await.unwrap();
+        assert!(
+            host.service
+                .list(SessionListQuery::default())
+                .await
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+        let mut query = SessionListQuery::default();
+        query.archived = true;
+        assert_eq!(
+            host.service
+                .list(query.clone())
+                .await
+                .unwrap()
+                .sessions
+                .len(),
+            1
+        );
+        assert!(
+            host.service
+                .prompt(&id, EndpointId::new(), MessageContent::text("no"))
+                .await
+                .is_err()
+        );
+        assert!(
+            host.service
+                .prompt_internal(&id, MessageContent::text("no"))
+                .await
+                .is_err()
+        );
+        assert!(host.service.compact(&id, EndpointId::new()).await.is_err());
+        assert!(host.service.keep(&id).await.is_err());
+        assert!(
+            host.service
+                .set_config(&id, SessionConfigUpdate::Mode(SessionMode::Watch))
+                .await
+                .is_err()
+        );
+        assert!(
+            find_session_metadata(root.path(), id.as_str())
+                .starts_with(root.path().join("runtime/sessions/archive"))
+        );
+        host.shutdown().await;
+        drop(host);
+        let host = Host::build(&config).await.unwrap();
+        assert!(host.service.is_archived(&id).await.unwrap());
+        assert_eq!(host.service.list(query).await.unwrap().sessions.len(), 1);
+        host.delete_session(&id).await.unwrap();
+        assert!(!cwd.exists());
+        assert!(host.service.snapshot(&id).await.is_err());
+        assert!(root.path().join("runtime/sessions/archive").is_dir());
+        host.shutdown().await;
+    }
+    #[tokio::test]
+    async fn prompt_creation_resolves_defaults_inheritance_and_explicit_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let parent = host
+            .create_session(HostSessionOptions {
+                model: Some("deepseek/deepseek-v4-pro".into()),
+                reasoning: Some("high".into()),
+                mode: Some(SessionMode::Watch),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let cases = [
+            (
+                json!({}),
+                None,
+                "deepseek/deepseek-v4-pro",
+                None,
+                SessionMode::Confirm,
+            ),
+            (
+                json!({"cwd": root.path()}),
+                Some(parent.clone()),
+                "deepseek/deepseek-v4-pro",
+                Some("high"),
+                SessionMode::Watch,
+            ),
+            (
+                json!({"model": "deepseek/deepseek-v4-pro", "reasoning": "low"}),
+                Some(parent),
+                "deepseek/deepseek-v4-pro",
+                Some("low"),
+                SessionMode::Watch,
+            ),
+        ];
+        for (extra, caller, model, reasoning, mode) in cases {
+            let mut input = json!({"endpoint_id": "test", "message": "unused"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let params = serde_json::from_value(input).unwrap();
+            let (id, _) = host.resolve_prompt_session(&params, caller).await.unwrap();
+            let record = host.service.snapshot(&id).await.unwrap().record;
+            assert_eq!(record.llm.model, model);
+            assert_eq!(record.llm.reasoning.as_deref(), reasoning);
+            assert_eq!(record.info.mode, mode);
+        }
+        host.shutdown().await;
     }
 }

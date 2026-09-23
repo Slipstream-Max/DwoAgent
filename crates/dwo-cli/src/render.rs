@@ -143,34 +143,133 @@ fn render_model_capabilities(capabilities: Option<&Value>) -> String {
     }
 }
 
-pub fn write_session_list(value: &Value) -> Result<()> {
-    let statuses: Vec<SessionStatusSnapshot> = serde_json::from_value(value.clone())?;
-    if statuses.is_empty() {
+/// `session.list` 的返回：分页对象 `{ sessions, nextCursor }`；老 daemon 直接返回
+/// 数组，两种都认。条目是 `SessionListItem`（**不是** snapshot，没有 `record`），
+/// 所以一律走 `Value` 手取字段 —— dwo-cli 没依赖 `serde` 的 derive，别为这个添依赖。
+fn text_of(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_string))
+}
+
+fn session_items(value: &Value) -> Result<(Vec<Value>, Option<usize>)> {
+    if value.is_array() {
+        return Ok((value.as_array().cloned().unwrap_or_default(), None));
+    }
+    let items = value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let next_cursor = value
+        .get("nextCursor")
+        .and_then(Value::as_u64)
+        .map(|cursor| cursor as usize);
+    Ok((items, next_cursor))
+}
+
+fn session_id(item: &Value) -> String {
+    text_of(item, &["sessionId", "session_id", "id"]).unwrap_or_else(|| "-".to_string())
+}
+
+fn session_title(item: &Value) -> String {
+    text_of(item, &["title"]).unwrap_or_else(|| "(untitled)".to_string())
+}
+
+fn session_status(item: &Value) -> String {
+    text_of(item, &["status"]).unwrap_or_else(|| "-".to_string())
+}
+
+fn session_parent(item: &Value) -> Option<String> {
+    text_of(item, &["parentSessionId", "parent_session_id"])
+}
+
+/// 属性列：`fork from xxx` / `xxx 的 sub` / `root`。
+fn session_attr(item: &Value) -> String {
+    if let Some(source) = text_of(item, &["forkedFrom", "forked_from"]) {
+        return format!("fork from {source}");
+    }
+    match session_parent(item) {
+        Some(parent) => format!("{parent} 的 sub"),
+        None => "root".to_string(),
+    }
+}
+
+pub fn write_session_list(value: &Value, page: usize, num: usize, sub: bool) -> Result<()> {
+    let (sessions, next_cursor) = session_items(value)?;
+    if sessions.is_empty() {
         output::line(format_args!("No sessions"))?;
         return Ok(());
     }
-    let running = statuses
+
+    // `--sub`：root 在前，它的子会话紧跟在后面（缩进一眼看出层级）。
+    let mut ordered: Vec<&Value> = Vec::new();
+    if sub {
+        for root in sessions
+            .iter()
+            .filter(|item| session_parent(item).is_none())
+        {
+            ordered.push(root);
+            let root_id = session_id(root);
+            ordered.extend(
+                sessions
+                    .iter()
+                    .filter(|item| session_parent(item).as_deref() == Some(root_id.as_str())),
+            );
+        }
+        // 父会话不在这一页的（分页边界）也要列出来，不然会凭空消失。
+        for item in &sessions {
+            if !ordered
+                .iter()
+                .any(|kept| session_id(kept) == session_id(item))
+            {
+                ordered.push(item);
+            }
+        }
+    } else {
+        ordered.extend(sessions.iter());
+    }
+
+    let running = ordered
         .iter()
-        .filter(|status| status.phase != RuntimePhase::Idle)
+        .filter(|item| {
+            let status = session_status(item);
+            status != "idle" && status != "-"
+        })
         .count();
     output::line(format_args!(
         "Sessions: {}  running={}  idle={}",
-        statuses.len(),
+        ordered.len(),
         running,
-        statuses.len() - running
+        ordered.len() - running
     ))?;
     output::line(format_args!(""))?;
-    output::line(format_args!(
-        "STATUS              ID  MODEL  UPDATED  TITLE"
-    ))?;
-    for status in statuses {
+    output::line(format_args!("TITLE  ID  ATTR  UPDATED  STATUS"))?;
+    for item in ordered {
+        let indent = if sub && session_parent(item).is_some() {
+            "  "
+        } else {
+            ""
+        };
+        let updated = item
+            .get("updatedAt")
+            .or_else(|| item.get("updated_at"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         output::line(format_args!(
-            "{:<18}  {}  {}  {}  {}",
-            phase_name(status.phase),
-            status.record.info.id,
-            status.record.llm.model,
-            timestamp(status.record.info.updated_at_ms),
-            status.record.info.title
+            "{}{}  {}  {}  {}  {}",
+            indent,
+            session_title(item),
+            session_id(item),
+            session_attr(item),
+            timestamp(updated),
+            session_status(item)
+        ))?;
+    }
+    if next_cursor.is_some() {
+        output::line(format_args!(""))?;
+        output::line(format_args!(
+            "Page {page} · {num} 条/页 · 下一页: dwo session list --num {num} --page {}",
+            page + 1
         ))?;
     }
     Ok(())
@@ -263,7 +362,10 @@ pub fn write_automation_list(statuses: &[AutomationJobStatus]) -> Result<()> {
 }
 
 pub fn write_automation_status(status: &AutomationJobStatus) -> Result<()> {
-    output::line(format_args!("projectId: {}", status.project_id))?;
+    output::line(format_args!(
+        "projectId: {}",
+        status.project_id.as_deref().unwrap_or("global")
+    ))?;
     output::line(format_args!("name: {}", status.job.name))?;
     output::line(format_args!(
         "enabled: {}",
@@ -306,8 +408,8 @@ pub fn write_automation_status(status: &AutomationJobStatus) -> Result<()> {
         }
     }
     output::line(format_args!(
-        "topicId: {}",
-        status.job.topic_id.as_deref().unwrap_or("-")
+        "sectionId: {}",
+        status.job.section_id.as_deref().unwrap_or("-")
     ))?;
     if let Some(session) = &status.bound_session_id {
         output::line(format_args!("sessionId: {session}"))?;
@@ -377,5 +479,32 @@ mod tests {
     fn yaml_scalar_quotes_ambiguous_values() {
         assert_eq!(yaml_scalar("true"), "'true'");
         assert_eq!(yaml_scalar("plain title"), "plain title");
+    }
+
+    #[test]
+    fn session_list_payload_accepts_page_legacy_array_and_cursor() {
+        // 老 daemon：裸数组。
+        let (items, next_cursor) = session_items(&serde_json::json!([])).unwrap();
+        assert!(items.is_empty());
+        assert_eq!(next_cursor, None);
+
+        // 新 daemon：分页对象。
+        let (items, next_cursor) = session_items(&serde_json::json!({"sessions": []})).unwrap();
+        assert!(items.is_empty());
+        assert_eq!(next_cursor, None);
+
+        // 还有下一页。
+        let (items, next_cursor) =
+            session_items(&serde_json::json!({"sessions": [], "nextCursor": 40})).unwrap();
+        assert!(items.is_empty());
+        assert_eq!(next_cursor, Some(40));
+
+        // 条目是 SessionListItem（没有 record）：属性列按 parent / fork 区分。
+        let plain = serde_json::json!({"sessionId": "session-1", "title": "t"});
+        assert_eq!(session_attr(&plain), "root");
+        let child = serde_json::json!({"sessionId": "session-2", "parentSessionId": "session-1"});
+        assert_eq!(session_attr(&child), "session-1 的 sub");
+        let forked = serde_json::json!({"sessionId": "session-3", "forkedFrom": "session-1"});
+        assert_eq!(session_attr(&forked), "fork from session-1");
     }
 }

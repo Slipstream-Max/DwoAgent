@@ -41,7 +41,6 @@ pub struct NewSession {
     pub workspace: Option<SessionWorkspace>,
     /// Resolved runtime path. The persisted source of truth is `workspace`.
     pub cwd: Option<PathBuf>,
-    pub external_rule_files: Vec<ExternalRuleFile>,
     pub mode: Option<SessionMode>,
     pub llm: Option<SessionLlmSettings>,
     pub ephemeral: bool,
@@ -57,7 +56,13 @@ pub struct SessionListQuery {
     pub limit: Option<usize>,
     pub parent_session_id: Option<SessionId>,
     pub roots_only: bool,
+    /// 只要 fork 出来的会话（`forked_from` 有值）。
+    pub forked_only: bool,
+    /// 活跃 + 归档一起列（`--all`）。服务端的 `archived` 是「只看归档」，两回事。
+    pub include_archived: bool,
     pub cwd: Option<PathBuf>,
+    /// Return archived sessions instead of active sessions.
+    pub archived: bool,
 }
 
 impl SessionListQuery {
@@ -67,7 +72,10 @@ impl SessionListQuery {
             limit,
             parent_session_id: None,
             roots_only: false,
+            forked_only: false,
+            include_archived: false,
             cwd: None,
+            archived: false,
         }
     }
 
@@ -87,6 +95,10 @@ pub struct SessionListItem {
     pub model: String,
     pub reasoning: Option<String>,
     pub policy: dwo_tools::SessionMode,
+    /// 父会话（agent 跑出来的子会话）；`session list --sub` 靠它缩进。
+    pub parent_session_id: Option<SessionId>,
+    /// fork 来源（`session prompt --from X`）；`session list --forked` 靠它筛。
+    pub forked_from: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -104,10 +116,10 @@ pub struct SessionService {
     profile_root: PathBuf,
     external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
     external_rule_files: Arc<RwLock<Vec<ExternalRuleFile>>>,
-    session_rule_files: RwLock<HashMap<SessionId, Arc<RwLock<Vec<ExternalRuleFile>>>>>,
     max_model_steps: Arc<AtomicUsize>,
     loaded: Mutex<LoadedSessionRegistry>,
     session_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
+    mutation_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
     workspace_resolver: WorkspaceResolver,
     deletion_hook: RwLock<Option<SessionDeletionHook>>,
 }
@@ -223,10 +235,10 @@ impl SessionService {
             profile_root: profile.root,
             external_skill_dirs: Arc::new(RwLock::new(profile.external_skill_dirs)),
             external_rule_files: Arc::new(RwLock::new(profile.external_rule_files)),
-            session_rule_files: RwLock::new(HashMap::new()),
             max_model_steps: Arc::new(AtomicUsize::new(profile.config.max_model_steps)),
             loaded: Mutex::new(LoadedSessionRegistry::default()),
             session_locks: Mutex::new(HashMap::new()),
+            mutation_locks: Mutex::new(HashMap::new()),
             workspace_resolver,
             deletion_hook: RwLock::new(None),
         })
@@ -270,7 +282,6 @@ impl SessionService {
         new_session: NewSession,
     ) -> Result<Arc<SessionHandle>, SessionServiceError> {
         let id = new_session.id.clone().unwrap_or_default();
-        self.set_external_rule_files(&id, new_session.external_rule_files.clone());
         let (record, transcript, rollback_on_load_error) =
             if let Some(source_id) = &new_session.from {
                 let snapshot = self.load(source_id).await?.snapshot().await?;
@@ -298,6 +309,8 @@ impl SessionService {
                         .parent_session_id
                         .or_else(|| source.info.parent_session_id.clone()),
                 );
+                // fork（`--from`）出来的会话把来源记下来，`session list --forked` 靠它筛。
+                record.info.forked_from = new_session.from.clone();
                 record.info.ephemeral = new_session.ephemeral;
                 record.context = source.context;
                 record.current_plan = source.current_plan;
@@ -315,12 +328,6 @@ impl SessionService {
                 let llm = new_session.llm.ok_or_else(|| {
                     SessionServiceError::InvalidConfig("new session requires llm".to_string())
                 })?;
-                self.model
-                    .validate_selection(&ModelSelection {
-                        model: llm.model.clone(),
-                        reasoning: llm.reasoning.clone(),
-                    })
-                    .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
                 let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
                 let explicit_title = new_session
                     .title
@@ -328,7 +335,7 @@ impl SessionService {
                     .filter(|title| !title.is_empty());
                 let automatic_title = explicit_title.is_none();
                 let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
-                let prompt_builder = self.prompt_builder(&id, cwd.clone());
+                let prompt_builder = self.prompt_builder(cwd.clone());
                 let context = ContextManager::initialize(&prompt_builder)
                     .map_err(anyhow::Error::from)?
                     .into_context();
@@ -342,6 +349,12 @@ impl SessionService {
                 (record, Vec::new(), false)
             };
 
+        self.model
+            .validate_selection(&ModelSelection {
+                model: record.llm.model.clone(),
+                reasoning: record.llm.reasoning.clone(),
+            })
+            .map_err(|error| SessionServiceError::InvalidConfig(error.to_string()))?;
         let id = record.info.id.clone();
         let session_lock = {
             self.session_locks
@@ -429,7 +442,7 @@ impl SessionService {
             None => self.resolve_workspace(&record.info.id, &record.info.workspace)?,
         };
         let transcript = self.repository.load_transcript(id).await?;
-        let prompt_builder = self.prompt_builder(id, record.info.cwd.clone());
+        let prompt_builder = self.prompt_builder(record.info.cwd.clone());
         let mut record_changed = repair_empty_title(&mut record, &transcript);
         if !record.context.system_prompt.is_initialized() {
             record.context = ContextManager::initialize(&prompt_builder)
@@ -488,24 +501,38 @@ impl SessionService {
         query: SessionListQuery,
     ) -> Result<SessionListPage, SessionServiceError> {
         let deleting = self.loaded.lock().await.deleting.clone();
-        let mut records = self.repository.list().await?;
+        let mut records = if query.archived {
+            self.repository.list_archived().await?
+        } else if query.include_archived {
+            // `--all`：活跃的在前，归档的接在后面。
+            let mut both = self.repository.list().await?;
+            both.extend(self.repository.list_archived().await?);
+            both
+        } else {
+            self.repository.list().await?
+        };
         for record in &mut records {
             record.info.cwd = self.resolve_workspace(&record.info.id, &record.info.workspace)?;
         }
         records.retain(|record| !deleting.contains(&record.info.id));
-        for record in &mut records {
-            if !record.info.title.trim().is_empty() {
-                continue;
-            }
-            let transcript = self.repository.load_transcript(&record.info.id).await?;
-            if repair_empty_title(record, &transcript) {
-                self.repository.save(record).await?;
+        if !query.archived {
+            for record in &mut records {
+                if !record.info.title.trim().is_empty() {
+                    continue;
+                }
+                let transcript = self.repository.load_transcript(&record.info.id).await?;
+                if repair_empty_title(record, &transcript) {
+                    self.repository.save(record).await?;
+                }
             }
         }
         if let Some(parent) = &query.parent_session_id {
             records.retain(|record| record.info.parent_session_id.as_ref() == Some(parent));
         } else if query.roots_only {
             records.retain(|record| record.info.parent_session_id.is_none());
+        }
+        if query.forked_only {
+            records.retain(|record| record.info.forked_from.is_some());
         }
         if let Some(cwd) = &query.cwd {
             records.retain(|record| &record.info.cwd == cwd);
@@ -530,6 +557,8 @@ impl SessionService {
                 model: record.llm.model,
                 reasoning: record.llm.reasoning,
                 policy: record.info.mode,
+                parent_session_id: record.info.parent_session_id.clone(),
+                forked_from: record.info.forked_from.clone(),
             });
         }
         Ok(SessionListPage {
@@ -584,7 +613,44 @@ impl SessionService {
         Ok(())
     }
 
+    async fn mutation_lock(&self, id: &SessionId) -> Arc<Mutex<()>> {
+        self.mutation_locks
+            .lock()
+            .await
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub async fn ensure_active(&self, id: &SessionId) -> Result<(), SessionServiceError> {
+        if self.repository.is_archived(id).await? {
+            return Err(SessionServiceError::SessionArchived(id.clone()));
+        }
+        Ok(())
+    }
+
+    pub async fn archive(&self, id: &SessionId) -> Result<(), SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
+        if self.snapshot(id).await?.phase != RuntimePhase::Idle {
+            return Err(SessionServiceError::SessionBusy(id.clone()));
+        }
+        self.unload(id).await?;
+        let archived = self.repository.archive(id).await?;
+        if !archived {
+            return Err(SessionServiceError::SessionNotFound(id.clone()));
+        }
+        Ok(())
+    }
+
+    pub async fn is_archived(&self, id: &SessionId) -> Result<bool, SessionServiceError> {
+        Ok(self.repository.is_archived(id).await?)
+    }
+
     pub async fn delete(&self, id: &SessionId) -> Result<(), SessionServiceError> {
+        let mutation_lock = self.mutation_lock(id).await;
+        let _mutation = mutation_lock.lock().await;
         let session_lock = {
             self.session_locks
                 .lock()
@@ -631,14 +697,13 @@ impl SessionService {
         ) {
             hook(id, workspace);
         }
-        self.session_rule_files
-            .write()
-            .expect("session rule files registry lock poisoned")
-            .remove(id);
         Ok(())
     }
 
     pub async fn keep(&self, id: &SessionId) -> Result<bool, SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         self.load(id).await?.keep().await
     }
 
@@ -647,6 +712,9 @@ impl SessionService {
         id: &SessionId,
         update: SessionConfigUpdate,
     ) -> Result<(), SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         self.load(id).await?.set_config(update).await
     }
 
@@ -655,6 +723,9 @@ impl SessionService {
         id: &SessionId,
         update: SessionUpdate,
     ) -> Result<(), SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         self.load(id).await?.set(update).await
     }
 
@@ -663,33 +734,22 @@ impl SessionService {
         id: &SessionId,
         workspace: SessionWorkspace,
         cwd: PathBuf,
-        external_rule_files: Vec<ExternalRuleFile>,
     ) -> Result<(), SessionServiceError> {
-        let previous_rule_files = self
-            .session_rule_files
-            .read()
-            .expect("session rule files registry lock poisoned")
-            .get(id)
-            .and_then(|files| files.read().ok().map(|files| files.clone()))
-            .unwrap_or_default();
-        self.set_external_rule_files(id, external_rule_files);
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
-        let prompt_builder = self.prompt_builder(id, cwd.clone());
+        let prompt_builder = self.prompt_builder(cwd.clone());
         let tools = Arc::new(ToolManager::new_with_environment(
             cwd.clone(),
             self.policy.clone(),
             self.file_edit.clone(),
             [("DWO_SESSION_ID".to_string(), id.to_string())],
         )?);
-        let result = self
-            .load(id)
+        self.load(id)
             .await?
             .set_workspace(workspace, cwd, tools, prompt_builder)
-            .await;
-        if result.is_err() {
-            self.set_external_rule_files(id, previous_rule_files);
-        }
-        result
+            .await
     }
 
     fn resolve_workspace(
@@ -699,19 +759,6 @@ impl SessionService {
     ) -> Result<PathBuf, SessionServiceError> {
         let path = (self.workspace_resolver)(id, workspace)?;
         Ok(std::fs::canonicalize(path).map_err(anyhow::Error::from)?)
-    }
-
-    pub fn set_external_rule_files(&self, id: &SessionId, files: Vec<ExternalRuleFile>) {
-        let shared = self
-            .session_rule_files
-            .write()
-            .expect("session rule files registry lock poisoned")
-            .entry(id.clone())
-            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
-            .clone();
-        *shared
-            .write()
-            .expect("session external rule files lock poisoned") = files;
     }
 
     pub async fn subscribe(
@@ -735,6 +782,9 @@ impl SessionService {
         origin: EndpointId,
         content: MessageContent,
     ) -> Result<PromptAccepted, SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         self.load(id).await?.prompt(origin, content).await
     }
 
@@ -743,6 +793,9 @@ impl SessionService {
         id: &SessionId,
         content: MessageContent,
     ) -> Result<crate::TurnId, SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         self.load(id).await?.prompt_internal(content).await
     }
 
@@ -751,6 +804,9 @@ impl SessionService {
         id: &SessionId,
         origin: EndpointId,
     ) -> Result<crate::CompactionAccepted, SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         self.load(id).await?.compact(origin).await
     }
 
@@ -781,6 +837,9 @@ impl SessionService {
         id: &SessionId,
         notification: SessionNotification,
     ) -> Result<crate::MessageId, SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
         self.load(id)
             .await?
             .publish_notification(notification)
@@ -806,17 +865,10 @@ impl SessionService {
         .await;
     }
 
-    fn prompt_builder(&self, id: &SessionId, cwd: PathBuf) -> SystemPromptBuilder {
-        let session_rule_files = self
-            .session_rule_files
-            .write()
-            .expect("session rule files registry lock poisoned")
-            .entry(id.clone())
-            .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
-            .clone();
+    fn prompt_builder(&self, cwd: PathBuf) -> SystemPromptBuilder {
         SystemPromptBuilder::new(Some(self.profile_root.clone()), cwd)
             .with_external_skill_dirs(self.external_skill_dirs.clone())
-            .with_external_rule_files(self.external_rule_files.clone(), session_rule_files)
+            .with_external_rule_files(self.external_rule_files.clone())
             .with_tool_prompt(dwo_tools::prompt::tools())
             .with_subsession_prompt(dwo_tools::prompt::SUBSESSIONS)
             .with_automation_prompt(dwo_tools::prompt::AUTOMATION)

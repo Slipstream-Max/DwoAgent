@@ -5,65 +5,80 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use super::Host;
-use crate::automation::{AutomationConfig, AutomationJob};
+use crate::automation::AutomationJob;
 
 #[derive(Deserialize)]
-pub(crate) struct ProjectParam {
-    pub(crate) project_id: String,
+struct AutomationRequest<T> {
+    project_id: Option<String>,
+    #[serde(default)]
+    global: bool,
+    caller_session_id: Option<String>,
+    #[serde(flatten)]
+    params: T,
+}
+
+impl<T> AutomationRequest<T> {
+    async fn project(&self, host: &Host, custom_cwd: bool) -> Result<Option<String>> {
+        let global = self.global || custom_cwd;
+        anyhow::ensure!(
+            !global || self.project_id.is_none(),
+            "global/cwd cannot be combined with project_id"
+        );
+        if let Some(project_id) = &self.project_id {
+            host.projects.get(project_id)?;
+            return Ok(Some(project_id.clone()));
+        }
+        if global {
+            return Ok(None);
+        }
+        let Some(caller) = &self.caller_session_id else {
+            return Ok(None);
+        };
+        let id = dwo_agent_service::SessionId::parse(caller.clone()).map_err(anyhow::Error::msg)?;
+        host.service.snapshot(&id).await?;
+        Ok(host
+            .projects
+            .locate_session(caller)
+            .map(|(project, _)| project.id))
+    }
 }
 
 #[derive(Deserialize)]
-pub(crate) struct JobParam {
-    pub(crate) project_id: String,
-    pub(crate) job: String,
+struct ListParam {}
+
+#[derive(Deserialize)]
+struct JobParam {
+    job: String,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct AddParam {
-    pub(crate) project_id: String,
-    pub(crate) job: AutomationJob,
+struct AddParam {
+    job: AutomationJob,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct ToggleParam {
-    pub(crate) project_id: String,
-    pub(crate) job: Option<String>,
+struct ToggleParam {
+    job: Option<String>,
     #[serde(default)]
-    pub(crate) all: bool,
+    all: bool,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct UpdateParam {
-    pub(crate) project_id: String,
-    pub(crate) name: String,
-    #[serde(default)]
-    pub(crate) job: Option<AutomationJob>,
-    #[serde(default)]
-    pub(crate) prompt: Option<String>,
-    #[serde(default)]
-    pub(crate) enabled: Option<bool>,
-    #[serde(default)]
-    pub(crate) model: Option<Option<String>>,
-    #[serde(default)]
-    pub(crate) reasoning: Option<Option<String>>,
-    #[serde(default)]
-    pub(crate) policy: Option<SessionMode>,
+struct UpdateParam {
+    name: String,
+    job: Option<AutomationJob>,
+    prompt: Option<String>,
+    enabled: Option<bool>,
+    model: Option<Option<String>>,
+    reasoning: Option<Option<String>>,
+    policy: Option<SessionMode>,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct HistoryParam {
-    pub(crate) project_id: String,
-    #[serde(default)]
-    pub(crate) job: Option<String>,
+struct HistoryParam {
+    job: Option<String>,
     #[serde(default = "default_history_limit")]
-    pub(crate) limit: usize,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct RunParam {
-    pub(crate) project_id: String,
-    pub(crate) job: String,
-    pub(crate) caller_session_id: Option<String>,
+    limit: usize,
 }
 
 fn default_history_limit() -> usize {
@@ -78,94 +93,109 @@ impl Host {
     ) -> Result<Value> {
         match method {
             "automation.list" => {
-                let params: ProjectParam = serde_json::from_value(params)?;
-                self.automation_list(params.project_id).await
+                let request: AutomationRequest<ListParam> = serde_json::from_value(params)?;
+                let project = request.project(self, false).await?;
+                Ok(serde_json::to_value(self.automation.list(&project).await)?)
             }
             "automation.status" => {
-                let params: JobParam = serde_json::from_value(params)?;
-                self.automation_status(params.project_id, params.job).await
+                let request: AutomationRequest<JobParam> = serde_json::from_value(params)?;
+                let project = request.project(self, false).await?;
+                Ok(serde_json::to_value(
+                    self.automation
+                        .status(&project, &request.params.job)
+                        .await?,
+                )?)
             }
             "automation.update" => {
-                let params: UpdateParam = serde_json::from_value(params)?;
-                self.automation_update(params).await
+                let request: AutomationRequest<UpdateParam> = serde_json::from_value(params)?;
+                let project = request
+                    .project(
+                        self,
+                        request
+                            .params
+                            .job
+                            .as_ref()
+                            .is_some_and(|job| job.cwd.is_some()),
+                    )
+                    .await?;
+                self.automation_update(project, request.params).await
             }
             "automation.history" => {
-                let params: HistoryParam = serde_json::from_value(params)?;
-                self.automation_history(params.project_id, params.job, params.limit)
-                    .await
+                let request: AutomationRequest<HistoryParam> = serde_json::from_value(params)?;
+                let project = request.project(self, false).await?;
+                Ok(
+                    json!({"runs": self.automation.history(&project, request.params.job.as_deref(), request.params.limit).await}),
+                )
             }
             "automation.add" => {
-                let params: AddParam = serde_json::from_value(params)?;
-                self.automation_add(params.project_id, params.job).await
+                let request: AutomationRequest<AddParam> = serde_json::from_value(params)?;
+                let project = request
+                    .project(self, request.params.job.cwd.is_some())
+                    .await?;
+                self.automation_add(project, request.params.job).await
             }
             "automation.enable" | "automation.disable" => {
-                let params: ToggleParam = serde_json::from_value(params)?;
+                let request: AutomationRequest<ToggleParam> = serde_json::from_value(params)?;
+                let project = request.project(self, false).await?;
                 self.automation_set_enabled(
-                    params.project_id,
-                    params.job,
-                    params.all,
+                    project,
+                    request.params.job,
+                    request.params.all,
                     method == "automation.enable",
                 )
                 .await
             }
             "automation.delete" => {
-                let params: ToggleParam = serde_json::from_value(params)?;
-                self.automation_delete(params.project_id, params.job, params.all)
+                let request: AutomationRequest<ToggleParam> = serde_json::from_value(params)?;
+                let project = request.project(self, false).await?;
+                self.automation_delete(project, request.params.job, request.params.all)
                     .await
             }
             "automation.run" => {
-                let params: RunParam = serde_json::from_value(params)?;
-                self.automation_run(params.project_id, params.job, params.caller_session_id)
+                let request: AutomationRequest<JobParam> = serde_json::from_value(params)?;
+                let project = request.project(self, false).await?;
+                self.automation_run(project, request.params.job, request.caller_session_id)
                     .await
             }
             other => anyhow::bail!("unknown automation method: {other}"),
         }
     }
 
-    pub(crate) async fn automation_list(&self, project_id: String) -> Result<Value> {
-        self.projects.get(&project_id)?;
-        Ok(serde_json::to_value(
-            self.automation.list(Some(&project_id)).await,
-        )?)
-    }
-
-    pub(crate) async fn automation_status(&self, project_id: String, job: String) -> Result<Value> {
-        Ok(serde_json::to_value(
-            self.automation.status(&project_id, &job).await?,
-        )?)
-    }
-
-    pub(crate) async fn automation_update(self: &Arc<Self>, params: UpdateParam) -> Result<Value> {
-        let project_id = params.project_id.clone();
+    async fn automation_update(
+        self: &Arc<Self>,
+        project_id: Option<String>,
+        params: UpdateParam,
+    ) -> Result<Value> {
         let name = params.name.clone();
-        self.mutate_automation_config(&project_id, |config| {
-            let job = config
-                .jobs
-                .iter_mut()
-                .find(|job| job.name == name)
-                .with_context(|| format!("automation job not found: {name}"))?;
-            if let Some(replacement) = params.job {
-                anyhow::ensure!(replacement.name == name, "automation name cannot change");
-                *job = replacement;
-            }
-            if let Some(prompt) = params.prompt {
-                job.prompt = prompt;
-            }
-            if let Some(enabled) = params.enabled {
-                job.enabled = enabled;
-            }
-            if let Some(model) = params.model {
-                job.model = model;
-            }
-            if let Some(reasoning) = params.reasoning {
-                job.reasoning = reasoning;
-            }
-            if let Some(policy) = params.policy {
-                job.policy = Some(policy);
-            }
-            Ok(())
-        })
-        .await?;
+        self.automation
+            .update_config(&project_id, |config| {
+                let job = config
+                    .jobs
+                    .iter_mut()
+                    .find(|job| job.name == name)
+                    .with_context(|| format!("automation job not found: {name}"))?;
+                if let Some(replacement) = params.job {
+                    anyhow::ensure!(replacement.name == name, "automation name cannot change");
+                    *job = replacement;
+                }
+                if let Some(prompt) = params.prompt {
+                    job.prompt = prompt;
+                }
+                if let Some(enabled) = params.enabled {
+                    job.enabled = enabled;
+                }
+                if let Some(model) = params.model {
+                    job.model = model;
+                }
+                if let Some(reasoning) = params.reasoning {
+                    job.reasoning = reasoning;
+                }
+                if let Some(policy) = params.policy {
+                    job.policy = Some(policy);
+                }
+                Ok(())
+            })
+            .await?;
         self.events
             .publish(
                 "automation.changed",
@@ -177,32 +207,23 @@ impl Host {
         )?)
     }
 
-    pub(crate) async fn automation_history(
-        &self,
-        project_id: String,
-        job: Option<String>,
-        limit: usize,
-    ) -> Result<Value> {
-        self.projects.get(&project_id)?;
-        Ok(json!({"runs": self.automation.history(&project_id, job.as_deref(), limit).await}))
-    }
-
-    pub(crate) async fn automation_add(
+    async fn automation_add(
         self: &Arc<Self>,
-        project_id: String,
+        project_id: Option<String>,
         job: AutomationJob,
     ) -> Result<Value> {
         let name = job.name.clone();
-        self.mutate_automation_config(&project_id, |config| {
-            anyhow::ensure!(
-                !config.jobs.iter().any(|existing| existing.name == name),
-                "automation job already exists: {name}"
-            );
-            config.enabled = true;
-            config.jobs.push(job);
-            Ok(())
-        })
-        .await?;
+        self.automation
+            .update_config(&project_id, |config| {
+                anyhow::ensure!(
+                    !config.jobs.iter().any(|existing| existing.name == name),
+                    "automation job already exists: {name}"
+                );
+                config.enabled = true;
+                config.jobs.push(job);
+                Ok(())
+            })
+            .await?;
         self.events
             .publish(
                 "automation.changed",
@@ -214,34 +235,35 @@ impl Host {
         )?)
     }
 
-    pub(crate) async fn automation_set_enabled(
+    async fn automation_set_enabled(
         self: &Arc<Self>,
-        project_id: String,
+        project_id: Option<String>,
         job: Option<String>,
         all: bool,
         enabled: bool,
     ) -> Result<Value> {
         anyhow::ensure!(all ^ job.is_some(), "specify a job or --all");
         let event_job = job.clone();
-        self.mutate_automation_config(&project_id, |config| {
-            if enabled {
-                config.enabled = true;
-            }
-            if all {
-                for job in &mut config.jobs {
+        self.automation
+            .update_config(&project_id, |config| {
+                if enabled {
+                    config.enabled = true;
+                }
+                if all {
+                    for job in &mut config.jobs {
+                        job.enabled = enabled;
+                    }
+                } else if let Some(name) = &job {
+                    let job = config
+                        .jobs
+                        .iter_mut()
+                        .find(|job| &job.name == name)
+                        .with_context(|| format!("automation job not found: {name}"))?;
                     job.enabled = enabled;
                 }
-            } else if let Some(name) = &job {
-                let job = config
-                    .jobs
-                    .iter_mut()
-                    .find(|job| &job.name == name)
-                    .with_context(|| format!("automation job not found: {name}"))?;
-                job.enabled = enabled;
-            }
-            Ok(())
-        })
-        .await?;
+                Ok(())
+            })
+            .await?;
         self.events
             .publish(
                 "automation.changed",
@@ -254,28 +276,29 @@ impl Host {
         }))
     }
 
-    pub(crate) async fn automation_delete(
+    async fn automation_delete(
         self: &Arc<Self>,
-        project_id: String,
+        project_id: Option<String>,
         job: Option<String>,
         all: bool,
     ) -> Result<Value> {
         anyhow::ensure!(all ^ job.is_some(), "specify a job or --all");
         let event_job = job.clone();
-        self.mutate_automation_config(&project_id, |config| {
-            if all {
-                config.jobs.clear();
-            } else if let Some(name) = &job {
-                let previous = config.jobs.len();
-                config.jobs.retain(|job| &job.name != name);
-                anyhow::ensure!(
-                    config.jobs.len() != previous,
-                    "automation job not found: {name}"
-                );
-            }
-            Ok(())
-        })
-        .await?;
+        self.automation
+            .update_config(&project_id, |config| {
+                if all {
+                    config.jobs.clear();
+                } else if let Some(name) = &job {
+                    let previous = config.jobs.len();
+                    config.jobs.retain(|job| &job.name != name);
+                    anyhow::ensure!(
+                        config.jobs.len() != previous,
+                        "automation job not found: {name}"
+                    );
+                }
+                Ok(())
+            })
+            .await?;
         self.automation
             .remove_job_state(&project_id, job.as_deref(), all)
             .await?;
@@ -288,9 +311,9 @@ impl Host {
         Ok(json!({"deleted": if all { "all" } else { job.as_deref().unwrap_or_default() }}))
     }
 
-    pub(crate) async fn automation_run(
+    async fn automation_run(
         self: &Arc<Self>,
-        project_id: String,
+        project_id: Option<String>,
         job: String,
         caller_session_id: Option<String>,
     ) -> Result<Value> {
@@ -306,16 +329,6 @@ impl Host {
             )
             .await;
         Ok(serde_json::to_value(run)?)
-    }
-
-    async fn mutate_automation_config<F>(&self, project_id: &str, update: F) -> Result<()>
-    where
-        F: FnOnce(&mut AutomationConfig) -> Result<()>,
-    {
-        self.projects.get(project_id)?;
-        self.automation
-            .update_project_config(project_id, update)
-            .await
     }
 }
 
@@ -351,7 +364,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(host.automation.list(Some(&project.id)).await.len(), 1);
+        assert_eq!(
+            host.automation.list(&Some(project.id.clone())).await.len(),
+            1
+        );
 
         host.handle_method(
             "automation.disable",
@@ -362,7 +378,7 @@ mod tests {
         assert!(
             !host
                 .automation
-                .status(&project.id, "daily-report")
+                .status(&Some(project.id.clone()), "daily-report")
                 .await
                 .unwrap()
                 .job
@@ -375,17 +391,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(host.automation.list(Some(&project.id)).await.is_empty());
         assert!(
-            host.projects
-                .automation_config_path(&project.id)
-                .unwrap()
+            host.automation
+                .list(&Some(project.id.clone()))
+                .await
+                .is_empty()
+        );
+        assert!(
+            root.path()
+                .join("runtime/automations")
+                .join(&project.id)
+                .join("config.yaml")
                 .is_file()
         );
         assert!(
-            host.projects
-                .automation_history_path(&project.id)
-                .unwrap()
+            root.path()
+                .join("runtime/automations")
+                .join(&project.id)
+                .join("history.yaml")
                 .is_file()
         );
         assert!(!root.path().join("runtime/automation-runs.yaml").exists());
@@ -409,7 +432,7 @@ mod tests {
         for (name, session) in [
             (
                 "background-failure",
-                json!({"mode": "fixed", "sessionId": "invalid-session-id"}),
+                json!({"mode": "fixed", "sessionId": "session-missing"}),
             ),
             (
                 "valid-start",
@@ -458,6 +481,79 @@ mod tests {
         assert!(record.session_id.is_some());
         assert!(record.turn_id.is_none());
 
+        host.shutdown().await;
+    }
+    #[tokio::test]
+    async fn host_resolves_global_and_project_scope_and_deletes_bound_configs() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        let host = Host::build(&config).await.unwrap();
+        let unassigned = host.create_session(Default::default()).await.unwrap();
+        let job = json!({"name": "same-name", "enabled": false,
+            "schedule": {"cron": "0 9 * * *"}, "session": {"mode": "new", "behavior": "once"}, "prompt": "test"});
+        let global = host
+            .handle_method(
+                "automation.add",
+                json!({"caller_session_id": unassigned, "job": job}),
+            )
+            .await
+            .unwrap();
+        assert!(global["projectId"].is_null());
+        let project = host
+            .handle_method("project.create", json!({"pwd": root.path()}))
+            .await
+            .unwrap();
+        let project_id = project["id"].as_str().unwrap();
+        let assigned = host
+            .create_session(super::super::HostSessionOptions {
+                project_id: Some(project_id.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let scoped = host
+            .handle_method(
+                "automation.add",
+                json!({"caller_session_id": assigned, "job": job}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped["projectId"], project_id);
+        let listed = host
+            .handle_method(
+                "automation.list",
+                json!({"caller_session_id": assigned, "global": true}),
+            )
+            .await
+            .unwrap();
+        assert!(listed[0]["projectId"].is_null());
+        let mut custom = job;
+        custom["name"] = json!("custom-path");
+        custom["cwd"] = json!(root.path());
+        let custom = host
+            .handle_method(
+                "automation.add",
+                json!({"caller_session_id": assigned, "job": custom}),
+            )
+            .await
+            .unwrap();
+        assert!(custom["projectId"].is_null());
+        let project_config = root.path().join("runtime/automations").join(project_id);
+        assert!(project_config.join("config.yaml").is_file());
+        host.handle_method("project.delete", json!({"project_id": project_id}))
+            .await
+            .unwrap();
+        assert!(!project_config.exists());
+        assert!(
+            root.path()
+                .join("runtime/automations/global/config.yaml")
+                .is_file()
+        );
+        assert!(host.projects.locate_session(assigned.as_str()).is_none());
+        host.shutdown().await;
+        drop(host);
+        let host = Host::build(&config).await.unwrap();
+        assert_eq!(host.automation.list(&None).await.len(), 2);
         host.shutdown().await;
     }
 }

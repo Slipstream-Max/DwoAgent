@@ -5,8 +5,7 @@ mod rpc;
 
 pub use registry::{
     ManagementCapabilities, MethodOperation, MethodRoute, MethodSpec, capabilities,
-    is_always_proposal, is_confirm_proposal, is_session_blocked, is_side_effect_method,
-    method_allowed, method_spec,
+    is_side_effect_method, method_allowed, method_spec,
 };
 pub use rpc::{
     PromptDirectiveOption, PromptDirectiveOptions, ReasoningOption, RpcError, RpcEvent, RpcRequest,

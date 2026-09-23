@@ -1,36 +1,13 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const OVERVIEW_FILE: &str = "overview.md";
 pub const AGENTS_FILE: &str = "AGENTS.md";
-pub const PROPOSALS_FILE: &str = "proposals.json";
-pub const AUTOMATION_DIR: &str = "automation";
-pub const AUTOMATION_CONFIG_FILE: &str = "config.yaml";
-pub const AUTOMATION_HISTORY_FILE: &str = "history.yaml";
-pub const UNASSIGNED_PROJECT_ID: &str = "project-unassigned";
-pub const UNASSIGNED_PROJECT_NAME: &str = "Work";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectKind {
-    Project,
-    Work,
-}
-
-pub const ARCHIVE_SECTION_ID: &str = "section-archive";
-pub const ARCHIVE_TOPIC_ID: &str = "topic-archive";
-
-#[derive(Serialize, Deserialize)]
-struct ArchiveTransaction {
-    projects: Vec<Project>,
-    removed: Option<String>,
-}
 
 #[derive(Debug, Error)]
 pub enum ProjectError {
@@ -38,10 +15,6 @@ pub enum ProjectError {
     ProjectNotFound(String),
     #[error("section not found: {0}")]
     SectionNotFound(String),
-    #[error("topic not found: {0}")]
-    TopicNotFound(String),
-    #[error("label not found: {0}")]
-    LabelNotFound(String),
     #[error("worktree not found: {0}")]
     WorktreeNotFound(String),
     #[error("invalid project data: {0}")]
@@ -59,7 +32,6 @@ pub enum ProjectError {
         source: serde_json::Error,
     },
 }
-
 pub type Result<T> = std::result::Result<T, ProjectError>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,18 +39,38 @@ pub type Result<T> = std::result::Result<T, ProjectError>;
 pub struct Project {
     pub id: String,
     pub name: String,
-    pub kind: ProjectKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pwd: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository: Option<RepositoryRecord>,
+    pub pwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<Section>,
+    pub default_section_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_assignments: Vec<SessionAssignment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worktrees: Vec<WorktreeRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_worktree_id: Option<String>,
-    pub board: Board,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryRecord>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Section {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub order: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAssignment {
+    pub session_id: String,
+    pub section_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,113 +100,34 @@ pub struct WorktreeRecord {
     pub created_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Board {
-    pub uncategorized_section_id: String,
-    pub uncategorized_topic_id: String,
-    pub sections: Vec<Section>,
-    pub topics: Vec<Topic>,
-    pub labels: Vec<Label>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Section {
-    pub id: String,
-    pub name: String,
-    pub order: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Topic {
-    pub id: String,
-    pub section_id: String,
-    pub title: String,
-    pub order: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub session_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub label_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Label {
-    pub id: String,
-    pub name: String,
-    pub color: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Proposal {
-    pub id: String,
-    pub project_id: String,
-    pub method: String,
-    pub payload: serde_json::Value,
-    pub source_session_id: String,
-    pub status: ProposalStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    pub created_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_at_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProposalStatus {
-    Pending,
-    Accepted,
-    Rejected,
-    Failed,
-}
-
-impl ProposalStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Accepted => "accepted",
-            Self::Rejected => "rejected",
-            Self::Failed => "failed",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CreateProject {
-    pub name: String,
-    pub kind: ProjectKind,
-    pub pwd: Option<PathBuf>,
+    pub name: Option<String>,
+    pub pwd: PathBuf,
 }
 
 #[derive(Debug)]
 pub struct ProjectService {
     root: PathBuf,
     projects: RwLock<Vec<Project>>,
-    proposal_lock: Mutex<()>,
 }
 
 impl ProjectService {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        create_dir_all(&root)?;
-        recover_archive(&root)?;
+        fs::create_dir_all(&root).map_err(|source| ProjectError::Io {
+            path: root.clone(),
+            source,
+        })?;
         let mut projects = Vec::new();
-        for entry in read_dir(&root)? {
+        for entry in fs::read_dir(&root).map_err(|source| ProjectError::Io {
+            path: root.clone(),
+            source,
+        })? {
             let entry = entry.map_err(|source| ProjectError::Io {
                 path: root.clone(),
                 source,
             })?;
-            if !entry.path().is_dir() {
-                continue;
-            }
             let path = entry.path().join("project.json");
             if !path.is_file() {
                 continue;
@@ -228,157 +141,278 @@ impl ProjectService {
                     path: path.clone(),
                     source,
                 })?;
-            validate_project(&project)?;
+            validate(&project)?;
             projects.push(project);
         }
         projects.sort_by_key(|project| project.created_at_ms);
         Ok(Self {
             root,
             projects: RwLock::new(projects),
-            proposal_lock: Mutex::new(()),
         })
     }
-
     pub fn list(&self) -> Vec<Project> {
         self.projects.read().expect("project lock poisoned").clone()
     }
-
-    pub fn get(&self, project_id: &str) -> Result<Project> {
+    pub fn get(&self, id: &str) -> Result<Project> {
         self.projects
             .read()
             .expect("project lock poisoned")
             .iter()
-            .find(|project| project.id == project_id)
+            .find(|project| project.id == id)
             .cloned()
-            .ok_or_else(|| ProjectError::ProjectNotFound(project_id.to_string()))
+            .ok_or_else(|| ProjectError::ProjectNotFound(id.into()))
     }
-
     pub fn create(&self, input: CreateProject) -> Result<Project> {
-        let name = nonempty("project name", input.name)?;
-        let pwd = input.pwd.as_deref().map(canonical_directory).transpose()?;
-        validate_project_location(input.kind, pwd.as_deref())?;
+        let pwd = canonical_directory(&input.pwd)?;
+        let name = input
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| {
+                pwd.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Project".into())
+            });
         let mut projects = self.projects.write().expect("project lock poisoned");
-        if let Some(pwd) = &pwd
-            && projects
-                .iter()
-                .any(|project| project.pwd.as_deref() == Some(pwd.as_path()))
-        {
+        if projects.iter().any(|project| project.pwd == pwd) {
             return Err(ProjectError::Invalid(format!(
                 "a project already uses pwd: {}",
                 pwd.display()
             )));
         }
-        self.create_locked(&mut projects, name, input.kind, pwd)
-    }
-
-    pub fn get_or_create_by_pwd(&self, name: String, pwd: &Path) -> Result<Project> {
-        let name = nonempty("project name", name)?;
-        let pwd = canonical_directory(pwd)?;
-        let mut projects = self.projects.write().expect("project lock poisoned");
-        if let Some(project) = projects
-            .iter()
-            .find(|project| project.pwd.as_deref() == Some(pwd.as_path()))
-        {
-            return Ok(project.clone());
-        }
-        self.create_locked(&mut projects, name, ProjectKind::Project, Some(pwd))
-    }
-
-    pub fn get_or_create_unassigned(&self) -> Result<Project> {
-        if let Some(project) = self
-            .projects
-            .read()
-            .expect("project lock poisoned")
-            .iter()
-            .find(|project| project.id == UNASSIGNED_PROJECT_ID)
-            .cloned()
-        {
-            return Ok(project);
-        }
-        let mut projects = self.projects.write().expect("project lock poisoned");
-        if let Some(project) = projects
-            .iter()
-            .find(|project| project.id == UNASSIGNED_PROJECT_ID)
-            .cloned()
-        {
-            return Ok(project);
-        }
-        self.create_locked_with_id(
-            &mut projects,
-            UNASSIGNED_PROJECT_ID.to_string(),
-            UNASSIGNED_PROJECT_NAME.to_string(),
-            ProjectKind::Work,
-            None,
-        )
-    }
-
-    fn create_locked(
-        &self,
-        projects: &mut Vec<Project>,
-        name: String,
-        kind: ProjectKind,
-        pwd: Option<PathBuf>,
-    ) -> Result<Project> {
-        self.create_locked_with_id(&mut *projects, new_id("project"), name, kind, pwd)
-    }
-
-    fn create_locked_with_id(
-        &self,
-        projects: &mut Vec<Project>,
-        id: String,
-        name: String,
-        kind: ProjectKind,
-        pwd: Option<PathBuf>,
-    ) -> Result<Project> {
-        let project_dir = self.project_dir(&id);
-        create_dir_all(&project_dir)?;
-        let section_id = new_id("section");
-        let topic_id = new_id("topic");
-        let now = unix_time_ms();
+        let section = Section {
+            id: new_id("section"),
+            name: "默认".into(),
+            color: "#6b7280".into(),
+            order: 0,
+        };
+        let now = now_ms();
         let project = Project {
-            id,
+            id: new_id("project"),
             name,
-            kind,
             pwd,
-            repository: None,
+            sections: vec![section.clone()],
+            default_section_id: section.id,
+            session_assignments: Vec::new(),
             worktrees: Vec::new(),
             default_worktree_id: None,
-            board: Board {
-                uncategorized_section_id: section_id.clone(),
-                uncategorized_topic_id: topic_id.clone(),
-                sections: vec![Section {
-                    id: section_id.clone(),
-                    name: "未分类".to_string(),
-                    order: 0,
-                }],
-                topics: vec![Topic {
-                    id: topic_id.clone(),
-                    section_id,
-                    title: "未分类".to_string(),
-                    order: 0,
-                    session_ids: Vec::new(),
-                    label_ids: Vec::new(),
-                }],
-                labels: Vec::new(),
-            },
+            repository: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
-        self.create_topic_files(&project.id, &topic_id)?;
-        atomic_write(&project_dir.join(AGENTS_FILE), b"")?;
         self.persist(&project)?;
         projects.push(project.clone());
         Ok(project)
     }
-
-    pub fn update_project(&self, project_id: &str, name: String) -> Result<Project> {
+    pub fn update_project(&self, id: &str, name: String) -> Result<Project> {
         let name = nonempty("project name", name)?;
-        self.mutate(project_id, |project| {
+        self.mutate(id, |project| {
             project.name = name;
             Ok(())
         })
     }
-
+    pub fn delete(&self, id: &str) -> Result<()> {
+        let mut projects = self.projects.write().expect("project lock poisoned");
+        let index = projects
+            .iter()
+            .position(|project| project.id == id)
+            .ok_or_else(|| ProjectError::ProjectNotFound(id.into()))?;
+        let path = self.project_dir(&projects[index].id);
+        let _permit = dwo_file_guard::permit_file(&path.join("project.json"));
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|source| ProjectError::Io { path, source })?;
+        }
+        projects.remove(index);
+        Ok(())
+    }
+    pub fn create_section(
+        &self,
+        project_id: &str,
+        name: String,
+        color: Option<String>,
+    ) -> Result<Section> {
+        let section = Section {
+            id: new_id("section"),
+            name: nonempty("section name", name)?,
+            color: color
+                .filter(|color| !color.trim().is_empty())
+                .unwrap_or_else(|| "#6b7280".into()),
+            order: 0,
+        };
+        let id = section.id.clone();
+        let project = self.mutate(project_id, |project| {
+            let mut section = section.clone();
+            section.order = project.sections.len() as u32;
+            project.sections.push(section);
+            Ok(())
+        })?;
+        project
+            .sections
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or(ProjectError::SectionNotFound(id))
+    }
+    pub fn update_section(
+        &self,
+        project_id: &str,
+        section_id: &str,
+        name: String,
+        color: Option<String>,
+    ) -> Result<Section> {
+        let name = nonempty("section name", name)?;
+        let project = self.mutate(project_id, |project| {
+            let section = project
+                .sections
+                .iter_mut()
+                .find(|section| section.id == section_id)
+                .ok_or_else(|| ProjectError::SectionNotFound(section_id.into()))?;
+            section.name = name;
+            if let Some(color) = color.filter(|color| !color.trim().is_empty()) {
+                section.color = color;
+            }
+            Ok(())
+        })?;
+        project
+            .sections
+            .into_iter()
+            .find(|section| section.id == section_id)
+            .ok_or_else(|| ProjectError::SectionNotFound(section_id.into()))
+    }
+    pub fn reorder_section(
+        &self,
+        project_id: &str,
+        section_id: &str,
+        position: usize,
+    ) -> Result<Vec<Section>> {
+        let project = self.mutate(project_id, |project| {
+            let index = project
+                .sections
+                .iter()
+                .position(|section| section.id == section_id)
+                .ok_or_else(|| ProjectError::SectionNotFound(section_id.into()))?;
+            let section = project.sections.remove(index);
+            project
+                .sections
+                .insert(position.min(project.sections.len()), section);
+            for (order, section) in project.sections.iter_mut().enumerate() {
+                section.order = order as u32;
+            }
+            Ok(())
+        })?;
+        Ok(project.sections)
+    }
+    pub fn delete_section(&self, project_id: &str, section_id: &str) -> Result<Project> {
+        self.mutate(project_id, |project| {
+            if project.default_section_id == section_id {
+                return Err(ProjectError::Invalid(
+                    "default section cannot be deleted".into(),
+                ));
+            }
+            let before = project.sections.len();
+            project.sections.retain(|section| section.id != section_id);
+            if before == project.sections.len() {
+                return Err(ProjectError::SectionNotFound(section_id.into()));
+            }
+            if project
+                .session_assignments
+                .iter()
+                .any(|assignment| assignment.section_id == section_id)
+            {
+                return Err(ProjectError::Invalid("section still owns sessions".into()));
+            }
+            Ok(())
+        })
+    }
+    pub fn assign_session(
+        &self,
+        project_id: &str,
+        section_id: Option<&str>,
+        session_id: String,
+        worktree_id: Option<String>,
+    ) -> Result<SessionAssignment> {
+        let session_id = nonempty("session id", session_id)?;
+        let mut projects = self.projects.write().expect("project lock poisoned");
+        if projects.iter().any(|p| {
+            p.id != project_id
+                && p.session_assignments
+                    .iter()
+                    .any(|a| a.session_id == session_id)
+        }) {
+            return Err(ProjectError::Invalid(
+                "session already belongs to a different project".into(),
+            ));
+        }
+        let index = projects
+            .iter()
+            .position(|p| p.id == project_id)
+            .ok_or_else(|| ProjectError::ProjectNotFound(project_id.into()))?;
+        let mut project = projects[index].clone();
+        let existing = project
+            .session_assignments
+            .iter()
+            .find(|a| a.session_id == session_id);
+        let assignment = SessionAssignment {
+            section_id: section_id
+                .map(str::to_owned)
+                .or_else(|| existing.map(|a| a.section_id.clone()))
+                .unwrap_or_else(|| project.default_section_id.clone()),
+            worktree_id: worktree_id.or_else(|| existing.and_then(|a| a.worktree_id.clone())),
+            session_id,
+        };
+        project
+            .session_assignments
+            .retain(|a| a.session_id != assignment.session_id);
+        project.session_assignments.push(assignment.clone());
+        project.updated_at_ms = now_ms();
+        validate(&project)?;
+        self.persist(&project)?;
+        projects[index] = project;
+        Ok(assignment)
+    }
+    pub fn unassign_session(&self, session_id: &str) -> Result<()> {
+        let mut projects = self.projects.write().expect("project lock poisoned");
+        let Some(project) = projects.iter_mut().find(|p| {
+            p.session_assignments
+                .iter()
+                .any(|a| a.session_id == session_id)
+        }) else {
+            return Ok(());
+        };
+        let mut updated = project.clone();
+        updated
+            .session_assignments
+            .retain(|a| a.session_id != session_id);
+        updated.updated_at_ms = now_ms();
+        self.persist(&updated)?;
+        *project = updated;
+        Ok(())
+    }
+    pub fn locate_session(&self, session_id: &str) -> Option<(Project, SessionAssignment)> {
+        self.projects
+            .read()
+            .expect("project lock poisoned")
+            .iter()
+            .find_map(|project| {
+                project
+                    .session_assignments
+                    .iter()
+                    .find(|a| a.session_id == session_id)
+                    .map(|a| (project.clone(), a.clone()))
+            })
+    }
+    pub fn project_rule_path(&self, project_id: &str) -> Result<PathBuf> {
+        Ok(self.get(project_id)?.pwd.join(AGENTS_FILE))
+    }
+    pub fn set_project_rule(&self, project_id: &str, content: &str) -> Result<()> {
+        atomic_write(&self.project_rule_path(project_id)?, content.as_bytes())
+    }
+    pub fn project_rule(&self, project_id: &str) -> Result<String> {
+        let path = self.project_rule_path(project_id)?;
+        match fs::read_to_string(&path) {
+            Ok(content) => Ok(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(source) => Err(ProjectError::Io { path, source }),
+        }
+    }
     pub fn set_repository(
         &self,
         project_id: &str,
@@ -386,71 +420,49 @@ impl ProjectService {
         primary: WorktreeRecord,
     ) -> Result<Project> {
         self.mutate(project_id, |project| {
-            if project.kind != ProjectKind::Project {
-                return Err(ProjectError::Invalid(
-                    "independent projects cannot attach repositories".to_string(),
-                ));
-            }
             project.repository = Some(repository);
-            project.default_worktree_id = Some(primary.id.clone());
+            project.default_worktree_id = (project.pwd == primary.path).then(|| primary.id.clone());
             project.worktrees = vec![primary];
             Ok(())
         })
     }
-
     pub fn add_worktree(&self, project_id: &str, worktree: WorktreeRecord) -> Result<Project> {
         self.mutate(project_id, |project| {
-            if project.kind != ProjectKind::Project {
-                return Err(ProjectError::Invalid(
-                    "independent projects cannot register worktrees".to_string(),
-                ));
-            }
-            if project.repository.is_none() {
-                return Err(ProjectError::Invalid(
-                    "project has no attached repository".to_string(),
-                ));
-            }
             if project
                 .worktrees
                 .iter()
-                .any(|existing| existing.id == worktree.id || existing.path == worktree.path)
+                .any(|item| item.id == worktree.id || item.path == worktree.path)
             {
-                return Err(ProjectError::Invalid(format!(
-                    "worktree is already registered: {}",
-                    worktree.path.display()
-                )));
+                return Err(ProjectError::Invalid(
+                    "worktree is already registered".into(),
+                ));
             }
             project.worktrees.push(worktree);
             Ok(())
         })
     }
-
     pub fn update_worktree(
         &self,
         project_id: &str,
         worktree_id: &str,
         name: String,
     ) -> Result<WorktreeRecord> {
-        let name = nonempty("worktree name", name)?;
-        let worktree_id = worktree_id.to_string();
         let project = self.mutate(project_id, |project| {
             let worktree = project
                 .worktrees
                 .iter_mut()
-                .find(|worktree| worktree.id == worktree_id)
-                .ok_or_else(|| ProjectError::WorktreeNotFound(worktree_id.clone()))?;
-            worktree.name = name;
+                .find(|item| item.id == worktree_id)
+                .ok_or_else(|| ProjectError::WorktreeNotFound(worktree_id.into()))?;
+            worktree.name = nonempty("worktree name", name)?;
             Ok(())
         })?;
         project
             .worktrees
             .into_iter()
-            .find(|worktree| worktree.id == worktree_id)
-            .ok_or(ProjectError::WorktreeNotFound(worktree_id))
+            .find(|item| item.id == worktree_id)
+            .ok_or_else(|| ProjectError::WorktreeNotFound(worktree_id.into()))
     }
-
     pub fn remove_worktree(&self, project_id: &str, worktree_id: &str) -> Result<Project> {
-        let worktree_id = worktree_id.to_string();
         self.mutate(project_id, |project| {
             if project
                 .worktrees
@@ -458,561 +470,24 @@ impl ProjectService {
                 .any(|w| w.id == worktree_id && w.source == WorktreeSource::Primary)
             {
                 return Err(ProjectError::Invalid(
-                    "primary worktree cannot be removed".into(),
+                    "default worktree cannot be removed".into(),
                 ));
             }
             let before = project.worktrees.len();
-            project
-                .worktrees
-                .retain(|worktree| worktree.id != worktree_id);
-            if project.worktrees.len() == before {
-                return Err(ProjectError::WorktreeNotFound(worktree_id.clone()));
+            project.worktrees.retain(|item| item.id != worktree_id);
+            if before == project.worktrees.len() {
+                return Err(ProjectError::WorktreeNotFound(worktree_id.into()));
             }
-            if project.default_worktree_id.as_deref() == Some(worktree_id.as_str()) {
-                project.default_worktree_id = project
-                    .worktrees
-                    .first()
-                    .map(|worktree| worktree.id.clone());
-            }
-            Ok(())
-        })
-    }
-
-    pub fn create_section(&self, project_id: &str, name: String) -> Result<Section> {
-        let name = nonempty("section name", name)?;
-        let section = Section {
-            id: new_id("section"),
-            name,
-            order: 0,
-        };
-        let result = section.clone();
-        self.mutate(project_id, |project| {
-            let mut section = section;
-            section.order = project.board.sections.len() as u32;
-            project.board.sections.push(section);
-            Ok(())
-        })?;
-        Ok(result_with_section_order(self.get(project_id)?, &result.id))
-    }
-
-    pub fn update_section(
-        &self,
-        project_id: &str,
-        section_id: &str,
-        name: String,
-    ) -> Result<Section> {
-        let name = nonempty("section name", name)?;
-        let section_id = section_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            let section = project
-                .board
-                .sections
-                .iter_mut()
-                .find(|section| section.id == section_id)
-                .ok_or_else(|| ProjectError::SectionNotFound(section_id.clone()))?;
-            section.name = name;
-            Ok(())
-        })?;
-        find_section(&project, &section_id).cloned()
-    }
-
-    pub fn reorder_section(
-        &self,
-        project_id: &str,
-        section_id: &str,
-        position: usize,
-    ) -> Result<Vec<Section>> {
-        let section_id = section_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            move_item(&mut project.board.sections, &section_id, position, |item| {
-                &item.id
-            })
-            .ok_or_else(|| ProjectError::SectionNotFound(section_id.clone()))?;
-            normalize_orders(&mut project.board.sections, |item, order| {
-                item.order = order
-            });
-            Ok(())
-        })?;
-        Ok(project.board.sections)
-    }
-
-    pub fn create_topic(&self, project_id: &str, section_id: &str, title: String) -> Result<Topic> {
-        let title = nonempty("topic title", title)?;
-        let topic_id = new_id("topic");
-        let section_id = section_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            ensure_section(project, &section_id)?;
-            let order = project
-                .board
-                .topics
+            if project
+                .session_assignments
                 .iter()
-                .filter(|topic| topic.section_id == section_id)
-                .count() as u32;
-            project.board.topics.push(Topic {
-                id: topic_id.clone(),
-                section_id: section_id.clone(),
-                title,
-                order,
-                session_ids: Vec::new(),
-                label_ids: Vec::new(),
-            });
-            Ok(())
-        })?;
-        self.create_topic_files(project_id, &topic_id)?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    pub fn update_topic(&self, project_id: &str, topic_id: &str, title: String) -> Result<Topic> {
-        let title = nonempty("topic title", title)?;
-        let topic_id = topic_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            find_topic_mut(project, &topic_id)?.title = title;
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    pub fn move_topic(
-        &self,
-        project_id: &str,
-        topic_id: &str,
-        section_id: &str,
-        position: usize,
-    ) -> Result<Topic> {
-        let topic_id = topic_id.to_string();
-        let section_id = section_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            ensure_section(project, &section_id)?;
-            let old_section = find_topic(project, &topic_id)?.section_id.clone();
-            let index = project
-                .board
-                .topics
-                .iter()
-                .position(|topic| topic.id == topic_id)
-                .expect("topic checked above");
-            let mut topic = project.board.topics.remove(index);
-            topic.section_id = section_id.clone();
-            let mut target_indices = project
-                .board
-                .topics
-                .iter()
-                .enumerate()
-                .filter_map(|(index, topic)| (topic.section_id == section_id).then_some(index))
-                .collect::<Vec<_>>();
-            let insert = if position >= target_indices.len() {
-                target_indices
-                    .last()
-                    .map_or(project.board.topics.len(), |index| index + 1)
-            } else {
-                target_indices.remove(position)
-            };
-            project.board.topics.insert(insert, topic);
-            normalize_topic_orders(&mut project.board.topics, &old_section);
-            normalize_topic_orders(&mut project.board.topics, &section_id);
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    pub fn assign_session(&self, project_id: &str, topic_id: &str, id: String) -> Result<Topic> {
-        let id = nonempty("session id", id)?;
-        if let Some((project, topic)) = self.locate_session(&id) {
-            if project.id == project_id && topic.id == topic_id {
-                return Ok(topic);
-            }
-            return Err(ProjectError::Invalid("session ownership is fixed".into()));
-        }
-        let topic_id = topic_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            let topic = find_topic_mut(project, &topic_id)?;
-            push_unique(&mut topic.session_ids, id);
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    pub fn move_session(&self, project_id: &str, topic_id: &str, id: String) -> Result<Topic> {
-        let id = nonempty("session id", id)?;
-        if let Some((project, topic)) = self.locate_session(&id) {
-            if project.id != project_id {
-                return Err(ProjectError::Invalid(
-                    "session belongs to a different project".to_string(),
-                ));
-            }
-            if topic.id == topic_id {
-                return Ok(topic);
-            }
-        }
-        if topic_id == ARCHIVE_TOPIC_ID {
-            return Err(ProjectError::Invalid(
-                "cannot move a session into Archive".to_string(),
-            ));
-        }
-        let session = id;
-        let target = topic_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            for topic in &mut project.board.topics {
-                topic.session_ids.retain(|existing| existing != &session);
-            }
-            let topic = find_topic_mut(project, &target)?;
-            push_unique(&mut topic.session_ids, session.clone());
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    pub fn create_label(
-        &self,
-        project_id: &str,
-        name: String,
-        color: String,
-        description: Option<String>,
-    ) -> Result<Label> {
-        let label = Label {
-            id: new_id("label"),
-            name: nonempty("label name", name)?,
-            color: nonempty("label color", color)?,
-            description: clean_optional(description),
-        };
-        let result = label.clone();
-        self.mutate(project_id, |project| {
-            project.board.labels.push(label);
-            Ok(())
-        })?;
-        Ok(result)
-    }
-
-    pub fn update_label(
-        &self,
-        project_id: &str,
-        label_id: &str,
-        name: String,
-        color: String,
-        description: Option<String>,
-    ) -> Result<Label> {
-        let label_id = label_id.to_string();
-        let name = nonempty("label name", name)?;
-        let color = nonempty("label color", color)?;
-        let project = self.mutate(project_id, |project| {
-            let label = project
-                .board
-                .labels
-                .iter_mut()
-                .find(|label| label.id == label_id)
-                .ok_or_else(|| ProjectError::LabelNotFound(label_id.clone()))?;
-            label.name = name;
-            label.color = color;
-            label.description = clean_optional(description);
-            Ok(())
-        })?;
-        project
-            .board
-            .labels
-            .into_iter()
-            .find(|label| label.id == label_id)
-            .ok_or(ProjectError::LabelNotFound(label_id))
-    }
-
-    pub fn delete_label(&self, project_id: &str, label_id: &str) -> Result<Project> {
-        let label_id = label_id.to_string();
-        self.mutate(project_id, |project| {
-            let before = project.board.labels.len();
-            project.board.labels.retain(|label| label.id != label_id);
-            if before == project.board.labels.len() {
-                return Err(ProjectError::LabelNotFound(label_id.clone()));
-            }
-            for topic in &mut project.board.topics {
-                topic.label_ids.retain(|id| id != &label_id);
-            }
-            Ok(())
-        })
-    }
-
-    pub fn assign_label(&self, project_id: &str, topic_id: &str, label_id: &str) -> Result<Topic> {
-        let topic_id = topic_id.to_string();
-        let label_id = label_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            if !project
-                .board
-                .labels
-                .iter()
-                .any(|label| label.id == label_id)
+                .any(|a| a.worktree_id.as_deref() == Some(worktree_id))
             {
-                return Err(ProjectError::LabelNotFound(label_id.clone()));
+                return Err(ProjectError::Invalid("worktree still owns sessions".into()));
             }
-            let topic = find_topic_mut(project, &topic_id)?;
-            push_unique(&mut topic.label_ids, label_id);
             Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    pub fn unassign_label(
-        &self,
-        project_id: &str,
-        topic_id: &str,
-        label_id: &str,
-    ) -> Result<Topic> {
-        let topic_id = topic_id.to_string();
-        let label_id = label_id.to_string();
-        let project = self.mutate(project_id, |project| {
-            find_topic_mut(project, &topic_id)?
-                .label_ids
-                .retain(|id| id != &label_id);
-            Ok(())
-        })?;
-        find_topic(&project, &topic_id).cloned()
-    }
-
-    pub fn overview(&self, project_id: &str, topic_id: &str) -> Result<String> {
-        self.read_topic_file(project_id, topic_id, OVERVIEW_FILE)
-    }
-
-    pub fn set_overview(&self, project_id: &str, topic_id: &str, content: &str) -> Result<()> {
-        self.write_topic_file(project_id, topic_id, OVERVIEW_FILE, content)
-    }
-
-    pub fn agents(&self, project_id: &str, topic_id: &str) -> Result<String> {
-        self.read_topic_file(project_id, topic_id, AGENTS_FILE)
-    }
-
-    pub fn set_agents(&self, project_id: &str, topic_id: &str, content: &str) -> Result<()> {
-        self.write_topic_file(project_id, topic_id, AGENTS_FILE, content)
-    }
-
-    pub fn agents_path(&self, project_id: &str, topic_id: &str) -> Result<PathBuf> {
-        self.ensure_topic(project_id, topic_id)?;
-        Ok(self.topic_dir(project_id, topic_id).join(AGENTS_FILE))
-    }
-
-    pub fn project_rule_path(&self, project_id: &str) -> Result<PathBuf> {
-        self.ensure_project(project_id)?;
-        Ok(self.project_dir(project_id).join(AGENTS_FILE))
-    }
-
-    pub fn set_project_rule(&self, project_id: &str, content: &str) -> Result<()> {
-        atomic_write(&self.project_rule_path(project_id)?, content.as_bytes())
-    }
-
-    pub fn is_archived(&self, session_id: &str) -> bool {
-        self.locate_session(session_id)
-            .is_some_and(|(p, t)| p.id == UNASSIGNED_PROJECT_ID && t.id == ARCHIVE_TOPIC_ID)
-    }
-
-    /// Commit the new ownership before removing containers; replay the journal on restart.
-    pub fn archive(
-        &self,
-        project_id: &str,
-        section_id: Option<&str>,
-        topic_id: Option<&str>,
-        session_id: Option<&str>,
-    ) -> Result<Vec<String>> {
-        self.get_or_create_unassigned()?;
-        let mut guard = self.projects.write().expect("project lock poisoned");
-        let mut projects = guard.clone();
-        let source = projects
-            .iter_mut()
-            .find(|p| p.id == project_id)
-            .ok_or_else(|| ProjectError::ProjectNotFound(project_id.into()))?;
-        if let Some(id) = section_id {
-            ensure_section(source, id)?;
-        }
-        if let Some(id) = topic_id {
-            find_topic(source, id)?;
-        }
-        if project_id == UNASSIGNED_PROJECT_ID && session_id.is_none() {
-            return Err(ProjectError::Invalid(
-                "Work system containers cannot be archived".into(),
-            ));
-        }
-        let selected = |t: &Topic| {
-            section_id.is_none_or(|id| t.section_id == id) && topic_id.is_none_or(|id| t.id == id)
-        };
-        let ids: Vec<String> = source
-            .board
-            .topics
-            .iter()
-            .filter(|t| selected(t))
-            .flat_map(|t| t.session_ids.iter())
-            .filter(|id| session_id.is_none_or(|s| *id == s))
-            .cloned()
-            .collect();
-        if session_id.is_some() && ids.is_empty() {
-            return Err(ProjectError::Invalid(
-                "session does not belong to container".into(),
-            ));
-        }
-        for topic in &mut source.board.topics {
-            topic.session_ids.retain(|id| !ids.contains(id));
-        }
-        if session_id.is_none() {
-            source
-                .board
-                .topics
-                .retain(|t| !selected(t) || t.id == source.board.uncategorized_topic_id);
-            if let Some(id) = section_id {
-                source
-                    .board
-                    .sections
-                    .retain(|s| s.id != id || s.id == source.board.uncategorized_section_id);
-            }
-        }
-        source.updated_at_ms = unix_time_ms();
-        let removed = (section_id.is_none() && topic_id.is_none() && session_id.is_none())
-            .then(|| project_id.to_string());
-        if let Some(id) = &removed {
-            projects.retain(|p| &p.id != id);
-        }
-        let work = projects
-            .iter_mut()
-            .find(|p| p.id == UNASSIGNED_PROJECT_ID)
-            .expect("Work exists");
-        if !work
-            .board
-            .sections
-            .iter()
-            .any(|s| s.id == ARCHIVE_SECTION_ID)
-        {
-            work.board.sections.push(Section {
-                id: ARCHIVE_SECTION_ID.into(),
-                name: "Archive".into(),
-                order: work.board.sections.len() as u32,
-            });
-            work.board.topics.push(Topic {
-                id: ARCHIVE_TOPIC_ID.into(),
-                section_id: ARCHIVE_SECTION_ID.into(),
-                title: "Archive".into(),
-                order: 0,
-                session_ids: vec![],
-                label_ids: vec![],
-            });
-            self.create_topic_files(UNASSIGNED_PROJECT_ID, ARCHIVE_TOPIC_ID)?;
-        }
-        append_unique(
-            &mut find_topic_mut(work, ARCHIVE_TOPIC_ID)?.session_ids,
-            ids.clone(),
-        );
-        work.updated_at_ms = unix_time_ms();
-        for p in &projects {
-            validate_project(p)?;
-        }
-        let path = self.root.join("archive-transaction.json");
-        let bytes = serde_json::to_vec(&ArchiveTransaction {
-            projects: projects.clone(),
-            removed,
         })
-        .map_err(|source| ProjectError::Json {
-            path: path.clone(),
-            source,
-        })?;
-        atomic_write(&path, &bytes)?;
-        recover_archive(&self.root)?;
-        *guard = projects;
-        Ok(ids)
     }
-
-    pub fn list_proposals(&self, project_id: &str) -> Result<Vec<Proposal>> {
-        self.ensure_project(project_id)?;
-        let path = self.project_dir(project_id).join(PROPOSALS_FILE);
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
-        let bytes = fs::read(&path).map_err(|source| ProjectError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        serde_json::from_slice(&bytes).map_err(|source| ProjectError::Json { path, source })
-    }
-
-    pub fn append_proposal(&self, project_id: &str, proposal: Proposal) -> Result<()> {
-        let _guard = self.proposal_lock.lock().expect("proposal lock poisoned");
-        let mut proposals = self.list_proposals(project_id)?;
-        proposals.push(proposal);
-        self.write_proposals(project_id, &proposals)
-    }
-
-    pub fn update_proposals(
-        &self,
-        project_id: &str,
-        update: impl FnOnce(&mut Vec<Proposal>) -> Result<()>,
-    ) -> Result<Vec<Proposal>> {
-        let _guard = self.proposal_lock.lock().expect("proposal lock poisoned");
-        let mut proposals = self.list_proposals(project_id)?;
-        update(&mut proposals)?;
-        self.write_proposals(project_id, &proposals)?;
-        Ok(proposals)
-    }
-
-    fn write_proposals(&self, project_id: &str, proposals: &[Proposal]) -> Result<()> {
-        self.ensure_project(project_id)?;
-        let path = self.project_dir(project_id).join(PROPOSALS_FILE);
-        let bytes = serde_json::to_vec_pretty(proposals).map_err(|source| ProjectError::Json {
-            path: path.clone(),
-            source,
-        })?;
-        atomic_write(&path, &bytes)
-    }
-
-    fn project_automation_dir(&self, project_id: &str) -> Result<PathBuf> {
-        self.ensure_project(project_id)?;
-        Ok(self.project_dir(project_id).join(AUTOMATION_DIR))
-    }
-
-    pub fn automation_config_path(&self, project_id: &str) -> Result<PathBuf> {
-        Ok(self
-            .project_automation_dir(project_id)?
-            .join(AUTOMATION_CONFIG_FILE))
-    }
-
-    pub fn automation_history_path(&self, project_id: &str) -> Result<PathBuf> {
-        Ok(self
-            .project_automation_dir(project_id)?
-            .join(AUTOMATION_HISTORY_FILE))
-    }
-
-    pub fn locate_session(&self, session_id: &str) -> Option<(Project, Topic)> {
-        self.projects
-            .read()
-            .expect("project lock poisoned")
-            .iter()
-            .find_map(|project| {
-                project
-                    .board
-                    .topics
-                    .iter()
-                    .find(|topic| topic.session_ids.iter().any(|id| id == session_id))
-                    .cloned()
-                    .map(|topic| (project.clone(), topic))
-            })
-    }
-
-    pub fn unassign_session_everywhere(&self, session_id: &str) -> Result<()> {
-        let project_ids = self
-            .projects
-            .read()
-            .expect("project lock poisoned")
-            .iter()
-            .filter(|project| {
-                project.board.topics.iter().any(|topic| {
-                    topic
-                        .session_ids
-                        .iter()
-                        .any(|existing| existing == session_id)
-                })
-            })
-            .map(|project| project.id.clone())
-            .collect::<Vec<_>>();
-        for project_id in project_ids {
-            self.mutate(&project_id, |project| {
-                for topic in &mut project.board.topics {
-                    topic.session_ids.retain(|existing| existing != session_id);
-                }
-                Ok(())
-            })?;
-        }
-        Ok(())
-    }
-
     fn mutate(
         &self,
         project_id: &str,
@@ -1021,371 +496,125 @@ impl ProjectService {
         let mut projects = self.projects.write().expect("project lock poisoned");
         let index = projects
             .iter()
-            .position(|p| p.id == project_id)
-            .ok_or_else(|| ProjectError::ProjectNotFound(project_id.to_string()))?;
-        let mut next = projects[index].clone();
-        let project = &mut next;
-        apply(project)?;
-        project.updated_at_ms = unix_time_ms();
-        validate_project(project)?;
-        self.persist(project)?;
-        projects[index] = next.clone();
-        Ok(next)
+            .position(|project| project.id == project_id)
+            .ok_or_else(|| ProjectError::ProjectNotFound(project_id.into()))?;
+        let mut project = projects[index].clone();
+        apply(&mut project)?;
+        project.updated_at_ms = now_ms();
+        validate(&project)?;
+        self.persist(&project)?;
+        projects[index] = project.clone();
+        Ok(project)
     }
-
-    fn ensure_project(&self, project_id: &str) -> Result<()> {
-        self.get(project_id).map(|_| ())
+    fn project_dir(&self, id: &str) -> PathBuf {
+        self.root.join(id)
     }
-
-    fn ensure_topic(&self, project_id: &str, topic_id: &str) -> Result<()> {
-        let project = self.get(project_id)?;
-        find_topic(&project, topic_id).map(|_| ())
-    }
-
-    fn read_topic_file(&self, project_id: &str, topic_id: &str, name: &str) -> Result<String> {
-        self.ensure_topic(project_id, topic_id)?;
-        let path = self.topic_dir(project_id, topic_id).join(name);
-        fs::read_to_string(&path).map_err(|source| ProjectError::Io { path, source })
-    }
-
-    fn write_topic_file(
-        &self,
-        project_id: &str,
-        topic_id: &str,
-        name: &str,
-        content: &str,
-    ) -> Result<()> {
-        self.ensure_topic(project_id, topic_id)?;
-        let path = self.topic_dir(project_id, topic_id).join(name);
-        atomic_write(&path, content.as_bytes())
-    }
-
     fn persist(&self, project: &Project) -> Result<()> {
-        let path = self.project_dir(&project.id).join("project.json");
+        let dir = self.project_dir(&project.id);
+        fs::create_dir_all(&dir).map_err(|source| ProjectError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let path = dir.join("project.json");
         let bytes = serde_json::to_vec_pretty(project).map_err(|source| ProjectError::Json {
             path: path.clone(),
             source,
         })?;
-        atomic_write(&path, &bytes)
-    }
-
-    fn create_topic_files(&self, project_id: &str, topic_id: &str) -> Result<()> {
-        let directory = self.topic_dir(project_id, topic_id);
-        create_dir_all(&directory)?;
-        atomic_write(&directory.join(OVERVIEW_FILE), b"")?;
-        atomic_write(&directory.join(AGENTS_FILE), b"")
-    }
-
-    fn project_dir(&self, project_id: &str) -> PathBuf {
-        self.root.join(project_id)
-    }
-
-    fn topic_dir(&self, project_id: &str, topic_id: &str) -> PathBuf {
-        self.project_dir(project_id).join("topics").join(topic_id)
+        let permit = dwo_file_guard::permit_file(&path);
+        let result = atomic_write(&path, &bytes);
+        drop(permit);
+        result
     }
 }
 
-fn recover_archive(root: &Path) -> Result<()> {
-    let journal = root.join("archive-transaction.json");
-    if !journal.exists() {
-        return Ok(());
-    }
-    let bytes = fs::read(&journal).map_err(|source| ProjectError::Io {
-        path: journal.clone(),
-        source,
-    })?;
-    let transaction: ArchiveTransaction =
-        serde_json::from_slice(&bytes).map_err(|source| ProjectError::Json {
-            path: journal.clone(),
-            source,
-        })?;
-    for project in transaction.projects {
-        validate_project(&project)?;
-        let path = root.join(&project.id).join("project.json");
-        let bytes = serde_json::to_vec_pretty(&project).map_err(|source| ProjectError::Json {
-            path: path.clone(),
-            source,
-        })?;
-        atomic_write(&path, &bytes)?;
-    }
-    if let Some(id) = transaction.removed {
-        let path = root.join(id).join("project.json");
-        if path.exists() {
-            let _permit = dwo_file_guard::permit_file(&path);
-            fs::remove_file(&path).map_err(|source| ProjectError::Io { path, source })?;
-        }
-    }
-    let _permit = dwo_file_guard::permit_file(&journal);
-    fs::remove_file(&journal).map_err(|source| ProjectError::Io {
-        path: journal,
-        source,
-    })
-}
-
-fn validate_project(project: &Project) -> Result<()> {
-    if project.id.trim().is_empty() || project.name.trim().is_empty() {
-        return Err(ProjectError::Invalid(
-            "project id and name are required".to_string(),
-        ));
-    }
-    validate_project_location(project.kind, project.pwd.as_deref())?;
-    if project.kind == ProjectKind::Work
-        && (project.repository.is_some()
-            || !project.worktrees.is_empty()
-            || project.default_worktree_id.is_some())
+fn validate(project: &Project) -> Result<()> {
+    if project.id.trim().is_empty() || project.name.trim().is_empty() || !project.pwd.is_absolute()
     {
         return Err(ProjectError::Invalid(
-            "independent projects cannot own repositories or worktrees".to_string(),
+            "project id, name and absolute pwd are required".into(),
         ));
+    }
+    let section_ids = project
+        .sections
+        .iter()
+        .map(|section| section.id.as_str())
+        .collect::<HashSet<_>>();
+    if section_ids.len() != project.sections.len()
+        || !section_ids.contains(project.default_section_id.as_str())
+        || project
+            .sections
+            .iter()
+            .any(|section| section.name.trim().is_empty() || section.color.trim().is_empty())
+    {
+        return Err(ProjectError::Invalid("invalid project sections".into()));
     }
     let worktree_ids = project
         .worktrees
         .iter()
         .map(|worktree| worktree.id.as_str())
         .collect::<HashSet<_>>();
-    let worktree_paths = project
-        .worktrees
-        .iter()
-        .map(|worktree| &worktree.path)
-        .collect::<HashSet<_>>();
-    if worktree_ids.len() != project.worktrees.len()
-        || worktree_paths.len() != project.worktrees.len()
-        || project
-            .default_worktree_id
-            .as_deref()
-            .is_some_and(|id| !worktree_ids.contains(id))
-        || (project.repository.is_none() && !project.worktrees.is_empty())
-        || project.worktrees.iter().any(|worktree| {
-            worktree.id.trim().is_empty()
-                || worktree.name.trim().is_empty()
-                || !worktree.path.is_absolute()
+    if project
+        .default_worktree_id
+        .as_deref()
+        .is_some_and(|id| !worktree_ids.contains(id))
+        || project.session_assignments.iter().any(|assignment| {
+            !section_ids.contains(assignment.section_id.as_str())
+                || assignment
+                    .worktree_id
+                    .as_deref()
+                    .is_some_and(|id| !worktree_ids.contains(id))
         })
     {
+        return Err(ProjectError::Invalid("invalid project assignments".into()));
+    }
+    let sessions = project
+        .session_assignments
+        .iter()
+        .map(|assignment| assignment.session_id.as_str())
+        .collect::<HashSet<_>>();
+    if sessions.len() != project.session_assignments.len() {
         return Err(ProjectError::Invalid(
-            "invalid project worktree records".to_string(),
-        ));
-    }
-    let section_ids = project
-        .board
-        .sections
-        .iter()
-        .map(|section| section.id.as_str())
-        .collect::<HashSet<_>>();
-    if section_ids.len() != project.board.sections.len()
-        || !section_ids.contains(project.board.uncategorized_section_id.as_str())
-    {
-        return Err(ProjectError::Invalid("invalid board sections".to_string()));
-    }
-    let topic_ids = project
-        .board
-        .topics
-        .iter()
-        .map(|topic| topic.id.as_str())
-        .collect::<HashSet<_>>();
-    if topic_ids.len() != project.board.topics.len()
-        || !topic_ids.contains(project.board.uncategorized_topic_id.as_str())
-        || project
-            .board
-            .topics
-            .iter()
-            .any(|topic| !section_ids.contains(topic.section_id.as_str()))
-    {
-        return Err(ProjectError::Invalid("invalid board topics".to_string()));
-    }
-    let label_ids = project
-        .board
-        .labels
-        .iter()
-        .map(|label| label.id.as_str())
-        .collect::<HashSet<_>>();
-    if label_ids.len() != project.board.labels.len()
-        || project
-            .board
-            .topics
-            .iter()
-            .flat_map(|topic| &topic.label_ids)
-            .any(|id| !label_ids.contains(id.as_str()))
-    {
-        return Err(ProjectError::Invalid("invalid board labels".to_string()));
-    }
-    let mut sessions = HashSet::new();
-    if project
-        .board
-        .topics
-        .iter()
-        .any(|topic| topic.session_ids.iter().any(|id| !sessions.insert(id)))
-    {
-        return Err(ProjectError::Invalid(
-            "a session can belong to only one topic in a project".to_string(),
+            "a session can have only one project assignment".into(),
         ));
     }
     Ok(())
 }
-
-fn validate_project_location(kind: ProjectKind, pwd: Option<&Path>) -> Result<()> {
-    match (kind, pwd) {
-        (ProjectKind::Project, Some(pwd)) if pwd.is_absolute() => Ok(()),
-        (ProjectKind::Project, _) => Err(ProjectError::Invalid(
-            "shared projects require an absolute pwd".to_string(),
-        )),
-        (ProjectKind::Work, None) => Ok(()),
-        (ProjectKind::Work, Some(_)) => Err(ProjectError::Invalid(
-            "independent projects cannot define pwd".to_string(),
-        )),
-    }
-}
-
-fn ensure_section(project: &Project, section_id: &str) -> Result<()> {
-    find_section(project, section_id).map(|_| ())
-}
-
-fn find_section<'a>(project: &'a Project, id: &str) -> Result<&'a Section> {
-    project
-        .board
-        .sections
-        .iter()
-        .find(|section| section.id == id)
-        .ok_or_else(|| ProjectError::SectionNotFound(id.to_string()))
-}
-
-fn find_topic<'a>(project: &'a Project, id: &str) -> Result<&'a Topic> {
-    project
-        .board
-        .topics
-        .iter()
-        .find(|topic| topic.id == id)
-        .ok_or_else(|| ProjectError::TopicNotFound(id.to_string()))
-}
-
-fn find_topic_mut<'a>(project: &'a mut Project, id: &str) -> Result<&'a mut Topic> {
-    project
-        .board
-        .topics
-        .iter_mut()
-        .find(|topic| topic.id == id)
-        .ok_or_else(|| ProjectError::TopicNotFound(id.to_string()))
-}
-
-fn result_with_section_order(project: Project, id: &str) -> Section {
-    project
-        .board
-        .sections
-        .into_iter()
-        .find(|section| section.id == id)
-        .expect("new section is present")
-}
-
-fn move_item<T>(
-    items: &mut Vec<T>,
-    id: &str,
-    position: usize,
-    key: impl Fn(&T) -> &String,
-) -> Option<()> {
-    let index = items.iter().position(|item| key(item) == id)?;
-    let item = items.remove(index);
-    let position = position.min(items.len());
-    items.insert(position, item);
-    Some(())
-}
-
-fn normalize_orders<T>(items: &mut [T], set: impl Fn(&mut T, u32)) {
-    for (index, item) in items.iter_mut().enumerate() {
-        set(item, index as u32);
-    }
-}
-
-fn normalize_topic_orders(topics: &mut [Topic], section_id: &str) {
-    for (order, topic) in topics
-        .iter_mut()
-        .filter(|topic| topic.section_id == section_id)
-        .enumerate()
-    {
-        topic.order = order as u32;
-    }
-}
-
-fn push_unique(values: &mut Vec<String>, value: String) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
-}
-
-fn append_unique(values: &mut Vec<String>, incoming: Vec<String>) {
-    for value in incoming {
-        push_unique(values, value);
-    }
-}
-
-fn nonempty(field: &str, value: String) -> Result<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        Err(ProjectError::Invalid(format!("{field} is required")))
-    } else {
-        Ok(value)
-    }
-}
-
-fn clean_optional(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn new_id(prefix: &str) -> String {
-    format!("{prefix}-{}", uuid::Uuid::new_v4())
-}
-
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    let path = fs::canonicalize(path).map_err(|source| ProjectError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if !path.is_dir() {
         return Err(ProjectError::Invalid(format!(
             "project pwd is not a directory: {}",
             path.display()
         )));
     }
-    fs::canonicalize(path).map_err(|source| ProjectError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    Ok(path)
 }
-
-fn create_dir_all(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).map_err(|source| ProjectError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn read_dir(path: &Path) -> Result<fs::ReadDir> {
-    fs::read_dir(path).map_err(|source| ProjectError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
+fn nonempty(field: &str, value: String) -> Result<String> {
+    if value.trim().is_empty() {
+        Err(ProjectError::Invalid(format!("{field} cannot be empty")))
+    } else {
+        Ok(value)
     }
-    let _permit = dwo_file_guard::permit_file(path);
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).map_err(|source| ProjectError::Io {
-        path: temporary.clone(),
+}
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+fn new_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temp, bytes).map_err(|source| ProjectError::Io {
+        path: temp.clone(),
         source,
     })?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| ProjectError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    }
-    fs::rename(&temporary, path).map_err(|source| ProjectError::Io {
+    fs::rename(&temp, path).map_err(|source| ProjectError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -1396,354 +625,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_default_board_without_embedding_a_workspace() {
+    fn assignments_move_sections_and_preserve_valid_state_on_failure() {
         let root = tempfile::tempdir().unwrap();
-        let service = ProjectService::open(root.path().join("projects")).unwrap();
-        let project = service
+        let store = ProjectService::open(root.path().join("storage")).unwrap();
+        let project = store
             .create(CreateProject {
-                name: "Demo".to_string(),
-                kind: ProjectKind::Work,
-                pwd: None,
+                name: None,
+                pwd: root.path().into(),
             })
             .unwrap();
+        assert_eq!(project.sections.len(), 1);
+        let first = store
+            .assign_session(&project.id, None, "session-test".into(), None)
+            .unwrap();
+        assert_eq!(first.section_id, project.default_section_id);
+        let section = store
+            .create_section(&project.id, "Next".into(), Some("red".into()))
+            .unwrap();
+        store
+            .assign_session(&project.id, Some(&section.id), "session-test".into(), None)
+            .unwrap();
+        assert!(
+            store
+                .assign_session(&project.id, Some("missing"), "session-test".into(), None)
+                .is_err()
+        );
+        let reopened = ProjectService::open(root.path().join("storage")).unwrap();
+        assert_eq!(
+            reopened
+                .locate_session("session-test")
+                .unwrap()
+                .1
+                .section_id,
+            section.id
+        );
+        assert!(store.delete_section(&project.id, &section.id).is_err());
+        assert!(
+            store
+                .delete_section(&project.id, &project.default_section_id)
+                .is_err()
+        );
+    }
 
-        assert_eq!(project.pwd, None);
+    #[test]
+    fn delete_releases_protection_and_keeps_project_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let _protection = dwo_file_guard::Protection::install(root.path(), &["runtime"], &[]);
+        let store = ProjectService::open(root.path().join("runtime/projects")).unwrap();
+        let project = store
+            .create(CreateProject {
+                name: None,
+                pwd: root.path().into(),
+            })
+            .unwrap();
+        store.set_project_rule(&project.id, "rules").unwrap();
+        store.delete(&project.id).unwrap();
+        assert!(store.list().is_empty());
         assert!(
             !root
                 .path()
-                .join("projects")
-                .join(&project.id)
-                .join("workspace")
+                .join("runtime/projects")
+                .join(project.id)
                 .exists()
         );
-        assert_eq!(project.board.sections.len(), 1);
-        assert_eq!(project.board.topics.len(), 1);
-        let topic = &project.board.topics[0];
-        assert_eq!(topic.id, project.board.uncategorized_topic_id);
-        assert_eq!(service.agents(&project.id, &topic.id).unwrap(), "");
-        assert_eq!(service.overview(&project.id, &topic.id).unwrap(), "");
-        assert!(!root.path().join("workspaces").exists());
-
-        let stored: serde_json::Value = serde_json::from_slice(
-            &fs::read(
-                root.path()
-                    .join("projects")
-                    .join(&project.id)
-                    .join("project.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(stored["kind"], "work");
-        assert!(stored.get("pwd").is_none());
-        assert!(stored.get("workspaces").is_none());
-    }
-
-    #[test]
-    fn rejects_invalid_project_kind_and_location_combinations() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        let service = ProjectService::open(root.path().join("projects")).unwrap();
-
-        assert!(matches!(
-            service.create(CreateProject {
-                name: "Missing pwd".to_string(),
-                kind: ProjectKind::Project,
-                pwd: None,
-            }),
-            Err(ProjectError::Invalid(_))
-        ));
-        assert!(matches!(
-            service.create(CreateProject {
-                name: "Unexpected pwd".to_string(),
-                kind: ProjectKind::Work,
-                pwd: Some(workspace),
-            }),
-            Err(ProjectError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_unknown_project_fields() {
-        let root = tempfile::tempdir().unwrap();
-        let projects = root.path().join("projects");
-        let project_dir = projects.join("project-invalid");
-        fs::create_dir_all(&project_dir).unwrap();
-        fs::write(
-            project_dir.join("project.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "id": "project-invalid",
-                "name": "Invalid",
-                "kind": "work",
-                "workspaces": [],
-                "board": {
-                    "uncategorizedSectionId": "section-inbox",
-                    "uncategorizedTopicId": "topic-inbox",
-                    "sections": [{"id": "section-inbox", "name": "Inbox", "order": 0}],
-                    "topics": [{
-                        "id": "topic-inbox",
-                        "sectionId": "section-inbox",
-                        "title": "Inbox",
-                        "order": 0
-                    }],
-                    "labels": []
-                },
-                "createdAtMs": 1,
-                "updatedAtMs": 1
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            ProjectService::open(projects),
-            Err(ProjectError::Json { .. })
-        ));
-    }
-
-    #[test]
-    fn persists_board_markdown_and_relations() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("existing");
-        fs::create_dir_all(&workspace).unwrap();
-        let service = ProjectService::open(root.path().join("projects")).unwrap();
-        let project = service
-            .create(CreateProject {
-                name: "Demo".to_string(),
-                kind: ProjectKind::Project,
-                pwd: Some(workspace.clone()),
-            })
-            .unwrap();
-        let section = service
-            .create_section(&project.id, "Build".to_string())
-            .unwrap();
-        let topic = service
-            .create_topic(&project.id, &section.id, "Project API".to_string())
-            .unwrap();
-        let label = service
-            .create_label(
-                &project.id,
-                "Backend".to_string(),
-                "#388E3C".to_string(),
-                None,
-            )
-            .unwrap();
-        service
-            .assign_label(&project.id, &topic.id, &label.id)
-            .unwrap();
-        service
-            .assign_session(&project.id, &topic.id, "session-1".to_string())
-            .unwrap();
-        service
-            .set_overview(&project.id, &topic.id, "# Plan")
-            .unwrap();
-        service
-            .set_agents(&project.id, &topic.id, "Stay scoped.")
-            .unwrap();
-        let common_dir = root.path().join("repo.git");
-        fs::create_dir_all(&common_dir).unwrap();
-        service
-            .set_repository(
-                &project.id,
-                RepositoryRecord {
-                    root: fs::canonicalize(&workspace).unwrap(),
-                    common_dir: fs::canonicalize(common_dir).unwrap(),
-                    remote_url: Some("https://example.test/repo.git".to_string()),
-                },
-                WorktreeRecord {
-                    id: "worktree-local".to_string(),
-                    name: "Local".to_string(),
-                    path: fs::canonicalize(&workspace).unwrap(),
-                    source: WorktreeSource::Primary,
-                    created_at_ms: 1,
-                },
-            )
-            .unwrap();
-
-        let reloaded = ProjectService::open(root.path().join("projects")).unwrap();
-        let loaded = reloaded.get(&project.id).unwrap();
-        let loaded_topic = find_topic(&loaded, &topic.id).unwrap();
-        assert_eq!(loaded_topic.session_ids, ["session-1"]);
-        assert_eq!(loaded_topic.label_ids, [label.id]);
-        assert_eq!(reloaded.overview(&project.id, &topic.id).unwrap(), "# Plan");
         assert_eq!(
-            reloaded.agents(&project.id, &topic.id).unwrap(),
-            "Stay scoped."
+            std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap(),
+            "rules"
         );
-        assert_eq!(loaded.pwd, Some(fs::canonicalize(workspace).unwrap()));
-        assert_eq!(
-            loaded.default_worktree_id.as_deref(),
-            Some("worktree-local")
-        );
-        assert_eq!(loaded.worktrees.len(), 1);
-        assert_eq!(
-            loaded.repository.unwrap().remote_url.as_deref(),
-            Some("https://example.test/repo.git")
-        );
-    }
-
-    #[test]
-    fn archive_preserves_sessions_and_replays_durable_ownership() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("repo");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(workspace.join("keep.txt"), "keep").unwrap();
-        let path = root.path().join("projects");
-        let service = ProjectService::open(&path).unwrap();
-        let project = service
-            .create(CreateProject {
-                name: "Demo".into(),
-                kind: ProjectKind::Project,
-                pwd: Some(workspace.clone()),
-            })
-            .unwrap();
-        let section = service
-            .create_section(&project.id, "Active".into())
-            .unwrap();
-        let topic = service
-            .create_topic(&project.id, &section.id, "Task".into())
-            .unwrap();
-        service
-            .assign_session(&project.id, &topic.id, "session-1".into())
-            .unwrap();
-        assert!(
-            service
-                .assign_session(
-                    &project.id,
-                    &project.board.uncategorized_topic_id,
-                    "session-1".into()
-                )
-                .is_err()
-        );
-        service
-            .move_topic(
-                &project.id,
-                &topic.id,
-                &project.board.uncategorized_section_id,
-                0,
-            )
-            .unwrap();
-        service
-            .archive(&project.id, None, Some(&topic.id), None)
-            .unwrap();
-        assert!(service.is_archived("session-1"));
-        let reloaded = ProjectService::open(&path).unwrap();
-        assert!(reloaded.is_archived("session-1"));
-        assert!(
-            !reloaded
-                .get(&project.id)
-                .unwrap()
-                .board
-                .topics
-                .iter()
-                .any(|t| t.id == topic.id)
-        );
-        reloaded.archive(&project.id, None, None, None).unwrap();
-        assert!(
-            ProjectService::open(&path)
-                .unwrap()
-                .get(&project.id)
-                .is_err()
-        );
-        assert_eq!(
-            fs::read_to_string(workspace.join("keep.txt")).unwrap(),
-            "keep"
-        );
-
-        let projects = reloaded.list();
-        let journal = ArchiveTransaction {
-            projects: projects.clone(),
-            removed: Some(project.id.clone()),
-        };
-        fs::write(
-            path.join("archive-transaction.json"),
-            serde_json::to_vec(&journal).unwrap(),
-        )
-        .unwrap();
-        fs::remove_file(path.join(UNASSIGNED_PROJECT_ID).join("project.json")).unwrap();
-        let recovered = ProjectService::open(&path).unwrap();
-        assert!(recovered.is_archived("session-1"));
-        assert!(!path.join("archive-transaction.json").exists());
-    }
-
-    #[test]
-    fn get_or_create_by_pwd_is_atomic_and_explicit_duplicates_are_rejected() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        let service =
-            std::sync::Arc::new(ProjectService::open(root.path().join("projects")).unwrap());
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let threads = (0..8)
-            .map(|index| {
-                let service = service.clone();
-                let barrier = barrier.clone();
-                let workspace = workspace.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    service
-                        .get_or_create_by_pwd(format!("Project {index}"), &workspace)
-                        .unwrap()
-                        .id
-                })
-            })
-            .collect::<Vec<_>>();
-        let ids = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect::<HashSet<_>>();
-        assert_eq!(ids.len(), 1);
-        assert_eq!(service.list().len(), 1);
-
-        let duplicate = service.create(CreateProject {
-            name: "Duplicate".to_string(),
-            kind: ProjectKind::Project,
-            pwd: Some(workspace),
-        });
-        assert!(matches!(duplicate, Err(ProjectError::Invalid(_))));
-    }
-
-    #[test]
-    fn proposals_roundtrip_and_updates() {
-        let root = tempfile::tempdir().unwrap();
-        let service = ProjectService::open(root.path().join("projects")).unwrap();
-        let project = service
-            .create(CreateProject {
-                name: "Demo".to_string(),
-                kind: ProjectKind::Work,
-                pwd: None,
-            })
-            .unwrap();
-        assert!(service.list_proposals(&project.id).unwrap().is_empty());
-        service
-            .append_proposal(
-                &project.id,
-                Proposal {
-                    id: "proposal-test".to_string(),
-                    project_id: project.id.clone(),
-                    method: "project.topic.create".to_string(),
-                    payload: serde_json::json!({"project_id": project.id}),
-                    source_session_id: "session-1".to_string(),
-                    status: ProposalStatus::Pending,
-                    error: None,
-                    result: None,
-                    created_at_ms: 1,
-                    resolved_at_ms: None,
-                },
-            )
-            .unwrap();
-        let listed = service.list_proposals(&project.id).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, ProposalStatus::Pending);
-        let updated = service
-            .update_proposals(&project.id, |proposals| {
-                proposals[0].status = ProposalStatus::Accepted;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(updated[0].status, ProposalStatus::Accepted);
-        let stored = service.list_proposals(&project.id).unwrap();
-        assert_eq!(stored[0].status, ProposalStatus::Accepted);
     }
 }

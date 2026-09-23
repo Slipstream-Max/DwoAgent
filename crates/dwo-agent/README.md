@@ -1,387 +1,103 @@
 # dwo
 
-`dwo` is the long-running dwoagent host and its control CLI. One daemon owns
-the profile, sessions, channel state, model clients, and tool runtimes. CLI and
-ACP processes connect to that daemon over local IPC instead of creating their
-own `SessionService`.
+dwo 是长期运行的 dwoagent Host 和控制 CLI。一个 daemon 持有 profile、Session、Project、
+Channel、模型客户端和工具 runtime；CLI 与 ACP 通过本地 IPC 连接，不会各自创建
+SessionService。
 
-```text
+~~~text
 crates/dwo-agent/       binary composition entry point
-crates/dwo-cli/         commands, install, rendering, composition callback
+crates/dwo-cli/         commands, install, rendering
 crates/dwo-host/        long-running state owner and management APIs
 crates/dwo-ipc/         local named-pipe/Unix-socket transport
 crates/dwo-websocket/   remote /acp and /dwo transport
-crates/dwo-acp/         ACP v1/v2 adapters and Zed stdio shim
+crates/dwo-acp/         ACP v1/v2 adapters
 crates/dwo-channels/    message platform adapters
 crates/dwo-command/     shared slash-command behavior
 crates/dwo-protocol/    Dwo RPC envelopes and method registry
-```
+~~~
 
-Only `dwo serve` constructs the `Host` and its `SessionService`. CLI and ACP
-commands are local clients; channel runtimes live inside the daemon and call
-the shared service directly. Platform adapters normalize inbound messages and
-perform final network sends. Channel adapters share command and session
-behavior without owning Host state.
+只有 dwo serve 构造 Host。外部命令通过 IPC 调用 Host；Channel runtime 在 daemon 内运行，
+并复用同一套 Session 和 Project 逻辑。
 
-```text
+## 常用命令
+
+~~~text
 dwo install [--start]
 dwo uninstall [--purge]
 dwo serve
 dwo daemon start|stop|status
-
 dwo config-show
-dwo session list [--all]
-dwo session status <id> [--json]
+
+dwo session list [--all] [--archived]
+dwo session prompt <message> [--cwd <path> | --project <id> [--section <id>]]
+dwo session move <id> --project <id> --section <id>
+dwo session archive <id>
 dwo session delete <id>
 dwo session keep <id>
-dwo session move <id> --project <project-id> --topic <topic-id>
-dwo session prompt <message> [--title <title>] [--cwd <path> | --project <project-id> [--topic <topic-id>]] [--policy <policy>] [--model <model>] [--reasoning <mode>] [--ephemeral] [--to <id> | --from <id>]
 dwo session cancel <id>
 dwo session watch <id> [--cursor <cursor>] [--limit <count>]
-dwo session approve|deny <id> <permission-id>
 
-dwo project list
-dwo project get <project-id>
-dwo project create <name> [--kind <shared|independent>] [--cwd <path>] [--from-session <session-id>]
-dwo project update <project-id> <name>
-dwo section list <project-id>
-dwo section create <project-id> <name>
-dwo section update <project-id> <section-id> <name>
-dwo section delete <project-id> <section-id>
-dwo section reorder <project-id> <section-id> <position>
-dwo topic list <project-id>
-dwo topic get <project-id> <topic-id>
-dwo topic create <project-id> <section-id> <title>
-dwo topic update <project-id> <topic-id> <title>
-dwo topic delete <project-id> <topic-id>
-dwo topic move <project-id> <topic-id> <section-id> [--to-project <project-id>] [--position <n>]
-dwo topic reorder <project-id> <topic-id> <section-id> <position>
+dwo project list|get|create|update|delete ...
+dwo section list|create|update|delete|reorder ...
+dwo session move ...
+dwo project worktree list|get|create|attach|rename|detach|remove ...
 
-dwo channel list
-dwo channel weixin status
-dwo channel weixin bind
-dwo channel weixin unbind
-dwo channel weixin send-message <message>
-dwo channel weixin send-file <path>
-dwo channel telegram status
-dwo channel telegram bind
-dwo channel telegram unbind
-dwo channel telegram send-message <message>
-dwo channel telegram send-file <path>
-dwo channel feishu status
-dwo channel feishu bind
-dwo channel feishu unbind
-dwo channel feishu send-message <message>
-dwo channel feishu send-file <path>
-dwo websocket status
-dwo websocket token
-dwo websocket reset-token
-dwo model list
-dwo model get-default
-dwo model set-default <provider/model> --reasoning <mode>
-dwo mcp list
-dwo mcp get <name>
-dwo mcp add [-t|--transport <stdio|http>] [-e|--env KEY=value] [-H|--header "Name: value"] <name> [<url> | -- <command> [args...]]
-dwo mcp add-json <name> <json>
-dwo mcp remove <name>
-dwo mcp search <query>
-dwo mcp call <server.tool> --args '<json>'
-dwo mcp auth <server>
-dwo mcp auth <server> --logout
-dwo skills list
-dwo skills add <file-or-directory> [--name <name>]
-dwo skills remove <name>
-dwo automation --project <id> list [--json]
-dwo automation --project <id> status <job> [--json]
-dwo automation --project <id> add <job> --cron <expr> --prompt <text> [options]
-dwo automation --project <id> enable|disable <job>
-dwo automation --project <id> enable|disable --all
-dwo automation --project <id> delete <job>
-dwo automation --project <id> delete --all --yes
-dwo automation --project <id> run <job> [--json]
+dwo automation --project <id> list|add|enable|disable|delete|run ...
+dwo automation --global list|add|enable|disable|delete|run ...
 dwo acp [--protocol v1|v2]
-```
+~~~
 
-Without `--to` or `--from`, `session prompt` creates a root session from an
-external shell or a direct child when `DWO_SESSION_ID` identifies the calling
-agent. `--to` continues an existing session; `--from` copies an idle session
-and prompts the copy. They are mutually exclusive. Agent callers can target
-only direct children, and child policy cannot be more permissive than its
-parent. A fork keeps the source cwd and parent; `--title` may override its
-title, while `--cwd` is rejected with either `--to` or `--from`.
+project create 接收 --cwd <path>，名称可省略；创建时自动得到默认 Section。Project 只管理
+pwd、Section、Session assignment、规则文件、Repository、Worktree 和 Automation scope。
+Session 通过 assignment 记录到 Project 的 Section，session.json 不保存这些属性。
 
-`--ephemeral` is available only when creating a new session. It cannot be used
-with `--to` or `--from`; forked sessions are persistent. An ephemeral session
-accepts `--to` follow-ups until a turn completes successfully. Successful,
-failed, and cancelled turns start a five-minute deletion grace period; failed
-or cancelled sessions can be prompted again during that period. Use
-`dwo session keep <id>` to make the session persistent. A graceful daemon stop
-deletes all remaining ephemeral sessions immediately.
+创建 Session 时：
 
-`dwo install` deploys the running executable to `~/.dwoagent/bin`, adds that
-directory to the Windows user PATH, and registers the daemon using the stable
-installed path.
+| 参数 | 行为 |
+| --- | --- |
+| --project <id> | 使用 Project root 或指定 Worktree，并写入 Section assignment |
+| --cwd <path> | 使用外部 cwd，不创建 Project |
+| 两者都省略 | 在 runtime/workspaces/<session-id> 创建 managed workspace |
 
-`session prompt --to ... --model ...` can move an idle image-bearing session to a text-only model.
-Before committing the switch, the current image-capable model converts the
-images into a text summary; the model context is then image-free while replay
-keeps the original image events. The switch fails without changing state if
-that summary fails, and it is rejected while an image turn is active. A
-text-only model also rejects new image prompts before storing them.
+子 Session 和 Fork 默认继承父 Session 的 cwd、Project、Section、Worktree、model 和 policy；
+权限只能收紧。--to 继续已有 Session，--from 从 idle Session Fork，两者互斥。
 
-Project, Section, Topic, and Session are separate top-level CLI resources even
-though the management RPC uses `project.section.*` and `project.topic.*` method
-names. `topic move` can move a Topic between Sections or Projects; `session move`
-assigns a Session to a target Topic and rebinds its workspace when the target
-Project kind requires it, while preserving the Session's persisted data.
-`project create --from-session` creates a Project and moves the calling Session
-to its uncategorized Topic. The complete command reference is in
-[`docs/cli.md`](../../docs/cli.md).
+Session 默认是持久 Session；只有创建时传入 --ephemeral 才是临时 Session。Session 先 archive 再 delete。
+Archive 将目录移动到 runtime/sessions/archive；delete 时 Host
+清理 Project assignment 并真正删除 Session 文件和 DWO 管理的 workspace。Ephemeral Session
+结束后进入自动删除宽限期，宽限期结束后直接删除；session keep 可将它转换为持久 Session。
 
-Windows uses a named pipe and an on-login scheduled task whose generated VBS
-launcher keeps the daemon window hidden. macOS uses a Unix domain socket and a
-per-user launchd agent. `serve` itself stays in the foreground; the
-operating-system service manager owns background lifecycle.
+## Runtime 布局
 
-The default profile is `~/.dwoagent`:
-
-```text
+~~~text
 profile.yaml
 resource/prompts/System.md
 resource/prompts/AGENTS.md
 resource/skills/
 resource/mcp/mcp.json
-runtime/sessions/YYYY/MM/DD/<session-id>/
+runtime/sessions/<date>/<session-id>/
   session.json
   model_context.json
   client_transcript.jsonl
-runtime/projects/<project-id>/
-  project.json
-  topics/<topic-id>/overview.md
-  topics/<topic-id>/AGENTS.md
+runtime/sessions/archive/<session-id>/
+runtime/projects/<project-id>/project.json
+runtime/automations/<project-id>/{config,history}.yaml
+runtime/automations/global/{config,history}.yaml
 runtime/workspaces/<session-id>/
-runtime/attachments/weixin/YYYY/MM/DD/<session-id>/
-runtime/attachments/telegram/YYYY/MM/DD/<session-id>/
-runtime/attachments/feishu/YYYY/MM/DD/<session-id>/
-resource/mcp/oauth/
-logs/
-channels/weixin/runtime.yaml
-channels/weixin/secret.yaml
-channels/telegram/runtime.yaml
-channels/telegram/secret.yaml
-channels/feishu/runtime.yaml
-channels/feishu/secret.yaml
+runtime/attachments/
 runtime/websocket/secret.yaml
-```
+logs/
+~~~
 
-Weixin user settings live in `profile.yaml` and are validated before the host
-starts:
+Project rules 位于 <project.pwd>/AGENTS.md，由 project.rules.get/set 读写。Prompt 使用
+profile rules 和当前 cwd 下的 AGENTS.md，不复制规则到 Session。
 
-```yaml
-channels:
-  weixin:
-    enabled: true
-    replayTurns: 5
-    outputMode: final
-    markdownFilter: true
-    mediaInput: true
-  telegram:
-    enabled: false
-    replayTurns: 5
-    outputMode: final
-    botTokenEnv: TELEGRAM_BOT_TOKEN
-    tgProxy: null
-    mediaInput: true
-  feishu:
-    enabled: false
-    replayTurns: 5
-    outputMode: final
-    appIdEnv: FEISHU_APP_ID
-    appSecretEnv: FEISHU_APP_SECRET
-    platform: feishu
-    mediaInput: true
-```
+Project 的 Worktree assignment 决定 Session cwd：没有 Worktree 时使用 Project root；Worktree
+detach 只解除登记，remove 才调用 Git 删除。Global Automation 可以指定 cwd；Project
+Automation 只能使用 Project root 或 Worktree。三种 Automation Session 行为是 every_time、
+once 和 fixed，fixed 继承目标 Session 的 cwd 与 assignment。
 
-Weixin `runtime.yaml` stores the selected session, `syncBuf`, and SDK context
-tokens; its `secret.yaml` stores QR-login credentials. Telegram `runtime.yaml`
-stores one selected session; its `secret.yaml` stores the bot identity and the
-single bound private user/chat. Feishu `runtime.yaml` also stores one selected
-session, while its `secret.yaml` stores only the bound `open_id` and `chat_id`.
-Application credentials are never persisted. These files are daemon-owned.
-
-Telegram is private-chat only. The token is read from `botTokenEnv`, never
-persisted. `dwo channel telegram bind` prints a one-time code that must be sent
-as `/bind <code>` in the bot private chat. `tgProxy` is an optional HTTP proxy
-used only by Telegram. The command menu is generated from the same clap
-metadata as Weixin `/help`.
-
-Feishu and Lark use the same private-chat adapter. `platform: feishu` selects
-`https://open.feishu.cn`; `platform: lark` selects
-`https://open.larksuite.com`. Create an enterprise application in the matching
-open platform, enable its bot, choose long-connection event delivery, subscribe
-to `im.message.receive_v1`, and grant permissions to receive messages, send
-messages as the application, and get/upload message resources. Publish the
-application, set the environment variables named by `appIdEnv` and
-`appSecretEnv`, restart the daemon, then run `dwo channel feishu bind` and send
-the printed `/bind <code>` to the bot in a private chat. No public webhook is
-required. The adapter reconnects its `openlark` WebSocket with bounded backoff.
-
-`replayTurns` is limited to 10. After `/use`, each replayed turn combines the
-user prompt and every non-empty assistant response into one message; tool
-results are omitted. If the last turn is still active, its normal replay is
-replaced with the user prompt, the most recent reasoning round, and a `Prompt
-turn is running` notice. `/status` reports only current session state.
-
-`status` reports whether the channel is configured and bound, the bound user
-ID, and the selected session. `connected` means persisted credentials validate;
-Telegram additionally requires its token environment variable to resolve;
-Feishu requires both application credential environment variables. It is not
-a live network health check. `send-message` and `send-file` always target the
-bound private conversation.
-
-Inbound Weixin media, Telegram photo/document/video, and Feishu/Lark
-image/file messages are downloaded under the selected session's dated channel
-attachment directory and submitted as a structured resource link containing
-the local path, MIME type, name, and size. A media-only message is a valid
-prompt. Telegram and Feishu send model output as plain text without markdown
-rewriting. Host-created sessions belong to a Project. Sessions without an
-explicit Project share the independent `project-unassigned` Project, while each
-generated workspace lives under `runtime/workspaces/<session-id>`. Project
-directories contain metadata and Topic resources rather than working files;
-they do not contain workspace records.
-
-Channel slash commands are declared as one clap-derived command enum shared by
-platform adapters. Parsing, argument validation, and `/help` descriptions
-therefore come from one command definition instead of separate handwritten
-lists. The commands include `/new [name] [--cwd <path>]`, `/fork`, and `/policy
-[full_access|confirm|watch]`. `/fork` copies the selected session without
-selecting the copy. In confirm mode, `/allow` and `/deny` act on the
-current pending permission; an optional request ID can still be supplied.
-Assistant responses are buffered for the whole turn, joined in commit order,
-and split only when the combined text exceeds 4,000 characters. Tool calls are
-sent immediately only when confirmation is required, together with the
-permission request ID.
-
-When a channel is enabled and bound, its adapter publishes a concise,
-secret-free capability snapshot in memory. Binding and unbinding changes are
-reported to existing sessions by the environment watcher; no channel capability
-file is written to `runtime`.
-
-MCP servers are configured in `resource/mcp/mcp.json`. Static HTTP headers and
-stdio environment variables are resolved from that file, including `${ENV}`
-references. Only servers declaring `auth.type: oauth` use the interactive
-`dwo mcp auth` flow. The daemon initializes configured servers concurrently at
-startup and keeps the resulting catalog in memory; each successful
-connection stays managed by the daemon. New or changed servers are initialized
-the same way by the config watcher. Failed or unauthenticated servers remain in
-the catalog with their status and error. MCP schemas are never registered as
-model tools.
-
-`mcp search` reads only the current in-memory catalog and never starts a server.
-A server match lists all of that server's tools; directly matching tools also
-expand their input schema. A tool-only match lists only matching tools with
-schemas. CLI results are rendered as YAML-style text; `--args` remains JSON
-because it is the MCP tool argument payload.
-
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-    },
-    "github": {
-      "type": "streamableHttp",
-      "url": "https://example.test/mcp",
-      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"}
-    },
-    "notion": {
-      "type": "streamableHttp",
-      "url": "https://example.test/mcp",
-      "auth": {"type": "oauth"}
-    }
-  }
-}
-```
-
-Weixin binding uses the real `weixin-agent` QR flow. Bound channels reconnect
-inside the daemon, persist sync state, route slash commands through the shared
-`SessionService`, and support answer-only or full tool-progress streaming. A user
-prompt submitted by ACP is mirrored to the bound Weixin observer; a prompt that
-originates from Weixin is not echoed back to the same endpoint.
-
-The ACP command is a small stdio JSON-RPC bridge to the daemon IPC endpoint; it
-depends on the ACP schema rather than embedding another agent runtime. Protocol
-v2 is the default, while `--protocol v1` keeps the prompt request open until
-the turn returns its stop reason. Both versions share the same sessions and
-events as CLI and channel clients. Loading a session keeps a live observer
-attached, so idle ACP clients continue to receive prompts, tool events, and
-permission requests from other clients.
-
-ACP text blocks, images, text embedded resources, and resource links retain
-their original order. Resource text keeps its URI and MIME type; links keep
-their name, URI, and available metadata so referenced files and directories
-remain visible to the model. Images stay as structured blocks and are accepted
-only when the selected model supports them. Audio and binary embedded
-resources are rejected.
-
-Non-empty ACP `mcpServers` and `additionalDirectories` are rejected. MCP
-runtime ownership remains daemon-global through `resource/mcp/mcp.json`.
-
-Zed implements Send now as adjacent `session/cancel` and `session/prompt`
-messages. The adapter coalesces that same-connection, same-session pair within
-500ms and submits the prompt to the Host FIFO instead of cancelling the turn.
-A standalone cancel is forwarded after the grace period. Hosted Responses
-tools are surfaced through the same ACP tool updates as local tools, although
-their execution remains provider-side.
-
-External prompts use stable FIFO semantics. During an active turn they wait for
-the current model-response or tool-call boundary, join that turn in arrival
-order, and never cancel tools implicitly. The origin endpoint does not receive
-its own prompt notification; every other observer does.
-
-Completed child turns are delivered to their parent as internal
-`<subsession_result>` messages. They never appear as user prompt events. An
-idle parent starts immediately; a running parent accepts the result at its next
-model-response or tool-call boundary. Explicit cancellation clears queued user
-prompts, preserves internal messages, and prevents preserved messages from
-waking another model step after the cancelled turn.
-
-## Automation
-
-The daemon validates and hot-reloads the complete `profile.yaml`, including
-models, defaults, logging, and channels. Invalid intermediate
-writes leave the previous runtime configuration active. Channel changes
-restart managed connections; model changes reach existing sessions on their
-next request, while changed defaults apply only to newly created sessions.
-
-Automation jobs use a standard five-field cron expression. New sessions require an explicit
-`behavior`: `every_time` creates one per run, while `once` marks and reuses one
-session owned by that job. A fixed-session run targets
-an explicit ID and uses the same FIFO prompt semantics as other clients.
-
-Automation is unattended. Tool confirmation requests are denied automatically
-instead of waiting forever. Full execution remains in the target session; the
-Project-level `timeoutSeconds` limit asks an overdue turn to stop using tools
-and provide its final answer on the next model step. Runs targeting the same
-session are queued by the Automation runtime and submitted as separate turns.
-Each Project owns `runtime/projects/<project-id>/automation/config.yaml` and
-`history.yaml`; the runtime keeps no global automation file. Manual `automation run` returns
-after the session and prompt have started, without waiting for completion.
-When invoked from an agent session, its
-completion, cancellation, or failure is delivered back as an internal
-`<automation_result>` message, so the caller never needs to wait or poll.
-
-```yaml
-enabled: true
-timeoutSeconds: 900
-jobs:
-  - name: daily-report
-    schedule:
-      cron: "0 9 * * *"
-      timezone: Asia/Shanghai
-    session:
-      mode: new
-      behavior: every_time
-    prompt: Summarize the current project status.
-```
+Windows 使用 named pipe 和隐藏的登录启动任务；macOS 使用 Unix domain socket 和 launchd。
+serve 保持前台运行，系统服务管理器负责后台生命周期。完整命令与 schema 见
+[docs/cli.md](../../docs/cli.md)、[docs/projects.md](../../docs/projects.md) 和
+[docs/automation.md](../../docs/automation.md)。

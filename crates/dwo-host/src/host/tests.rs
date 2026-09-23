@@ -1,7 +1,7 @@
 use super::*;
 use dwo_agent_service::SessionListQuery;
 
-pub(super) fn write_test_profile(root: &Path) -> PathBuf {
+pub(crate) fn write_test_profile(root: &Path) -> PathBuf {
     std::fs::create_dir_all(root.join("resource/prompts")).unwrap();
     std::fs::write(
         root.join("resource/prompts/System.md"),
@@ -269,13 +269,9 @@ async fn runtime_state_files_stay_locked_while_the_host_runs() {
         .await
         .unwrap();
 
-    let (owner, _) = host.projects.locate_session(session_id.as_str()).unwrap();
-    host.handle_method(
-        "project.session.archive",
-        json!({"project_id": owner.id, "session_id": session_id}),
-    )
-    .await
-    .unwrap();
+    host.handle_method("session.archive", json!({"session_id": session_id}))
+        .await
+        .unwrap();
     host.delete_session(&session_id).await.unwrap();
     assert!(!session_file.exists());
 

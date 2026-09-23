@@ -48,10 +48,10 @@ Rule 来源按下面顺序加入 System Prompt：
 | <session-cwd>/AGENTS.md | Session 当前工作目录 |
 | <session-cwd>/.agents/AGENTS.md | Session 当前工作目录 |
 | externalRuleFiles | Profile 根目录；相对路径相对 Profile 根目录 |
-| Topic 的 AGENTS.md | 关联 Session 当前工作目录 |
+| Project 根目录或 Session cwd 下的 AGENTS.md | 作用于该目录及其子目录 |
 
 空的 Rule 文件会忽略。每份 Rule 都带 source 和 pwd，模型可以判断它来自哪里、约束哪个目录。
-Topic Knowledge 的存储和移动行为见 [Project 文件与行为](projects.md)。
+Project rules 的路径和读写行为见 [Project 文件与行为](projects.md)。
 
 Profile 中配置外部 Rule：
 

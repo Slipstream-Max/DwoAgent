@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,6 +27,9 @@ pub trait SessionRepository: Send + Sync {
     async fn load(&self, id: &SessionId) -> Result<Option<SessionRecord>>;
     async fn list(&self) -> Result<Vec<SessionRecord>>;
     async fn delete(&self, id: &SessionId) -> Result<bool>;
+    async fn archive(&self, id: &SessionId) -> Result<bool>;
+    async fn is_archived(&self, id: &SessionId) -> Result<bool>;
+    async fn list_archived(&self) -> Result<Vec<SessionRecord>>;
     async fn append_transcript_event(
         &self,
         id: &SessionId,
@@ -39,6 +42,7 @@ pub trait SessionRepository: Send + Sync {
 pub struct MemorySessionRepository {
     records: RwLock<HashMap<SessionId, SessionRecord>>,
     transcripts: RwLock<HashMap<SessionId, Vec<ClientTranscriptEvent>>>,
+    archived: RwLock<HashSet<SessionId>>,
 }
 
 #[async_trait]
@@ -61,14 +65,49 @@ impl SessionRepository for MemorySessionRepository {
     }
 
     async fn list(&self) -> Result<Vec<SessionRecord>> {
-        let mut records: Vec<_> = self.records.read().await.values().cloned().collect();
+        let archived = self.archived.read().await;
+        let mut records: Vec<_> = self
+            .records
+            .read()
+            .await
+            .values()
+            .filter(|record| !archived.contains(&record.info.id))
+            .cloned()
+            .collect();
         records.sort_by_key(|record| Reverse(record.info.updated_at_ms));
         Ok(records)
     }
 
     async fn delete(&self, id: &SessionId) -> Result<bool> {
         self.transcripts.write().await.remove(id);
+        self.archived.write().await.remove(id);
         Ok(self.records.write().await.remove(id).is_some())
+    }
+
+    async fn archive(&self, id: &SessionId) -> Result<bool> {
+        if !self.records.read().await.contains_key(id) {
+            return Ok(false);
+        }
+        self.archived.write().await.insert(id.clone());
+        Ok(true)
+    }
+
+    async fn is_archived(&self, id: &SessionId) -> Result<bool> {
+        Ok(self.archived.read().await.contains(id))
+    }
+
+    async fn list_archived(&self) -> Result<Vec<SessionRecord>> {
+        let archived = self.archived.read().await;
+        let mut records: Vec<_> = self
+            .records
+            .read()
+            .await
+            .values()
+            .filter(|record| archived.contains(&record.info.id))
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| Reverse(record.info.updated_at_ms));
+        Ok(records)
     }
 
     async fn append_transcript_event(
@@ -115,8 +154,10 @@ struct PersistedSessionMetadata {
 struct PersistedSessionInfo {
     id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    parent_session_id: Option<SessionId>,
-    title: String,
+   parent_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forked_from: Option<SessionId>,
+   title: String,
     workspace: SessionWorkspace,
     mode: dwo_tools::SessionMode,
     created_at_ms: u64,
@@ -133,7 +174,8 @@ impl PersistedSessionInfo {
     fn from_runtime(info: &SessionInfo) -> Self {
         Self {
             id: info.id.clone(),
-            parent_session_id: info.parent_session_id.clone(),
+           parent_session_id: info.parent_session_id.clone(),
+            forked_from: info.forked_from.clone(),
             title: info.title.clone(),
             workspace: info.workspace.clone(),
             mode: info.mode,
@@ -148,7 +190,8 @@ impl PersistedSessionInfo {
     fn into_runtime(self) -> SessionInfo {
         SessionInfo {
             id: self.id,
-            parent_session_id: self.parent_session_id,
+           parent_session_id: self.parent_session_id,
+            forked_from: self.forked_from,
             title: self.title,
             cwd: PathBuf::new(),
             workspace: self.workspace,
@@ -179,7 +222,9 @@ impl PersistedSessionMetadata {
 
 pub struct FsSessionRepository {
     root: PathBuf,
+    archive_root: PathBuf,
     paths: RwLock<HashMap<SessionId, PathBuf>>,
+    archived: RwLock<HashSet<SessionId>>,
     locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
@@ -187,16 +232,27 @@ impl FsSessionRepository {
     pub async fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         tokio::fs::create_dir_all(&root).await?;
+        let archive_root = root.join("archive");
+        tokio::fs::create_dir_all(&archive_root).await?;
         let mut paths = HashMap::new();
+        let mut archived = HashSet::new();
         for session_dir in Self::scan_session_dirs(&root).await? {
             let metadata: PersistedSessionMetadata =
                 Self::read_json(&session_dir.join(SESSION_META_FILE)).await?;
             paths.insert(metadata.info.id, session_dir);
         }
+        for session_dir in Self::scan_session_dirs(&archive_root).await? {
+            let metadata: PersistedSessionMetadata =
+                Self::read_json(&session_dir.join(SESSION_META_FILE)).await?;
+            archived.insert(metadata.info.id.clone());
+            paths.insert(metadata.info.id, session_dir);
+        }
         Ok(Self {
             root,
+            archive_root,
             paths: RwLock::new(paths),
             locks: Mutex::new(HashMap::new()),
+            archived: RwLock::new(archived),
         })
     }
 
@@ -235,15 +291,14 @@ impl FsSessionRepository {
             let mut entries = tokio::fs::read_dir(&directory).await?;
             while let Some(entry) = entries.next_entry().await? {
                 if entry.file_type().await?.is_dir() {
+                    if directory == root && entry.file_name() == "archive" {
+                        continue;
+                    }
                     directories.push(entry.path());
                 }
             }
         }
         Ok(sessions)
-    }
-
-    async fn session_dirs(&self) -> Vec<PathBuf> {
-        self.paths.read().await.values().cloned().collect()
     }
 
     async fn find_dir(&self, id: &SessionId) -> Option<PathBuf> {
@@ -288,7 +343,7 @@ impl FsSessionRepository {
     async fn remove_empty_date_directories(&self, path: &Path) -> Result<()> {
         let mut directory = path.parent().map(Path::to_path_buf);
         while let Some(current) = directory {
-            if current == self.root {
+            if current == self.root || current == self.archive_root {
                 break;
             }
             let mut entries = tokio::fs::read_dir(&current).await?;
@@ -307,7 +362,13 @@ impl SessionRepository for FsSessionRepository {
     async fn save(&self, record: &SessionRecord) -> Result<()> {
         let lock = self.session_lock(&record.info.id).await;
         let _write = lock.lock().await;
-        let session_dir = self.session_dir(record)?;
+        let session_dir = if self.archived.read().await.contains(&record.info.id) {
+            self.find_dir(&record.info.id)
+                .await
+                .context("archived session path is missing")?
+        } else {
+            self.session_dir(record)?
+        };
         tokio::fs::create_dir_all(&session_dir).await?;
         Self::write_json(
             &session_dir.join(SESSION_MODEL_CONTEXT_FILE),
@@ -337,11 +398,65 @@ impl SessionRepository for FsSessionRepository {
     }
 
     async fn list(&self) -> Result<Vec<SessionRecord>> {
-        let mut records = stream::iter(self.session_dirs().await)
-            .map(|session_dir| async move { Self::read_record(&session_dir).await })
-            .buffer_unordered(16)
-            .try_collect::<Vec<_>>()
-            .await?;
+        let archived = self.archived.read().await.clone();
+        let paths = self.paths.read().await.clone();
+        let mut records = stream::iter(
+            paths
+                .into_iter()
+                .filter(|(id, _)| !archived.contains(id))
+                .map(|(_, path)| path)
+                .collect::<Vec<_>>(),
+        )
+        .map(|session_dir| async move { Self::read_record(&session_dir).await })
+        .buffer_unordered(16)
+        .try_collect::<Vec<_>>()
+        .await?;
+        records.sort_by_key(|record| Reverse(record.info.updated_at_ms));
+        Ok(records)
+    }
+
+    async fn archive(&self, id: &SessionId) -> Result<bool> {
+        let lock = self.session_lock(id).await;
+        let _write = lock.lock().await;
+        if self.archived.read().await.contains(id) {
+            return Ok(true);
+        }
+        let Some(session_dir) = self.find_dir(id).await else {
+            return Ok(false);
+        };
+        let relative = session_dir
+            .strip_prefix(&self.root)
+            .context("session path is outside repository root")?;
+        let target = self.archive_root.join(relative);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        dwo_file_guard::release_tree(&session_dir);
+        tokio::fs::rename(&session_dir, &target).await?;
+        self.paths.write().await.insert(id.clone(), target);
+        self.archived.write().await.insert(id.clone());
+        self.remove_empty_date_directories(&session_dir).await?;
+        Ok(true)
+    }
+
+    async fn is_archived(&self, id: &SessionId) -> Result<bool> {
+        Ok(self.archived.read().await.contains(id))
+    }
+
+    async fn list_archived(&self) -> Result<Vec<SessionRecord>> {
+        let archived = self.archived.read().await.clone();
+        let paths = self.paths.read().await.clone();
+        let mut records = stream::iter(
+            paths
+                .into_iter()
+                .filter(|(id, _)| archived.contains(id))
+                .map(|(_, path)| path)
+                .collect::<Vec<_>>(),
+        )
+        .map(|session_dir| async move { Self::read_record(&session_dir).await })
+        .buffer_unordered(16)
+        .try_collect::<Vec<_>>()
+        .await?;
         records.sort_by_key(|record| Reverse(record.info.updated_at_ms));
         Ok(records)
     }
@@ -354,8 +469,9 @@ impl SessionRepository for FsSessionRepository {
         };
         dwo_file_guard::release_tree(&session_dir);
         tokio::fs::remove_dir_all(&session_dir).await?;
-        self.remove_empty_date_directories(&session_dir).await?;
         self.paths.write().await.remove(id);
+        self.archived.write().await.remove(id);
+        self.remove_empty_date_directories(&session_dir).await?;
         Ok(true)
     }
 

@@ -10,7 +10,7 @@
 | [Prompt、Skill 与 MCP](resources.md) | Prompt/Rule、Skill 目录、MCP JSON、优先级和资源热加载 |
 | [Channel 配置与行为](channels.md) | 微信、Telegram、飞书/Lark、QQ 的配置、绑定和消息行为 |
 | [CLI 命令参考](cli.md) | dwo 的全部命令，按资源分类 |
-| [Project 文件与行为](projects.md) | project.json、Board/Section/Topic/Label/Worktree 字段和 Workspace 规则 |
+| [Project 文件与行为](projects.md) | project.json、Section/Session assignment/Worktree 字段、规则文件和 Workspace 规则 |
 | [Automation](automation.md) | config.yaml、history.yaml、Cron、Session 策略和无人值守行为 |
 | [Slash Commands](slash-commands.md) | ACP 和消息平台中的 / 命令 |
 | [ACP 连接](acp.md) | ACP Client 配置、v1/v2 和输入输出能力 |

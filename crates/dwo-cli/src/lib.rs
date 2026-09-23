@@ -57,17 +57,9 @@ enum Command {
         #[command(subcommand)]
         command: SectionCommand,
     },
-    Topic {
-        #[command(subcommand)]
-        command: TopicCommand,
-    },
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
-    },
-    Proposal {
-        #[command(subcommand)]
-        command: ProposalCommand,
     },
     ConfigShow,
     Channel {
@@ -93,6 +85,8 @@ enum Command {
     Automation {
         #[arg(long, global = true)]
         project: Option<String>,
+        #[arg(long, global = true, conflicts_with = "project")]
+        global: bool,
         #[command(subcommand)]
         command: AutomationCommand,
     },
@@ -114,6 +108,23 @@ enum SessionCommand {
     List {
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        archived: bool,
+        /// 每页条数。
+        #[arg(long, default_value_t = 20)]
+        num: usize,
+        /// 页码，从 1 开始。
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+        /// 只列 root 及其子会话（子会话缩进跟在它父会话后面）。
+        #[arg(long, conflicts_with = "all")]
+        sub: bool,
+        /// 只列 fork 出来的会话。
+        #[arg(long, conflicts_with = "all")]
+        forked: bool,
+        /// 原样输出分页对象。
+        #[arg(long)]
+        json: bool,
     },
     Delete {
         id: String,
@@ -123,15 +134,13 @@ enum SessionCommand {
     },
     Archive {
         id: String,
-        #[arg(long)]
-        project: String,
     },
     Move {
         id: String,
         #[arg(long)]
         project: String,
         #[arg(long)]
-        topic: String,
+        section: String,
     },
     Set {
         id: String,
@@ -158,7 +167,7 @@ enum SessionCommand {
         #[arg(long, conflicts_with_all = ["cwd", "to", "from"])]
         project: Option<String>,
         #[arg(long, requires = "project")]
-        topic: Option<String>,
+        section: Option<String>,
         #[arg(long)]
         policy: Option<String>,
         #[arg(long)]
@@ -218,46 +227,6 @@ enum SectionCommand {
 }
 
 #[derive(Subcommand)]
-enum TopicCommand {
-    List {
-        project: String,
-    },
-    Get {
-        project: String,
-        id: String,
-    },
-    Create {
-        project: String,
-        section: String,
-        title: String,
-        #[arg(long)]
-        overview: String,
-    },
-    Update {
-        project: String,
-        id: String,
-        title: String,
-    },
-    Archive {
-        project: String,
-        id: String,
-    },
-    Move {
-        project: String,
-        id: String,
-        section: String,
-        #[arg(long, default_value_t = usize::MAX)]
-        position: usize,
-    },
-    Reorder {
-        project: String,
-        id: String,
-        section: String,
-        position: usize,
-    },
-}
-
-#[derive(Subcommand)]
 enum ProjectCommand {
     List,
     Get {
@@ -268,56 +237,16 @@ enum ProjectCommand {
         #[arg(long)]
         cwd: PathBuf,
     },
-    Archive {
+    Delete {
         project: String,
     },
     Update {
         project: String,
         name: String,
     },
-    Repository {
-        #[command(subcommand)]
-        command: RepositoryCommand,
-    },
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum ProposalCommand {
-    List {
-        project: String,
-        #[arg(long)]
-        status: Option<String>,
-    },
-    Accept {
-        project: String,
-        #[arg(long = "id")]
-        id: Vec<String>,
-        #[arg(long)]
-        all: bool,
-    },
-    Reject {
-        project: String,
-        #[arg(long = "id")]
-        id: Vec<String>,
-        #[arg(long)]
-        all: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum RepositoryCommand {
-    Get {
-        project: String,
-    },
-    Attach {
-        project: String,
-        path: PathBuf,
-        #[arg(long)]
-        name: Option<String>,
     },
 }
 
@@ -514,9 +443,11 @@ enum AutomationCommand {
         #[arg(long)]
         session_id: Option<String>,
         #[arg(long)]
-        topic: Option<String>,
+        section: Option<String>,
         #[arg(long)]
         title: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        cwd: Option<PathBuf>,
         #[arg(long)]
         disabled: bool,
         #[arg(long)]
@@ -608,9 +539,7 @@ where
         },
         Command::Session { command } => run_session(command, &config_path).await?,
         Command::Section { command } => run_section(command, &config_path).await?,
-        Command::Topic { command } => run_topic(command, &config_path).await?,
         Command::Project { command } => run_project(command, &config_path).await?,
-        Command::Proposal { command } => run_proposal(command, &config_path).await?,
         Command::ConfigShow => {
             let value = ipc::request_dwo(&config_path, "config.snapshot", json!({})).await?;
             render::write_value(&value)?;
@@ -620,9 +549,11 @@ where
         Command::Mcp { command } => run_mcp(command, &config_path).await?,
         Command::Model { command } => run_model(command, &config_path).await?,
         Command::Skills { command } => run_skills(command, &config_path).await?,
-        Command::Automation { project, command } => {
-            run_automation(command, project, &config_path).await?
-        }
+        Command::Automation {
+            project,
+            global,
+            command,
+        } => run_automation(command, project, global, &config_path).await?,
         Command::Acp { protocol } => acp::run(config_path, protocol).await?,
     }
     Ok(())
@@ -631,19 +562,20 @@ where
 async fn run_automation(
     command: AutomationCommand,
     project: Option<String>,
+    global: bool,
     config_path: &Path,
 ) -> Result<()> {
     anyhow::ensure!(
         !matches!(&command, AutomationCommand::Delete { .. }) || current_session_id().is_none(),
         "automation delete is unavailable inside an agent session"
     );
-    let project_id = resolve_automation_project(config_path, project).await?;
+    let project_id = project;
     match command {
         AutomationCommand::List { json } => {
             let value = ipc::request_dwo(
                 config_path,
                 "automation.list",
-                json!({"project_id": project_id}),
+                json!({"caller_session_id": current_session_id(), "global": global, "project_id": project_id}),
             )
             .await?;
             if json {
@@ -657,7 +589,7 @@ async fn run_automation(
             let value = ipc::request_dwo(
                 config_path,
                 "automation.status",
-                json!({"project_id": project_id, "job": job}),
+                json!({"caller_session_id": current_session_id(), "global": global, "project_id": project_id, "job": job}),
             )
             .await?;
             if json {
@@ -674,8 +606,9 @@ async fn run_automation(
             prompt,
             session,
             session_id,
-            topic,
+            section,
             title,
+            cwd,
             disabled,
             json,
         } => {
@@ -711,7 +644,8 @@ async fn run_automation(
                 schedule: AutomationSchedule { cron, timezone },
                 session,
                 prompt,
-                topic_id: topic,
+                cwd,
+                section_id: section,
                 model: None,
                 reasoning: None,
                 policy: None,
@@ -719,7 +653,7 @@ async fn run_automation(
             let value = ipc::request_dwo(
                 config_path,
                 "automation.add",
-                json!({"project_id": project_id, "job": job}),
+                json!({"caller_session_id": current_session_id(), "global": global, "project_id": project_id, "job": job}),
             )
             .await?;
             if json {
@@ -730,17 +664,19 @@ async fn run_automation(
             }
         }
         AutomationCommand::Enable { job, all } => {
-            set_automation_enabled(config_path, &project_id, job, all, true).await?;
+            set_automation_enabled(config_path, project_id.as_deref(), global, job, all, true)
+                .await?;
         }
         AutomationCommand::Disable { job, all } => {
-            set_automation_enabled(config_path, &project_id, job, all, false).await?;
+            set_automation_enabled(config_path, project_id.as_deref(), global, job, all, false)
+                .await?;
         }
         AutomationCommand::Delete { job, all, yes } => {
             anyhow::ensure!(!all || yes, "automation delete --all requires --yes");
             ipc::request_dwo(
                 config_path,
                 "automation.delete",
-                json!({"project_id": project_id, "job": job, "all": all}),
+                json!({"caller_session_id": current_session_id(), "global": global, "project_id": project_id, "job": job, "all": all}),
             )
             .await?;
             output::line(format_args!(
@@ -759,7 +695,8 @@ async fn run_automation(
                 json!({
                     "project_id": project_id,
                     "job": job,
-                    "caller_session_id": current_session_id()
+                    "caller_session_id": current_session_id(),
+                    "global": global
                 }),
             )
             .await?;
@@ -782,7 +719,8 @@ async fn run_automation(
 
 async fn set_automation_enabled(
     config_path: &Path,
-    project_id: &str,
+    project_id: Option<&str>,
+    global: bool,
     job: Option<String>,
     all: bool,
     enabled: bool,
@@ -795,7 +733,7 @@ async fn set_automation_enabled(
     ipc::request_dwo(
         config_path,
         method,
-        json!({"project_id": project_id, "job": job, "all": all}),
+        json!({"caller_session_id": current_session_id(), "global": global, "project_id": project_id, "job": job, "all": all}),
     )
     .await?;
     output::line(format_args!(
@@ -808,29 +746,6 @@ async fn set_automation_enabled(
         }
     ))?;
     Ok(())
-}
-
-async fn resolve_automation_project(config_path: &Path, project: Option<String>) -> Result<String> {
-    if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
-        return Ok(project);
-    }
-    let session_id = current_session_id().context(
-        "--project is required when the command is not running inside a project session",
-    )?;
-    let value = ipc::request_dwo(config_path, "project.list", json!({})).await?;
-    let projects: Vec<dwo_project::Project> = serde_json::from_value(value)?;
-    projects
-        .into_iter()
-        .find(|project| {
-            project.board.topics.iter().any(|topic| {
-                topic
-                    .session_ids
-                    .iter()
-                    .any(|assigned| assigned == &session_id)
-            })
-        })
-        .map(|project| project.id)
-        .with_context(|| format!("session {session_id} does not belong to a project"))
 }
 
 async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
@@ -1167,14 +1082,39 @@ fn collect_skill_import_files(
 async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> {
     let endpoint_id = format!("cli-{}", Uuid::new_v4());
     match command {
-        SessionCommand::List { all } => {
+        SessionCommand::List {
+            all,
+            archived,
+            num,
+            page,
+            sub,
+            forked,
+            json,
+        } => {
+            let page = page.max(1);
+            let num = num.max(1);
             let value = ipc::request_dwo(
                 config_path,
                 "session.list",
-                json!({"all": all, "caller_session_id": current_session_id()}),
+                json!({
+                    "all": all || sub,
+                    "archived": archived,
+                    // `--all` = 活跃 + 归档一起；服务端的 `archived` 是「只看归档」，
+                    // 语义不同，所以另开一个 include_archived。
+                    "include_archived": all,
+                    "forked": forked,
+                    "limit": num,
+                    // 服务端的 cursor 就是个 offset，页码在 CLI 侧换算。
+                    "cursor": ((page - 1) * num).to_string(),
+                    "caller_session_id": current_session_id(),
+                }),
             )
             .await?;
-            render::write_session_list(&value)?;
+            if json {
+                output::line(format_args!("{}", serde_json::to_string_pretty(&value)?))?;
+            } else {
+                render::write_session_list(&value, page, num, sub)?;
+            }
         }
         SessionCommand::Delete { id } => {
             ipc::request_dwo(config_path, "session.delete", json!({"session_id": id})).await?;
@@ -1192,20 +1132,22 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                 }
             ))?;
         }
-        SessionCommand::Archive { id, project } => {
-            let value = ipc::request_dwo(
-                config_path,
-                "project.session.archive",
-                attach_caller(json!({"project_id": project, "session_id": id})),
-            )
-            .await?;
+        SessionCommand::Archive { id } => {
+            let value =
+                ipc::request_dwo(config_path, "session.archive", json!({"session_id": id})).await?;
             render::write_value(&value)?;
         }
-        SessionCommand::Move { id, project, topic } => {
+        SessionCommand::Move {
+            id,
+            project,
+            section,
+        } => {
             let value = ipc::request_dwo(
                 config_path,
-                "project.topic.session.assign",
-                attach_caller(json!({"project_id": project, "topic_id": topic, "session_id": id})),
+                "project.session.assign",
+                attach_caller(
+                    json!({"project_id": project, "section_id": section, "session_id": id}),
+                ),
             )
             .await?;
             render::write_value(&value)?;
@@ -1253,7 +1195,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             title,
             cwd,
             project,
-            topic,
+            section,
             policy,
             model,
             reasoning,
@@ -1276,7 +1218,7 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                     "title": title,
                     "cwd": cwd,
                     "project_id": project,
-                    "topic_id": topic,
+                    "section_id": section,
                     "policy": policy,
                     "model": model,
                     "reasoning": reasoning,
@@ -1309,48 +1251,16 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
     Ok(())
 }
 
-async fn run_proposal(command: ProposalCommand, config_path: &Path) -> Result<()> {
-    let value = match command {
-        ProposalCommand::List { project, status } => {
-            ipc::request_dwo(
-                config_path,
-                "project.proposal.list",
-                attach_caller(json!({"project_id": project, "status": status})),
-            )
-            .await?
-        }
-        ProposalCommand::Accept { project, id, all } => {
-            ipc::request_dwo(
-                config_path,
-                "project.proposal.accept",
-                attach_caller(json!({"project_id": project, "proposal_ids": id, "all": all})),
-            )
-            .await?
-        }
-        ProposalCommand::Reject { project, id, all } => {
-            ipc::request_dwo(
-                config_path,
-                "project.proposal.reject",
-                attach_caller(json!({"project_id": project, "proposal_ids": id, "all": all})),
-            )
-            .await?
-        }
-    };
-    render::write_value(&value)
-}
-
 async fn run_section(command: SectionCommand, config_path: &Path) -> Result<()> {
     let (method, params) = match command {
         SectionCommand::List { project } => {
-            let value =
-                ipc::request_dwo(config_path, "project.board", json!({"project_id": project}))
-                    .await?;
-            let sections = value
-                .get("board")
-                .and_then(|board| board.get("sections"))
-                .cloned()
-                .context("project board response is missing sections")?;
-            return render::write_value(&sections);
+            let value = ipc::request_dwo(
+                config_path,
+                "project.section.list",
+                json!({"project_id": project}),
+            )
+            .await?;
+            return render::write_value(&value);
         }
         SectionCommand::Create { project, name } => (
             "project.section.create",
@@ -1361,7 +1271,7 @@ async fn run_section(command: SectionCommand, config_path: &Path) -> Result<()> 
             json!({"project_id": project, "section_id": id, "name": name}),
         ),
         SectionCommand::Archive { project, id } => (
-            "project.section.archive",
+            "project.section.delete",
             json!({"project_id": project, "section_id": id}),
         ),
         SectionCommand::Reorder {
@@ -1377,68 +1287,6 @@ async fn run_section(command: SectionCommand, config_path: &Path) -> Result<()> 
     render::write_value(&value)
 }
 
-async fn run_topic(command: TopicCommand, config_path: &Path) -> Result<()> {
-    let (method, params) = match command {
-        TopicCommand::List { project } => {
-            let value =
-                ipc::request_dwo(config_path, "project.board", json!({"project_id": project}))
-                    .await?;
-            let topics = value
-                .get("board")
-                .and_then(|board| board.get("topics"))
-                .cloned()
-                .context("project board response is missing topics")?;
-            return render::write_value(&topics);
-        }
-        TopicCommand::Get { project, id } => (
-            "project.topic.get",
-            json!({"project_id": project, "topic_id": id}),
-        ),
-        TopicCommand::Create {
-            project,
-            section,
-            title,
-            overview,
-        } => (
-            "project.topic.create",
-            json!({"project_id": project, "section_id": section, "title": title, "overview": overview}),
-        ),
-        TopicCommand::Update { project, id, title } => (
-            "project.topic.update",
-            json!({"project_id": project, "topic_id": id, "title": title}),
-        ),
-        TopicCommand::Archive { project, id } => (
-            "project.topic.archive",
-            json!({"project_id": project, "topic_id": id}),
-        ),
-        TopicCommand::Move {
-            project,
-            id,
-            section,
-            position,
-        } => (
-            "project.topic.move",
-            json!({"project_id": project, "topic_id": id, "section_id": section, "position": position}),
-        ),
-        TopicCommand::Reorder {
-            project,
-            id,
-            section,
-            position,
-        } => (
-            "project.topic.reorder",
-            json!({
-                "project_id": project,
-                "topic_id": id,
-                "section_id": section,
-                "position": position,
-            }),
-        ),
-    };
-    let value = ipc::request_dwo(config_path, method, attach_caller(params)).await?;
-    render::write_value(&value)
-}
-
 async fn run_project(command: ProjectCommand, config_path: &Path) -> Result<()> {
     let (method, params) = match command {
         ProjectCommand::List => ("project.list", json!({})),
@@ -1446,24 +1294,11 @@ async fn run_project(command: ProjectCommand, config_path: &Path) -> Result<()> 
         ProjectCommand::Create { name, cwd } => {
             ("project.create", json!({"name": name, "pwd": cwd}))
         }
-        ProjectCommand::Archive { project } => ("project.archive", json!({"project_id": project})),
+        ProjectCommand::Delete { project } => ("project.delete", json!({"project_id": project})),
         ProjectCommand::Update { project, name } => (
             "project.update",
             json!({"project_id": project, "name": name}),
         ),
-        ProjectCommand::Repository { command } => match command {
-            RepositoryCommand::Get { project } => {
-                ("project.repository.get", json!({"project_id": project}))
-            }
-            RepositoryCommand::Attach {
-                project,
-                path,
-                name,
-            } => (
-                "project.repository.attach",
-                json!({"project_id": project, "path": path, "name": name}),
-            ),
-        },
         ProjectCommand::Worktree { command } => match command {
             WorktreeCommand::List { project } => {
                 ("project.worktree.list", json!({"project_id": project}))
@@ -1942,6 +1777,21 @@ model:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_session_list_paging_and_scopes() {
+        // 分页 + fork / sub 过滤都能解析。
+        Cli::try_parse_from([
+            "dwo", "session", "list", "--num", "5", "--page", "3", "--forked",
+        ])
+        .unwrap();
+        Cli::try_parse_from(["dwo", "session", "list", "--sub"]).unwrap();
+        Cli::try_parse_from(["dwo", "session", "list", "--all", "--archived", "--json"]).unwrap();
+
+        // `--all` 跟 `--sub` / `--forked` 互斥。
+        assert!(Cli::try_parse_from(["dwo", "session", "list", "--all", "--forked"]).is_err());
+        assert!(Cli::try_parse_from(["dwo", "session", "list", "--all", "--sub"]).is_err());
+    }
 
     #[test]
     fn parses_acp_protocol_version() {
@@ -2465,8 +2315,8 @@ mod tests {
             "work here",
             "--project",
             "project-1",
-            "--topic",
-            "topic-1",
+            "--section",
+            "section-1",
         ])
         .unwrap();
         assert!(matches!(
@@ -2474,11 +2324,11 @@ mod tests {
             Command::Session {
                 command: SessionCommand::Prompt {
                     project: Some(ref project),
-                    topic: Some(ref topic),
+                    section: Some(ref section),
                     cwd: None,
                     ..
                 }
-            } if project == "project-1" && topic == "topic-1"
+            } if project == "project-1" && section == "section-1"
         ));
         assert!(
             Cli::try_parse_from([
@@ -2577,7 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_project_board_commands() {
+    fn parses_project_section_commands() {
         let project =
             Cli::try_parse_from(["dwo", "project", "create", "DwoAgent", "--cwd", "C:/repo"])
                 .unwrap();
@@ -2600,15 +2450,6 @@ mod tests {
             } if project == "project-1" && name == "Planning"
         ));
 
-        let topic =
-            Cli::try_parse_from(["dwo", "topic", "move", "project-1", "topic-1", "section-2"])
-                .unwrap();
-        assert!(matches!(
-            topic.command,
-            Command::Topic {
-                command: TopicCommand::Move { .. }
-            }
-        ));
         assert!(Cli::try_parse_from(["dwo", "session", "move", "session-1"]).is_err());
         assert!(
             Cli::try_parse_from([
@@ -2622,58 +2463,5 @@ mod tests {
             ])
             .is_err()
         );
-    }
-
-    #[test]
-    fn parses_proposal_commands() {
-        let list = Cli::try_parse_from([
-            "dwo",
-            "proposal",
-            "list",
-            "project-1",
-            "--status",
-            "pending",
-        ])
-        .unwrap();
-        assert!(matches!(
-            list.command,
-            Command::Proposal {
-                command: ProposalCommand::List {
-                    ref project,
-                    ref status,
-                }
-            } if project == "project-1" && status.as_deref() == Some("pending")
-        ));
-
-        let accept = Cli::try_parse_from([
-            "dwo",
-            "proposal",
-            "accept",
-            "project-1",
-            "--id",
-            "p1",
-            "--id",
-            "p2",
-        ])
-        .unwrap();
-        assert!(matches!(
-            accept.command,
-            Command::Proposal {
-                command: ProposalCommand::Accept {
-                    ref id,
-                    all: false,
-                    ..
-                }
-            } if id.len() == 2 && id[0] == "p1"
-        ));
-
-        let reject =
-            Cli::try_parse_from(["dwo", "proposal", "reject", "project-1", "--all"]).unwrap();
-        assert!(matches!(
-            reject.command,
-            Command::Proposal {
-                command: ProposalCommand::Reject { all: true, .. }
-            }
-        ));
     }
 }

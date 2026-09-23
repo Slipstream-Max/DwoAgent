@@ -99,6 +99,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     command("session.fork", MethodRoute::Both, None),
     query("session.read", MethodRoute::Dwo),
     command("session.delete", MethodRoute::Both, None),
+    command("session.archive", MethodRoute::Dwo, None),
     command("session.keep", MethodRoute::Dwo, None),
     command("session.close", MethodRoute::Both, None),
     command("session.set_config_option", MethodRoute::Acp, None),
@@ -113,12 +114,22 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     subscription("session.watch", MethodRoute::Acp),
     query("project.list", MethodRoute::Dwo),
     query("project.get", MethodRoute::Dwo),
-    query("project.board", MethodRoute::Dwo),
     command("project.create", MethodRoute::Dwo, Some("project.changed")),
     command("project.update", MethodRoute::Dwo, Some("project.changed")),
-    query("project.repository.get", MethodRoute::Dwo),
+    command("project.delete", MethodRoute::Dwo, Some("project.changed")),
+    query("project.rules.get", MethodRoute::Dwo),
+    command(
+        "project.rules.set",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
     query("project.worktree.list", MethodRoute::Dwo),
     query("project.worktree.get", MethodRoute::Dwo),
+    command(
+        "project.worktree.attach",
+        MethodRoute::Dwo,
+        Some("project.changed"),
+    ),
     command(
         "project.worktree.create",
         MethodRoute::Dwo,
@@ -139,6 +150,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
+    query("project.section.list", MethodRoute::Dwo),
     command(
         "project.section.create",
         MethodRoute::Dwo,
@@ -150,7 +162,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         Some("project.changed"),
     ),
     command(
-        "project.section.archive",
+        "project.section.delete",
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
@@ -159,89 +171,15 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
-    query("project.topic.get", MethodRoute::Dwo),
     command(
-        "project.topic.create",
+        "project.session.assign",
         MethodRoute::Dwo,
         Some("project.changed"),
     ),
     command(
-        "project.topic.update",
+        "project.session.unassign",
         MethodRoute::Dwo,
         Some("project.changed"),
-    ),
-    command(
-        "project.topic.archive",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.topic.move",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.topic.reorder",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    query("project.topic.overview.get", MethodRoute::Dwo),
-    command(
-        "project.topic.overview.set",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    query("project.topic.agents.get", MethodRoute::Dwo),
-    command(
-        "project.topic.agents.set",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.topic.session.assign",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.topic.session.unassign",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.label.create",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.label.update",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.label.delete",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.label.assign",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    command(
-        "project.label.unassign",
-        MethodRoute::Dwo,
-        Some("project.changed"),
-    ),
-    query("project.proposal.list", MethodRoute::Dwo),
-    command(
-        "project.proposal.accept",
-        MethodRoute::Dwo,
-        Some("project.proposal.changed"),
-    ),
-    command(
-        "project.proposal.reject",
-        MethodRoute::Dwo,
-        Some("project.proposal.changed"),
     ),
     query("automation.list", MethodRoute::Dwo),
     query("automation.status", MethodRoute::Dwo),
@@ -393,7 +331,6 @@ pub const EVENTS: &[&str] = &[
     "websocket.status",
     "skill.changed",
     "project.changed",
-    "project.proposal.changed",
 ];
 
 const CHANNEL_KINDS: &[&str] = &["weixin", "telegram", "feishu", "qq"];
@@ -423,53 +360,6 @@ pub fn method_allowed(route: &str, method: &str) -> bool {
 
 pub fn is_side_effect_method(method: &str) -> bool {
     method_spec(method).is_some_and(|spec| spec.side_effect)
-}
-
-/// Session agents may never call these project methods; the daemon rejects them.
-pub const SESSION_BLOCKED_METHODS: &[&str] = &[
-    "project.create",
-    "project.repository.attach",
-    "project.worktree.create",
-    "project.worktree.attach",
-    "project.worktree.update",
-    "project.worktree.detach",
-    "project.worktree.remove",
-];
-
-/// Session calls to these project methods always become proposals.
-pub const ALWAYS_PROPOSAL_METHODS: &[&str] = &[
-    "project.section.create",
-    "project.section.archive",
-    "project.agents.set",
-    "project.update",
-    "project.archive",
-];
-
-/// Session calls to these project methods become proposals unless the profile
-/// sets `projectOps: direct`.
-pub const CONFIRM_PROPOSAL_METHODS: &[&str] = &[
-    "project.section.update",
-    "project.section.reorder",
-    "project.topic.create",
-    "project.topic.update",
-    "project.topic.move",
-    "project.topic.reorder",
-    "project.topic.archive",
-    "project.topic.agents.set",
-    "project.topic.session.assign",
-    "project.topic.session.unassign",
-];
-
-pub fn is_session_blocked(method: &str) -> bool {
-    SESSION_BLOCKED_METHODS.contains(&method)
-}
-
-pub fn is_always_proposal(method: &str) -> bool {
-    ALWAYS_PROPOSAL_METHODS.contains(&method)
-}
-
-pub fn is_confirm_proposal(method: &str) -> bool {
-    CONFIRM_PROPOSAL_METHODS.contains(&method)
 }
 
 pub fn capabilities() -> ManagementCapabilities {
@@ -511,14 +401,14 @@ mod tests {
     }
 
     #[test]
-    fn session_policy_covers_board_methods() {
-        assert!(is_session_blocked("project.create"));
-        assert!(is_always_proposal("project.section.create"));
-        assert!(is_confirm_proposal("project.topic.create"));
-        assert!(!is_confirm_proposal("project.label.create"));
-        assert!(method_allowed("dwo", "project.proposal.accept"));
-        assert!(is_side_effect_method("project.proposal.accept"));
-        assert!(EVENTS.contains(&"project.proposal.changed"));
+    fn retired_project_methods_are_not_exposed() {
+        for method in [
+            "project.topic.create",
+            "project.board",
+            "project.proposal.accept",
+        ] {
+            assert!(!method_allowed("dwo", method));
+        }
     }
 
     #[test]

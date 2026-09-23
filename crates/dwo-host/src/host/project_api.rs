@@ -2,11 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use dwo_agent_service::{ProjectOpPolicy, SessionId};
-use dwo_project::{
-    CreateProject, Project, ProjectKind, Proposal, ProposalStatus, RepositoryRecord,
-    WorktreeRecord, WorktreeSource,
-};
+use dwo_agent_service::SessionId;
+use dwo_project::{CreateProject, Project, RepositoryRecord, WorktreeRecord, WorktreeSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -16,54 +13,56 @@ use super::Host;
 struct ProjectIdParam {
     project_id: String,
 }
-
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CreateProjectParam {
     name: Option<String>,
     pwd: PathBuf,
 }
-
-#[derive(Deserialize)]
-struct ArchiveParam {
-    project_id: String,
-    section_id: Option<String>,
-    topic_id: Option<String>,
-    session_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ProjectRuleParam {
-    project_id: String,
-    content: Option<String>,
-}
-
 #[derive(Deserialize)]
 struct UpdateProjectParam {
     project_id: String,
     name: String,
 }
-
 #[derive(Deserialize)]
-struct AttachRepositoryParam {
+struct ProjectRuleParam {
     project_id: String,
-    path: PathBuf,
-    name: Option<String>,
+    content: Option<String>,
 }
-
+#[derive(Deserialize)]
+struct SectionParam {
+    project_id: String,
+    section_id: String,
+}
+#[derive(Deserialize)]
+struct CreateSectionParam {
+    project_id: String,
+    name: String,
+    color: Option<String>,
+}
+#[derive(Deserialize)]
+struct UpdateSectionParam {
+    project_id: String,
+    section_id: String,
+    name: String,
+    color: Option<String>,
+}
+#[derive(Deserialize)]
+struct ReorderSectionParam {
+    project_id: String,
+    section_id: String,
+    position: usize,
+}
 #[derive(Deserialize)]
 struct WorktreeParam {
     project_id: String,
     worktree_id: String,
 }
-
 #[derive(Deserialize)]
 struct AttachWorktreeParam {
     project_id: String,
     path: PathBuf,
     name: Option<String>,
 }
-
 #[derive(Deserialize)]
 struct CreateWorktreeParam {
     project_id: String,
@@ -72,125 +71,18 @@ struct CreateWorktreeParam {
     start_point: Option<String>,
     name: Option<String>,
 }
-
 #[derive(Deserialize)]
 struct UpdateWorktreeParam {
     project_id: String,
     worktree_id: String,
     name: String,
 }
-
-#[derive(Deserialize)]
-struct CreateSectionParam {
-    project_id: String,
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct UpdateSectionParam {
-    project_id: String,
-    section_id: String,
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct ReorderSectionParam {
-    project_id: String,
-    section_id: String,
-    position: usize,
-}
-
-#[derive(Deserialize)]
-struct TopicParam {
-    project_id: String,
-    topic_id: String,
-}
-
-#[derive(Deserialize)]
-struct CreateTopicParam {
-    project_id: String,
-    section_id: String,
-    title: String,
-    overview: String,
-}
-
-#[derive(Deserialize)]
-struct UpdateTopicParam {
-    project_id: String,
-    topic_id: String,
-    title: String,
-}
-
-#[derive(Deserialize)]
-struct MoveTopicParam {
-    project_id: String,
-    topic_id: String,
-    section_id: String,
-    position: usize,
-}
-
-#[derive(Deserialize)]
-struct MarkdownParam {
-    project_id: String,
-    topic_id: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct LabelParam {
-    project_id: String,
-    label_id: String,
-}
-
-#[derive(Deserialize)]
-struct CreateLabelParam {
-    project_id: String,
-    name: String,
-    color: String,
-    description: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UpdateLabelParam {
-    project_id: String,
-    label_id: String,
-    name: String,
-    color: String,
-    description: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TopicLabelParam {
-    project_id: String,
-    topic_id: String,
-    label_id: String,
-}
-
-#[derive(Deserialize)]
-struct ProposalListParam {
-    project_id: String,
-    status: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ResolveProposalsParam {
-    project_id: String,
-    proposal_ids: Option<Vec<String>>,
-    #[serde(default)]
-    all: bool,
-}
-
 #[derive(Deserialize)]
 struct AssignSessionParam {
     project_id: String,
-    topic_id: String,
+    section_id: Option<String>,
     session_id: String,
-}
-
-#[derive(Deserialize)]
-struct UnassignSessionParam {
-    project_id: String,
-    session_id: String,
+    worktree_id: Option<String>,
 }
 
 impl Host {
@@ -199,484 +91,251 @@ impl Host {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        let (caller_session_id, params) = split_caller_session(params);
-        if let Some(caller) = caller_session_id.as_deref() {
-            if dwo_protocol::is_session_blocked(method) {
-                if method == "project.create" {
-                    anyhow::bail!("会话不能创建项目，请在界面中新建项目");
-                }
-                anyhow::bail!("该操作不面向会话代理：{method}");
-            }
-            let needs_proposal = dwo_protocol::is_always_proposal(method)
-                || (dwo_protocol::is_confirm_proposal(method)
-                    && self.project_ops_policy() == ProjectOpPolicy::Confirm);
-            if needs_proposal {
-                return self.queue_project_proposal(method, params, caller).await;
-            }
-        }
-        if matches!(
-            method,
-            "project.proposal.accept" | "project.proposal.reject"
-        ) {
-            anyhow::ensure!(
-                caller_session_id.is_none(),
-                "提案需要由用户在桌面端或命令行中确认"
-            );
-        }
-        let result = match method {
-            "project.list" => serde_json::to_value(self.projects.list())?,
-            "project.get" | "project.board" => {
-                let params: ProjectIdParam = serde_json::from_value(params)?;
-                serde_json::to_value(self.projects.get(&params.project_id)?)?
+        match method {
+            "project.list" => Ok(serde_json::to_value(self.projects.list())?),
+            "project.get" => {
+                let p: ProjectIdParam = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(self.projects.get(&p.project_id)?)?)
             }
             "project.create" => {
-                let params: CreateProjectParam = serde_json::from_value(params)?;
-                anyhow::ensure!(params.pwd.is_absolute(), "project pwd must be absolute");
-                let name = params
-                    .name
-                    .filter(|n| !n.trim().is_empty())
-                    .or_else(|| {
-                        params
-                            .pwd
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                    })
-                    .context("project name is required for a filesystem root")?;
-                let info = super::git::inspect_repository(&params.pwd).await.ok();
+                let p: CreateProjectParam = serde_json::from_value(params)?;
+                anyhow::ensure!(p.pwd.is_absolute(), "project pwd must be absolute");
                 let mut project = self.projects.create(CreateProject {
-                    name,
-                    kind: ProjectKind::Project,
-                    pwd: Some(params.pwd),
+                    name: p.name,
+                    pwd: p.pwd.clone(),
                 })?;
-                if let Some(info) = info {
+                if let Ok(info) = super::git::inspect_repository(&p.pwd).await {
                     project = self.register_repository(&project.id, info, "Local")?;
                 }
                 self.project_changed(&project.id, "create").await;
-                serde_json::to_value(project)?
+                Ok(serde_json::to_value(project)?)
             }
             "project.update" => {
-                let params: UpdateProjectParam = serde_json::from_value(params)?;
-                let project = self
-                    .projects
-                    .update_project(&params.project_id, params.name)?;
-                self.project_changed(&params.project_id, "update").await;
-                serde_json::to_value(project)?
+                let p: UpdateProjectParam = serde_json::from_value(params)?;
+                let project = self.projects.update_project(&p.project_id, p.name)?;
+                self.project_changed(&p.project_id, "update").await;
+                Ok(serde_json::to_value(project)?)
             }
-            "project.repository.get" => {
-                let params: ProjectIdParam = serde_json::from_value(params)?;
-                serde_json::to_value(self.projects.get(&params.project_id)?.repository)?
+            "project.delete" => {
+                let p: ProjectIdParam = serde_json::from_value(params)?;
+                self.automation.remove_project_config(&p.project_id).await?;
+                let _lifecycle = self.sessions.lifecycle.lock().await;
+                self.projects.delete(&p.project_id)?;
+                self.project_changed(&p.project_id, "delete").await;
+                Ok(json!({"deleted": true}))
             }
-            "project.repository.attach" => {
-                let params: AttachRepositoryParam = serde_json::from_value(params)?;
-                let info = super::git::inspect_repository(&self.profile_path(params.path)).await?;
-                let project = self.register_repository(
-                    &params.project_id,
-                    info,
-                    params.name.as_deref().unwrap_or("Local"),
+            "project.rules.get" => {
+                let p: ProjectRuleParam = serde_json::from_value(params)?;
+                Ok(json!({"content": self.projects.project_rule(&p.project_id)?}))
+            }
+            "project.rules.set" => {
+                let p: ProjectRuleParam = serde_json::from_value(params)?;
+                self.projects.set_project_rule(
+                    &p.project_id,
+                    p.content.as_deref().context("content is required")?,
                 )?;
-                self.project_changed(&params.project_id, "repository.attach")
+                self.project_changed(&p.project_id, "rules.set").await;
+                Ok(json!({"updated": true}))
+            }
+            "project.section.list" => {
+                let p: ProjectIdParam = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(
+                    self.projects.get(&p.project_id)?.sections,
+                )?)
+            }
+            "project.section.create" => {
+                let p: CreateSectionParam = serde_json::from_value(params)?;
+                let section = self
+                    .projects
+                    .create_section(&p.project_id, p.name, p.color)?;
+                self.project_changed(&p.project_id, "section.create").await;
+                Ok(serde_json::to_value(section)?)
+            }
+            "project.section.update" => {
+                let p: UpdateSectionParam = serde_json::from_value(params)?;
+                let section =
+                    self.projects
+                        .update_section(&p.project_id, &p.section_id, p.name, p.color)?;
+                self.project_changed(&p.project_id, "section.update").await;
+                Ok(serde_json::to_value(section)?)
+            }
+            "project.section.reorder" => {
+                let p: ReorderSectionParam = serde_json::from_value(params)?;
+                let sections =
+                    self.projects
+                        .reorder_section(&p.project_id, &p.section_id, p.position)?;
+                self.project_changed(&p.project_id, "section.reorder").await;
+                Ok(serde_json::to_value(sections)?)
+            }
+            "project.section.delete" => {
+                let p: SectionParam = serde_json::from_value(params)?;
+                let _lifecycle = self.sessions.lifecycle.lock().await;
+                anyhow::ensure!(
+                    !self
+                        .automation
+                        .list(&Some(p.project_id.clone()))
+                        .await
+                        .iter()
+                        .any(|job| job.job.section_id.as_deref() == Some(p.section_id.as_str())),
+                    "section still owns automation jobs"
+                );
+                let project = self.projects.delete_section(&p.project_id, &p.section_id)?;
+                self.project_changed(&p.project_id, "section.delete").await;
+                Ok(serde_json::to_value(project)?)
+            }
+            "project.session.assign" => {
+                let p: AssignSessionParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(p.session_id).map_err(anyhow::Error::msg)?;
+                let assignment = self
+                    .sessions
+                    .assign(&p.project_id, p.section_id.as_deref(), &id, p.worktree_id)
+                    .await?;
+                self.project_changed(&p.project_id, "session.assign").await;
+                Ok(serde_json::to_value(assignment)?)
+            }
+            "project.session.unassign" => {
+                let p: AssignSessionParam = serde_json::from_value(params)?;
+                let _lifecycle = self.sessions.lifecycle.lock().await;
+                let (owner, _) = self
+                    .projects
+                    .locate_session(&p.session_id)
+                    .context("session has no project")?;
+                anyhow::ensure!(
+                    owner.id == p.project_id,
+                    "session belongs to a different project"
+                );
+                self.projects.unassign_session(&p.session_id)?;
+                self.project_changed(&p.project_id, "session.unassign")
                     .await;
-                serde_json::to_value(project)?
+                Ok(json!({"unassigned": true}))
             }
             "project.worktree.list" => {
-                let params: ProjectIdParam = serde_json::from_value(params)?;
-                serde_json::to_value(self.worktree_views(&params.project_id).await?)?
+                let p: ProjectIdParam = serde_json::from_value(params)?;
+                Ok(serde_json::to_value(
+                    self.worktree_views(&p.project_id).await?,
+                )?)
             }
             "project.worktree.get" => {
-                let params: WorktreeParam = serde_json::from_value(params)?;
-                self.worktree_views(&params.project_id)
+                let p: WorktreeParam = serde_json::from_value(params)?;
+                self.worktree_views(&p.project_id)
                     .await?
                     .into_iter()
-                    .find(|view| view["worktree"]["id"] == params.worktree_id)
-                    .with_context(|| format!("worktree not found: {}", params.worktree_id))?
+                    .find(|view| view["worktree"]["id"] == p.worktree_id)
+                    .context("worktree not found")
             }
             "project.worktree.attach" => {
-                let params: AttachWorktreeParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
+                let p: AttachWorktreeParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&p.project_id)?;
                 let repository = project
                     .repository
                     .as_ref()
-                    .context("project has no attached repository")?;
-                let info = super::git::inspect_repository(&self.profile_path(params.path)).await?;
+                    .context("project has no repository")?;
+                let info = super::git::inspect_repository(&self.profile_path(p.path)).await?;
                 anyhow::ensure!(
                     info.common_dir == repository.common_dir,
-                    "worktree belongs to a different Git repository"
+                    "worktree belongs to a different repository"
                 );
-                let path = info.root;
-                let name = params.name.unwrap_or_else(|| default_worktree_name(&path));
+                let name = p.name.unwrap_or_else(|| default_worktree_name(&info.root));
                 let project = self.projects.add_worktree(
-                    &params.project_id,
-                    worktree_record(name, path, WorktreeSource::External),
+                    &p.project_id,
+                    worktree_record(name, info.root, WorktreeSource::External),
                 )?;
-                self.project_changed(&params.project_id, "worktree.attach")
-                    .await;
-                serde_json::to_value(project)?
+                self.project_changed(&p.project_id, "worktree.attach").await;
+                Ok(serde_json::to_value(project)?)
             }
             "project.worktree.create" => {
-                let params: CreateWorktreeParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
+                let p: CreateWorktreeParam = serde_json::from_value(params)?;
+                let project = self.projects.get(&p.project_id)?;
                 let repository = project
                     .repository
                     .as_ref()
-                    .context("project has no attached repository")?;
-                let name = params.name.unwrap_or_else(|| params.branch.clone());
-                anyhow::ensure!(
-                    !name.trim().is_empty()
-                        && !name.contains(['/', '\\', ':'])
-                        && name != "."
-                        && name != "..",
-                    "worktree name must be a single directory name"
-                );
-                let path = project
-                    .pwd
-                    .as_ref()
-                    .and_then(|p| p.parent())
-                    .context("project path has no parent")?
-                    .join(&name);
-                anyhow::ensure!(
-                    params.path.as_ref().is_none_or(|p| *p == path),
-                    "worktree path must be a sibling of project pwd named after the worktree"
-                );
+                    .context("project has no repository")?;
+                let name = p.name.unwrap_or_else(|| p.branch.clone());
+                let path = p
+                    .path
+                    .unwrap_or_else(|| project.pwd.parent().unwrap_or(&project.pwd).join(&name));
                 anyhow::ensure!(!path.exists(), "worktree path already exists");
                 let status = super::git::create_worktree(
                     &repository.root,
                     &path,
-                    &params.branch,
-                    params.start_point.as_deref(),
+                    &p.branch,
+                    p.start_point.as_deref(),
                 )
                 .await?;
                 let project = self.projects.add_worktree(
-                    &params.project_id,
+                    &p.project_id,
                     worktree_record(name, status.path, WorktreeSource::Managed),
                 )?;
-                self.project_changed(&params.project_id, "worktree.create")
-                    .await;
-                serde_json::to_value(project)?
+                self.project_changed(&p.project_id, "worktree.create").await;
+                Ok(serde_json::to_value(project)?)
             }
             "project.worktree.update" => {
-                let params: UpdateWorktreeParam = serde_json::from_value(params)?;
-                let worktree = self.projects.update_worktree(
-                    &params.project_id,
-                    &params.worktree_id,
-                    params.name,
-                )?;
-                self.project_changed(&params.project_id, "worktree.update")
-                    .await;
-                serde_json::to_value(worktree)?
+                let p: UpdateWorktreeParam = serde_json::from_value(params)?;
+                let worktree =
+                    self.projects
+                        .update_worktree(&p.project_id, &p.worktree_id, p.name)?;
+                self.project_changed(&p.project_id, "worktree.update").await;
+                Ok(serde_json::to_value(worktree)?)
             }
             "project.worktree.detach" | "project.worktree.remove" => {
-                let params: WorktreeParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
-                anyhow::ensure!(
-                    find_worktree(&project, &params.worktree_id)?.source != WorktreeSource::Primary,
-                    "the primary worktree cannot be detached"
-                );
-                let project = self
-                    .projects
-                    .remove_worktree(&params.project_id, &params.worktree_id)?;
-                self.project_changed(&params.project_id, "worktree.detach")
-                    .await;
-                serde_json::to_value(project)?
-            }
-            "project.section.create" => {
-                let params: CreateSectionParam = serde_json::from_value(params)?;
-                let section = self
-                    .projects
-                    .create_section(&params.project_id, params.name)?;
-                self.project_changed(&params.project_id, "section.create")
-                    .await;
-                serde_json::to_value(section)?
-            }
-            "project.section.update" => {
-                let params: UpdateSectionParam = serde_json::from_value(params)?;
-                let section = self.projects.update_section(
-                    &params.project_id,
-                    &params.section_id,
-                    params.name,
-                )?;
-                self.project_changed(&params.project_id, "section.update")
-                    .await;
-                serde_json::to_value(section)?
-            }
-            "project.archive"
-            | "project.section.archive"
-            | "project.topic.archive"
-            | "project.session.archive" => {
-                let params: ArchiveParam = serde_json::from_value(params)?;
-                anyhow::ensure!(
-                    (method == "project.archive"
-                        && params.section_id.is_none()
-                        && params.topic_id.is_none()
-                        && params.session_id.is_none())
-                        || (method == "project.section.archive"
-                            && params.section_id.is_some()
-                            && params.topic_id.is_none()
-                            && params.session_id.is_none())
-                        || (method == "project.topic.archive"
-                            && params.topic_id.is_some()
-                            && params.section_id.is_none()
-                            && params.session_id.is_none())
-                        || (method == "project.session.archive"
-                            && params.session_id.is_some()
-                            && params.section_id.is_none()
-                            && params.topic_id.is_none()),
-                    "archive requires exactly the target ID for this operation"
-                );
-                let ids = self.archive_container(params).await?;
-                json!({"archived": ids})
-            }
-            "project.agents.get" | "project.agents.set" => {
-                let params: ProjectRuleParam = serde_json::from_value(params)?;
-                if method.ends_with(".set") {
-                    self.projects.set_project_rule(
-                        &params.project_id,
-                        params.content.as_deref().context("content is required")?,
-                    )?;
-                    self.project_changed(&params.project_id, "agents.set").await;
-                }
-                json!({"content": std::fs::read_to_string(self.projects.project_rule_path(&params.project_id)?).unwrap_or_default()})
-            }
-            "project.section.reorder" => {
-                let params: ReorderSectionParam = serde_json::from_value(params)?;
-                let sections = self.projects.reorder_section(
-                    &params.project_id,
-                    &params.section_id,
-                    params.position,
-                )?;
-                self.project_changed(&params.project_id, "section.reorder")
-                    .await;
-                serde_json::to_value(sections)?
-            }
-            "project.topic.get" => {
-                let params: TopicParam = serde_json::from_value(params)?;
-                self.project_topic_detail(&params.project_id, &params.topic_id)
-                    .await?
-            }
-            "project.topic.create" => {
-                let params: CreateTopicParam = serde_json::from_value(params)?;
-                anyhow::ensure!(
-                    !params.overview.trim().is_empty(),
-                    "topic overview is required"
-                );
-                let topic = self.projects.create_topic(
-                    &params.project_id,
-                    &params.section_id,
-                    params.title,
-                )?;
-                self.projects
-                    .set_overview(&params.project_id, &topic.id, &params.overview)?;
-                self.project_changed(&params.project_id, "topic.create")
-                    .await;
-                serde_json::to_value(topic)?
-            }
-            "project.topic.update" => {
-                let params: UpdateTopicParam = serde_json::from_value(params)?;
-                let topic = self.projects.update_topic(
-                    &params.project_id,
-                    &params.topic_id,
-                    params.title,
-                )?;
-                self.project_changed(&params.project_id, "topic.update")
-                    .await;
-                serde_json::to_value(topic)?
-            }
-            "project.topic.move" | "project.topic.reorder" => {
-                let params: MoveTopicParam = serde_json::from_value(params)?;
-                let topic = self.projects.move_topic(
-                    &params.project_id,
-                    &params.topic_id,
-                    &params.section_id,
-                    params.position,
-                )?;
-                self.project_changed(&params.project_id, "topic.move").await;
-                serde_json::to_value(topic)?
-            }
-            "project.topic.overview.get" => {
-                let params: TopicParam = serde_json::from_value(params)?;
-                json!({"content": self.projects.overview(&params.project_id, &params.topic_id)?})
-            }
-            "project.topic.overview.set" => {
-                let params: MarkdownParam = serde_json::from_value(params)?;
-                self.projects.set_overview(
-                    &params.project_id,
-                    &params.topic_id,
-                    &params.content,
-                )?;
-                self.project_changed(&params.project_id, "topic.overview.set")
-                    .await;
-                json!({"updated": true})
-            }
-            "project.topic.agents.get" => {
-                let params: TopicParam = serde_json::from_value(params)?;
-                json!({"content": self.projects.agents(&params.project_id, &params.topic_id)?})
-            }
-            "project.topic.agents.set" => {
-                let params: MarkdownParam = serde_json::from_value(params)?;
-                self.projects
-                    .set_agents(&params.project_id, &params.topic_id, &params.content)?;
-                self.project_changed(&params.project_id, "topic.agents.set")
-                    .await;
-                json!({"updated": true})
-            }
-            "project.label.create" => {
-                let params: CreateLabelParam = serde_json::from_value(params)?;
-                let label = self.projects.create_label(
-                    &params.project_id,
-                    params.name,
-                    params.color,
-                    params.description,
-                )?;
-                self.project_changed(&params.project_id, "label.create")
-                    .await;
-                serde_json::to_value(label)?
-            }
-            "project.label.update" => {
-                let params: UpdateLabelParam = serde_json::from_value(params)?;
-                let label = self.projects.update_label(
-                    &params.project_id,
-                    &params.label_id,
-                    params.name,
-                    params.color,
-                    params.description,
-                )?;
-                self.project_changed(&params.project_id, "label.update")
-                    .await;
-                serde_json::to_value(label)?
-            }
-            "project.label.delete" => {
-                let params: LabelParam = serde_json::from_value(params)?;
-                let project = self
-                    .projects
-                    .delete_label(&params.project_id, &params.label_id)?;
-                self.project_changed(&params.project_id, "label.delete")
-                    .await;
-                serde_json::to_value(project)?
-            }
-            "project.label.assign" => {
-                let params: TopicLabelParam = serde_json::from_value(params)?;
-                let topic = self.projects.assign_label(
-                    &params.project_id,
-                    &params.topic_id,
-                    &params.label_id,
-                )?;
-                self.project_changed(&params.project_id, "label.assign")
-                    .await;
-                serde_json::to_value(topic)?
-            }
-            "project.label.unassign" => {
-                let params: TopicLabelParam = serde_json::from_value(params)?;
-                let topic = self.projects.unassign_label(
-                    &params.project_id,
-                    &params.topic_id,
-                    &params.label_id,
-                )?;
-                self.project_changed(&params.project_id, "label.unassign")
-                    .await;
-                serde_json::to_value(topic)?
-            }
-            "project.proposal.list" => {
-                let params: ProposalListParam = serde_json::from_value(params)?;
-                let proposals = self.projects.list_proposals(&params.project_id)?;
-                let pending = proposals
+                let _lifecycle = self.sessions.lifecycle.lock().await;
+                let p: WorktreeParam = serde_json::from_value(params)?;
+                let existing = self.projects.get(&p.project_id)?;
+                let worktree = existing
+                    .worktrees
                     .iter()
-                    .filter(|proposal| proposal.status == ProposalStatus::Pending)
-                    .count();
-                let proposals = match params.status.as_deref() {
-                    Some(status) => proposals
-                        .into_iter()
-                        .filter(|proposal| proposal.status.as_str() == status)
-                        .collect::<Vec<_>>(),
-                    None => proposals,
-                };
-                json!({"proposals": proposals, "pending": pending})
-            }
-            "project.proposal.accept" | "project.proposal.reject" => {
-                let params: ResolveProposalsParam = serde_json::from_value(params)?;
-                let resolved = self
-                    .resolve_project_proposals(&params, method.ends_with("accept"))
-                    .await?;
-                json!({"resolved": resolved})
-            }
-            "project.topic.session.assign" => {
-                let params: AssignSessionParam = serde_json::from_value(params)?;
-                let topic = self.projects.move_session(
-                    &params.project_id,
-                    &params.topic_id,
-                    params.session_id,
-                )?;
-                self.project_changed(&params.project_id, "session.assign")
-                    .await;
-                serde_json::to_value(topic)?
-            }
-            "project.topic.session.unassign" => {
-                let params: UnassignSessionParam = serde_json::from_value(params)?;
-                let project = self.projects.get(&params.project_id)?;
+                    .find(|w| w.id == p.worktree_id)
+                    .context("worktree not found")?;
                 anyhow::ensure!(
-                    project.board.topics.iter().any(|topic| {
-                        topic
-                            .session_ids
-                            .iter()
-                            .any(|session| session == &params.session_id)
-                    }),
-                    "session is not assigned to this project"
+                    worktree.source != WorktreeSource::Primary,
+                    "primary worktree cannot be removed"
                 );
-                self.projects
-                    .unassign_session_everywhere(&params.session_id)?;
-                self.project_changed(&params.project_id, "session.unassign")
-                    .await;
-                json!({"unassigned": true})
+                anyhow::ensure!(
+                    !existing
+                        .session_assignments
+                        .iter()
+                        .any(|a| a.worktree_id.as_ref() == Some(&p.worktree_id)),
+                    "worktree still owns sessions"
+                );
+                if method == "project.worktree.remove" {
+                    self.ensure_worktree_unused(&worktree.path).await?;
+                    let repository = existing
+                        .repository
+                        .as_ref()
+                        .context("project has no repository")?;
+                    super::git::remove_worktree(&repository.root, &worktree.path).await?;
+                }
+                let project = self
+                    .projects
+                    .remove_worktree(&p.project_id, &p.worktree_id)?;
+                self.project_changed(&p.project_id, "worktree.remove").await;
+                Ok(serde_json::to_value(project)?)
             }
             _ => anyhow::bail!("unknown project method: {method}"),
-        };
-        Ok(result)
+        }
     }
 
-    async fn project_topic_detail(&self, project_id: &str, topic_id: &str) -> Result<Value> {
-        let project = self.projects.get(project_id)?;
-        let topic = project
-            .board
-            .topics
-            .iter()
-            .find(|topic| topic.id == topic_id)
-            .cloned()
-            .with_context(|| format!("topic not found: {topic_id}"))?;
-        let labels = project
-            .board
-            .labels
-            .iter()
-            .filter(|label| topic.label_ids.contains(&label.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut sessions = Vec::new();
-        for id in &topic.session_ids {
-            let id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
-            if let Ok(status) = self.service.status(&id).await {
-                sessions.push(status);
+    async fn ensure_worktree_unused(&self, path: &std::path::Path) -> Result<()> {
+        for archived in [false, true] {
+            let mut cursor = None;
+            loop {
+                let mut query = dwo_agent_service::SessionListQuery::new(cursor, Some(500));
+                query.archived = archived;
+                let page = self.service.list(query).await?;
+                anyhow::ensure!(
+                    !page
+                        .sessions
+                        .iter()
+                        .any(|session| session.cwd.starts_with(path)),
+                    "worktree is still used by an active or archived session"
+                );
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
             }
         }
-        let uncategorized_topic_id = project.board.uncategorized_topic_id.as_str();
-        let tasks = self
-            .automation
-            .list(Some(project_id))
-            .await
-            .into_iter()
-            .filter(|status| {
-                status
-                    .job
-                    .topic_id
-                    .as_deref()
-                    .unwrap_or(uncategorized_topic_id)
-                    == topic_id
-            })
-            .collect::<Vec<_>>();
-        Ok(json!({
-            "topic": topic,
-            "overview": self.projects.overview(project_id, topic_id)?,
-            "agents": self.projects.agents(project_id, topic_id)?,
-            "labels": labels,
-            "sessions": sessions,
-            "tasks": tasks,
-        }))
+        Ok(())
     }
 
     fn profile_path(&self, path: PathBuf) -> PathBuf {
@@ -686,7 +345,6 @@ impl Host {
             self.profile_root.join(path)
         }
     }
-
     fn register_repository(
         &self,
         project_id: &str,
@@ -695,114 +353,37 @@ impl Host {
     ) -> Result<Project> {
         anyhow::ensure!(
             self.projects.get(project_id)?.repository.is_none(),
-            "project already has an attached repository"
+            "project already has a repository"
         );
-        self.projects
-            .set_repository(
-                project_id,
-                RepositoryRecord {
-                    root: info.root.clone(),
-                    common_dir: info.common_dir,
-                    remote_url: info.remote_url,
-                },
-                worktree_record(name.into(), info.root, WorktreeSource::Primary),
-            )
-            .map_err(Into::into)
+        Ok(self.projects.set_repository(
+            project_id,
+            RepositoryRecord {
+                root: info.root.clone(),
+                common_dir: info.common_dir,
+                remote_url: info.remote_url,
+            },
+            worktree_record(name.into(), info.root, WorktreeSource::Primary),
+        )?)
     }
-
     async fn worktree_views(&self, project_id: &str) -> Result<Vec<Value>> {
         let project = self.projects.get(project_id)?;
-        let mut views = Vec::with_capacity(project.worktrees.len());
-        for worktree in project.worktrees {
+        let mut views = Vec::new();
+        for worktree in &project.worktrees {
             let status = super::git::worktree_status(&worktree.path).await;
-            let mut topics = Vec::new();
-            for topic in &project.board.topics {
-                let mut sessions = Vec::new();
-                for session_id in &topic.session_ids {
-                    let id = SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
-                    if let Ok(snapshot) = self.service.status(&id).await
-                        && snapshot.record.info.cwd == worktree.path
-                    {
-                        sessions.push(snapshot);
-                    }
-                }
-                if !sessions.is_empty() {
-                    topics.push(json!({"topic": topic, "sessions": sessions}));
+            let mut sessions = Vec::new();
+            for assignment in project.session_assignments.iter().filter(|assignment| {
+                assignment.worktree_id.as_deref() == Some(worktree.id.as_str())
+            }) {
+                if let Ok(id) = SessionId::parse(assignment.session_id.clone())
+                    && let Ok(snapshot) = self.service.status(&id).await
+                {
+                    sessions.push(snapshot);
                 }
             }
-            views.push(json!({
-                "worktree": worktree,
-                "git": status.as_ref().ok(),
-                "available": status.is_ok(),
-                "topics": topics,
-            }));
+            views.push(json!({"worktree": worktree, "git": status.as_ref().ok(), "available": status.is_ok(), "sessions": sessions}));
         }
         Ok(views)
     }
-
-    async fn archive_container(&self, params: ArchiveParam) -> Result<Vec<String>> {
-        let _lifecycle = self.automation.lifecycle.lock().await;
-        let project = self.projects.get(&params.project_id)?;
-        let topics: Vec<String> = project
-            .board
-            .topics
-            .iter()
-            .filter(|t| {
-                params
-                    .section_id
-                    .as_ref()
-                    .is_none_or(|id| &t.section_id == id)
-                    && params.topic_id.as_ref().is_none_or(|id| &t.id == id)
-            })
-            .map(|t| t.id.clone())
-            .collect();
-        let ids: Vec<String> = project
-            .board
-            .topics
-            .iter()
-            .filter(|t| topics.contains(&t.id))
-            .flat_map(|t| t.session_ids.iter())
-            .filter(|id| params.session_id.as_ref().is_none_or(|s| *id == s))
-            .cloned()
-            .collect();
-        for value in &ids {
-            let id = SessionId::parse(value.clone()).map_err(anyhow::Error::msg)?;
-            let snapshot = self.service.snapshot(&id).await?;
-            anyhow::ensure!(
-                snapshot.phase == dwo_agent_service::RuntimePhase::Idle,
-                "stop session {id} before archiving"
-            );
-        }
-        let jobs = self.automation.list(Some(&project.id)).await;
-        anyhow::ensure!(
-            jobs.iter().all(|j| j.active_runs.is_empty()),
-            "stop project automation runs before archiving"
-        );
-        self.automation.update_project_config(&project.id, |config| {
-                for job in &mut config.jobs {
-                    let fixed_selected = matches!(&job.session, crate::automation::AutomationSession::Fixed { session_id } if ids.contains(session_id));
-                    if fixed_selected || (params.session_id.is_none() && topics.contains(&job.topic_id.clone().unwrap_or_else(|| project.board.uncategorized_topic_id.clone()))) {
-                        job.enabled = false;
-                    }
-                }
-                Ok(())
-            }).await?;
-        let ids = self.projects.archive(
-            &project.id,
-            params.section_id.as_deref(),
-            params.topic_id.as_deref(),
-            params.session_id.as_deref(),
-        )?;
-        for value in &ids {
-            let id = SessionId::parse(value.clone()).map_err(anyhow::Error::msg)?;
-            self.service.set_external_rule_files(&id, vec![]);
-        }
-        self.project_changed(&project.id, "archive").await;
-        self.project_changed(dwo_project::UNASSIGNED_PROJECT_ID, "archive")
-            .await;
-        Ok(ids)
-    }
-
     async fn project_changed(&self, project_id: &str, action: &str) {
         self.events
             .publish(
@@ -811,141 +392,6 @@ impl Host {
             )
             .await;
     }
-
-    fn project_ops_policy(&self) -> ProjectOpPolicy {
-        self.profile
-            .read()
-            .expect("profile lock poisoned")
-            .config
-            .project_ops
-    }
-
-    async fn queue_project_proposal(
-        self: &Arc<Self>,
-        method: &str,
-        params: Value,
-        caller_session_id: &str,
-    ) -> Result<Value> {
-        let project_id = params
-            .get("project_id")
-            .and_then(Value::as_str)
-            .context("project_id is required")?
-            .to_string();
-        match self.projects.locate_session(caller_session_id) {
-            Some((project, _)) if project.id == project_id => {}
-            Some((project, _)) => anyhow::bail!(
-                "会话 {caller_session_id} 只能修改自己所在的项目（{}）",
-                project.id
-            ),
-            None => anyhow::bail!("会话 {caller_session_id} 尚未分配到项目看板"),
-        }
-        let proposal = Proposal {
-            id: format!("proposal-{}", uuid::Uuid::new_v4()),
-            project_id: project_id.clone(),
-            method: method.to_string(),
-            payload: params,
-            source_session_id: caller_session_id.to_string(),
-            status: ProposalStatus::Pending,
-            error: None,
-            result: None,
-            created_at_ms: unix_now_ms(),
-            resolved_at_ms: None,
-        };
-        let proposal_id = proposal.id.clone();
-        self.projects.append_proposal(&project_id, proposal)?;
-        self.events
-            .publish(
-                "project.proposal.changed",
-                json!({"projectId": project_id, "action": "proposed", "proposalId": proposal_id}),
-            )
-            .await;
-        Ok(json!({"proposed": true, "proposalId": proposal_id, "projectId": project_id}))
-    }
-
-    async fn resolve_project_proposals(
-        self: &Arc<Self>,
-        params: &ResolveProposalsParam,
-        accepted: bool,
-    ) -> Result<Vec<Value>> {
-        let proposals = self.projects.list_proposals(&params.project_id)?;
-        let targets = if params.all {
-            proposals
-                .iter()
-                .filter(|proposal| proposal.status == ProposalStatus::Pending)
-                .map(|proposal| proposal.id.clone())
-                .collect::<Vec<_>>()
-        } else {
-            params.proposal_ids.clone().unwrap_or_default()
-        };
-        anyhow::ensure!(!targets.is_empty(), "no proposals selected");
-        let mut outcomes = Vec::new();
-        for id in targets {
-            let Some(proposal) = proposals.iter().find(|proposal| proposal.id == id).cloned()
-            else {
-                outcomes.push(json!({"proposalId": id, "status": "missing"}));
-                continue;
-            };
-            if proposal.status != ProposalStatus::Pending {
-                outcomes.push(json!({"proposalId": id, "status": proposal.status.as_str()}));
-                continue;
-            }
-            let (status, error, result) = if accepted {
-                match Box::pin(self.handle_method(&proposal.method, proposal.payload.clone())).await
-                {
-                    Ok(result) => (ProposalStatus::Accepted, None, Some(result)),
-                    Err(error) => (ProposalStatus::Failed, Some(format!("{error:#}")), None),
-                }
-            } else {
-                (ProposalStatus::Rejected, None, None)
-            };
-            let error_for_store = error.clone();
-            let result_for_store = result.clone();
-            self.projects
-                .update_proposals(&params.project_id, |proposals| {
-                    if let Some(entry) = proposals.iter_mut().find(|entry| entry.id == id) {
-                        entry.status = status;
-                        entry.error = error_for_store;
-                        entry.result = result_for_store;
-                        entry.resolved_at_ms = Some(unix_now_ms());
-                    }
-                    Ok(())
-                })?;
-            self.events
-                .publish(
-                    "project.proposal.changed",
-                    json!({
-                        "projectId": params.project_id,
-                        "action": status.as_str(),
-                        "proposalId": id,
-                    }),
-                )
-                .await;
-            outcomes.push(json!({
-                "proposalId": id,
-                "status": status.as_str(),
-                "error": error,
-            }));
-        }
-        Ok(outcomes)
-    }
-}
-
-fn split_caller_session(mut params: Value) -> (Option<String>, Value) {
-    let caller_session_id = params
-        .get("caller_session_id")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    if let Some(object) = params.as_object_mut() {
-        object.remove("caller_session_id");
-    }
-    (caller_session_id, params)
-}
-
-fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn worktree_record(name: String, path: PathBuf, source: WorktreeSource) -> WorktreeRecord {
@@ -960,321 +406,136 @@ fn worktree_record(name: String, path: PathBuf, source: WorktreeSource) -> Workt
             .as_millis() as u64,
     }
 }
-
-pub(super) fn find_worktree<'a>(
-    project: &'a Project,
-    worktree_id: &str,
-) -> Result<&'a WorktreeRecord> {
-    project
-        .worktrees
-        .iter()
-        .find(|worktree| worktree.id == worktree_id)
-        .with_context(|| format!("worktree not found: {worktree_id}"))
-}
-
 fn default_worktree_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Worktree".to_string())
+        .unwrap_or_else(|| "Worktree".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::tests::write_test_profile;
+    use crate::host::{HostSessionOptions, tests::write_test_profile};
 
-    #[tokio::test]
-    async fn project_archive_preserves_cwd_and_requires_archive_for_deletion() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("demo");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("keep.txt"), "keep").unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-        let project = host
-            .handle_method("project.create", json!({"pwd": workspace}))
-            .await
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
             .unwrap();
-        assert_eq!(project["name"], "demo");
-        assert_eq!(project["kind"], "project");
-        let pid = project["id"].as_str().unwrap();
-        let section = project["board"]["uncategorizedSectionId"].as_str().unwrap();
         assert!(
-            host.handle_method(
-                "project.topic.create",
-                json!({"project_id": pid, "section_id": section, "title": "Task", "overview": ""})
-            )
-            .await
-            .is_err()
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        let topic = host.handle_method("project.topic.create", json!({"project_id": pid, "section_id": section, "title": "Task", "overview": "Implement feature"})).await.unwrap();
-        let tid = topic["id"].as_str().unwrap();
-        host.handle_method(
-            "project.agents.set",
-            json!({"project_id": pid, "content": "Project rule sentinel"}),
-        )
-        .await
-        .unwrap();
-        host.handle_method(
-            "project.topic.agents.set",
-            json!({"project_id": pid, "topic_id": tid, "content": "Topic rule sentinel"}),
-        )
-        .await
-        .unwrap();
-        let created = host
-            .handle_method("session.new", json!({"project_id": pid, "topic_id": tid}))
-            .await
-            .unwrap();
-        let id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
-        let snapshot = host.service.snapshot(&id).await.unwrap();
-        let cwd = snapshot.record.info.cwd;
-        let prompt = serde_json::to_string(&snapshot.record.context).unwrap();
-        assert!(prompt.contains("Project rule sentinel"));
-        assert!(prompt.contains("Topic rule sentinel"));
-        assert!(host.delete_session(&id).await.is_err());
-        assert!(
-            host.handle_method(
-                "session.set",
-                json!({"session_id": id, "worktree_id": "other"})
-            )
-            .await
-            .is_err()
-        );
-        host.handle_method("project.archive", json!({"project_id": pid}))
-            .await
-            .unwrap();
-        assert!(host.projects.is_archived(id.as_str()));
-        host.service.unload(&id).await.unwrap();
-        assert_eq!(
-            host.service.snapshot(&id).await.unwrap().record.info.cwd,
-            cwd
-        );
-        assert!(host.projects.get(pid).is_err());
-        assert!(
-            host.prompt_session(
-                &id,
-                dwo_agent_service::EndpointId::parse("test").unwrap(),
-                dwo_context::MessageContent::text("run")
-            )
-            .await
-            .is_err()
-        );
-        host.delete_session(&id).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("keep.txt")).unwrap(),
-            "keep"
-        );
-        host.shutdown().await;
     }
 
     #[tokio::test]
-    async fn worktree_is_a_sibling_and_detach_preserves_checkout_and_session() {
+    async fn worktree_remove_deletes_git_tree_and_detach_only_unregisters() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        for args in [
-            vec!["init"],
-            vec![
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(
+            &repo,
+            &[
                 "-c",
                 "user.name=Test",
                 "-c",
-                "user.email=test@example.test",
+                "user.email=test@example.com",
                 "commit",
                 "--allow-empty",
                 "-m",
                 "initial",
             ],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .current_dir(&repo)
-                    .args(args)
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
-            );
-        }
+        );
         let host = Host::build(&write_test_profile(root.path())).await.unwrap();
         let project = host
             .handle_method("project.create", json!({"pwd": repo}))
             .await
             .unwrap();
-        let pid = project["id"].as_str().unwrap();
-        assert!(!project["repository"].is_null());
-        let project = host
-            .handle_method(
-                "project.worktree.create",
-                json!({"project_id": pid, "branch": "feature-a", "name": "feature-a"}),
-            )
-            .await
-            .unwrap();
-        let tree = project["worktrees"].as_array().unwrap().last().unwrap();
-        let wid = tree["id"].as_str().unwrap();
-        let cwd = std::fs::canonicalize(root.path().join("feature-a")).unwrap();
+        let project_id = project["id"].as_str().unwrap();
+        let tree = root.path().join("tree");
         let created = host
             .handle_method(
-                "session.new",
-                json!({"project_id": pid, "worktree_id": wid}),
+                "project.worktree.create",
+                json!({"project_id": project_id, "branch": "test-branch", "path": tree}),
             )
             .await
             .unwrap();
-        let id = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+        let worktree_id = created["worktrees"][1]["id"].as_str().unwrap();
+        let section = host
+            .projects
+            .create_section(project_id, "Next".into(), None)
+            .unwrap();
+        let id = host
+            .create_session(HostSessionOptions {
+                project_id: Some(project_id.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         host.handle_method(
-            "project.worktree.remove",
-            json!({"project_id": pid, "worktree_id": wid}),
+            "project.session.assign",
+            json!({"project_id": project_id, "session_id": id, "worktree_id": worktree_id}),
         )
         .await
         .unwrap();
-        host.service.unload(&id).await.unwrap();
         assert_eq!(
             host.service.snapshot(&id).await.unwrap().record.info.cwd,
-            cwd
+            std::fs::canonicalize(&tree).unwrap()
         );
-        assert!(cwd.join(".git").exists());
+        host.handle_method(
+            "project.session.assign",
+            json!({"project_id": project_id, "session_id": id, "section_id": section.id}),
+        )
+        .await
+        .unwrap();
+        let assignment = host.projects.locate_session(id.as_str()).unwrap().1;
+        assert_eq!(assignment.section_id, section.id);
+        assert_eq!(assignment.worktree_id.as_deref(), Some(worktree_id));
         assert!(
             host.handle_method(
-                "project.worktree.create",
-                json!({"project_id": pid, "branch": "bad", "name": "../escape"})
+                "project.session.assign",
+                json!({"project_id": project_id, "session_id": "session-missing"})
             )
             .await
             .is_err()
         );
+        let remove = json!({"project_id": project_id, "worktree_id": worktree_id});
         assert!(
-            host.handle_method(
-                "project.worktree.create",
-                json!({"project_id": pid, "branch": "other", "name": "feature-a"})
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            host.handle_method("project.repository.clone", json!({}))
+            host.handle_method("project.worktree.remove", remove.clone())
                 .await
                 .is_err()
         );
+        host.archive_session(&id).await.unwrap();
         assert!(
-            host.handle_method("project.topic.move_to_project", json!({}))
+            host.handle_method("project.worktree.remove", remove.clone())
                 .await
                 .is_err()
         );
-        host.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn session_project_edits_become_proposals_until_confirmed() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("demo");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-        let project = host
-            .handle_method("project.create", json!({"pwd": workspace}))
+        host.delete_session(&id).await.unwrap();
+        host.handle_method("project.worktree.detach", remove)
             .await
             .unwrap();
-        let pid = project["id"].as_str().unwrap().to_string();
-        let section = project["board"]["uncategorizedSectionId"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let topic = host
+        assert!(tree.is_dir());
+        let attached = host
             .handle_method(
-                "project.topic.create",
-                json!({"project_id": &pid, "section_id": &section, "title": "Task", "overview": "seed"}),
+                "project.worktree.attach",
+                json!({"project_id": project_id, "path": tree}),
             )
             .await
             .unwrap();
-        let tid = topic["id"].as_str().unwrap().to_string();
-        let created = host
-            .handle_method("session.new", json!({"project_id": &pid, "topic_id": &tid}))
-            .await
-            .unwrap();
-        let sid = created["session_id"].as_str().unwrap().to_string();
-
-        let response = host
-            .handle_method(
-                "project.topic.create",
-                json!({
-                    "project_id": &pid,
-                    "section_id": &section,
-                    "title": "Proposed",
-                    "overview": "from session",
-                    "caller_session_id": &sid,
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response["proposed"], true);
-        let proposal_id = response["proposalId"].as_str().unwrap().to_string();
-        let listed = host
-            .handle_method("project.proposal.list", json!({"project_id": &pid}))
-            .await
-            .unwrap();
-        assert_eq!(listed["pending"], 1);
-
-        assert!(
-            host.handle_method(
-                "project.proposal.accept",
-                json!({"project_id": &pid, "proposal_ids": [&proposal_id], "caller_session_id": &sid}),
-            )
-            .await
-            .is_err()
-        );
-
-        let resolved = host
-            .handle_method(
-                "project.proposal.accept",
-                json!({"project_id": &pid, "all": true}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resolved["resolved"][0]["status"], "accepted");
-        let board = host
-            .handle_method("project.board", json!({"project_id": &pid}))
-            .await
-            .unwrap();
-        assert!(
-            board["board"]["topics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|topic| topic["title"] == "Proposed")
-        );
-        host.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn sessions_cannot_create_projects_or_touch_worktrees() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("demo");
-        std::fs::create_dir_all(&workspace).unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
-        let project = host
-            .handle_method("project.create", json!({"pwd": workspace}))
-            .await
-            .unwrap();
-        let pid = project["id"].as_str().unwrap().to_string();
-        let created = host
-            .handle_method("session.new", json!({"project_id": &pid}))
-            .await
-            .unwrap();
-        let sid = created["session_id"].as_str().unwrap().to_string();
-        let other = root.path().join("other");
-        std::fs::create_dir_all(&other).unwrap();
-        assert!(
-            host.handle_method(
-                "project.create",
-                json!({"pwd": other, "caller_session_id": &sid}),
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            host.handle_method(
-                "project.worktree.create",
-                json!({"project_id": &pid, "branch": "x", "caller_session_id": &sid}),
-            )
-            .await
-            .is_err()
-        );
+        let worktree_id = attached["worktrees"][1]["id"].as_str().unwrap();
+        host.handle_method(
+            "project.worktree.remove",
+            json!({"project_id": project_id, "worktree_id": worktree_id}),
+        )
+        .await
+        .unwrap();
+        assert!(!tree.exists());
+        assert_eq!(host.projects.get(project_id).unwrap().worktrees.len(), 1);
         host.shutdown().await;
     }
 }

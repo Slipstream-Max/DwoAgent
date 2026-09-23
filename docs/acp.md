@@ -59,8 +59,8 @@ Prompt 时，cancel 正常生效；如果连接在窗口内断开（关闭窗口
 ## Session
 
 ACP 可以新建、列出、加载、继续和删除 daemon 中的 Session；`session/close` 用于关闭客户端
-侧的对话视图。Client 创建 Session 时提供的 cwd 会成为 External Workspace，并归入固定的
-“未分配会话” Project。完整的 Project/Topic 归类和 Workspace 类型见
+侧的对话视图。Client 创建 Session 时提供的 cwd 会成为 External Workspace，不会创建隐藏
+Project。Project assignment 和 Workspace 类型见
 [Project 文件与行为](projects.md)。
 
 `session/close` 只断开当前连接对该 Session 的事件订阅，不会取消正在运行的 turn，也不会卸载

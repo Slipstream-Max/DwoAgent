@@ -44,7 +44,7 @@ protects the whole `runtime` tree and skips:
 
 - directories named `workspaces` and `workspace`: managed session workspaces
   and project working folders that agent tools write to
-- `AGENTS.md` and `overview.md`: project and topic rule files that stay
+- `AGENTS.md`: project-root and current-working-directory rule files that stay
   editable while the host runs
 - `*.log`: deploy scripts append to `runtime/restart.log` while the host runs
 - `*.tmp`: temporary files a crashed atomic write may have left behind

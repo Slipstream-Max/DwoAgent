@@ -4,7 +4,7 @@ use super::{ConfigSnapshot, ConfigUpdateParam, Host};
 
 impl Host {
     pub(crate) fn config_snapshot(&self, session_count: usize) -> ConfigSnapshot {
-        let (policy, default_model, default_reasoning, models, max_model_steps, project_ops) = {
+        let (policy, default_model, default_reasoning, models, max_model_steps) = {
             let profile = self.profile.read().expect("profile lock poisoned");
             (
                 profile.config.policy_mode,
@@ -12,7 +12,6 @@ impl Host {
                 profile.config.model.default.reasoning.clone(),
                 profile.model_options.clone(),
                 profile.config.max_model_steps,
-                profile.config.project_ops,
             )
         };
         ConfigSnapshot {
@@ -21,7 +20,6 @@ impl Host {
             default_reasoning,
             models,
             max_model_steps,
-            project_ops,
             session_count,
         }
     }
@@ -42,9 +40,6 @@ impl Host {
             }
             if let Some(files) = params.external_rule_files {
                 profile.external_rule_files = files;
-            }
-            if let Some(project_ops) = params.project_ops {
-                profile.project_ops = project_ops;
             }
             Ok(())
         })

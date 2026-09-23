@@ -32,7 +32,7 @@ OpenClaw 功能很全，代价是常驻内存、组件数量和整体复杂度�
 | **多平台接入** | 本地支持 CLI 和 ACP（IDE），远程支持微信、Telegram、飞书/Lark、QQ Bot；WebSocket 另有 /acp 和 /dwo 两条独立入口；图片和文件也能进入 session。 |
 | **多端接力** | 同一个 session 可以同时被 CLI、ACP 和各个 channel 使用：任意已连接端点都能查看进度、取消任务、处理权限请求和继续发消息；运行中的新消息按 FIFO 排队，在模型响应或工具调用的边界加入当前 turn。 |
 | **子 Agent** | 子 session 有独立 context 和 transcript，可以继续派生；父 session 不需要轮询，子任务结果会自动作为内部消息送达。支持 Fork 和一次性临时子 Agent（`--ephemeral`）。 |
-| **Project、Board 与 Worktree** | Project 持久化工作路径、Repository 和 Git Worktree、Section/Topic/Label 看板以及 session 归属；共享仓库可以用不同 worktree 让多个 session 并行工作。 |
+| **Project、Section 与 Worktree** | Project 持久化工作路径、Section、Session assignment、Repository 和 Git Worktree；同一仓库可以用不同 worktree 让多个 session 并行工作。Automation 另存于 project 或 global scope。 |
 | **Automation 定时任务** | 每个 Project 有独立的 cron 任务、Session 策略和执行历史；按无人值守方式运行，超时自动取消，需要人工确认的权限请求自动拒绝。 |
 | **持久化会话** | 模型上下文和完整 transcript 分开存储；上下文压缩和模型切换都不会丢原始记录。 |
 | **三种权限模式** | `full_access` 适合可信环境，`confirm` 会请求确认，`watch` 只开放简单的只读操作；子 Agent 只能收紧、不能放宽。 |

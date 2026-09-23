@@ -525,36 +525,31 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
 }
 
 #[test]
-fn prompt_uses_and_watches_session_rule_files_with_their_pwd() {
+fn prompt_discovers_and_watches_workspace_rules() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
     let cwd = root.path().join("workspace");
-    let topic_rules = root.path().join("runtime/topics/topic-1/AGENTS.md");
+    let workspace_rules = cwd.join("AGENTS.md");
     std::fs::create_dir_all(&cwd).unwrap();
     write(
         &profile.join("resource/prompts/System.md"),
         "Profile system prompt",
     );
-    write(&topic_rules, "topic rule v1");
+    write(&workspace_rules, "workspace rule v1");
 
-    let builder = SystemPromptBuilder::new(Some(profile), cwd.clone()).with_external_rule_files(
-        std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-        std::sync::Arc::new(std::sync::RwLock::new(vec![
-            dwo_context::ExternalRuleFile::new(topic_rules.clone(), cwd.clone()),
-        ])),
-    );
+    let builder = SystemPromptBuilder::new(Some(profile), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     let prompt = manager.system_prompt();
-    assert!(prompt.contains("topic rule v1"));
+    assert!(prompt.contains("workspace rule v1"));
     assert!(prompt.contains("AGENTS.md"));
     let canonical_cwd = std::fs::canonicalize(&cwd).unwrap();
     assert!(prompt.contains(&canonical_cwd.to_string_lossy().to_string()));
 
-    write(&topic_rules, "topic rule v2");
+    write(&workspace_rules, "workspace rule v2");
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
     let watcher = manager.model_messages().last().unwrap();
     assert_eq!(watcher.kind, MessageKind::EnvWatcher);
-    assert!(watcher.content.contains("topic rule v2"));
+    assert!(watcher.content.contains("workspace rule v2"));
     assert!(
         watcher
             .content
@@ -579,10 +574,8 @@ fn prompt_watches_profile_rule_file_content_and_list_changes() {
     let profile_rules = std::sync::Arc::new(std::sync::RwLock::new(vec![
         dwo_context::ExternalRuleFile::new(first.clone(), profile.clone()),
     ]));
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd).with_external_rule_files(
-        profile_rules.clone(),
-        std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-    );
+    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd)
+        .with_external_rule_files(profile_rules.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     assert!(manager.system_prompt().contains("profile rule v1"));
 

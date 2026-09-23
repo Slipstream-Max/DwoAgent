@@ -78,10 +78,10 @@ let accepted = host
 
 | API | 行为 |
 | --- | --- |
-| `create_session(options)` | 创建、fork 或绑定 Project/Topic，并返回 `SessionId` |
+| `create_session(options)` | 创建、fork 或绑定 Project/Section，并返回 `SessionId` |
 | `subscribe_session(id, cursor)` | 先取得快照/回放，再接收 live Session 事件 |
 | `prompt_session(id, endpoint, content)` | 展开有效 Skill/MCP directive 后提交 prompt |
-| `delete_session(id)` | 关闭并删除 Session 记录，同时清理 Topic 关联；只删除 DWO 管理的 Session workspace |
+| `archive_session(id)` / `delete_session(id)` | 先归档并解除 Section assignment；只有 archived Session 才能真正删除，并只删除 DWO 管理的 workspace |
 | `subscribe_events(cursor, limit, event)` | 订阅 Host 级事件 |
 | `handle_request(client, request, method, params)` | Management/ACP 协议入口 |
 

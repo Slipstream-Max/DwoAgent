@@ -102,7 +102,6 @@ pub struct SystemPromptBuilder {
     cwd: PathBuf,
     external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
     profile_rule_files: Arc<RwLock<Vec<ExternalRuleFile>>>,
-    session_rule_files: Arc<RwLock<Vec<ExternalRuleFile>>>,
     tool_prompt: Option<String>,
     subsession_prompt: Option<String>,
     automation_prompt: Option<String>,
@@ -116,7 +115,6 @@ impl SystemPromptBuilder {
             cwd: cwd.into(),
             external_skill_dirs: Arc::new(RwLock::new(Vec::new())),
             profile_rule_files: Arc::new(RwLock::new(Vec::new())),
-            session_rule_files: Arc::new(RwLock::new(Vec::new())),
             tool_prompt: None,
             subsession_prompt: None,
             automation_prompt: None,
@@ -134,13 +132,8 @@ impl SystemPromptBuilder {
         self
     }
 
-    pub fn with_external_rule_files(
-        mut self,
-        profile: Arc<RwLock<Vec<ExternalRuleFile>>>,
-        session: Arc<RwLock<Vec<ExternalRuleFile>>>,
-    ) -> Self {
+    pub fn with_external_rule_files(mut self, profile: Arc<RwLock<Vec<ExternalRuleFile>>>) -> Self {
         self.profile_rule_files = profile;
-        self.session_rule_files = session;
         self
     }
 
@@ -248,12 +241,7 @@ impl SystemPromptBuilder {
             .read()
             .expect("external rule files lock poisoned")
             .clone();
-        let session_rule_files = self
-            .session_rule_files
-            .read()
-            .expect("session external rule files lock poisoned")
-            .clone();
-        for source in profile_rule_files.iter().chain(&session_rule_files) {
+        for source in &profile_rule_files {
             if let Some(content) = read_optional_nonempty(&source.path)? {
                 let path = resolve_or_original(&source.path);
                 if let Some(existing) = rules.iter_mut().find(|rule| rule.path == path) {

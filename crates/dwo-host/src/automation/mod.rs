@@ -8,16 +8,17 @@ use chrono::{DateTime, Local, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
 use dwo_agent_service::{
-    EndpointId, ExternalRuleFile, NewSession, SessionEventPayload, SessionId, SessionListQuery,
-    SessionLlmSettings, SessionService, SessionServiceError, SessionSubscription, SessionWorkspace,
-    TurnId,
+    EndpointId, SessionEventPayload, SessionId, SessionListQuery, SessionService,
+    SessionServiceError, SessionSubscription, TurnId,
 };
-use dwo_project::{ProjectKind, ProjectService};
+use dwo_project::ProjectService;
 use dwo_tools::{ConfirmationDecision, SessionMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use crate::host::{HostSessionOptions, session_manager::SessionManager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -49,8 +50,11 @@ pub struct AutomationJob {
     pub schedule: AutomationSchedule,
     pub session: AutomationSession,
     pub prompt: String,
+    /// Custom working directory for an automation that is not bound to a project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     #[serde(default)]
-    pub topic_id: Option<String>,
+    pub section_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -106,7 +110,7 @@ pub enum AutomationRunStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AutomationRunRecord {
     pub run_id: String,
-    pub project_id: String,
+    pub project_id: Option<String>,
     pub job: String,
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
@@ -122,7 +126,7 @@ pub struct AutomationRunRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutomationJobStatus {
-    pub project_id: String,
+    pub project_id: Option<String>,
     pub job: AutomationJob,
     pub scheduler_enabled: bool,
     pub next_run_at: Option<String>,
@@ -134,11 +138,11 @@ pub struct AutomationJobStatus {
 
 #[derive(Default)]
 struct RuntimeState {
-    projects: BTreeMap<String, ProjectAutomationState>,
+    scopes: BTreeMap<Option<String>, AutomationScopeState>,
     active: BTreeMap<String, AutomationRunRecord>,
 }
 
-struct ProjectAutomationState {
+struct AutomationScopeState {
     config: AutomationConfig,
     next_runs: BTreeMap<String, DateTime<Utc>>,
     history: AutomationHistory,
@@ -161,63 +165,73 @@ struct AutomationExecution {
     turn_id: TurnId,
 }
 
-#[derive(Clone)]
-struct AutomationDefaults {
-    model: String,
-    reasoning: Option<String>,
-    mode: SessionMode,
-}
-
 pub struct AutomationRuntime {
-    pub(crate) lifecycle: Mutex<()>,
+    sessions: Arc<SessionManager>,
+    starts: Mutex<()>,
     service: Arc<SessionService>,
     projects: Arc<ProjectService>,
     profile_root: PathBuf,
-    defaults: Mutex<AutomationDefaults>,
     shutdown: CancellationToken,
     state: Mutex<RuntimeState>,
     session_queues: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
 impl AutomationRuntime {
-    pub fn new(
+    pub(crate) fn new(
         service: Arc<SessionService>,
         projects: Arc<ProjectService>,
+        sessions: Arc<SessionManager>,
         profile_root: PathBuf,
-        default_model: String,
-        default_reasoning: Option<String>,
-        default_mode: SessionMode,
         shutdown: CancellationToken,
     ) -> Result<Arc<Self>> {
         let mut project_states = BTreeMap::new();
         for project in projects.list() {
-            let config = read_project_config(&projects.automation_config_path(&project.id)?)?;
+            let config_path = profile_root
+                .join("runtime/automations")
+                .join(&project.id)
+                .join("config.yaml");
+            let history_path = profile_root
+                .join("runtime/automations")
+                .join(&project.id)
+                .join("history.yaml");
+            let config = read_config(&config_path)?;
             validate_project_config(&project, &config)?;
             let next_runs = build_next_runs(&config)?;
-            let mut history = read_history(&projects.automation_history_path(&project.id)?)?;
+            let mut history = read_history(&history_path)?;
             mark_interrupted_runs(&mut history);
             project_states.insert(
-                project.id,
-                ProjectAutomationState {
+                Some(project.id),
+                AutomationScopeState {
                     config,
                     next_runs,
                     history,
                 },
             );
         }
+        let global_config_path = profile_root.join("runtime/automations/global/config.yaml");
+        let global_history_path = profile_root.join("runtime/automations/global/history.yaml");
+        let global_config = read_config(&global_config_path)?;
+        validate_config(&global_config)?;
+        let global_next_runs = build_next_runs(&global_config)?;
+        let mut global_history = read_history(&global_history_path)?;
+        mark_interrupted_runs(&mut global_history);
+        project_states.insert(
+            None,
+            AutomationScopeState {
+                config: global_config,
+                next_runs: global_next_runs,
+                history: global_history,
+            },
+        );
         Ok(Arc::new(Self {
-            lifecycle: Mutex::new(()),
+            sessions,
+            starts: Mutex::new(()),
             service,
             projects,
             profile_root,
-            defaults: Mutex::new(AutomationDefaults {
-                model: default_model,
-                reasoning: default_reasoning,
-                mode: default_mode,
-            }),
             shutdown,
             state: Mutex::new(RuntimeState {
-                projects: project_states,
+                scopes: project_states,
                 active: BTreeMap::new(),
             }),
             session_queues: Mutex::new(BTreeMap::new()),
@@ -229,13 +243,23 @@ impl AutomationRuntime {
         tokio::spawn(async move { runtime.scheduler_loop().await });
     }
 
-    pub async fn list(&self, project_id: Option<&str>) -> Vec<AutomationJobStatus> {
+    pub async fn job_count(&self) -> usize {
+        self.state
+            .lock()
+            .await
+            .scopes
+            .values()
+            .map(|scope| scope.config.jobs.len())
+            .sum()
+    }
+
+    pub async fn list(&self, project_id: &Option<String>) -> Vec<AutomationJobStatus> {
         let (projects, active) = {
             let state = self.state.lock().await;
             let projects = state
-                .projects
+                .scopes
                 .iter()
-                .filter(|(id, _)| project_id.is_none_or(|wanted| wanted == id.as_str()))
+                .filter(|(id, _)| *id == project_id)
                 .map(|(id, project)| {
                     (
                         id.clone(),
@@ -247,7 +271,7 @@ impl AutomationRuntime {
                 .collect::<Vec<_>>();
             (projects, state.active.values().cloned().collect::<Vec<_>>())
         };
-        let default_model = self.defaults.lock().await.model.clone();
+        let default_model = self.sessions.defaults().0.model;
         let mut sessions = Vec::new();
         let mut cursor = None;
         loop {
@@ -309,8 +333,12 @@ impl AutomationRuntime {
         statuses
     }
 
-    pub async fn status(&self, project_id: &str, name: &str) -> Result<AutomationJobStatus> {
-        self.list(Some(project_id))
+    pub async fn status(
+        &self,
+        project_id: &Option<String>,
+        name: &str,
+    ) -> Result<AutomationJobStatus> {
+        self.list(project_id)
             .await
             .into_iter()
             .find(|status| status.job.name == name)
@@ -319,14 +347,14 @@ impl AutomationRuntime {
 
     pub async fn history(
         &self,
-        project_id: &str,
+        project_id: &Option<String>,
         name: Option<&str>,
         limit: usize,
     ) -> Vec<AutomationRunRecord> {
         let limit = limit.clamp(1, 100);
         let state = self.state.lock().await;
         state
-            .projects
+            .scopes
             .get(project_id)
             .into_iter()
             .flat_map(|project| project.history.runs.iter())
@@ -339,15 +367,15 @@ impl AutomationRuntime {
 
     pub async fn remove_job_state(
         &self,
-        project_id: &str,
+        project_id: &Option<String>,
         name: Option<&str>,
         all: bool,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
         let project = state
-            .projects
+            .scopes
             .get_mut(project_id)
-            .with_context(|| format!("project not found: {project_id}"))?;
+            .with_context(|| format!("automation scope not found: {project_id:?}"))?;
         if all {
             project.history.runs.clear();
             project.history.once_sessions.clear();
@@ -355,26 +383,22 @@ impl AutomationRuntime {
             project.history.runs.retain(|run| run.job != name);
             project.history.once_sessions.remove(name);
         }
-        write_history(
-            &self.projects.automation_history_path(project_id)?,
-            &project.history,
-        )
-        .await?;
+        write_history(&self.automation_history_path(project_id), &project.history).await?;
         Ok(())
     }
 
     pub async fn run_now(
         self: &Arc<Self>,
-        project_id: &str,
+        project_id: &Option<String>,
         name: &str,
         caller: Option<SessionId>,
     ) -> Result<AutomationRunRecord> {
         let job = {
             let state = self.state.lock().await;
             state
-                .projects
+                .scopes
                 .get(project_id)
-                .with_context(|| format!("project not found: {project_id}"))?
+                .with_context(|| format!("automation scope not found: {project_id:?}"))?
                 .config
                 .jobs
                 .iter()
@@ -382,8 +406,7 @@ impl AutomationRuntime {
                 .cloned()
                 .with_context(|| format!("automation job not found: {name}"))?
         };
-        self.start_job(project_id.to_string(), job, false, caller)
-            .await
+        self.start_job(project_id.clone(), job, false, caller).await
     }
 
     async fn scheduler_loop(self: Arc<Self>) {
@@ -406,69 +429,90 @@ impl AutomationRuntime {
         }
     }
 
-    pub async fn apply_defaults(
-        &self,
-        default_model: String,
-        default_reasoning: Option<String>,
-        default_mode: SessionMode,
-    ) {
-        *self.defaults.lock().await = AutomationDefaults {
-            model: default_model,
-            reasoning: default_reasoning,
-            mode: default_mode,
-        };
-    }
-
-    pub async fn update_project_config<F>(&self, project_id: &str, update: F) -> Result<()>
+    pub async fn update_config<F>(&self, project_id: &Option<String>, update: F) -> Result<()>
     where
         F: FnOnce(&mut AutomationConfig) -> Result<()>,
     {
-        let project = self.projects.get(project_id)?;
+        let project = project_id
+            .as_deref()
+            .map(|id| self.projects.get(id))
+            .transpose()?;
         let mut state = self.state.lock().await;
         let mut config = state
-            .projects
+            .scopes
             .get(project_id)
             .map(|project| project.config.clone())
             .unwrap_or_default();
         update(&mut config)?;
-        validate_project_config(&project, &config)?;
+        if let Some(project) = &project {
+            validate_project_config(project, &config)?;
+        } else {
+            validate_config(&config)?;
+            anyhow::ensure!(
+                config.jobs.iter().all(|job| job.section_id.is_none()),
+                "section requires a project"
+            );
+        }
         let next_runs = build_next_runs(&config)?;
-        write_config(&self.projects.automation_config_path(project_id)?, &config).await?;
-        let project_state = state
-            .projects
-            .entry(project_id.to_string())
-            .or_insert_with(|| ProjectAutomationState {
-                config: AutomationConfig::default(),
-                next_runs: BTreeMap::new(),
-                history: AutomationHistory::default(),
-            });
+        write_config(&self.automation_config_path(project_id), &config).await?;
+        let project_state =
+            state
+                .scopes
+                .entry(project_id.clone())
+                .or_insert_with(|| AutomationScopeState {
+                    config: AutomationConfig::default(),
+                    next_runs: BTreeMap::new(),
+                    history: AutomationHistory::default(),
+                });
         project_state.config = config;
         project_state.next_runs = next_runs;
         Ok(())
     }
 
-    pub async fn move_topic_jobs(
-        &self,
-        project_id: &str,
-        from_topic_id: &str,
-        to_topic_id: &str,
-    ) -> Result<()> {
-        self.update_project_config(project_id, |config| {
-            for job in &mut config.jobs {
-                if job.topic_id.as_deref() == Some(from_topic_id) {
-                    job.topic_id = Some(to_topic_id.to_string());
-                }
-            }
-            Ok(())
-        })
-        .await
+    pub async fn remove_project_config(&self, project_id: &str) -> Result<()> {
+        let _start = self.starts.lock().await;
+        self.projects.get(project_id)?;
+        let mut state = self.state.lock().await;
+        anyhow::ensure!(
+            !state
+                .active
+                .values()
+                .any(|run| run.project_id.as_deref() == Some(project_id)),
+            "stop project automation runs before deleting the project"
+        );
+        let directory = self
+            .profile_root
+            .join("runtime/automations")
+            .join(project_id);
+        if directory.exists() {
+            dwo_file_guard::release_tree(&directory);
+            tokio::fs::remove_dir_all(&directory)
+                .await
+                .with_context(|| format!("remove automation config {}", directory.display()))?;
+        }
+        state.scopes.remove(&Some(project_id.to_owned()));
+        Ok(())
     }
 
-    async fn take_due_jobs(&self) -> Vec<(String, AutomationJob)> {
+    fn automation_config_path(&self, project_id: &Option<String>) -> PathBuf {
+        self.scope_directory(project_id).join("config.yaml")
+    }
+
+    fn automation_history_path(&self, project_id: &Option<String>) -> PathBuf {
+        self.scope_directory(project_id).join("history.yaml")
+    }
+
+    fn scope_directory(&self, project_id: &Option<String>) -> PathBuf {
+        self.profile_root
+            .join("runtime/automations")
+            .join(project_id.as_deref().unwrap_or("global"))
+    }
+
+    async fn take_due_jobs(&self) -> Vec<(Option<String>, AutomationJob)> {
         let now = Utc::now();
         let mut state = self.state.lock().await;
         let mut due = Vec::new();
-        for (project_id, project) in &mut state.projects {
+        for (project_id, project) in &mut state.scopes {
             if !project.config.enabled {
                 continue;
             }
@@ -492,7 +536,7 @@ impl AutomationRuntime {
                     }
                     Err(error) => tracing::warn!(
                         event = "automation.schedule_failed",
-                        project_id = %project_id,
+                        project_id = ?project_id,
                         job = %job.name,
                         error = %format!("{error:#}"),
                         "schedule automation job failed"
@@ -506,40 +550,27 @@ impl AutomationRuntime {
 
     async fn start_job(
         self: &Arc<Self>,
-        project_id: String,
+        project_id: Option<String>,
         job: AutomationJob,
         scheduled: bool,
         caller: Option<SessionId>,
     ) -> Result<AutomationRunRecord> {
-        let _lifecycle = self.lifecycle.lock().await;
-        let project = self.projects.get(&project_id)?;
-        let topic_id = job
-            .topic_id
-            .as_deref()
-            .unwrap_or(&project.board.uncategorized_topic_id);
-        anyhow::ensure!(
-            topic_id != dwo_project::ARCHIVE_TOPIC_ID
-                && project.board.topics.iter().any(|t| t.id == topic_id),
-            "task topic is archived or missing"
-        );
-        if let AutomationSession::Fixed { session_id } = &job.session {
-            anyhow::ensure!(
-                !self.projects.is_archived(session_id),
-                "task session is archived"
-            );
+        let _start = self.starts.lock().await;
+        if let Some(project_id) = &project_id {
+            self.projects.get(project_id)?;
         }
-        if scheduled {
+        {
             let state = self.state.lock().await;
             anyhow::ensure!(
                 state
-                    .projects
+                    .scopes
                     .get(&project_id)
-                    .is_some_and(|p| p.config.enabled
+                    .is_some_and(|p| (!scheduled || p.config.enabled)
                         && p.config
                             .jobs
                             .iter()
-                            .any(|j| j.name == job.name && j.enabled)),
-                "scheduled task was disabled"
+                            .any(|j| j.name == job.name && (!scheduled || j.enabled))),
+                "automation job was removed or disabled"
             );
         }
         let run_id = format!("run-{}", Uuid::new_v4().simple());
@@ -572,29 +603,41 @@ impl AutomationRuntime {
         };
         started.session_id = Some(session_id.to_string());
         self.set_active(started.clone()).await;
-        if let Some(model) = &job.model {
-            self.service
-                .set_config(
-                    &session_id,
-                    dwo_agent_service::SessionConfigUpdate::Model(model.clone()),
-                )
-                .await?;
+        let configured = async {
+            if let Some(model) = &job.model {
+                self.service
+                    .set_config(
+                        &session_id,
+                        dwo_agent_service::SessionConfigUpdate::Model(model.clone()),
+                    )
+                    .await?;
+            }
+            if let Some(reasoning) = &job.reasoning {
+                self.service
+                    .set_config(
+                        &session_id,
+                        dwo_agent_service::SessionConfigUpdate::Reasoning(Some(reasoning.clone())),
+                    )
+                    .await?;
+            }
+            if let Some(policy) = job.policy {
+                self.service
+                    .set_config(
+                        &session_id,
+                        dwo_agent_service::SessionConfigUpdate::Mode(policy),
+                    )
+                    .await?;
+            }
+            anyhow::Ok(())
         }
-        if let Some(reasoning) = &job.reasoning {
-            self.service
-                .set_config(
-                    &session_id,
-                    dwo_agent_service::SessionConfigUpdate::Reasoning(Some(reasoning.clone())),
-                )
-                .await?;
-        }
-        if let Some(policy) = job.policy {
-            self.service
-                .set_config(
-                    &session_id,
-                    dwo_agent_service::SessionConfigUpdate::Mode(policy),
-                )
-                .await?;
+        .await;
+        if let Err(error) = configured {
+            started.status = AutomationRunStatus::Failed;
+            started.finished_at = Some(Utc::now().to_rfc3339());
+            started.error = Some(format!("{error:#}"));
+            self.clear_active(&started.run_id).await;
+            self.append_history(started).await?;
+            return Err(error);
         }
         let session_queue = if matches!(
             &job.session,
@@ -621,7 +664,11 @@ impl AutomationRuntime {
         Ok(returned)
     }
 
-    async fn resolve_session(&self, project_id: &str, job: &AutomationJob) -> Result<SessionId> {
+    async fn resolve_session(
+        &self,
+        project_id: &Option<String>,
+        job: &AutomationJob,
+    ) -> Result<SessionId> {
         let session_id = match &job.session {
             AutomationSession::New { behavior, title } => match behavior {
                 AutomationNewBehavior::EveryTime => {
@@ -635,8 +682,7 @@ impl AutomationRuntime {
                 id
             }
         };
-        self.bind_session_to_job_topic(project_id, job, &session_id)
-            .await?;
+        self.service.ensure_active(&session_id).await?;
         Ok(session_id)
     }
 
@@ -693,123 +739,31 @@ impl AutomationRuntime {
 
     async fn create_session(
         &self,
-        project_id: &str,
+        project_id: &Option<String>,
         job: &AutomationJob,
         title: &Option<String>,
     ) -> Result<SessionId> {
-        let project = self.projects.get(project_id)?;
-        let topic_id = job
-            .topic_id
-            .as_deref()
-            .unwrap_or(&project.board.uncategorized_topic_id);
-        let id = SessionId::new();
-        let (workspace, cwd) = match project.kind {
-            ProjectKind::Project => (
-                SessionWorkspace::External {
-                    pwd: project.pwd.clone().context("project is missing pwd")?,
-                },
-                project
-                    .pwd
-                    .clone()
-                    .context("shared project is missing pwd")?,
-            ),
-            ProjectKind::Work => {
-                let path = crate::host::managed_workspace_path(&self.profile_root, &id);
-                std::fs::create_dir_all(&path)?;
-                (SessionWorkspace::Managed, path)
-            }
-        };
-        let external_rule_files = vec![
-            ExternalRuleFile::new(self.projects.project_rule_path(project_id)?, cwd.clone()),
-            ExternalRuleFile::new(
-                self.projects.agents_path(project_id, topic_id)?,
-                cwd.clone(),
-            ),
-        ];
-        let defaults = self.defaults.lock().await.clone();
-        let model = job.model.clone().unwrap_or_else(|| defaults.model.clone());
-        let reasoning = job.reasoning.clone().or_else(|| {
-            job.model
-                .is_none()
-                .then(|| defaults.reasoning.clone())
-                .flatten()
-        });
-        let result = self
-            .service
-            .create(NewSession {
-                from: None,
-                id: Some(id.clone()),
-                parent_session_id: None,
+        self.sessions
+            .create(HostSessionOptions {
                 title: Some(
                     title
                         .clone()
                         .unwrap_or_else(|| format!("automation/{}", job.name)),
                 ),
-                workspace: Some(workspace.clone()),
-                cwd: Some(cwd.clone()),
-                external_rule_files,
-                mode: Some(job.policy.unwrap_or(defaults.mode)),
-                llm: Some(SessionLlmSettings::new(model, reasoning)),
-                ephemeral: false,
+                cwd: job.cwd.clone(),
+                project_id: project_id.clone(),
+                section_id: job.section_id.clone(),
+                mode: job.policy,
+                model: job.model.clone(),
+                reasoning: job.reasoning.clone(),
+                ..HostSessionOptions::default()
             })
-            .await;
-        if let Err(error) = result {
-            if workspace == SessionWorkspace::Managed && cwd.is_dir() {
-                let _ = std::fs::remove_dir_all(cwd);
-            }
-            return Err(error.into());
-        }
-        Ok(id)
-    }
-
-    async fn bind_session_to_job_topic(
-        &self,
-        project_id: &str,
-        job: &AutomationJob,
-        session_id: &SessionId,
-    ) -> Result<()> {
-        let project = self.projects.get(project_id)?;
-        let topic_id = job
-            .topic_id
-            .as_deref()
-            .unwrap_or(&project.board.uncategorized_topic_id);
-        self.projects.agents_path(project_id, topic_id)?;
-        let snapshot = self.service.snapshot(session_id).await?;
-        let source_assignment = self.projects.locate_session(session_id.as_str());
-        let Some(source_assignment) = source_assignment else {
-            self.projects
-                .assign_session(project_id, topic_id, session_id.to_string())?;
-            self.service.set_external_rule_files(
-                session_id,
-                vec![ExternalRuleFile::new(
-                    self.projects.agents_path(project_id, topic_id)?,
-                    snapshot.record.info.cwd,
-                )],
-            );
-            return Ok(());
-        };
-        anyhow::ensure!(
-            source_assignment.0.id == project_id && source_assignment.1.id == topic_id,
-            "automation cannot move a session between topics"
-        );
-        if source_assignment.0.id == project_id {
-            self.service.set_external_rule_files(
-                session_id,
-                vec![ExternalRuleFile::new(
-                    self.projects.agents_path(project_id, topic_id)?,
-                    snapshot.record.info.cwd,
-                )],
-            );
-            self.projects
-                .assign_session(project_id, topic_id, session_id.to_string())?;
-            return Ok(());
-        }
-        Ok(())
+            .await
     }
 
     async fn once_session(
         &self,
-        project_id: &str,
+        project_id: &Option<String>,
         job: &AutomationJob,
         title: &Option<String>,
     ) -> Result<SessionId> {
@@ -817,7 +771,7 @@ impl AutomationRuntime {
             .state
             .lock()
             .await
-            .projects
+            .scopes
             .get(project_id)
             .and_then(|project| project.history.once_sessions.get(&job.name))
             .cloned();
@@ -833,20 +787,16 @@ impl AutomationRuntime {
         let history = {
             let mut state = self.state.lock().await;
             let project = state
-                .projects
+                .scopes
                 .get_mut(project_id)
-                .with_context(|| format!("project not found: {project_id}"))?;
+                .with_context(|| format!("automation scope not found: {project_id:?}"))?;
             project
                 .history
                 .once_sessions
                 .insert(job.name.clone(), session_id.to_string());
             project.history.clone()
         };
-        write_history(
-            &self.projects.automation_history_path(project_id)?,
-            &history,
-        )
-        .await?;
+        write_history(&self.automation_history_path(project_id), &history).await?;
         Ok(session_id)
     }
 
@@ -917,7 +867,7 @@ impl AutomationRuntime {
             .state
             .lock()
             .await
-            .projects
+            .scopes
             .get(&record.project_id)
             .map(|project| project.config.timeout_seconds)
             .unwrap_or_else(default_timeout_seconds);
@@ -1024,19 +974,15 @@ impl AutomationRuntime {
         let project_id = record.project_id.clone();
         let mut state = self.state.lock().await;
         let project = state
-            .projects
+            .scopes
             .get_mut(&project_id)
-            .with_context(|| format!("project not found: {project_id}"))?;
+            .with_context(|| format!("automation scope not found: {project_id:?}"))?;
         project.history.runs.push(record);
         if project.history.runs.len() > 100 {
             let remove = project.history.runs.len() - 100;
             project.history.runs.drain(..remove);
         }
-        write_history(
-            &self.projects.automation_history_path(&project_id)?,
-            &project.history,
-        )
-        .await
+        write_history(&self.automation_history_path(&project_id), &project.history).await
     }
 }
 
@@ -1067,7 +1013,7 @@ fn read_history(path: &Path) -> Result<AutomationHistory> {
         .with_context(|| format!("parse automation history from {}", path.display()))
 }
 
-fn read_project_config(path: &Path) -> Result<AutomationConfig> {
+fn read_config(path: &Path) -> Result<AutomationConfig> {
     if !path.is_file() {
         return Ok(AutomationConfig::default());
     }
@@ -1129,6 +1075,10 @@ fn validate_config(config: &AutomationConfig) -> Result<()> {
             bail!("automation job {} prompt must not be empty", job.name);
         }
         if let AutomationSession::Fixed { session_id } = &job.session {
+            anyhow::ensure!(
+                job.cwd.is_none() && job.section_id.is_none(),
+                "fixed automation inherits its session workspace and section"
+            );
             SessionId::parse(session_id.clone()).map_err(anyhow::Error::msg)?;
         }
         next_run(&job.schedule)?;
@@ -1142,15 +1092,14 @@ fn validate_project_config(
 ) -> Result<()> {
     validate_config(config)?;
     for job in &config.jobs {
-        if let Some(topic_id) = &job.topic_id {
+        anyhow::ensure!(job.cwd.is_none(), "project automation cannot specify cwd");
+        if let Some(section_id) = &job.section_id {
             anyhow::ensure!(
-                !job.enabled
-                    || project
-                        .board
-                        .topics
-                        .iter()
-                        .any(|topic| &topic.id == topic_id),
-                "automation job {} refers to an unknown topic: {topic_id}",
+                project
+                    .sections
+                    .iter()
+                    .any(|section| &section.id == section_id),
+                "automation job {} refers to an unknown section: {section_id}",
                 job.name
             );
         }
@@ -1237,7 +1186,7 @@ jobs:
   - name: fresh
     schedule: { cron: "0 9 * * *", timezone: Asia/Shanghai }
     session: { mode: new, behavior: once }
-    topicId: topic-demo
+    sectionId: section-demo
     prompt: report status
   - name: fixed
     schedule: { cron: "*/5 * * * *" }
@@ -1299,7 +1248,7 @@ jobs:
     fn automation_result_contains_terminal_state_and_ids() {
         let notification = automation_result_notification(&AutomationRunRecord {
             run_id: "run-test".to_string(),
-            project_id: "project-test".to_string(),
+            project_id: Some("project-test".to_string()),
             job: "daily-report".to_string(),
             session_id: Some("session-test".to_string()),
             turn_id: Some("turn-test".to_string()),
@@ -1323,5 +1272,154 @@ jobs:
         assert_eq!(value["status"], "failed");
         assert_eq!(value["content"], "partial response");
         assert_eq!(value["error"], "model failed");
+    }
+    #[tokio::test]
+    async fn session_modes_share_creation_and_reject_archived_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let host = crate::Host::build(&crate::host::tests::write_test_profile(root.path()))
+            .await
+            .unwrap();
+        let runtime = &host.automation;
+        let mut job: AutomationJob = serde_json::from_value(serde_json::json!({
+            "name": "once-test", "enabled": false,
+            "schedule": {"cron": "0 9 * * *"},
+            "session": {"mode": "new", "behavior": "every_time"}, "prompt": "test"
+        }))
+        .unwrap();
+        let first = runtime.resolve_session(&None, &job).await.unwrap();
+        let second = runtime.resolve_session(&None, &job).await.unwrap();
+        assert_ne!(first, second);
+        let first_snapshot = runtime.service.snapshot(&first).await.unwrap();
+        assert_eq!(
+            first_snapshot.record.info.cwd,
+            crate::host::managed_workspace_path(
+                &std::fs::canonicalize(root.path()).unwrap(),
+                &first
+            )
+        );
+        assert!(runtime.projects.locate_session(first.as_str()).is_none());
+        job.session = AutomationSession::New {
+            behavior: AutomationNewBehavior::Once,
+            title: None,
+        };
+        let once = runtime.resolve_session(&None, &job).await.unwrap();
+        assert_eq!(runtime.resolve_session(&None, &job).await.unwrap(), once);
+        host.archive_session(&once).await.unwrap();
+        assert!(
+            runtime
+                .resolve_session(&None, &job)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("archived")
+        );
+        job.session = AutomationSession::Fixed {
+            session_id: once.to_string(),
+        };
+        assert!(
+            runtime
+                .resolve_session(&None, &job)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("archived")
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_custom_path_and_fixed_targets_keep_their_directory_and_assignment() {
+        let root = tempfile::tempdir().unwrap();
+        let host = crate::Host::build(&crate::host::tests::write_test_profile(root.path()))
+            .await
+            .unwrap();
+        let runtime = &host.automation;
+        let pwd = std::fs::canonicalize(root.path()).unwrap();
+        let project = runtime
+            .projects
+            .create(dwo_project::CreateProject {
+                name: None,
+                pwd: pwd.clone(),
+            })
+            .unwrap();
+        let section = runtime
+            .projects
+            .create_section(&project.id, "Custom".into(), None)
+            .unwrap();
+        let job: AutomationJob = serde_json::from_value(serde_json::json!({
+            "name": "project-job", "enabled": false, "schedule": {"cron": "0 9 * * *"},
+            "session": {"mode": "new", "behavior": "every_time"}, "prompt": "test", "sectionId": section.id
+        })).unwrap();
+        let id = runtime
+            .resolve_session(&Some(project.id.clone()), &job)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .projects
+                .locate_session(id.as_str())
+                .unwrap()
+                .1
+                .section_id,
+            section.id
+        );
+        assert_eq!(
+            runtime.service.snapshot(&id).await.unwrap().record.info.cwd,
+            pwd
+        );
+        let mut fixed = job.clone();
+        fixed.section_id = None;
+        fixed.session = AutomationSession::Fixed {
+            session_id: id.to_string(),
+        };
+        assert_eq!(
+            runtime
+                .resolve_session(&Some(project.id), &fixed)
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            runtime
+                .projects
+                .locate_session(id.as_str())
+                .unwrap()
+                .1
+                .section_id,
+            section.id
+        );
+        let mut custom = job;
+        custom.section_id = None;
+        custom.cwd = Some(pwd.clone());
+        custom.model = Some("deepseek/deepseek-v4-pro".into());
+        custom.reasoning = Some("low".into());
+        let global_id = runtime.resolve_session(&None, &custom).await.unwrap();
+        let llm = runtime
+            .service
+            .snapshot(&global_id)
+            .await
+            .unwrap()
+            .record
+            .llm;
+        assert_eq!(llm.model, "deepseek/deepseek-v4-pro");
+        assert_eq!(llm.reasoning.as_deref(), Some("low"));
+        assert!(
+            runtime
+                .projects
+                .locate_session(global_id.as_str())
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .service
+                .snapshot(&global_id)
+                .await
+                .unwrap()
+                .record
+                .info
+                .cwd,
+            pwd
+        );
+        host.shutdown().await;
     }
 }

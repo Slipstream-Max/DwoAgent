@@ -17,7 +17,6 @@ dwo-channels = { path = "../dwo-channels" }
 dwo-command = { path = "../dwo-command" }
 dwo-context = { path = "../dwo-context" }
 dwo-file-guard = { path = "../dwo-file-guard" }
-dwo-mcp = { path = "../dwo-mcp" }
 dwo-protocol = { path = "../dwo-protocol" }
 dwo-project = { path = "../dwo-project" }
 dwo-tools = { path = "../dwo-tools" }

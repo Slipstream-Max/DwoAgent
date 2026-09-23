@@ -37,12 +37,6 @@ pub(super) fn render(change: &EnvChange) -> String {
             render_skills(skills)
         ),
         EnvChange::Channels { .. } => unreachable!("channel changes return above"),
-        EnvChange::Mcp {
-            config: Some(config),
-        } => config.render(),
-        EnvChange::Mcp { config: None } => {
-            "<mcp state=\"removed\">\nNo MCP servers are currently configured.\n</mcp>".to_string()
-        }
         EnvChange::Environment { environment } => format!(
             "The runtime environment changed:\ncwd: {}\nshell: {}\nplatform: {}\ncurrent_date: {}\ntimezone: {}",
             xml_escape(&environment.cwd),

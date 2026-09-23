@@ -26,6 +26,13 @@ pub(crate) fn scan(skills_dir: &Path) -> Result<Vec<SkillSnapshot>, SkillScanErr
     entries.sort_by_key(std::fs::DirEntry::file_name);
     let mut skills = Vec::new();
     for entry in entries {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".disabled")
+        {
+            continue;
+        }
         let path = entry.path().join("SKILL.md");
         if !path.is_file() {
             continue;

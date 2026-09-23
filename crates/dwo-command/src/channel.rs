@@ -219,7 +219,6 @@ mod tests {
         assert!(help.contains("/help - Display this command list."));
         assert!(help.contains("/compact - Compact the selected session context."));
         assert!(help.contains("/skill - Request an available skill by name"));
-        assert!(help.contains("/mcp - Request an available MCP server by name"));
     }
 
     #[test]

@@ -109,7 +109,7 @@ mod tests {
         let hub = HostEventHub::new();
         hub.publish("config.changed", serde_json::json!({"source": "api"}))
             .await;
-        hub.publish("mcp.status", serde_json::json!({"server": "demo"}))
+        hub.publish("skill.changed", serde_json::json!({"name": "demo"}))
             .await;
 
         let result = hub.read(Some(0), 10, None).await;
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(result.next_cursor, 2);
         assert!(!result.truncated);
 
-        let filtered = hub.read(Some(0), 10, Some("mcp.status")).await;
+        let filtered = hub.read(Some(0), 10, Some("skill.changed")).await;
         assert_eq!(filtered.events.len(), 1);
         assert_eq!(filtered.events[0].seq, 2);
     }

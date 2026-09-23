@@ -210,18 +210,6 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         Some("automation.changed"),
     ),
     command("automation.run", MethodRoute::Dwo, Some("automation.run")),
-    query("mcp.list", MethodRoute::Dwo),
-    query("mcp.config", MethodRoute::Dwo),
-    query("mcp.get", MethodRoute::Dwo),
-    query("mcp.search", MethodRoute::Dwo),
-    command("mcp.call", MethodRoute::Dwo, None),
-    command("mcp.auth.login", MethodRoute::Dwo, Some("mcp.status")),
-    command("mcp.auth.logout", MethodRoute::Dwo, Some("mcp.status")),
-    command("mcp.auth.unauth", MethodRoute::Dwo, Some("mcp.status")),
-    command("mcp.enable", MethodRoute::Dwo, Some("mcp.status")),
-    command("mcp.disable", MethodRoute::Dwo, Some("mcp.status")),
-    command("mcp.install", MethodRoute::Dwo, Some("mcp.status")),
-    command("mcp.uninstall", MethodRoute::Dwo, Some("mcp.status")),
     query("skill.list", MethodRoute::Dwo),
     command("skill.enable", MethodRoute::Dwo, Some("skill.changed")),
     command("skill.disable", MethodRoute::Dwo, Some("skill.changed")),
@@ -324,7 +312,6 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
 pub const EVENTS: &[&str] = &[
     "config.changed",
     "config.apply_failed",
-    "mcp.status",
     "automation.changed",
     "automation.run",
     "channel.status",
@@ -396,7 +383,6 @@ mod tests {
     #[test]
     fn only_mutations_are_idempotency_candidates() {
         assert!(is_side_effect_method("session.prompt"));
-        assert!(is_side_effect_method("mcp.call"));
         assert!(!is_side_effect_method("dwo.capabilities"));
     }
 
@@ -408,6 +394,20 @@ mod tests {
             "project.proposal.accept",
         ] {
             assert!(!method_allowed("dwo", method));
+        }
+    }
+
+    #[test]
+    fn retired_server_management_is_not_advertised_or_routed() {
+        assert!(
+            !METHOD_SPECS
+                .iter()
+                .any(|spec| spec.name.starts_with("mcp."))
+        );
+        assert!(!EVENTS.iter().any(|event| event.starts_with("mcp.")));
+        for route in ["dwo", "acp"] {
+            assert!(!method_allowed(route, "mcp.list"));
+            assert!(!method_allowed(route, "mcp.call"));
         }
     }
 

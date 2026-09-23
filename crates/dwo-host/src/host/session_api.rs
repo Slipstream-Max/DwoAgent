@@ -671,18 +671,7 @@ impl Host {
         } else {
             Vec::new()
         };
-        let mcp_servers = if kinds.mcp {
-            self.mcp
-                .catalog_snapshot()
-                .await?
-                .servers
-                .into_iter()
-                .map(|server| server.name)
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Ok(expand_prompt_directives(content, &skills, &mcp_servers))
+        Ok(expand_prompt_directives(content, &skills))
     }
 
     pub(crate) async fn prompt_directive_options(&self, id: &SessionId) -> Result<Value> {
@@ -708,23 +697,8 @@ impl Host {
             })
         })
         .collect::<Vec<_>>();
-        let mcp_servers = self
-            .mcp
-            .catalog_snapshot()
-            .await?
-            .servers
-            .into_iter()
-            .filter(|server| !server.name.chars().any(char::is_whitespace))
-            .map(|server| {
-                json!({
-                    "name": server.name,
-                    "description": server.description,
-                })
-            })
-            .collect::<Vec<_>>();
         Ok(json!({
             "skills": skills,
-            "mcpServers": mcp_servers,
         }))
     }
 }
@@ -957,7 +931,7 @@ mod tests {
             .expand_prompt_directives(
                 &project,
                 MessageContent::text(
-                    "use /skill shared now; keep /skill missing and bare /mcp unchanged",
+                    "use /skill shared now; keep /skill missing and bare /skill unchanged",
                 ),
             )
             .await
@@ -967,7 +941,7 @@ mod tests {
         assert!(text.contains(&expected_path.display().to_string()));
         assert!(!text.contains(&profile_skill.display().to_string()));
         assert!(text.contains("/skill missing"));
-        assert!(text.contains("bare /mcp unchanged"));
+        assert!(text.contains("bare /skill unchanged"));
 
         let session_id = host
             .create_session(HostSessionOptions {

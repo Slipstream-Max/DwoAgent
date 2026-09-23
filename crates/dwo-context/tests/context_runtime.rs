@@ -1,6 +1,6 @@
 use dwo_context::{
     ChannelCapabilitySnapshot, CompactionPlanner, ContentBlock, ContextManager, ContextMessage,
-    McpSnapshot, MessageContent, MessageKind, MessageRole, SessionContext, SystemPromptBuilder,
+    MessageContent, MessageKind, MessageRole, SessionContext, SystemPromptBuilder,
     ToolResultRecord, estimate_content_tokens, estimate_context_tokens,
 };
 use serde_json::json;
@@ -141,7 +141,6 @@ fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
         &profile.join("resource/skills/demo/SKILL.md"),
         "---\nname: demo\ndescription: Demo skill\n---\nInstructions",
     );
-    write(&profile.join("resource/mcp/mcp.json"), "{}");
 
     let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
@@ -151,7 +150,6 @@ fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
     assert!(prompt.contains("cwd rule v1"));
     assert!(!prompt.contains("parent ignored"));
     assert!(prompt.contains("Demo skill"));
-    assert!(!prompt.contains("<mcp>"));
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 0);
 
     write(
@@ -361,7 +359,7 @@ fn prompt_renders_command_guidance_in_separate_xml_blocks() {
 }
 
 #[test]
-fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
+fn retired_server_config_does_not_block_startup_or_trigger_environment_updates() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
     let cwd = root.path().join("workspace");
@@ -369,64 +367,19 @@ fn prompt_progressively_exposes_mcp_catalog_and_watches_configuration() {
         &profile.join("resource/prompts/System.md"),
         "You are an agent.",
     );
-    write(
-        &profile.join("resource/mcp/mcp.json"),
-        "{\"mcpServers\":{}}",
-    );
+    // Old configuration, even invalid JSON, must no longer participate in prompt loading.
+    let retired = profile.join("resource/mcp/mcp.json");
+    write(&retired, "invalid old configuration");
     std::fs::create_dir_all(&cwd).unwrap();
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd);
+    let builder = SystemPromptBuilder::new(Some(profile), cwd);
     let mut manager = ContextManager::initialize(&builder).unwrap();
     assert!(!manager.system_prompt().contains("<mcp>"));
-
     write(
-        &profile.join("resource/mcp/mcp.json"),
-        r#"{"mcpServers":{"github":{"transport":"streamableHttp","url":"https://example.test/mcp"}}}"#,
+        &retired,
+        r#"{"mcpServers":{"old":{"command":"nonexistent"}}}"#,
     );
-    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
-    let pending = &manager.model_messages().last().unwrap().content;
-    assert!(pending.contains("github    ? tools    starting"));
-    assert!(pending.contains("dwo mcp search <query>"));
-
-    let fingerprint = builder
-        .build_initial()
-        .unwrap()
-        .snapshot
-        .unwrap()
-        .mcp
-        .unwrap()
-        .fingerprint;
-    McpSnapshot::set_runtime(
-        profile.clone(),
-        McpSnapshot {
-            path: profile.join("resource/mcp/mcp.json"),
-            fingerprint,
-            server_count: 1,
-            summary: "github    18 tools    ready".to_string(),
-        },
-    );
-    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
-    assert!(
-        manager
-            .model_messages()
-            .last()
-            .unwrap()
-            .content
-            .contains("github    18 tools    ready")
-    );
-
-    write(
-        &profile.join("resource/mcp/mcp.json"),
-        "{\"mcpServers\":{}}",
-    );
-    assert_eq!(manager.refresh_environment(&builder).unwrap(), 1);
-    assert!(
-        manager
-            .model_messages()
-            .last()
-            .unwrap()
-            .content
-            .contains("<mcp state=\"removed\">")
-    );
+    assert_eq!(manager.refresh_environment(&builder).unwrap(), 0);
+    assert!(retired.is_file());
 }
 
 #[test]

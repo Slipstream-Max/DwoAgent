@@ -10,7 +10,7 @@ dwo daemon start
 dwo daemon status
 ~~~
 
-status 应显示 healthy: true。模型、MCP、Session 和工具都由 daemon 管理；关闭 IDE 只会断开
+status 应显示 healthy: true。模型、Session 和工具都由 daemon 管理；关闭 IDE 只会断开
 当前 ACP 连接，不会停止 Session。
 
 ## Client 配置
@@ -70,8 +70,8 @@ daemon 中的 Session。关闭对话、窗口或整个客户端后，Session 保
 加载 Session 后，ACP 会持续接收其他入口提交的 Prompt、Tool Event、权限请求和状态变化。
 Model、Reasoning 和 Policy 作为 Config Option 显示，客户端修改后会写回 Session。
 
-ACP 不接受非空的 session mcpServers 或 additionalDirectories。MCP 统一由 daemon 托管，配置见
-[Prompt、Skill 与 MCP](resources.md#mcp)。
+ACP 不接受非空的 session mcpServers 或 additionalDirectories。外部工具通过
+[Skill](resources.md#skill) 使用。
 
 ## 输入和输出
 
@@ -90,7 +90,7 @@ Provider Hosted Tool 在远端执行，不经过本地工具权限确认，但�
 ## Slash Commands 和计划
 
 ACP 会发布 /compact、/resume、/fork、/status、/plan，以及当前 Catalog 中的
-/skill <name>、/mcp <name>。语法和消息平台差异见 [Slash Commands](slash-commands.md)。
+/skill <name>。语法和消息平台差异见 [Slash Commands](slash-commands.md)。
 
 plan 工具的普通 Tool Lifecycle 不直接显示；ACP v2 使用 plan_update，v1 使用兼容的 plan
 Session Update。计划不会自动启动下一 Turn，只有新 Prompt 或 /resume 会继续。

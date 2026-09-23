@@ -94,7 +94,7 @@ logging:
 日志写入 Profile 根目录的 logs/ 并按日轮转。日志记录控制流、ID、耗时和错误，不记录 prompt、
 模型回答、tool 参数、授权头或 Channel 正文。DWO_LOG 可临时覆盖级别，例如：
 
-    DWO_LOG=dwo_agent_service=debug,dwo_mcp=trace
+    DWO_LOG=dwo_agent_service=debug,dwo_host=trace
 
 ## model
 
@@ -212,8 +212,8 @@ websocket:
 ## resources
 
 Profile 只声明两类外部资源路径：externalSkillsDirs 和 externalRuleFiles。System.md、AGENTS.md、
-Skill 目录、MCP JSON、加载优先级、环境变量和 OAuth 的配置统一见
-[Prompt、Skill 与 MCP](resources.md)。
+Skill 目录与加载优先级统一见
+[Prompt 与 Skill](resources.md)。
 
 ## Profile 根目录
 
@@ -228,11 +228,9 @@ Skill 目录、MCP JSON、加载优先级、环境变量和 OAuth 的配置统�
 |  |  `- AGENTS.md
 |  |- models/
 |  |  `- <family>.yaml
-|  |- skills/
-|  |  `- <skill>/SKILL.md
-|  `- mcp/
-|     |- mcp.json
-|     `- oauth/
+|  `- skills/
+|     |- <skill>/SKILL.md
+|     `- .disabled/<skill>/
 |- runtime/
 |  |- sessions/YYYY/MM/DD/<session-id>/
 |  |- projects/<project-id>/
@@ -257,7 +255,7 @@ daemon 运行期间会锁住 runtime 目录里的状态文件：外部程序可�
 
 | 路径 | 说明 |
 | --- | --- |
-| profile.yaml、resource/** | Profile、Prompt、Skill、Model List、MCP 配置 |
+| profile.yaml、resource/** | Profile、Prompt、Skill、Model List |
 | `<project.pwd>/AGENTS.md`、Session cwd 下的 `AGENTS.md` | Project 与工作目录规则文件，保持运行期可编辑 |
 | runtime/workspaces/**、runtime/projects/<id>/workspace/** | Session 与 Project 的工作目录 |
 | runtime/*.log、*.tmp | 部署脚本日志与崩溃残留的临时文件 |
@@ -282,8 +280,8 @@ IPC 端点是用户级的（`\\.\pipe\dwoagent` 或 `$TMPDIR/dwoagent.sock`）�
 
 ## 热加载与校验
 
-daemon 监视 Profile、Prompt、Skill、Model List、MCP 和规则文件。可热加载的配置会在完整校验
-通过后应用；MCP、Channel 和 WebSocket 可能重启相应连接。修改后运行：
+daemon 监视 Profile、Prompt、Skill、Model List 和规则文件。可热加载的配置会在完整校验
+通过后应用；Channel 和 WebSocket 可能重启相应连接。修改后运行：
 
 ~~~text
 dwo config-show

@@ -1,7 +1,7 @@
 # Agent 工具
 
-这些工具由 daemon 直接执行，不需要为基础能力单独配置 MCP。模型能看到的工具只有下面四个；
-MCP Server 的配置见 [Prompt、Skill 与 MCP](resources.md#mcp)。
+这些工具由 daemon 直接执行。模型能看到的工具只有下面四个；
+扩展能力通过 [Skill](resources.md#skill) 和外部命令提供。
 
 ## terminal
 

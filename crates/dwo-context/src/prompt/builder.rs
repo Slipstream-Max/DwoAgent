@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::env_watcher::DynamicEnvironmentSnapshot;
 
 use super::environment::EnvironmentSnapshot;
-use super::mcp::McpSnapshot;
 use super::skills::{self, SkillSnapshot};
 use super::{ChannelCapabilitySnapshot, xml_block, xml_escape};
 
@@ -19,7 +18,6 @@ pub struct AgentProfilePaths {
     pub system_prompt: PathBuf,
     pub agents_rules: PathBuf,
     pub skills: PathBuf,
-    pub mcp: PathBuf,
 }
 
 impl AgentProfilePaths {
@@ -30,7 +28,6 @@ impl AgentProfilePaths {
             system_prompt: resource.join("prompts").join("System.md"),
             agents_rules: resource.join("prompts").join("AGENTS.md"),
             skills: resource.join("skills"),
-            mcp: resource.join("mcp/mcp.json"),
             root,
             resource,
         }
@@ -67,7 +64,6 @@ pub struct PromptSnapshot {
     pub skills: Vec<SkillSnapshot>,
     #[serde(default)]
     pub channels: Vec<ChannelCapabilitySnapshot>,
-    pub mcp: Option<McpSnapshot>,
     pub environment: EnvironmentSnapshot,
 }
 
@@ -78,7 +74,6 @@ impl PromptSnapshot {
             rules: self.rules.clone(),
             skills: self.skills.clone(),
             channels: self.channels.clone(),
-            mcp: self.mcp.clone(),
             environment: self.environment.clone(),
         }
     }
@@ -170,7 +165,6 @@ impl SystemPromptBuilder {
             rules: self.read_agents_rules()?,
             skills: self.read_skills()?,
             channels: self.read_channels(),
-            mcp: self.read_mcp()?,
             environment: EnvironmentSnapshot::capture(&self.cwd),
         })
     }
@@ -186,7 +180,6 @@ impl SystemPromptBuilder {
             rules: dynamic.rules,
             skills: dynamic.skills,
             channels: dynamic.channels,
-            mcp: dynamic.mcp,
             environment: dynamic.environment,
         };
         let content = render_prompt(
@@ -296,16 +289,6 @@ impl SystemPromptBuilder {
             ChannelCapabilitySnapshot::scan(&profile.root)
         })
     }
-
-    fn read_mcp(&self) -> Result<Option<McpSnapshot>, PromptBuildError> {
-        let Some(profile) = &self.profile else {
-            return Ok(None);
-        };
-        McpSnapshot::read(&profile.mcp).map_err(|source| PromptBuildError::Read {
-            path: profile.mcp.clone(),
-            source,
-        })
-    }
 }
 
 fn render_prompt(
@@ -362,9 +345,6 @@ fn render_prompt(
     let skills = skills::render_catalog(&snapshot.skills);
     if !skills.is_empty() {
         blocks.push(skills);
-    }
-    if let Some(mcp) = &snapshot.mcp {
-        blocks.push(mcp.render());
     }
     blocks.push(snapshot.environment.render());
     format!("<agent_context>\n{}\n</agent_context>", blocks.join("\n\n"))

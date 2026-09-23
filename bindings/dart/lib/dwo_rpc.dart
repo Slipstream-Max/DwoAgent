@@ -417,35 +417,6 @@ final class DwoRpcClient {
   Future<JsonObject> uninstallSkill(String name, {String? requestId}) =>
       call('skill.uninstall', params: {'name': name}, requestId: requestId);
 
-  Future<JsonObject> mcpServers() => call('mcp.list');
-
-  Future<JsonObject> mcpConfig() => call('mcp.config');
-
-  Future<JsonObject> installMcp(JsonObject params, {String? requestId}) =>
-      call('mcp.install', params: params, requestId: requestId);
-
-  Future<JsonObject> setMcpEnabled(
-    String server,
-    bool enabled, {
-    String? requestId,
-  }) =>
-      call(
-        enabled ? 'mcp.enable' : 'mcp.disable',
-        params: {'server': server},
-        requestId: requestId,
-      );
-
-  Future<JsonObject> authenticateMcp(
-    String server, {
-    bool authorized = true,
-    String? requestId,
-  }) =>
-      call(
-        authorized ? 'mcp.auth.login' : 'mcp.auth.unauth',
-        params: {'server': server},
-        requestId: requestId,
-      );
-
   Future<List<JsonObject>> automations(String projectId) async =>
       _objectArray(
         await callValue('automation.list', params: {'project_id': projectId}),

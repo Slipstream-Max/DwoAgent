@@ -5,7 +5,7 @@ Dwo 对外有两套协议：
 | 协议 | 用途 | 入口 |
 | --- | --- | --- |
 | ACP v1/v2 | 创建 Session、提交 prompt、接收 Agent 事件 | dwo acp 或 WebSocket /acp |
-| Management RPC v3 | 管理配置、Project、MCP、Channel、Automation 和事件 | 本地 IPC 或 WebSocket /dwo |
+| Management RPC v3 | 管理配置、Project、Channel、Automation 和事件 | 本地 IPC 或 WebSocket /dwo |
 
 不要用 Management RPC 发送聊天 prompt；聊天交互统一走 ACP。Rust 类型见
 [dwo-protocol](../crates/dwo-protocol/README.md)。
@@ -85,14 +85,12 @@ runtime/automations/<project-id>/，省略并设置 global 时读写 runtime/aut
 Project scope 可以由 caller_session_id 推导；Global Job 可以带 cwd。字段和 Session 行为见
 [automation.md](automation.md)。
 
-### Prompt、Rule、Skill、MCP、Channel 和 WebSocket
+### Prompt、Rule、Skill、Channel 和 WebSocket
 
 ~~~text
 prompt.list / prompt.get / prompt.set
 rule.list / rule.get / rule.set
 skill.list / skill.install / skill.enable / skill.disable / skill.uninstall
-mcp.list / mcp.get / mcp.config / mcp.install / mcp.enable / mcp.disable / mcp.uninstall
-mcp.auth.login / mcp.auth.logout / mcp.search / mcp.call
 channel.list / channel.<name>.status / channel.<name>.config
 channel.<name>.enable / disable / bind / begin / poll / unbind / remove
 channel.<name>.send_message / channel.<name>.send_file
@@ -107,7 +105,7 @@ event.read
 event.subscribe
 ~~~
 
-常见事件有 config.changed、config.apply_failed、mcp.status、skill.changed、channel.status、
+常见事件有 config.changed、config.apply_failed、skill.changed、channel.status、
 project.changed、automation.changed 和 automation.run。Session 事件由 ACP 的 session/update 或
 state_update 传递。重连后先调用 dwo.capabilities，再用 event.read 的 cursor 补齐管理事件；
 Session 则重新 ACP load/resume 并按需回放 transcript。

@@ -1,7 +1,7 @@
 # dwo-host API
 
 `dwo-host` 是 DwoAgent 的长期运行应用层。一个 `Host` 拥有唯一的 SessionService、Session
-repository、ProjectService、有效配置、MCP runtime、Channel runtime、Automation scheduler、事件历史和
+repository、ProjectService、有效配置、Channel runtime、Automation scheduler、事件历史和
 shutdown 边界。IPC、WebSocket、ACP shim、CLI 和 Flutter 都是它外面的适配器。
 
 二开有两种接入方式：
@@ -32,10 +32,9 @@ host.shutdown().await;
 `Host::build` 接受 profile 根目录或其中的配置文件路径，并完成：
 
 - 解析严格的单 Host 配置；
-- 启动和同步 MCP runtime；
 - 创建 Session repository 与 SessionService；
 - 恢复 Channel、Automation 和 ephemeral Session 状态；
-- 启动配置、MCP watcher 和 Automation scheduler。
+- 启动配置 watcher 和 Automation scheduler。
 
 它不会自动打开 IPC 或 WebSocket listener。官方 binary 在 composition root 中并行调用
 `dwo_ipc::serve` 和 `dwo_websocket::serve`。
@@ -44,7 +43,7 @@ host.shutdown().await;
 | --- | --- |
 | `Host::build(path)` | 加载并启动 Host，返回 `Arc<Host>` |
 | `Host::shutdown_token()` | transport 和后台任务共享的 cancellation token |
-| `Host::shutdown()` | 停止 Channel、MCP、SessionService，并清理 ephemeral Session |
+| `Host::shutdown()` | 停止 Channel、SessionService，并清理 ephemeral Session |
 | `profile_root(path)` | 在创建 Host 前解析根目录 |
 | `logging::init(path)` | 初始化 JSONL 文件日志并返回必须持有的 `LoggingGuard` |
 | `logging::reload(config)` | 更新日志级别和保留天数 |
@@ -80,7 +79,7 @@ let accepted = host
 | --- | --- |
 | `create_session(options)` | 创建、fork 或绑定 Project/Section，并返回 `SessionId` |
 | `subscribe_session(id, cursor)` | 先取得快照/回放，再接收 live Session 事件 |
-| `prompt_session(id, endpoint, content)` | 展开有效 Skill/MCP directive 后提交 prompt |
+| `prompt_session(id, endpoint, content)` | 展开有效 Skill directive 后提交 prompt |
 | `archive_session(id)` / `delete_session(id)` | 先归档并解除 Section assignment；只有 archived Session 才能真正删除，并只删除 DWO 管理的 workspace |
 | `subscribe_events(cursor, limit, event)` | 订阅 Host 级事件 |
 | `handle_request(client, request, method, params)` | Management/ACP 协议入口 |
@@ -123,7 +122,7 @@ transport 在调用 Host 前仍必须：
 4. 把 `anyhow::Error` 转成 `RpcError`，保证一次请求只有 result 或 error；
 5. 单独实现 `event.subscribe` 的长连接发送循环。
 
-Project、Model、Provider、Prompt、Rule、Skill、MCP、Automation 和 Channel 的具体管理实现目前是
+Project、Model、Provider、Prompt、Rule、Skill、Automation 和 Channel 的具体管理实现目前是
 Host 内部 API。crate 外二开应通过 `handle_request` 使用这些域；不要绕过 ConfigManager
 直接写内存状态。这样人工编辑、API 修改、原子校验、watcher 和运行事件才保持一致。
 

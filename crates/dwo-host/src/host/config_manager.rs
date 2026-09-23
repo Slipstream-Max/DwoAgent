@@ -27,7 +27,9 @@ impl ConfigManager {
 
     pub(crate) fn fingerprint(&self) -> Result<String> {
         let mut files = vec![self.path.clone()];
-        collect_files(&self.root.join("resource"), &mut files)?;
+        for directory in ["models", "prompts", "skills"] {
+            collect_files(&self.root.join("resource").join(directory), &mut files)?;
+        }
         files.sort();
 
         let mut hasher = DefaultHasher::new();
@@ -186,6 +188,32 @@ mod tests {
                 .is_err()
         );
         assert!(!escaped.exists());
+    }
+
+    #[test]
+    fn fingerprint_only_tracks_supported_resource_directories() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("profile.yaml"), "policyMode: confirm\n").unwrap();
+        let manager = ConfigManager::new(root.path().to_path_buf());
+        let mut previous = manager.fingerprint().unwrap();
+        let retired = root.path().join("resource/mcp/mcp.json");
+        std::fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        std::fs::write(&retired, "obsolete").unwrap();
+        assert_eq!(previous, manager.fingerprint().unwrap());
+        for resource in [
+            "models/custom.yaml",
+            "prompts/System.md",
+            "skills/demo/SKILL.md",
+        ] {
+            let path = root.path().join("resource").join(resource);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "new content").unwrap();
+            let current = manager.fingerprint().unwrap();
+            assert_ne!(previous, current);
+            previous = current;
+        }
+        std::fs::write(retired, "changed obsolete config").unwrap();
+        assert_eq!(previous, manager.fingerprint().unwrap());
     }
 
     #[test]

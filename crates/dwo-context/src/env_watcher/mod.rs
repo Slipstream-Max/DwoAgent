@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub use change::EnvChange;
 
-use crate::prompt::{
-    ChannelCapabilitySnapshot, EnvironmentSnapshot, McpSnapshot, RuleSnapshot, SkillSnapshot,
-};
+use crate::prompt::{ChannelCapabilitySnapshot, EnvironmentSnapshot, RuleSnapshot, SkillSnapshot};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DynamicEnvironmentSnapshot {
@@ -16,7 +14,6 @@ pub struct DynamicEnvironmentSnapshot {
     pub skills: Vec<SkillSnapshot>,
     #[serde(default)]
     pub channels: Vec<ChannelCapabilitySnapshot>,
-    pub mcp: Option<McpSnapshot>,
     pub environment: EnvironmentSnapshot,
 }
 
@@ -56,11 +53,6 @@ impl EnvWatcherState {
             changes.push(EnvChange::Channels {
                 previous: previous.channels,
                 current: current.channels.clone(),
-            });
-        }
-        if previous.mcp != current.mcp {
-            changes.push(EnvChange::Mcp {
-                config: current.mcp.clone(),
             });
         }
         if previous.environment != current.environment {

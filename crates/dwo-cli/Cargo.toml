@@ -14,7 +14,6 @@ dwo-agent-service = { path = "../dwo-agent-service" }
 dwo-channels = { path = "../dwo-channels" }
 dwo-host = { path = "../dwo-host" }
 dwo-ipc = { path = "../dwo-ipc" }
-dwo-mcp = { path = "../dwo-mcp" }
 dwo-tools = { path = "../dwo-tools" }
 libc.workspace = true
 qr2term.workspace = true

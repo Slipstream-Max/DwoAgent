@@ -74,7 +74,7 @@ profile.yaml
 resource/prompts/System.md
 resource/prompts/AGENTS.md
 resource/skills/
-resource/mcp/mcp.json
+resource/models/
 runtime/sessions/<date>/<session-id>/
   session.json
   model_context.json

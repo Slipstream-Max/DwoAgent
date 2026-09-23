@@ -7,7 +7,7 @@
 | --- | --- |
 | [Profile 配置](profile.md) | profile.yaml 全部字段、默认值、Provider、Channel 字段和资源目录 |
 | [模型与 Provider](models.md) | Model List、新增模型、模型能力和支持范围 |
-| [Prompt、Skill 与 MCP](resources.md) | Prompt/Rule、Skill 目录、MCP JSON、优先级和资源热加载 |
+| [Prompt 与 Skill](resources.md) | Prompt/Rule、Skill 目录、优先级和资源热加载 |
 | [Channel 配置与行为](channels.md) | 微信、Telegram、飞书/Lark、QQ 的配置、绑定和消息行为 |
 | [CLI 命令参考](cli.md) | dwo 的全部命令，按资源分类 |
 | [Project 文件与行为](projects.md) | project.json、Section/Session assignment/Worktree 字段、规则文件和 Workspace 规则 |

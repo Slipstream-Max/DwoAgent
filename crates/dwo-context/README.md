@@ -17,15 +17,14 @@ ContextManager
 <agent-profile>/resource/
 |- prompts/System.md
 |- prompts/AGENTS.md
-|- skills/<skill>/SKILL.md
-`- mcp.json
+`- skills/<skill>/SKILL.md
 ```
 
 Rules also include `AGENTS.md` files at the session's initial `cwd` and external
 rule files supplied by the profile or the current session working directory. Every
 rule snapshot carries the source file path, the `pwd` where its instructions
 apply, and its content. All configured rule paths are watched. Changes to the
-system prompt, rules, skills, MCP config, or environment append `EnvWatcher`
+system prompt, rules, skills, or environment append `EnvWatcher`
 messages at model-step boundaries. They do not mutate the existing system
 prompt.
 

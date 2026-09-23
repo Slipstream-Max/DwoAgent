@@ -218,8 +218,6 @@ pub struct SessionSnapshot {
 pub struct PromptDirectiveOptions {
     #[serde(default)]
     pub skills: Vec<PromptDirectiveOption>,
-    #[serde(default)]
-    pub mcp_servers: Vec<PromptDirectiveOption>,
 }
 
 #[derive(Debug, Deserialize)]

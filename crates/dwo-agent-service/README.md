@@ -14,8 +14,7 @@ The rewrite profile has one strict `profile.yaml` and fixed resource paths:
    |- prompts/System.md
    |- prompts/AGENTS.md
    |- models/<family>.yaml
-   |- skills/<skill>/SKILL.md
-   `- mcp.json
+   `- skills/<skill>/SKILL.md
 ```
 
 ```yaml

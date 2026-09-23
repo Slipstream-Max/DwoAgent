@@ -5,7 +5,7 @@ cursor 和管理 client。远程可直接使用 `DwoWebSocketTransport` 连接 `
 named pipe transport 在 Flutter 应用层实现 `DwoTransport` 后复用同一个 `DwoRpcClient`。
 
 聊天不走这个包。Flutter 的聊天连接使用 ACP v2：本地连接 IPC `route=acp`，远程连接
-WebSocket `/acp`。Dwo RPC 只负责 Host 配置、Session 查询、Skill、MCP、Automation 和
+WebSocket `/acp`。Dwo RPC 只负责 Host 配置、Session 查询、Skill、Automation 和
 Channel 管理。
 
 WebSocket listener 使用独立的 `websocketStatus`、`websocketConfig`、

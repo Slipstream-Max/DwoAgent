@@ -8,7 +8,6 @@ use dwo_agent_service::{
     FsSessionRepository, LoadedAgentProfile, SessionConfig, SessionId, SessionLlmSettings,
     SessionService, SessionWorkspace,
 };
-use dwo_mcp::McpRuntime;
 use dwo_project::ProjectService;
 use dwo_protocol::ReasoningOption;
 use dwo_tools::{PolicyConfig, SessionMode};
@@ -25,7 +24,6 @@ mod config_api;
 mod config_manager;
 pub mod events;
 mod git;
-mod mcp_api;
 mod model_api;
 mod project_api;
 mod prompt_api;
@@ -41,7 +39,6 @@ pub struct Host {
     service: Arc<SessionService>,
     sessions: Arc<session_manager::SessionManager>,
     pub channel_gateway: Arc<ChannelGateway>,
-    pub mcp: Arc<McpRuntime>,
     pub automation: Arc<AutomationRuntime>,
     projects: Arc<ProjectService>,
     channels: RwLock<Arc<ChannelManager>>,
@@ -253,9 +250,6 @@ impl Host {
             "runtime file protection installed"
         );
         let config_manager = ConfigManager::new(profile_root.clone());
-        let mcp = Arc::new(McpRuntime::new(&profile_root));
-        mcp.sync_and_start().await?;
-        tracing::info!(event = "mcp.synchronized", "MCP configuration synchronized");
         let profile = LoadedAgentProfile::load(&profile_root)?;
         let source = config_manager.fingerprint()?;
         let runtime_profile = RuntimeProfile::from_loaded(source, &profile);
@@ -321,7 +315,6 @@ impl Host {
             service,
             sessions,
             channel_gateway: Arc::new(ChannelGateway::new()),
-            mcp,
             automation,
             projects,
             channels: RwLock::new(channels),
@@ -336,7 +329,6 @@ impl Host {
             websocket_running: AtomicBool::new(false),
         });
         host.channel_gateway.start_all(host.clone()).await;
-        host.start_mcp_watcher();
         host.start_profile_watcher();
         host.automation.start();
         Ok(host)
@@ -347,11 +339,7 @@ impl Host {
     }
 
     pub async fn shutdown(&self) {
-        tokio::join!(
-            self.channel_gateway.stop_all(),
-            self.mcp.shutdown(),
-            self.service.shutdown()
-        );
+        tokio::join!(self.channel_gateway.stop_all(), self.service.shutdown());
         self.runtime_protection.release();
     }
 
@@ -367,9 +355,6 @@ impl Host {
         }
         if method.starts_with("automation.") {
             return self.dispatch_automation(method, params).await;
-        }
-        if method.starts_with("mcp.") {
-            return self.dispatch_mcp(method, params).await;
         }
         if method.starts_with("skill.") {
             return self.dispatch_skill(method, params).await;
@@ -574,46 +559,6 @@ impl Host {
         Ok(())
     }
 
-    fn start_mcp_watcher(self: &Arc<Self>) {
-        let host = self.clone();
-        let runtime = self.mcp.clone();
-        let shutdown = self.shutdown.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            let mut last_error: Option<String> = None;
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = interval.tick() => {
-                        if let Err(error) = runtime.sync_and_start().await {
-                            let message = format!("{error:#}");
-                            if last_error.as_deref() != Some(message.as_str()) {
-                                let _ = host
-                                    .events
-                                    .publish(
-                                        "mcp.status",
-                                        json!({"status": "apply_failed", "error": message}),
-                                    )
-                                    .await;
-                                last_error = Some(message.clone());
-                            }
-                            tracing::warn!(
-                                event = "mcp.synchronization_failed",
-                                error = %message,
-                                "synchronize MCP configuration failed"
-                            );
-                        } else if last_error.take().is_some() {
-                            let _ = host
-                                .events
-                                .publish("mcp.status", json!({"status": "synchronized"}))
-                                .await;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     pub async fn subscribe_events(
         &self,
         cursor: Option<u64>,
@@ -671,19 +616,6 @@ fn validate_markdown_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_mcp_document(path: &Path) -> Result<Value> {
-    if !path.is_file() {
-        return Ok(json!({"mcpServers": {}}));
-    }
-    let source = std::fs::read_to_string(path)?;
-    let value: Value = serde_json::from_str(&source)?;
-    anyhow::ensure!(
-        value.get("mcpServers").and_then(Value::as_object).is_some(),
-        "mcpServers must be an object"
-    );
-    Ok(value)
-}
-
 fn redacted_model_config(config: &dwo_agent_service::AgentModelConfig) -> Result<Value> {
     let mut value = serde_json::to_value(config)?;
     if let Some(providers) = value.get_mut("providers").and_then(Value::as_object_mut) {
@@ -698,29 +630,6 @@ fn redacted_model_config(config: &dwo_agent_service::AgentModelConfig) -> Result
         }
     }
     Ok(value)
-}
-
-fn redacted_mcp_config(document: &Value) -> Value {
-    let servers = document
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|servers| servers.iter())
-        .map(|(name, value)| redacted_mcp_server_config(name, value))
-        .collect::<Vec<_>>();
-    json!({"servers": servers})
-}
-
-pub(super) fn redacted_mcp_server_config(name: &str, value: &Value) -> Value {
-    let object = value.as_object();
-    json!({
-        "name": name,
-        "enabled": object.and_then(|v| v.get("enabled")).and_then(Value::as_bool).unwrap_or(true),
-        "type": object.and_then(|v| v.get("type")).and_then(Value::as_str).unwrap_or("stdio"),
-        "description": object.and_then(|v| v.get("description")).and_then(Value::as_str),
-        "authConfigured": object.and_then(|v| v.get("auth")).is_some(),
-        "credentialsConfigured": object.is_some_and(|v| v.contains_key("env") || v.contains_key("headers")),
-    })
 }
 
 pub fn profile_root(config_path: &Path) -> Result<PathBuf> {

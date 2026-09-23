@@ -63,7 +63,7 @@ assert_eq!(request.jsonrpc, "2.0");
 | `MethodOperation` | `Query`、`Command`、`Subscription` |
 | `SessionRecord` / `SessionSnapshot` | 客户端只读的精简 Session 投影 |
 | `SessionOptions` | Session 当前配置和模型选项 |
-| `PromptDirectiveOptions` | 当前 Session 可用的 Skill/MCP directive |
+| `PromptDirectiveOptions` | 当前 Session 可用的 Skill directive |
 
 这些类型都从 crate 根导出。Management 各方法的业务参数和返回结构见
 [Dwo API](https://github.com/Slipstream-Max/DwoAgent/blob/main/docs/api.md)；

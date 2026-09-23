@@ -65,14 +65,14 @@ impl Host {
             .external_skills_dirs
             .clone();
         let active = skill_snapshots(&self.profile_root, &external, &self.profile_root)?;
-        let disabled = list_skill_names(&self.profile_root.join("resource/skills.disabled"))?;
+        let disabled = list_skill_names(&self.profile_root.join("resource/skills/.disabled"))?;
         Ok(json!({"skills": active, "disabled": disabled}))
     }
 
     pub(crate) async fn skill_set_enabled(&self, name: String, enabled: bool) -> Result<Value> {
-        super::validate_resource_name(&name)?;
+        validate_skill_name(&name)?;
         let root = self.profile_root.join("resource/skills");
-        let disabled_root = self.profile_root.join("resource/skills.disabled");
+        let disabled_root = self.profile_root.join("resource/skills/.disabled");
         let (from, to) = if enabled {
             (disabled_root.join(&name), root.join(&name))
         } else {
@@ -89,13 +89,13 @@ impl Host {
     }
 
     async fn skill_install(&self, params: SkillInstallParam) -> Result<Value> {
-        super::validate_resource_name(&params.name)?;
+        validate_skill_name(&params.name)?;
         let name = params.name;
         let files = decode_skill_files(params.content, params.files)?;
         let dir = self.profile_root.join("resource/skills").join(&name);
         let disabled = self
             .profile_root
-            .join("resource/skills.disabled")
+            .join("resource/skills/.disabled")
             .join(&name);
         anyhow::ensure!(
             !dir.exists() && !disabled.exists(),
@@ -134,12 +134,12 @@ impl Host {
     }
 
     pub(crate) async fn skill_uninstall(&self, name: String) -> Result<Value> {
-        super::validate_resource_name(&name)?;
+        validate_skill_name(&name)?;
         let mut removed = false;
         for dir in [
             self.profile_root.join("resource/skills").join(&name),
             self.profile_root
-                .join("resource/skills.disabled")
+                .join("resource/skills/.disabled")
                 .join(&name),
         ] {
             removed |= self.config_manager.remove_resource_dir(&dir).await?;
@@ -154,6 +154,17 @@ impl Host {
         }
         Ok(json!({"name": name, "removed": removed}))
     }
+}
+
+fn validate_skill_name(name: &str) -> Result<()> {
+    super::validate_resource_name(name)?;
+    anyhow::ensure!(
+        !name
+            .trim_end_matches([' ', '.'])
+            .eq_ignore_ascii_case(".disabled"),
+        "reserved skill directory name: {name}"
+    );
+    Ok(())
 }
 
 pub(super) fn skill_snapshots(
@@ -287,6 +298,69 @@ mod tests {
         );
         let skills = host.handle_method("skill.list", json!({})).await.unwrap();
         assert_eq!(skills["skills"][0]["name"], "deploy");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn disabled_skills_stay_inside_skills_and_out_of_the_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        host.handle_method(
+            "skill.install",
+            json!({
+                "name": "demo", "content": "---\nname: demo\n---\nRun the CLI."
+            }),
+        )
+        .await
+        .unwrap();
+        host.handle_method("skill.disable", json!({"name": "demo"}))
+            .await
+            .unwrap();
+        let disabled = root.path().join("resource/skills/.disabled/demo/SKILL.md");
+        assert!(disabled.is_file());
+        let listed = host.skill_list().unwrap();
+        assert!(listed["skills"].as_array().unwrap().is_empty());
+        assert_eq!(listed["disabled"], json!(["demo"]));
+        // The storage directory cannot itself be installed, moved, or removed as a skill.
+        for method in [
+            "skill.install",
+            "skill.enable",
+            "skill.disable",
+            "skill.uninstall",
+        ] {
+            assert!(
+                host.handle_method(
+                    method,
+                    json!({
+                        "name": ".disabled", "content": "Reserved"
+                    })
+                )
+                .await
+                .is_err()
+            );
+        }
+        for name in [".DISABLED", ".disabled.", ".disabled "] {
+            assert!(validate_skill_name(name).is_err());
+        }
+        assert!(disabled.is_file());
+        host.handle_method("skill.enable", json!({"name": "demo"}))
+            .await
+            .unwrap();
+        assert!(!disabled.exists());
+        assert_eq!(host.skill_list().unwrap()["skills"][0]["name"], "demo");
+        host.handle_method("skill.disable", json!({"name": "demo"}))
+            .await
+            .unwrap();
+        host.handle_method("skill.uninstall", json!({"name": "demo"}))
+            .await
+            .unwrap();
+        assert!(!disabled.exists());
+        assert!(
+            host.skill_list().unwrap()["disabled"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         host.shutdown().await;
     }
 

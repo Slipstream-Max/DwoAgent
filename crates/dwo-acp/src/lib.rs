@@ -1218,7 +1218,10 @@ async fn complete_prompt(runtime: &AcpRuntime, session_id: &str, completion: Pro
 /// running). Only session-level (manual `/compact`) notifications may complete
 /// a prompt.
 fn compaction_prompt_completion(payload: &Value) -> Option<PromptCompletion> {
-    if payload.get("turn_id").is_some_and(|turn_id| !turn_id.is_null()) {
+    if payload
+        .get("turn_id")
+        .is_some_and(|turn_id| !turn_id.is_null())
+    {
         return None;
     }
     match payload.get("category").and_then(Value::as_str) {
@@ -1565,15 +1568,6 @@ fn available_commands(options: ipc_schema::PromptDirectiveOptions) -> Vec<Availa
             .filter(|description| !description.trim().is_empty())
             .unwrap_or_else(|| format!("Use the {} skill", skill.name));
         AvailableCommand::new(format!("skill {}", skill.name), description).input(
-            AvailableCommandInput::Text(TextCommandInput::new("optional prompt")),
-        )
-    }));
-    commands.extend(options.mcp_servers.into_iter().map(|server| {
-        let description = server
-            .description
-            .filter(|description| !description.trim().is_empty())
-            .unwrap_or_else(|| format!("Use the {} MCP server", server.name));
-        AvailableCommand::new(format!("mcp {}", server.name), description).input(
             AvailableCommandInput::Text(TextCommandInput::new("optional prompt")),
         )
     }));
@@ -2582,10 +2576,6 @@ mod tests {
                     name: "review".to_string(),
                     description: Some("Review changes".to_string()),
                 }],
-                mcp_servers: vec![ipc_schema::PromptDirectiveOption {
-                    name: "github".to_string(),
-                    description: None,
-                }],
             }),
         ));
         let json = serde_json::to_value(update).unwrap();
@@ -2608,7 +2598,7 @@ mod tests {
             json["availableCommands"][5]["input"]["hint"],
             "optional prompt"
         );
-        assert_eq!(json["availableCommands"][6]["name"], "mcp github");
+        assert_eq!(json["availableCommands"].as_array().unwrap().len(), 6);
     }
 
     #[test]
@@ -2842,7 +2832,11 @@ mod tests {
     fn turn_scoped_compaction_notifications_do_not_complete_a_prompt() {
         // Automatic compactions run inside a turn; their notifications carry the
         // turn's id and must never resolve the running turn's prompt request.
-        for category in ["compaction_completed", "compaction_cancelled", "compaction_failed"] {
+        for category in [
+            "compaction_completed",
+            "compaction_cancelled",
+            "compaction_failed",
+        ] {
             let automatic = json!({
                 "kind": "notification",
                 "turn_id": "turn-auto-compaction",

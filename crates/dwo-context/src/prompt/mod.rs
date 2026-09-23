@@ -1,7 +1,6 @@
 mod builder;
 mod channel;
 mod environment;
-mod mcp;
 mod skills;
 
 pub use builder::{
@@ -10,7 +9,6 @@ pub use builder::{
 };
 pub use channel::ChannelCapabilitySnapshot;
 pub use environment::EnvironmentSnapshot;
-pub use mcp::McpSnapshot;
 pub use skills::SkillSnapshot;
 
 pub(crate) fn xml_block(name: &str, content: &str) -> String {

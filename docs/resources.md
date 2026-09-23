@@ -1,7 +1,7 @@
-# Prompt、Skill 与 MCP
+# Prompt 与 Skill
 
 Resource 是 Agent 的可编辑能力层，位于 ~/.dwoagent/resource/。Profile 只负责声明外部资源路径；
-本文件说明 Prompt、Rule、Skill 和 MCP 的文件格式、加载顺序与管理方式。
+本文件说明 Prompt、Rule 和 Skill 的文件格式、加载顺序与管理方式。
 
 Model List 也在 resource/models/，但它有独立 schema，见 [模型与 Provider](models.md)。
 
@@ -9,25 +9,21 @@ Model List 也在 resource/models/，但它有独立 schema，见 [模型与 Pro
 
 ~~~text
 resource/
+|- models/
+|  `- <family>.yaml
 |- prompts/
 |  |- System.md
 |  `- AGENTS.md
-|- skills/
-|  `- <skill>/
-|     |- SKILL.md
-|     |- references/
-|     |- scripts/
-|     `- assets/
-|- skills.disabled/
-|  `- <skill>/
-|- models/
-|  `- <family>.yaml
-`- mcp/
-   |- mcp.json
-   `- oauth/
+`- skills/
+   |- <skill>/
+   |  |- SKILL.md
+   |  |- references/
+   |  |- scripts/
+   |  `- assets/
+   `- .disabled/<skill>/
 ~~~
 
-System.md 必须存在且非空。其他目录按需创建。oauth/ 和 skills.disabled/ 由 daemon 管理时生成。
+System.md 必须存在且非空。其他目录按需创建。禁用的 Skill 保存在 skills/.disabled/，不进入 Catalog。
 
 ## Prompt 和 Rule
 
@@ -130,122 +126,38 @@ dwo skills remove <name>
 ~~~
 
 单个 Markdown 文件安装成 SKILL.md；目录安装保留全部子文件。Management RPC 还提供
-skill.enable、skill.disable 和 skill.uninstall；禁用的目录移到 resource/skills.disabled/。
+skill.enable、skill.disable 和 skill.uninstall；禁用的目录移到 resource/skills/.disabled/。
 
-## MCP
+### 通过 mcp2skill 使用外部工具
 
-MCP 配置文件是 resource/mcp/mcp.json。daemon 统一托管连接和 OAuth，不为每个 ACP Client
-单独启动 Server。
+需要使用 MCP 服务时，可以在项目外通过 mcp2skill 将服务器转换为普通 Skill，安装到
+resource/skills/ 或 externalSkillsDirs。生成目录包含 SKILL.md 和 scripts/cli.py；Agent
+读取 Skill 后，通过 terminal 运行它的 CLI。mcp2skill 及其运行依赖由用户另行安装。
 
-### 完整示例
-
-~~~json
-{
-  "mcpServers": {
-    "local-tools": {
-      "type": "stdio",
-      "enabled": true,
-      "command": "node",
-      "args": ["server.js"],
-      "cwd": "servers/local-tools",
-      "env": {
-        "TOKEN": "${LOCAL_TOOLS_TOKEN}",
-        "PATH": "${PATH}"
-      },
-      "description": "Local project tools"
-    },
-    "github": {
-      "type": "streamableHttp",
-      "enabled": true,
-      "url": "https://example.test/mcp",
-      "headers": {
-        "Authorization": "Bearer ${GITHUB_TOKEN}"
-      },
-      "auth": {
-        "type": "oauth",
-        "scopes": ["repo"]
-      },
-      "description": "GitHub tools"
-    }
-  }
-}
-~~~
-
-顶层必须包含 mcpServers Object。Server 的 enabled 为 false 时不加载。
-
-### stdio 字段
-
-| 字段 | 必填 | 默认值 | 作用 |
-| --- | --- | --- | --- |
-| type | 否 | stdio | 只能是 stdio |
-| enabled | 否 | true | 是否加载 |
-| command | 是 | 无 | 可执行程序 |
-| args | 否 | [] | 字符串参数数组 |
-| env | 否 | {} | 传给子进程的环境变量 |
-| cwd | 否 | daemon 环境 | 工作目录；相对路径相对 resource/mcp/ |
-| description | 否 | 无 | Server Catalog 描述 |
-
-子进程继承 daemon 环境，env 覆盖同名项。command、args、env 和 cwd 支持 ${NAME} 展开；
-Windows 还支持 %NAME%。PATH 可以用 ${PATH} 继承并扩展现有值。
-
-### Streamable HTTP 字段
-
-| 字段 | 必填 | 默认值 | 作用 |
-| --- | --- | --- | --- |
-| type | 是 | 无 | streamableHttp、streamable-http 或 http |
-| enabled | 否 | true | 是否加载 |
-| url | 是 | 无 | MCP Endpoint |
-| headers | 否 | {} | HTTP Header，支持 ${NAME} |
-| auth | 否 | 无 | OAuth 配置 |
-| description | 否 | 无 | Server Catalog 描述 |
-
-OAuth：
-
-~~~json
-{
-  "auth": {
-    "type": "oauth",
-    "scopes": ["repo", "read:user"]
-  }
-}
-~~~
-
-type 目前只支持 oauth；scopes 默认空数组。授权数据保存在 resource/mcp/oauth/，不会通过配置
-查询回显。
-
-### MCP 生命周期
-
-daemon 启动或配置变化时初始化全部 Server，状态为 starting、ready、auth_required 或 failed。
-成功的 stdio/HTTP 连接会持续复用；Catalog 只在 daemon 内存中保存，重启后从 mcp.json 重建。
-
-CLI 管理：
+例如，进入 mcp2skill 目录后执行：
 
 ~~~text
-dwo mcp list
-dwo mcp get <name>
-dwo mcp add ...
-dwo mcp add-json <name> <json>
-dwo mcp remove <name>
-dwo mcp search <query>
-dwo mcp call <server.tool> --args '<json>'
-dwo mcp auth <server> [--logout]
+uv run --no-project python scripts/mcp2skill.py <config.json> --out <profile>/resource/skills
 ~~~
 
-完整参数见 [CLI 命令参考](cli.md)。对话中要求 Agent 使用指定资源时，使用
-[Slash Commands](slash-commands.md) 中的 /skill 和 /mcp。
+使用生成的 Skill 时，在该 Skill 目录按其说明执行，例如：
+
+~~~text
+uv run --with fastmcp python scripts/cli.py call-tool <tool> --arg value
+~~~
+
+DWO 不再内置 MCP 连接、Catalog、OAuth、`dwo mcp`、`/mcp` 或 `mcp.*` 管理 RPC；
+连接和认证由外部工具负责。旧配置和凭据文件不会被自动删除，也不再加载。
 
 ## 热加载和排查
 
-daemon 监听 Prompt、Rule、Skill 和 mcp.json。变化会在下一个安全边界更新 Session 环境；
-MCP 配置变化会重新初始化相关连接。
+daemon 监听 Prompt、Rule 和 Skill。变化会在下一个安全边界更新 Session 环境。
 
 排查顺序：
 
 ~~~text
 dwo config-show
 dwo skills list
-dwo mcp list
-dwo mcp get <name>
 ~~~
 
 然后查看 ~/.dwoagent/logs/。不要把 API Key、Token、OAuth 数据或带凭据的 Header 提交到仓库。

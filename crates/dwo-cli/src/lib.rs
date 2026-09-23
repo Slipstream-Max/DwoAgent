@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
@@ -6,7 +5,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
-use dwo_mcp::SearchGroup;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -69,10 +67,6 @@ enum Command {
     Websocket {
         #[command(subcommand)]
         command: WebsocketCommand,
-    },
-    Mcp {
-        #[command(subcommand)]
-        command: McpCommand,
     },
     Model {
         #[command(subcommand)]
@@ -326,66 +320,6 @@ enum ManagedChannelCommand {
 }
 
 #[derive(Subcommand)]
-enum McpCommand {
-    /// List configured MCP server names and their current status.
-    List,
-    /// Show a configured MCP server with redacted configuration and runtime status.
-    Get { name: String },
-    /// Add an MCP server using Claude Code-compatible arguments.
-    Add {
-        /// MCP transport. DWO currently supports stdio and http.
-        #[arg(short = 't', long, value_enum, default_value_t = McpTransportArg::Stdio)]
-        transport: McpTransportArg,
-        /// Environment variable for a stdio server, in KEY=value form. May be repeated.
-        #[arg(short = 'e', long, value_name = "KEY=value")]
-        env: Vec<String>,
-        /// HTTP header for an HTTP server, in "Name: value" form. May be repeated.
-        #[arg(short = 'H', long, value_name = "Name: value")]
-        header: Vec<String>,
-        /// MCP server name.
-        name: String,
-        /// HTTP URL for --transport http.
-        #[arg(
-            conflicts_with = "command",
-            required_unless_present = "command",
-            value_name = "URL"
-        )]
-        url: Option<String>,
-        /// Stdio command and its arguments. Put these after `--`.
-        #[arg(last = true, allow_hyphen_values = true, value_name = "COMMAND")]
-        command: Vec<String>,
-    },
-    /// Add one MCP server entry from JSON.
-    AddJson { name: String, json: String },
-    /// Remove an MCP server configuration.
-    Remove { name: String },
-    /// Search configured MCP servers and tools.
-    Search {
-        /// Case-insensitive terms matched against server and tool metadata.
-        query: String,
-    },
-    /// Call one MCP tool using a server.tool selector.
-    Call {
-        selector: String,
-        #[arg(long, default_value = "{}")]
-        args: String,
-    },
-    /// Authorize a server, or remove its stored authorization.
-    Auth {
-        server: String,
-        #[arg(long)]
-        logout: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum McpTransportArg {
-    Stdio,
-    #[value(alias = "streamable-http", alias = "streamableHttp")]
-    Http,
-}
-
-#[derive(Subcommand)]
 enum ModelCommand {
     /// List enabled models grouped by provider.
     List,
@@ -546,7 +480,6 @@ where
         }
         Command::Channel { command } => run_channel(command, &config_path).await?,
         Command::Websocket { command } => run_websocket(command, &config_path).await?,
-        Command::Mcp { command } => run_mcp(command, &config_path).await?,
         Command::Model { command } => run_model(command, &config_path).await?,
         Command::Skills { command } => run_skills(command, &config_path).await?,
         Command::Automation {
@@ -748,127 +681,6 @@ async fn set_automation_enabled(
     Ok(())
 }
 
-async fn run_mcp(command: McpCommand, config_path: &Path) -> Result<()> {
-    match command {
-        McpCommand::List => {
-            let value = ipc::request_dwo(config_path, "mcp.list", json!({})).await?;
-            let catalog: dwo_mcp::Catalog = serde_json::from_value(value)?;
-            output::line(format_args!("{}", dwo_mcp::render_list(&catalog)))?;
-        }
-        McpCommand::Get { name } => {
-            let value = ipc::request_dwo(config_path, "mcp.get", json!({"server": name})).await?;
-            render::write_value(&value)?;
-        }
-        McpCommand::Add {
-            transport,
-            env,
-            header,
-            name,
-            url,
-            command,
-        } => {
-            let config = match transport {
-                McpTransportArg::Stdio => {
-                    anyhow::ensure!(
-                        header.is_empty(),
-                        "--header is only available with --transport http"
-                    );
-                    let env = parse_mcp_assignments(&env, '=', "--env")?;
-                    anyhow::ensure!(url.is_none(), "a stdio command must be placed after --");
-                    let (command, args) = command
-                        .split_first()
-                        .context("a stdio command is required after --")?;
-                    json!({
-                        "command": command,
-                        "args": args,
-                        "env": env,
-                    })
-                }
-                McpTransportArg::Http => {
-                    anyhow::ensure!(
-                        env.is_empty(),
-                        "--env is only available with --transport stdio"
-                    );
-                    anyhow::ensure!(
-                        command.is_empty(),
-                        "--transport http accepts a URL, not a command after --"
-                    );
-                    let headers = parse_mcp_assignments(&header, ':', "--header")?;
-                    let url = url.context("--transport http requires a URL")?;
-                    json!({
-                        "type": "http",
-                        "url": url,
-                        "headers": headers,
-                    })
-                }
-            };
-            ipc::request_dwo(
-                config_path,
-                "mcp.install",
-                json!({"server": name, "config": config}),
-            )
-            .await?;
-            output::line(format_args!("Added MCP {name}"))?;
-        }
-        McpCommand::AddJson { name, json: source } => {
-            let config: Value = serde_json::from_str(&source).context("parse MCP JSON")?;
-            anyhow::ensure!(
-                config.is_object(),
-                "MCP JSON must be a server configuration object"
-            );
-            anyhow::ensure!(
-                config.get("mcpServers").is_none(),
-                "mcp add-json accepts one server entry, not an mcpServers wrapper"
-            );
-            ipc::request_dwo(
-                config_path,
-                "mcp.install",
-                json!({"server": name, "config": config}),
-            )
-            .await?;
-            output::line(format_args!("Added MCP {name}"))?;
-        }
-        McpCommand::Remove { name } => {
-            let value =
-                ipc::request_dwo(config_path, "mcp.uninstall", json!({"server": name})).await?;
-            anyhow::ensure!(value["removed"] == true, "MCP server not found: {name}");
-            output::line(format_args!("Removed MCP {name}"))?;
-        }
-        McpCommand::Search { query } => {
-            let value =
-                ipc::request_dwo(config_path, "mcp.search", json!({"query": query})).await?;
-            let groups: Vec<SearchGroup> = serde_json::from_value(value)?;
-            output::write(format_args!("{}", dwo_mcp::render_search(&groups)))?;
-        }
-        McpCommand::Call { selector, args } => {
-            let arguments: Value = serde_json::from_str(&args).context("parse --args JSON")?;
-            let value = ipc::request_dwo(
-                config_path,
-                "mcp.call",
-                json!({"selector": selector, "arguments": arguments}),
-            )
-            .await?;
-            render::write_value(&value)?;
-        }
-        McpCommand::Auth { server, logout } => {
-            let method = if logout {
-                "mcp.auth.logout"
-            } else {
-                output::line(format_args!(
-                    "Opening the authorization page for {server}..."
-                ))?;
-                "mcp.auth.login"
-            };
-            ipc::request_dwo(config_path, method, json!({"server": server})).await?;
-            output::line(format_args!(
-                "Authorization {}",
-                if logout { "removed" } else { "updated" }
-            ))?;
-        }
-    }
-    Ok(())
-}
-
 async fn run_model(command: ModelCommand, config_path: &Path) -> Result<()> {
     match command {
         ModelCommand::List => {
@@ -935,31 +747,6 @@ async fn run_skills(command: SkillsCommand, config_path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn parse_mcp_assignments(
-    values: &[String],
-    separator: char,
-    option: &str,
-) -> Result<BTreeMap<String, String>> {
-    let mut assignments = BTreeMap::new();
-    for value in values {
-        let (key, raw_value) = value
-            .split_once(separator)
-            .with_context(|| format!("{option} expects KEY{separator}VALUE"))?;
-        let key = key.trim();
-        anyhow::ensure!(!key.is_empty(), "{option} key must not be empty");
-        let value = if separator == ':' {
-            raw_value.trim_start().to_string()
-        } else {
-            raw_value.to_string()
-        };
-        anyhow::ensure!(
-            assignments.insert(key.to_string(), value).is_none(),
-            "{option} repeats key {key}"
-        );
-    }
-    Ok(assignments)
 }
 
 struct SkillImport {
@@ -1928,136 +1715,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_minimal_mcp_commands() {
-        let list = Cli::try_parse_from(["dwo", "mcp", "list"]).unwrap();
-        assert!(matches!(
-            list.command,
-            Command::Mcp {
-                command: McpCommand::List
-            }
-        ));
-
-        let search = Cli::try_parse_from(["dwo", "mcp", "search", "install"]).unwrap();
-        assert!(matches!(
-            search.command,
-            Command::Mcp {
-                command: McpCommand::Search { ref query }
-            } if query == "install"
-        ));
-
-        let auth = Cli::try_parse_from(["dwo", "mcp", "auth", "github", "--logout"]).unwrap();
-        assert!(matches!(
-            auth.command,
-            Command::Mcp {
-                command: McpCommand::Auth {
-                    ref server,
-                    logout: true,
-                }
-            } if server == "github"
-        ));
-    }
-
-    #[test]
-    fn parses_mcp_management_commands() {
-        let stdio = Cli::try_parse_from([
-            "dwo",
-            "mcp",
-            "add",
-            "-e",
-            "TOKEN=value",
-            "filesystem",
-            "--",
-            "npx",
-            "-y",
-            "@modelcontextprotocol/server-filesystem",
-        ])
-        .unwrap();
-        let Command::Mcp {
-            command:
-                McpCommand::Add {
-                    transport,
-                    env,
-                    header,
-                    name,
-                    url,
-                    command,
-                },
-        } = stdio.command
-        else {
-            panic!("expected stdio MCP add command")
-        };
-        assert_eq!(transport, McpTransportArg::Stdio);
-        assert_eq!(env, vec!["TOKEN=value"]);
-        assert!(header.is_empty());
-        assert_eq!(name, "filesystem");
-        assert_eq!(
-            command,
-            vec!["npx", "-y", "@modelcontextprotocol/server-filesystem"]
-        );
-        assert!(url.is_none());
-
-        let http = Cli::try_parse_from([
-            "dwo",
-            "mcp",
-            "add",
-            "-t",
-            "http",
-            "-H",
-            "Authorization: Bearer token",
-            "notion",
-            "https://mcp.notion.com/mcp",
-        ])
-        .unwrap();
-        let Command::Mcp {
-            command:
-                McpCommand::Add {
-                    transport,
-                    header,
-                    name,
-                    url,
-                    command,
-                    ..
-                },
-        } = http.command
-        else {
-            panic!("expected HTTP MCP add command")
-        };
-        assert_eq!(transport, McpTransportArg::Http);
-        assert_eq!(header, vec!["Authorization: Bearer token"]);
-        assert_eq!(name, "notion");
-        assert_eq!(url.as_deref(), Some("https://mcp.notion.com/mcp"));
-        assert!(command.is_empty());
-
-        let get = Cli::try_parse_from(["dwo", "mcp", "get", "notion"]).unwrap();
-        assert!(matches!(
-            get.command,
-            Command::Mcp {
-                command: McpCommand::Get { ref name }
-            } if name == "notion"
-        ));
-
-        let add_json = Cli::try_parse_from([
-            "dwo",
-            "mcp",
-            "add-json",
-            "notion",
-            r#"{"type":"http","url":"https://mcp.notion.com/mcp"}"#,
-        ])
-        .unwrap();
-        assert!(matches!(
-            add_json.command,
-            Command::Mcp {
-                command: McpCommand::AddJson { ref name, ref json }
-            } if name == "notion" && json.contains("mcp.notion.com")
-        ));
-
-        let remove = Cli::try_parse_from(["dwo", "mcp", "remove", "notion"]).unwrap();
-        assert!(matches!(
-            remove.command,
-            Command::Mcp {
-                command: McpCommand::Remove { ref name }
-            } if name == "notion"
-        ));
+    fn rejects_retired_server_commands() {
+        assert!(Cli::try_parse_from(["dwo", "mcp", "list"]).is_err());
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub use message::{
 };
 pub use prompt::{
     AgentProfilePaths, ChannelCapabilitySnapshot, EnvironmentSnapshot, ExternalRuleFile,
-    McpSnapshot, PromptBuildError, PromptSnapshot, RuleSnapshot, SkillSnapshot, SystemPromptBlock,
+    PromptBuildError, PromptSnapshot, RuleSnapshot, SkillSnapshot, SystemPromptBlock,
     SystemPromptBuilder,
 };
 pub use shell::Shell;

@@ -5,7 +5,6 @@ members = [
     "crates/dwo-context",
     "crates/dwo-file-guard",
     "crates/dwo-model-client",
-    "crates/dwo-mcp",
     "crates/dwo-agent-service",
     "crates/dwo-command",
     "crates/dwo-channels",

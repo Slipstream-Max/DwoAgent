@@ -12,7 +12,7 @@ Command。
 
 | 命令 | ACP | 微信/Telegram/飞书/QQ |
 | --- | --- | --- |
-| /skill、/mcp、/plan | 支持 | 支持 |
+| /skill、/plan | 支持 | 支持 |
 | /compact、/resume、/fork、/status | 支持 | 支持 |
 | /help、/list、/new、/use、/del、/cancel | 不支持 | 支持 |
 | /model、/reasoning、/policy | 不支持 | 支持 |
@@ -27,16 +27,7 @@ Command。
 ~~~
 
 要求 Agent 使用当前 Session 可用的指定 Skill。name 必须与合并后的 Skill Catalog 精确匹配。
-Skill 的目录格式和覆盖优先级见 [Prompt、Skill 与 MCP](resources.md#skill)。
-
-### /mcp
-
-~~~text
-/mcp <server> [prompt]
-~~~
-
-要求 Agent 使用 daemon 中指定的 MCP Server。server 必须与当前 MCP Catalog 精确匹配。Server
-配置和连接状态见 [Prompt、Skill 与 MCP](resources.md#mcp)。
+Skill 的目录格式和覆盖优先级见 [Prompt 与 Skill](resources.md#skill)。
 
 ### /plan
 
@@ -47,8 +38,8 @@ Skill 的目录格式和覆盖优先级见 [Prompt、Skill 与 MCP](resources.md
 让 Agent 先规划和确认需求，再执行工作。它是 Prompt Directive，不等于 plan 工具；Directive
 告诉模型进入规划方式，plan 工具负责保存 Session 的执行清单。
 
-Directive 可以出现在正文中，也可以在同一条消息中多次出现。未知 name、单独的 /skill 或
-/mcp 保持原文，不会伪造一个 Catalog 条目。
+Directive 可以出现在正文中，也可以在同一条消息中多次出现。未知 name、单独的 /skill
+保持原文，不会伪造一个 Catalog 条目。
 
 ## ACP 本地命令
 
@@ -62,7 +53,7 @@ Directive 可以出现在正文中，也可以在同一条消息中多次出现�
 这四个命令不接受参数。ACP 协议的 session/resume 是重新连接已有 Session，不调用模型；不要和
 /resume 混淆。ACP 原生 session/fork 和 /fork 都复制 Session，也都不会自动切换当前连接。
 
-ACP 还会把当前可用的 skill <name> 和 mcp <name> 发布为补全候选。名称包含空格时不会发布为
+ACP 还会把当前可用的 skill <name> 发布为补全候选。名称包含空格时不会发布为
 候选，因为 Directive 的 name 是单个 Token。
 
 ## 消息 Channel 命令

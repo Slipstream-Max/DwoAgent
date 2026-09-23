@@ -90,13 +90,12 @@ dwo project worktree remove <project-id> <worktree-id>
 detach 只取消登记；remove 还会按 Host 的 Git Worktree 流程移除对应工作树。Session 使用
 Project root 或其 assignment 指定的 Worktree cwd。
 
-## Model、MCP、Skill、Channel 和 WebSocket
+## Model、Skill、Channel 和 WebSocket
 
 ~~~text
 dwo model list
 dwo model get-default
 dwo model set-default <provider/modelId> --reasoning <mode>
-dwo mcp list|get|add|remove|search|call|auth ...
 dwo skills list|add|remove ...
 dwo channel list
 dwo channel <weixin|telegram|feishu|qq> status|bind|unbind

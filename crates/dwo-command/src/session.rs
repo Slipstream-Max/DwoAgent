@@ -65,7 +65,7 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_session_command(&MessageContent::text("/mcp github search")).unwrap(),
+            parse_session_command(&MessageContent::text("/plan review changes")).unwrap(),
             None
         );
     }

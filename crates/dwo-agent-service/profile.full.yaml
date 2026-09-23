@@ -3,7 +3,6 @@
 #   resource/prompts/System.md   required
 #   resource/prompts/AGENTS.md   optional
 #   resource/skills/*/SKILL.md   optional
-#   resource/mcp/mcp.json        optional
 
 # full_access | confirm | watch
 policyMode: confirm

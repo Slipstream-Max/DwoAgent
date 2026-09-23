@@ -18,7 +18,7 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("resource/prompts"))?;
     std::fs::create_dir_all(root.join("resource/skills"))?;
     std::fs::create_dir_all(root.join("runtime/sessions"))?;
-    std::fs::create_dir_all(root.join("resource/mcp"))?;
+    std::fs::create_dir_all(root.join("resource/models"))?;
     std::fs::create_dir_all(root.join("channels"))?;
     // Bundled runtime dependencies (niubash and Git) live here, separate
     // from dwo's own executable and resource directories.
@@ -29,10 +29,6 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
         "You are a coding agent. Work carefully and report concrete results.\n",
     )?;
     write_if_missing(&root.join("resource/prompts/AGENTS.md"), "")?;
-    write_if_missing(
-        &root.join("resource/mcp/mcp.json"),
-        "{\n  \"mcpServers\": {}\n}\n",
-    )?;
     register_service(config_path, &executable)
 }
 

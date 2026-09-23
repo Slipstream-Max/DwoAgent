@@ -1,20 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use dwo_context::{ContentBlock, MessageContent};
 
 const SKILL_COMMAND: &str = "/skill";
-const MCP_COMMAND: &str = "/mcp";
 const PLAN_COMMAND: &str = "/plan";
 
-pub const COMMAND_DESCRIPTIONS: [(&str, &str); 3] = [
+pub const COMMAND_DESCRIPTIONS: [(&str, &str); 2] = [
     (
         "skill",
         "Request an available skill by name, optionally followed by a prompt.",
-    ),
-    (
-        "mcp",
-        "Request an available MCP server by name, optionally followed by a prompt.",
     ),
     (
         "plan",
@@ -25,13 +20,12 @@ pub const COMMAND_DESCRIPTIONS: [(&str, &str); 3] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectiveKinds {
     pub skill: bool,
-    pub mcp: bool,
     pub plan: bool,
 }
 
 impl DirectiveKinds {
     pub fn is_empty(&self) -> bool {
-        !self.skill && !self.mcp && !self.plan
+        !self.skill && !self.plan
     }
 }
 
@@ -44,7 +38,6 @@ pub struct AvailableSkill {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectiveKind {
     Skill,
-    Mcp,
     Plan,
 }
 
@@ -61,13 +54,11 @@ pub fn routes_to_channel_command(text: &str) -> bool {
 
 fn starts_with_prompt_directive(text: &str) -> bool {
     let text = text.trim_start();
-    [SKILL_COMMAND, MCP_COMMAND, PLAN_COMMAND]
-        .into_iter()
-        .any(|command| {
-            text.strip_prefix(command).is_some_and(|remainder| {
-                remainder.is_empty() || remainder.chars().next().is_some_and(char::is_whitespace)
-            })
+    [SKILL_COMMAND, PLAN_COMMAND].into_iter().any(|command| {
+        text.strip_prefix(command).is_some_and(|remainder| {
+            remainder.is_empty() || remainder.chars().next().is_some_and(char::is_whitespace)
         })
+    })
 }
 
 pub fn directive_kinds(content: &MessageContent) -> DirectiveKinds {
@@ -82,10 +73,9 @@ pub fn directive_kinds(content: &MessageContent) -> DirectiveKinds {
             };
             match directive.kind {
                 DirectiveKind::Skill => kinds.skill = true,
-                DirectiveKind::Mcp => kinds.mcp = true,
                 DirectiveKind::Plan => kinds.plan = true,
             }
-            if kinds.skill && kinds.mcp && kinds.plan {
+            if kinds.skill && kinds.plan {
                 return kinds;
             }
         }
@@ -93,19 +83,11 @@ pub fn directive_kinds(content: &MessageContent) -> DirectiveKinds {
     kinds
 }
 
-pub fn expand(
-    content: MessageContent,
-    skills: &[AvailableSkill],
-    mcp_servers: &[String],
-) -> MessageContent {
+pub fn expand(content: MessageContent, skills: &[AvailableSkill]) -> MessageContent {
     let skills = skills
         .iter()
         .map(|skill| (skill.name.as_str(), skill.path.as_path()))
         .collect::<HashMap<_, _>>();
-    let mcp_servers = mcp_servers
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
     MessageContent::blocks(
         content
             .into_blocks()
@@ -116,7 +98,7 @@ pub fn expand(
                     annotations,
                     meta,
                 } => ContentBlock::Text {
-                    text: expand_text(&text, &skills, &mcp_servers),
+                    text: expand_text(&text, &skills),
                     annotations,
                     meta,
                 },
@@ -126,11 +108,7 @@ pub fn expand(
     )
 }
 
-fn expand_text(
-    text: &str,
-    skills: &HashMap<&str, &std::path::Path>,
-    mcp_servers: &HashSet<&str>,
-) -> String {
+fn expand_text(text: &str, skills: &HashMap<&str, &std::path::Path>) -> String {
     let mut replacements = Vec::new();
     let mut covered_until = 0;
     for (start, _) in text.match_indices('/') {
@@ -144,9 +122,6 @@ fn expand_text(
             DirectiveKind::Skill => skills
                 .get(directive.name)
                 .map(|path| render_skill_request(directive.name, path)),
-            DirectiveKind::Mcp => mcp_servers
-                .contains(directive.name)
-                .then(|| render_mcp_request(directive.name)),
             DirectiveKind::Plan => Some(render_plan_request()),
         };
         if let Some(replacement) = replacement {
@@ -179,8 +154,6 @@ fn parse_at(text: &str, start: usize) -> Option<ParsedDirective<'_>> {
         (DirectiveKind::Plan, PLAN_COMMAND)
     } else if suffix.starts_with(SKILL_COMMAND) {
         (DirectiveKind::Skill, SKILL_COMMAND)
-    } else if suffix.starts_with(MCP_COMMAND) {
-        (DirectiveKind::Mcp, MCP_COMMAND)
     } else {
         return None;
     };
@@ -214,13 +187,6 @@ fn render_skill_request(name: &str, path: &std::path::Path) -> String {
     let path = xml_escape(&path.display().to_string());
     format!(
         "<skill_request name=\"{name}\" path=\"{path}\">\nThe user wants to use the {name} skill. Use the read_file tool to read the SKILL.md at {path} before acting, then follow its instructions.\n</skill_request>"
-    )
-}
-
-fn render_mcp_request(name: &str) -> String {
-    let name = xml_escape(name);
-    format!(
-        "<mcp_request name=\"{name}\">\nThe user wants to use the {name} MCP server. Use `dwo mcp search` in the terminal with {name} as the query to discover its tools, then use the matching MCP tool for the request.\n</mcp_request>"
     )
 }
 
@@ -304,12 +270,12 @@ mod tests {
     #[test]
     fn expands_matching_directives_anywhere_and_keeps_the_prompt() {
         let content = MessageContent::text(
-            "请/skill review inspect this, then /mcp github open issue /skill review",
+            "请/skill review inspect this, then /plan open issue /skill review",
         );
-        let expanded = expand(content, &skills(), &["github".to_string()]);
+        let expanded = expand(content, &skills());
         let text = expanded.as_text().unwrap();
         assert_eq!(text.matches("<skill_request").count(), 2);
-        assert_eq!(text.matches("<mcp_request").count(), 1);
+        assert_eq!(text.matches("<plan_request").count(), 1);
         assert!(text.contains(" inspect this, then "));
         assert!(text.ends_with("</skill_request>"));
     }
@@ -319,23 +285,18 @@ mod tests {
         for text in [
             "/skill",
             "/skill ",
-            "/mcp",
-            "/mcp missing prompt",
+            "/skill missing prompt",
             "/skills review",
-            "/mcpx github",
         ] {
             let content = MessageContent::text(text);
-            assert_eq!(
-                expand(content.clone(), &skills(), &["github".to_string()]),
-                content
-            );
+            assert_eq!(expand(content.clone(), &skills()), content);
         }
     }
 
     #[test]
     fn expands_bare_plan_directive_and_keeps_following_prompt() {
         let content = MessageContent::text("/plan 我想做一个新的 CLI 工具");
-        let expanded = expand(content, &[], &[]);
+        let expanded = expand(content, &[]);
         let text = expanded.as_text().unwrap();
         assert!(text.starts_with("<plan_request>"));
         assert!(text.ends_with("</plan_request> 我想做一个新的 CLI 工具"));
@@ -347,7 +308,7 @@ mod tests {
             text.contains("Do not take any action until the user explicitly confirms consensus")
         );
 
-        let bare = expand(MessageContent::text("/plan"), &[], &[]);
+        let bare = expand(MessageContent::text("/plan"), &[]);
         let bare_text = bare.as_text().unwrap();
         assert!(bare_text.starts_with("<plan_request>"));
         assert!(bare_text.ends_with("</plan_request>"));
@@ -380,7 +341,7 @@ mod tests {
             },
             ContentBlock::image("image/png", "data"),
         ]);
-        let expanded = expand(content, &skills(), &[]);
+        let expanded = expand(content, &skills());
         let ContentBlock::Text {
             text, annotations, ..
         } = &expanded.as_blocks()[0]
@@ -399,27 +360,26 @@ mod tests {
     #[test]
     fn matched_directives_do_not_create_overlapping_replacements() {
         let expanded = expand(
-            MessageContent::text("/skill /mcp github"),
+            MessageContent::text("/skill /plan github"),
             &[AvailableSkill {
-                name: "/mcp".to_string(),
-                path: PathBuf::from("C:/skills/mcp/SKILL.md"),
+                name: "/plan".to_string(),
+                path: PathBuf::from("C:/skills/plan/SKILL.md"),
             }],
-            &["github".to_string()],
         );
         let text = expanded.as_text().unwrap();
         assert_eq!(text.matches("<skill_request").count(), 1);
-        assert_eq!(text.matches("<mcp_request").count(), 0);
+        assert_eq!(text.matches("<plan_request").count(), 0);
         assert!(text.ends_with(" github"));
     }
 
     #[test]
     fn recognizes_only_exact_prompt_directive_prefixes() {
         assert!(starts_with_prompt_directive(" /skill"));
-        assert!(starts_with_prompt_directive("/mcp github"));
+        assert!(starts_with_prompt_directive("/plan review"));
         assert!(!starts_with_prompt_directive("/skills review"));
         assert!(!starts_with_prompt_directive("hello /skill review"));
         assert!(!routes_to_channel_command("/skill review"));
-        assert!(!routes_to_channel_command("/mcp"));
+        assert!(!routes_to_channel_command("/plan"));
         assert!(routes_to_channel_command("/skills review"));
         assert!(routes_to_channel_command("/status"));
     }

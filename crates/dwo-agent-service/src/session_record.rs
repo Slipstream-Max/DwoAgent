@@ -98,12 +98,12 @@ pub struct SessionRecord {
 pub struct SessionInfo {
     pub id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-   pub parent_session_id: Option<SessionId>,
+    pub parent_session_id: Option<SessionId>,
     /// fork 的来源会话（`session prompt --from X` / fork 出来的会话）；
     /// 跟 `parent_session_id`（agent 跑出来的子会话）是两回事。
     #[serde(default)]
     pub forked_from: Option<SessionId>,
-   pub title: String,
+    pub title: String,
     pub cwd: PathBuf,
     pub workspace: SessionWorkspace,
     pub mode: SessionMode,
@@ -214,9 +214,9 @@ impl SessionRecord {
         Self {
             info: SessionInfo {
                 id,
-               parent_session_id: None,
+                parent_session_id: None,
                 forked_from: None,
-               title,
+                title,
                 cwd,
                 workspace,
                 mode,

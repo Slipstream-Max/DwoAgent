@@ -154,10 +154,10 @@ struct PersistedSessionMetadata {
 struct PersistedSessionInfo {
     id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-   parent_session_id: Option<SessionId>,
+    parent_session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     forked_from: Option<SessionId>,
-   title: String,
+    title: String,
     workspace: SessionWorkspace,
     mode: dwo_tools::SessionMode,
     created_at_ms: u64,
@@ -174,7 +174,7 @@ impl PersistedSessionInfo {
     fn from_runtime(info: &SessionInfo) -> Self {
         Self {
             id: info.id.clone(),
-           parent_session_id: info.parent_session_id.clone(),
+            parent_session_id: info.parent_session_id.clone(),
             forked_from: info.forked_from.clone(),
             title: info.title.clone(),
             workspace: info.workspace.clone(),
@@ -190,7 +190,7 @@ impl PersistedSessionInfo {
     fn into_runtime(self) -> SessionInfo {
         SessionInfo {
             id: self.id,
-           parent_session_id: self.parent_session_id,
+            parent_session_id: self.parent_session_id,
             forked_from: self.forked_from,
             title: self.title,
             cwd: PathBuf::new(),

@@ -299,3 +299,38 @@ fn find_session_directory(root: &Path, session_id: &str) -> PathBuf {
     }
     panic!("session directory for {session_id} was not found");
 }
+
+#[tokio::test]
+async fn missing_external_workspace_is_tolerated_in_list_and_repaired_on_load() {
+    let root = tempfile::tempdir().unwrap();
+    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let cwd = root.path().join("vanishing-workdir");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let id = host
+        .create_session(HostSessionOptions {
+            cwd: Some(cwd.clone()),
+            ..HostSessionOptions::default()
+        })
+        .await
+        .unwrap();
+    host.service.unload(&id).await.unwrap();
+    std::fs::remove_dir_all(&cwd).unwrap();
+
+    // A stale workspace path must not break listings.
+    let page = host
+        .service
+        .list(SessionListQuery::new(None, None))
+        .await
+        .unwrap();
+    assert!(page.sessions.iter().any(|item| item.session_id == id));
+
+    // Loading the session repairs it onto a freshly created managed workspace.
+    host.service.load(&id).await.unwrap();
+    let snapshot = host.service.snapshot(&id).await.unwrap();
+    assert!(matches!(
+        snapshot.record.info.workspace,
+        SessionWorkspace::Managed
+    ));
+    assert!(snapshot.record.info.cwd.is_dir());
+    host.shutdown().await;
+}

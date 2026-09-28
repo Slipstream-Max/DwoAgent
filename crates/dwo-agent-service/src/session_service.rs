@@ -335,7 +335,8 @@ impl SessionService {
                     .filter(|title| !title.is_empty());
                 let automatic_title = explicit_title.is_none();
                 let title = explicit_title.unwrap_or_else(|| default_session_title(&cwd));
-                let prompt_builder = self.prompt_builder(cwd.clone());
+                let is_root = new_session.parent_session_id.is_none();
+                let prompt_builder = self.prompt_builder(cwd.clone(), is_root);
                 let context = ContextManager::initialize(&prompt_builder)
                     .map_err(anyhow::Error::from)?
                     .into_context();
@@ -437,13 +438,30 @@ impl SessionService {
             .load(id)
             .await?
             .ok_or_else(|| SessionServiceError::SessionNotFound(id.clone()))?;
-        record.info.cwd = match resolved_cwd {
+        let mut workspace_repaired = false;
+        let cwd = match resolved_cwd {
             Some(cwd) => cwd,
-            None => self.resolve_workspace(&record.info.id, &record.info.workspace)?,
+            None => match self.resolve_workspace(&record.info.id, &record.info.workspace) {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %record.info.id,
+                        workspace = ?record.info.workspace,
+                        error = %error,
+                        "session workspace missing; re-pointing to a managed workspace"
+                    );
+                    workspace_repaired =
+                        !matches!(&record.info.workspace, SessionWorkspace::Managed);
+                    record.info.workspace = SessionWorkspace::Managed;
+                    self.repair_workspace(&record.info.id).await?
+                }
+            },
         };
+        record.info.cwd = cwd;
         let transcript = self.repository.load_transcript(id).await?;
-        let prompt_builder = self.prompt_builder(record.info.cwd.clone());
-        let mut record_changed = repair_empty_title(&mut record, &transcript);
+        let is_root = record.info.parent_session_id.is_none();
+        let prompt_builder = self.prompt_builder(record.info.cwd.clone(), is_root);
+        let mut record_changed = repair_empty_title(&mut record, &transcript) || workspace_repaired;
         if !record.context.system_prompt.is_initialized() {
             record.context = ContextManager::initialize(&prompt_builder)
                 .map_err(anyhow::Error::from)?
@@ -512,7 +530,8 @@ impl SessionService {
             self.repository.list().await?
         };
         for record in &mut records {
-            record.info.cwd = self.resolve_workspace(&record.info.id, &record.info.workspace)?;
+            record.info.cwd =
+                self.resolve_workspace_lossy(&record.info.id, &record.info.workspace)?;
         }
         records.retain(|record| !deleting.contains(&record.info.id));
         if !query.archived {
@@ -739,15 +758,22 @@ impl SessionService {
         let _mutation = lock.lock().await;
         self.ensure_active(id).await?;
         let cwd = std::fs::canonicalize(cwd).map_err(anyhow::Error::from)?;
-        let prompt_builder = self.prompt_builder(cwd.clone());
+        let handle = self.load(id).await?;
+        let is_root = handle
+            .snapshot()
+            .await?
+            .record
+            .info
+            .parent_session_id
+            .is_none();
+        let prompt_builder = self.prompt_builder(cwd.clone(), is_root);
         let tools = Arc::new(ToolManager::new_with_environment(
             cwd.clone(),
             self.policy.clone(),
             self.file_edit.clone(),
             [("DWO_SESSION_ID".to_string(), id.to_string())],
         )?);
-        self.load(id)
-            .await?
+        handle
             .set_workspace(workspace, cwd, tools, prompt_builder)
             .await
     }
@@ -759,6 +785,27 @@ impl SessionService {
     ) -> Result<PathBuf, SessionServiceError> {
         let path = (self.workspace_resolver)(id, workspace)?;
         Ok(std::fs::canonicalize(path).map_err(anyhow::Error::from)?)
+    }
+
+    /// Lenient workspace resolution for listings: keep the raw path when it cannot be
+    /// canonicalized so one stale session cannot break the whole list.
+    fn resolve_workspace_lossy(
+        &self,
+        id: &SessionId,
+        workspace: &SessionWorkspace,
+    ) -> Result<PathBuf, SessionServiceError> {
+        let path = (self.workspace_resolver)(id, workspace)?;
+        Ok(std::fs::canonicalize(&path).unwrap_or(path))
+    }
+
+    /// Repair a missing workspace while a session is being loaded: create the managed
+    /// workspace directory so the session can be re-pointed at it.
+    async fn repair_workspace(&self, id: &SessionId) -> Result<PathBuf, SessionServiceError> {
+        let path = (self.workspace_resolver)(id, &SessionWorkspace::Managed)?;
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(std::fs::canonicalize(&path).unwrap_or(path))
     }
 
     pub async fn subscribe(
@@ -865,14 +912,18 @@ impl SessionService {
         .await;
     }
 
-    fn prompt_builder(&self, cwd: PathBuf) -> SystemPromptBuilder {
-        SystemPromptBuilder::new(self.profile_root.clone(), cwd)
+    fn prompt_builder(&self, cwd: PathBuf, is_root: bool) -> SystemPromptBuilder {
+        let builder = SystemPromptBuilder::new(self.profile_root.clone(), cwd)
             .with_external_skill_dirs(self.external_skill_dirs.clone())
             .with_external_rule_files(self.external_rule_files.clone())
             .with_tool_prompt(dwo_tools::prompt::tools())
-            .with_subsession_prompt(crate::prompt::SUBSESSIONS)
             .with_automation_prompt(crate::prompt::AUTOMATION)
-            .with_channel_prompt(crate::prompt::CHANNELS)
+            .with_channel_prompt(crate::prompt::CHANNELS);
+        if is_root {
+            builder.with_subsession_prompt(crate::prompt::SUBSESSIONS)
+        } else {
+            builder
+        }
     }
 }
 

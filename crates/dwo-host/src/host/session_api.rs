@@ -247,6 +247,9 @@ impl Host {
             "session.new" => {
                 let params: NewSessionParam = serde_json::from_value(params)?;
                 let caller = parse_optional_session(params.caller_session_id.clone())?;
+                if let Some(caller) = &caller {
+                    self.ensure_root_caller(caller).await?;
+                }
                 let id = self
                     .create_session(HostSessionOptions {
                         title: params.title,
@@ -524,6 +527,17 @@ impl Host {
         }
     }
 
+    /// Subsessions cannot create further subsessions: every creation entry point must
+    /// be driven by a root session.
+    async fn ensure_root_caller(&self, caller: &SessionId) -> Result<()> {
+        let caller_record = self.service.snapshot(caller).await?.record;
+        anyhow::ensure!(
+            caller_record.info.parent_session_id.is_none(),
+            "subsessions cannot create subsessions (session {caller} is not a root session)"
+        );
+        Ok(())
+    }
+
     pub(super) async fn resolve_prompt_session(
         &self,
         params: &PromptParam,
@@ -541,6 +555,9 @@ impl Host {
             params.section_id.is_none() || params.project_id.is_some(),
             "--section requires --project"
         );
+        if let Some(caller) = &caller {
+            self.ensure_root_caller(caller).await?;
+        }
         if let Some(target) = &params.session_id {
             anyhow::ensure!(
                 params.title.is_none()
@@ -1023,6 +1040,73 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "--from cannot be used with --to");
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subsessions_cannot_create_further_subsessions() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let parent_id = host
+            .create_session(HostSessionOptions::default())
+            .await
+            .unwrap();
+        let create = PromptParam {
+            session_id: None,
+            from_session_id: None,
+            caller_session_id: None,
+            endpoint_id: "test".to_string(),
+            message: PromptMessage::Text("unused".to_string()),
+            title: Some("child".to_string()),
+            cwd: None,
+            project_id: None,
+            section_id: None,
+            policy: None,
+            model: None,
+            reasoning: None,
+            ephemeral: false,
+        };
+        let (child_id, _) = host
+            .resolve_prompt_session(&create, Some(parent_id.clone()))
+            .await
+            .unwrap();
+
+        // A subsession cannot create further sessions through session.prompt ...
+        let error = host
+            .resolve_prompt_session(&create, Some(child_id.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("subsessions cannot create"),
+            "unexpected error: {error}"
+        );
+
+        // ... or through session.new.
+        let error = host
+            .handle_method(
+                "session.new",
+                json!({
+                    "title": null,
+                    "cwd": null,
+                    "project_id": null,
+                    "section_id": null,
+                    "worktree_id": null,
+                    "caller_session_id": child_id.to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("subsessions cannot create"),
+            "unexpected error: {error}"
+        );
+
+        // The root session can still create another child.
+        let (second_child, _) = host
+            .resolve_prompt_session(&create, Some(parent_id))
+            .await
+            .unwrap();
+        assert_ne!(second_child, child_id);
         host.shutdown().await;
     }
 

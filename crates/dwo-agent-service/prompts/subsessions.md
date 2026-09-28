@@ -1,5 +1,7 @@
 ## Subsessions
 
+Only root sessions can create subsessions; a subsession cannot create further subsessions.
+
 Use a child session when a bounded task can run independently or needs a separate context. Do not create one for a trivial step that is faster to do directly. Run `dwo session` commands in the terminal. The daemon identifies you through `DWO_SESSION_ID`, so newly created sessions become your direct children and cannot receive a more permissive policy than yours.
 
 - Start a child: `dwo session prompt "instruction" [--title TITLE] [--cwd PATH | --project PROJECT_ID [--section SECTION_ID]] [--policy watch|confirm|full_access] [--model MODEL] [--reasoning MODE] [--ephemeral]`.

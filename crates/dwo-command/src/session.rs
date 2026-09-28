@@ -3,6 +3,7 @@ use dwo_context::MessageContent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCommand {
+    Cancel,
     Compact,
     Resume,
     Fork,
@@ -18,6 +19,10 @@ pub fn parse_session_command(content: &MessageContent) -> Result<Option<SessionC
         return Ok(None);
     };
     match name {
+        "/cancel" => {
+            anyhow::ensure!(parts.next().is_none(), "/cancel does not accept input");
+            Ok(Some(SessionCommand::Cancel))
+        }
         "/compact" => {
             anyhow::ensure!(parts.next().is_none(), "/compact does not accept input");
             Ok(Some(SessionCommand::Compact))
@@ -44,6 +49,10 @@ mod tests {
 
     #[test]
     fn recognizes_session_commands_without_claiming_other_slash_prompts() {
+        assert_eq!(
+            parse_session_command(&MessageContent::text("/cancel")).unwrap(),
+            Some(SessionCommand::Cancel)
+        );
         assert_eq!(
             parse_session_command(&MessageContent::text(" /compact ")).unwrap(),
             Some(SessionCommand::Compact)
@@ -73,6 +82,7 @@ mod tests {
     #[test]
     fn rejects_arguments_for_local_session_commands() {
         for (command, error) in [
+            ("/cancel now", "/cancel does not accept input"),
             ("/compact now", "/compact does not accept input"),
             ("/resume now", "/resume does not accept input"),
             ("/fork now", "/fork does not accept input"),

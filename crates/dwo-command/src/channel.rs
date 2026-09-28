@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -22,14 +20,19 @@ struct ChannelCommandLine {
 pub enum ChannelCommand {
     #[command(about = "Display this command list.")]
     Help,
-    #[command(about = "List sessions with numbers and short IDs.")]
-    List,
+    #[command(about = "List Inbox or project sessions, with optional page number.")]
+    List {
+        #[arg(value_name = "PROJECT_OR_PAGE")]
+        scope: Option<String>,
+        #[arg(value_name = "PAGE")]
+        page: Option<usize>,
+    },
     #[command(about = "Create and select a session.")]
     New {
-        #[arg(value_name = "NAME", num_args = 0..)]
-        name: Vec<String>,
-        #[arg(long, value_name = "PATH")]
-        cwd: Option<PathBuf>,
+        #[arg(value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(value_name = "SECTION", requires = "project")]
+        section: Option<String>,
     },
     #[command(about = "Copy the selected session into a new session.")]
     Fork,
@@ -37,10 +40,12 @@ pub enum ChannelCommand {
     Use {
         #[arg(value_name = "SESSION")]
         session: String,
+        #[arg(value_name = "NUMBER")]
+        number: Option<usize>,
     },
     #[command(about = "Show the selected session state.")]
     Status,
-    #[command(about = "Delete by number, short ID, or full ID.")]
+    #[command(about = "Archive by Inbox number, short ID, or full ID.")]
     Del {
         #[arg(value_name = "SESSION")]
         session: String,
@@ -51,15 +56,15 @@ pub enum ChannelCommand {
     Compact,
     #[command(about = "Continue the selected session when it is idle.")]
     Resume,
-    #[command(about = "Change the selected session model.")]
+    #[command(about = "List available models or change the selected session model.")]
     Model {
         #[arg(value_name = "NAME")]
-        name: String,
+        name: Option<String>,
     },
-    #[command(about = "Change reasoning effort, or disable reasoning.")]
+    #[command(about = "List supported reasoning efforts or change the current effort.")]
     Reasoning {
         #[arg(value_name = "LEVEL|off")]
-        level: String,
+        level: Option<String>,
     },
     #[command(about = "Show or change the tool permission policy.")]
     Policy {
@@ -193,23 +198,22 @@ fn render_command_error(error: clap::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
     #[test]
-    fn new_command_supports_quoted_windows_cwd_and_multiword_title() {
-        let command =
-            parse_command(r#"/new Project review --cwd "C:\Users\Example User\Documents\repo""#)
-                .unwrap();
-        let ChannelCommand::New { name, cwd } = command else {
-            panic!("expected /new command");
-        };
-        assert_eq!(name, ["Project", "review"]);
-        assert_eq!(
-            cwd.as_deref(),
-            Some(Path::new(r"C:\Users\Example User\Documents\repo"))
+    fn new_accepts_project_and_section_names() {
+        assert!(
+            matches!(parse_command(r#"/new "My project" "Development""#).unwrap(),
+            ChannelCommand::New { project: Some(p), section: Some(s) } if p == "My project" && s == "Development")
         );
+        assert!(matches!(
+            parse_command("/new").unwrap(),
+            ChannelCommand::New {
+                project: None,
+                section: None
+            }
+        ));
+        assert!(parse_command("/new a b c").is_err());
     }
 
     #[test]
@@ -223,8 +227,8 @@ mod tests {
 
     #[test]
     fn command_parse_errors_use_slash_command_usage() {
-        let error = parse_command("/model").unwrap_err().to_string();
-        assert!(error.contains("Usage: /model <NAME>"), "{error}");
+        let error = parse_command("/model a b").unwrap_err().to_string();
+        assert!(error.contains("Usage: /model [NAME]"), "{error}");
     }
 
     #[test]
@@ -262,12 +266,34 @@ mod tests {
     fn session_commands_accept_short_references() {
         assert!(matches!(
             parse_command("/use 2").unwrap(),
-            ChannelCommand::Use { session } if session == "2"
+            ChannelCommand::Use { session, number: None } if session == "2"
         ));
         assert!(matches!(
             parse_command("/del abc12345").unwrap(),
             ChannelCommand::Del { session } if session == "abc12345"
         ));
+    }
+
+    #[test]
+    fn channel_scopes_and_optional_settings_parse() {
+        assert!(matches!(
+            parse_command("/model").unwrap(),
+            ChannelCommand::Model { name: None }
+        ));
+        assert!(matches!(
+            parse_command("/reasoning").unwrap(),
+            ChannelCommand::Reasoning { level: None }
+        ));
+        assert!(
+            matches!(parse_command("/list 2").unwrap(), ChannelCommand::List { scope: Some(s), page: None } if s == "2")
+        );
+        assert!(
+            matches!(parse_command(r#"/list "My project" 3"#).unwrap(), ChannelCommand::List { scope: Some(s), page: Some(3) } if s == "My project")
+        );
+        assert!(
+            matches!(parse_command(r#"/use "My project" 21"#).unwrap(), ChannelCommand::Use { session, number: Some(21) } if session == "My project")
+        );
+        assert!(!render_command_help().contains("/plan"));
     }
 
     #[test]

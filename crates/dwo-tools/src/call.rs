@@ -4,8 +4,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::plan::{PlanRequest, validate_entries};
 use crate::terminal::TerminalId;
+use crate::todo::{TodoRequest, validate_entries};
 
 const DEFAULT_YIELD_MS: u64 = 60_000;
 const DEFAULT_TIMEOUT_MS: u64 = 600_000;
@@ -24,7 +24,7 @@ pub enum ToolCall {
     Terminal(TerminalArgs),
     FileEdit(FileEditArgs),
     ReadFile(ReadFileArgs),
-    Plan(PlanRequest),
+    Todo(TodoRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +71,7 @@ pub enum ToolIntent {
     },
     FileEdit,
     ReadFile,
-    Plan,
+    Todo,
 }
 
 impl ToolCall {
@@ -91,7 +91,7 @@ impl ToolCall {
             },
             Self::FileEdit(_) => ToolIntent::FileEdit,
             Self::ReadFile(_) => ToolIntent::ReadFile,
-            Self::Plan(_) => ToolIntent::Plan,
+            Self::Todo(_) => ToolIntent::Todo,
         }
     }
 
@@ -100,7 +100,7 @@ impl ToolCall {
             Self::Terminal(_) => "terminal",
             Self::FileEdit(_) => "file_edit",
             Self::ReadFile(_) => "read_file",
-            Self::Plan(_) => "plan",
+            Self::Todo(_) => "todo",
         }
     }
 }
@@ -144,8 +144,8 @@ impl ParsedToolCall {
             "read_file" => ToolCall::ReadFile(
                 parse_read_file(&arguments).map_err(|message| parse_error(&id, &name, message))?,
             ),
-            "plan" => ToolCall::Plan(
-                parse_plan(&arguments).map_err(|message| parse_error(&id, &name, message))?,
+            "todo" => ToolCall::Todo(
+                parse_todo(&arguments).map_err(|message| parse_error(&id, &name, message))?,
             ),
             _ => return Err(parse_error(&id, &name, format!("Unknown tool: {name}"))),
         };
@@ -157,14 +157,14 @@ impl ParsedToolCall {
     }
 }
 
-fn parse_plan(args: &Map<String, Value>) -> Result<PlanRequest, String> {
-    let mut request: PlanRequest = serde_json::from_value(Value::Object(args.clone()))
-        .map_err(|error| format!("Invalid plan arguments: {error}"))?;
+fn parse_todo(args: &Map<String, Value>) -> Result<TodoRequest, String> {
+    let mut request: TodoRequest = serde_json::from_value(Value::Object(args.clone()))
+        .map_err(|error| format!("Invalid todo arguments: {error}"))?;
     match request.action {
-        crate::plan::PlanAction::Get if !request.entries.is_empty() => {
-            return Err("plan get requires an empty entries array".to_string());
+        crate::todo::TodoAction::Get if !request.entries.is_empty() => {
+            return Err("todo get requires an empty entries array".to_string());
         }
-        crate::plan::PlanAction::Update => validate_entries(&mut request.entries)?,
+        crate::todo::TodoAction::Update => validate_entries(&mut request.entries)?,
         _ => {}
     }
     Ok(request)
@@ -458,24 +458,24 @@ mod tests {
     }
 
     #[test]
-    fn plan_get_requires_empty_entries() {
+    fn todo_get_requires_empty_entries() {
         let parsed = ParsedToolCall::parse(json!({
-            "id":"plan-get",
-            "name":"plan",
+            "id":"todo-get",
+            "name":"todo",
             "arguments":{"action":"get", "entries":[]}
         }))
         .unwrap();
         assert!(matches!(
             parsed.call,
-            ToolCall::Plan(PlanRequest {
-                action: crate::plan::PlanAction::Get,
+            ToolCall::Todo(TodoRequest {
+                action: crate::todo::TodoAction::Get,
                 ref entries,
             }) if entries.is_empty()
         ));
 
         let error = ParsedToolCall::parse(json!({
-            "id":"plan-get",
-            "name":"plan",
+            "id":"todo-get",
+            "name":"todo",
             "arguments":{"action":"get", "entries":[{
                 "content":"no", "priority":"low", "status":"pending"
             }]}

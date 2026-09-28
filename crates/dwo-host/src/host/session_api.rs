@@ -359,12 +359,7 @@ impl Host {
                 EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
                 let turn_id = self
                     .service
-                    .prompt_internal(
-                        &id,
-                        MessageContent::text(
-                            "<resume>Continue the previous task from the current session state.</resume>",
-                        ),
-                    )
+                    .prompt_internal(&id, MessageContent::text(""))
                     .await?;
                 Ok(json!({
                     "accepted": true,

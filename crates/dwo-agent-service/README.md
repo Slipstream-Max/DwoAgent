@@ -168,14 +168,14 @@ model context. A permanently failed or retry-exhausted turn remains idle.
 
 ## Execution plans
 
-Each session may persist one current `ExecutionPlan`. The model-facing `plan`
+Each session may persist one current `ExecutionPlan`. The model-facing `todo`
 tool supports only `get` and `update`; an empty update clears the plan, and a
 plan whose entries are all `completed` or `cancelled` is removed from current
 session state after its terminal update is published.
 
 Plans never start, resume, queue turns, or inject notices into model context.
 Complete plan entries remain solely in `SessionRecord.current_plan` and in the
-plan tool result. `PlanUpdated` is a client/UI event. An empty update clears the
+todo tool result. `PlanUpdated` is a client/UI event. An empty update clears the
 current plan.
 
 Context usage is recomputed from system prompt, messages, reasoning, images,

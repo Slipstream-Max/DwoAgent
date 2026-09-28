@@ -29,16 +29,25 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    run_with_backend_io(AcpBackend::Ipc { config_path }, stdin, stdout).await
+}
+
+pub(super) async fn run_with_backend_io<R, W>(
+    backend: AcpBackend,
+    stdin: R,
+    stdout: W,
+) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
     let eof = CancellationToken::new();
     let transport = ByteStreams::new(
         stdout.compat_write(),
         EofReader::new(stdin, eof.clone()).compat(),
     );
     let runtime = AcpRuntime {
-        backend: AcpBackend::Ipc {
-            config_path: config_path.clone(),
-        },
-        config_path,
+        backend,
         observers: Arc::new(Mutex::new(HashMap::new())),
         prompt_waiters: Arc::new(Mutex::new(HashMap::new())),
         pending_cancels: PendingCancels::default(),
@@ -86,12 +95,12 @@ where
                 if let Err(error) = validate_new_session(&request) {
                     return responder.respond_with_error(invalid_params(error));
                 }
-                let value = match ipc::request_acp(
-                    &new_runtime.config_path,
-                    "session.new",
-                    json!({"cwd": request.cwd.into_inner(), "title": Value::Null}),
-                )
-                .await
+                let value = match new_runtime
+                    .request(
+                        "session.new",
+                        json!({"cwd": request.cwd.into_inner(), "title": Value::Null}),
+                    )
+                    .await
                 {
                     Ok(value) => value,
                     Err(error) => return responder.respond_with_error(internal_error(error)),
@@ -148,7 +157,7 @@ where
                     Ok(request) => request,
                     Err(error) => return responder.respond_with_error(invalid_params(error)),
                 };
-                let sessions = match list_sessions(&list_runtime.config_path, request).await {
+                let sessions = match list_sessions(&list_runtime, request).await {
                     Ok(sessions) => sessions,
                     Err(error) => return responder.respond_with_error(internal_error(error)),
                 };
@@ -272,22 +281,22 @@ fn agent_capabilities() -> v2::AgentCapabilities {
 }
 
 async fn list_sessions(
-    config_path: &Path,
+    runtime: &AcpRuntime,
     request: v2::ListSessionsRequest,
 ) -> Result<Vec<v2::SessionInfo>> {
-    let value = ipc::request_acp(
-        config_path,
-        "session.list",
-        json!({
-            "all": true,
-            "cursor": request.cursor.as_ref().map(ToString::to_string),
-            "cwd": request
-                .cwd
-                .as_ref()
-                .map(|cwd| AsRef::<Path>::as_ref(cwd).to_path_buf()),
-        }),
-    )
-    .await?;
+    let value = runtime
+        .request(
+            "session.list",
+            json!({
+                "all": true,
+                "cursor": request.cursor.as_ref().map(ToString::to_string),
+                "cwd": request
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| AsRef::<Path>::as_ref(cwd).to_path_buf()),
+            }),
+        )
+        .await?;
     let page: dwo_agent_service::SessionListPage =
         serde_json::from_value(value).unwrap_or_default();
     Ok(page
@@ -422,7 +431,9 @@ async fn run_prompt(
             return;
         }
     };
-    let replaces_pending_cancel = runtime.pending_cancels.consume(&session_id);
+    // Local commands must not turn Send now's preliminary cancel into
+    // a real cancellation. Only ordinary replacement prompts use that fallback.
+    let replaces_pending_cancel = runtime.pending_cancels.consume(&session_id) && command.is_none();
     let prepared = match prepare_observer(&runtime, &session_id, false).await {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -447,23 +458,22 @@ async fn run_prompt(
                 &snapshot,
                 dwo_command::session_status::SessionIdDisplay::Full,
             );
-            ipc::request_acp(
-                &runtime.config_path,
-                "session.notify",
-                json!({
-                    "session_id": session_id,
-                    "endpoint_id": observer.endpoint_id,
-                    "category": "status",
-                    "level": "info",
-                    "text": text,
-                    "data": {},
-                }),
-            )
-            .await?;
+            runtime
+                .request(
+                    "session.notify",
+                    json!({
+                        "session_id": session_id,
+                        "endpoint_id": observer.endpoint_id,
+                        "category": "status",
+                        "level": "info",
+                        "text": text,
+                        "data": {},
+                    }),
+                )
+                .await?;
             anyhow::Ok(())
         }
         .await;
-        forward_rejected_replacement(&runtime, &session_id, replaces_pending_cancel);
         match result {
             Ok(()) => {
                 let _ = responder.respond(v1::PromptResponse::new(v1::StopReason::EndTurn));
@@ -473,6 +483,33 @@ async fn run_prompt(
             }
         }
         return;
+    }
+    if command == Some(SlashCommand::Cancel) {
+        match runtime
+            .request("session.cancel", json!({"session_id": session_id}))
+            .await
+        {
+            Ok(_) => {
+                let _ = responder.respond(v1::PromptResponse::new(v1::StopReason::Cancelled));
+            }
+            Err(error) => {
+                let _ = responder.respond_with_error(internal_error(error));
+            }
+        }
+        return;
+    }
+    if command == Some(SlashCommand::Resume) {
+        match load_status_snapshot(&runtime, &session_id).await {
+            Ok(snapshot) if snapshot.active_turn_id.is_some() => {
+                let _ = responder.respond(v1::PromptResponse::new(v1::StopReason::EndTurn));
+                return;
+            }
+            Err(error) => {
+                let _ = responder.respond_with_error(internal_error(error));
+                return;
+            }
+            _ => {}
+        }
     }
     let (sender, completion) = oneshot::channel();
     {
@@ -544,6 +581,7 @@ async fn submit_prompt(
             "session.compact",
             json!({"session_id": session_id, "endpoint_id": observer.endpoint_id}),
         ),
+        Some(SlashCommand::Cancel) => ("session.cancel", json!({"session_id": session_id})),
         Some(SlashCommand::Resume) => (
             "session.resume-turn",
             json!({"session_id": session_id, "endpoint_id": observer.endpoint_id}),
@@ -559,7 +597,7 @@ async fn submit_prompt(
             }),
         ),
     };
-    ipc::request_acp(&runtime.config_path, method, params).await
+    runtime.request(method, params).await
 }
 
 async fn set_config_option(
@@ -573,12 +611,12 @@ async fn set_config_option(
     let Some(value) = request.value.as_id().map(ToString::to_string) else {
         return responder.respond_with_error(invalid_params("session config value must be an id"));
     };
-    let changed = match ipc::request_acp(
-        &runtime.config_path,
-        "session.set_config_option",
-        json!({"session_id": session_id, "config_id": config_id, "value": value}),
-    )
-    .await
+    let changed = match runtime
+        .request(
+            "session.set_config_option",
+            json!({"session_id": session_id, "config_id": config_id, "value": value}),
+        )
+        .await
     {
         Ok(changed) => changed,
         Err(error) => return responder.respond_with_error(internal_error(error)),
@@ -610,12 +648,9 @@ async fn set_config_option(
 }
 
 async fn delete_session(runtime: &AcpRuntime, session_id: String) -> Result<()> {
-    ipc::request_acp(
-        &runtime.config_path,
-        "session.delete",
-        json!({"session_id": session_id}),
-    )
-    .await?;
+    runtime
+        .request("session.delete", json!({"session_id": session_id}))
+        .await?;
     runtime.observers.lock().await.remove(&session_id);
     Ok(())
 }

@@ -142,7 +142,7 @@ impl LoadedAgentProfile {
             .iter()
             .map(|path| ExternalRuleFile::new(resolve_profile_path(&root, path), root.clone()))
             .collect();
-        SystemPromptBuilder::new(Some(root.clone()), root.clone())
+        SystemPromptBuilder::new(root.clone(), root.clone())
             .with_external_skill_dirs(Arc::new(RwLock::new(external_skill_dirs.clone())))
             .with_external_rule_files(Arc::new(RwLock::new(external_rule_files.clone())))
             .build_initial()

@@ -6,7 +6,7 @@ use dwo_agent_service::{
     CompactionAccepted, ConfirmationDecision, EndpointId, PromptAccepted, SessionConfigUpdate,
     SessionId, SessionListItem, SessionListQuery, SessionSnapshot, SessionSubscription, TurnId,
 };
-use dwo_channels::{ChannelHost, ChannelManager, SessionCreateRequest};
+use dwo_channels::{ChannelHost, ChannelManager, ChannelSessionItem, SessionCreateRequest};
 use dwo_context::MessageContent;
 
 use super::{Host, HostSessionOptions};
@@ -46,9 +46,97 @@ impl ChannelHost for Host {
         }
     }
 
+    async fn session_options(&self, id: &SessionId) -> Result<dwo_protocol::SessionOptions> {
+        let record = self.service.snapshot(id).await?.record;
+        let models = self
+            .profile
+            .read()
+            .expect("profile lock poisoned")
+            .model_options
+            .clone();
+        Ok(serde_json::from_value(serde_json::to_value(
+            super::SessionOptionSnapshot {
+                config: record.config(),
+                models,
+            },
+        )?)?)
+    }
+
+    async fn list_channel_sessions(
+        &self,
+        project: Option<&str>,
+    ) -> Result<Vec<ChannelSessionItem>> {
+        let project = project
+            .map(|name| resolve_project(self, name))
+            .transpose()?;
+        let sessions = <Self as ChannelHost>::list_sessions(self, false, None).await?;
+        let mut rows = Vec::new();
+        for session in sessions {
+            let assignment = self.projects.locate_session(session.session_id.as_str());
+            if project.is_none() && assignment.is_some() {
+                continue;
+            }
+            let section = if let Some(project) = &project {
+                let Some(assignment) = project
+                    .session_assignments
+                    .iter()
+                    .find(|a| a.session_id == session.session_id.as_str())
+                else {
+                    continue;
+                };
+                let section = project
+                    .sections
+                    .iter()
+                    .find(|s| s.id == assignment.section_id);
+                section.map(|s| (s.order, s.name.clone()))
+            } else {
+                None
+            };
+            let finished = self
+                .service
+                .status(&session.session_id)
+                .await?
+                .last_turn_finished_at_ms
+                .unwrap_or(0);
+            rows.push((section, finished, session));
+        }
+        rows.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.updated_at.cmp(&a.2.updated_at))
+                .then_with(|| a.2.session_id.as_str().cmp(b.2.session_id.as_str()))
+        });
+        Ok(rows
+            .into_iter()
+            .map(|(section, _, session)| ChannelSessionItem {
+                session,
+                section: section.map(|(_, name)| name),
+            })
+            .collect())
+    }
+
     async fn create_session(&self, request: SessionCreateRequest) -> Result<SessionSnapshot> {
+        let project = request
+            .project
+            .as_deref()
+            .map(|name| resolve_project(self, name))
+            .transpose()?;
+        let section_id = match (&project, request.section.as_deref()) {
+            (Some(project), Some(name)) => {
+                let matches: Vec<_> = project.sections.iter().filter(|s| s.name == name).collect();
+                anyhow::ensure!(
+                    matches.len() == 1,
+                    "Section '{name}' is missing or ambiguous"
+                );
+                Some(matches[0].id.clone())
+            }
+            (None, Some(_)) => anyhow::bail!("A section requires a project"),
+            _ => None,
+        };
         let id = self
             .create_session(HostSessionOptions {
+                project_id: project.map(|p| p.id),
+                section_id,
                 title: request.title,
                 cwd: request.cwd,
                 from: request.from,
@@ -71,8 +159,8 @@ impl ChannelHost for Host {
         Ok(self.service.snapshot(id).await?)
     }
 
-    async fn delete_session(&self, id: &SessionId) -> Result<()> {
-        Host::delete_session(self, id).await
+    async fn archive_session(&self, id: &SessionId) -> Result<()> {
+        Host::archive_session(self, id).await
     }
 
     async fn cancel_session(&self, id: &SessionId, expected_turn_id: Option<TurnId>) -> Result<()> {
@@ -115,5 +203,138 @@ impl ChannelHost for Host {
         content: MessageContent,
     ) -> Result<PromptAccepted> {
         Host::prompt_session(self, id, endpoint, content).await
+    }
+}
+
+fn resolve_project(host: &Host, name: &str) -> Result<dwo_project::Project> {
+    let matches: Vec<_> = host
+        .projects
+        .list()
+        .into_iter()
+        .filter(|p| p.name == name)
+        .collect();
+    anyhow::ensure!(
+        matches.len() == 1,
+        "Project '{name}' is missing or ambiguous"
+    );
+    Ok(matches.into_iter().next().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn channel_creation_scopes_and_archive_preserve_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(super::super::tests::write_test_profile(root.path()))
+            .await
+            .unwrap();
+        let project = host
+            .projects
+            .create(dwo_project::CreateProject {
+                name: Some("My project".into()),
+                pwd: root.path().to_path_buf(),
+            })
+            .unwrap();
+        let section = host
+            .projects
+            .create_section(&project.id, "Development".into(), Some("#ffffff".into()))
+            .unwrap();
+        let plain = <Host as ChannelHost>::create_session(&host, SessionCreateRequest::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            plain.record.info.workspace,
+            dwo_agent_service::SessionWorkspace::Managed
+        ));
+        assert!(
+            host.projects
+                .locate_session(plain.record.info.id.as_str())
+                .is_none()
+        );
+        let default = <Host as ChannelHost>::create_session(
+            &host,
+            SessionCreateRequest {
+                project: Some("My project".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host.projects
+                .locate_session(default.record.info.id.as_str())
+                .unwrap()
+                .1
+                .section_id,
+            project.default_section_id
+        );
+        let scoped = <Host as ChannelHost>::create_session(
+            &host,
+            SessionCreateRequest {
+                project: Some("My project".into()),
+                section: Some("Development".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host.projects
+                .locate_session(scoped.record.info.id.as_str())
+                .unwrap()
+                .1
+                .section_id,
+            section.id
+        );
+        assert_eq!(
+            host.list_channel_sessions(Some("My project"))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(host.list_channel_sessions(None).await.unwrap().len(), 1);
+        assert!(
+            <Host as ChannelHost>::create_session(
+                &host,
+                SessionCreateRequest {
+                    project: Some("Missing".into()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            <Host as ChannelHost>::create_session(
+                &host,
+                SessionCreateRequest {
+                    project: Some("My project".into()),
+                    section: Some("Missing".into()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        <Host as ChannelHost>::archive_session(&host, &scoped.record.info.id)
+            .await
+            .unwrap();
+        assert!(
+            host.service
+                .is_archived(&scoped.record.info.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            host.list_channel_sessions(Some("My project"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        host.shutdown().await;
     }
 }

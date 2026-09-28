@@ -866,13 +866,13 @@ impl SessionService {
     }
 
     fn prompt_builder(&self, cwd: PathBuf) -> SystemPromptBuilder {
-        SystemPromptBuilder::new(Some(self.profile_root.clone()), cwd)
+        SystemPromptBuilder::new(self.profile_root.clone(), cwd)
             .with_external_skill_dirs(self.external_skill_dirs.clone())
             .with_external_rule_files(self.external_rule_files.clone())
             .with_tool_prompt(dwo_tools::prompt::tools())
-            .with_subsession_prompt(dwo_tools::prompt::SUBSESSIONS)
-            .with_automation_prompt(dwo_tools::prompt::AUTOMATION)
-            .with_channel_prompt(dwo_tools::prompt::CHANNELS)
+            .with_subsession_prompt(crate::prompt::SUBSESSIONS)
+            .with_automation_prompt(crate::prompt::AUTOMATION)
+            .with_channel_prompt(crate::prompt::CHANNELS)
     }
 }
 

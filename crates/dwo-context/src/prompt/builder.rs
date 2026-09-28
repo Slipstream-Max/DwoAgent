@@ -9,8 +9,6 @@ use super::environment::EnvironmentSnapshot;
 use super::skills::{self, SkillSnapshot};
 use super::{ChannelCapabilitySnapshot, xml_block, xml_escape};
 
-const FALLBACK_AGENT_PROMPT: &str =
-    "You are an agent. Follow the user request and use the available tools when needed.";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProfilePaths {
     pub root: PathBuf,
@@ -93,7 +91,7 @@ impl SystemPromptBlock {
 
 #[derive(Debug, Clone)]
 pub struct SystemPromptBuilder {
-    profile: Option<AgentProfilePaths>,
+    profile: AgentProfilePaths,
     cwd: PathBuf,
     external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
     profile_rule_files: Arc<RwLock<Vec<ExternalRuleFile>>>,
@@ -104,9 +102,9 @@ pub struct SystemPromptBuilder {
 }
 
 impl SystemPromptBuilder {
-    pub fn new(profile_root: Option<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
+    pub fn new(profile_root: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
         Self {
-            profile: profile_root.map(AgentProfilePaths::new),
+            profile: AgentProfilePaths::new(profile_root),
             cwd: cwd.into(),
             external_skill_dirs: Arc::new(RwLock::new(Vec::new())),
             profile_rule_files: Arc::new(RwLock::new(Vec::new())),
@@ -145,10 +143,6 @@ impl SystemPromptBuilder {
     pub fn with_channel_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.channel_prompt = Some(prompt.into());
         self
-    }
-
-    pub fn profile(&self) -> Option<&AgentProfilePaths> {
-        self.profile.as_ref()
     }
 
     pub fn build_initial(&self) -> Result<SystemPromptBlock, PromptBuildError> {
@@ -196,20 +190,15 @@ impl SystemPromptBuilder {
     }
 
     fn read_agent_prompt(&self) -> Result<String, PromptBuildError> {
-        let Some(profile) = &self.profile else {
-            return Ok(FALLBACK_AGENT_PROMPT.to_string());
-        };
-        read_required_nonempty(&profile.system_prompt)
+        read_required_nonempty(&self.profile.system_prompt)
     }
 
     fn read_agents_rules(&self) -> Result<Vec<RuleSnapshot>, PromptBuildError> {
         let mut rules = Vec::new();
-        if let Some(profile) = &self.profile
-            && let Some(content) = read_optional_nonempty(&profile.agents_rules)?
-        {
+        if let Some(content) = read_optional_nonempty(&self.profile.agents_rules)? {
             rules.push(RuleSnapshot {
-                path: resolve_or_original(&profile.agents_rules),
-                pwd: resolve_or_original(&profile.root),
+                path: resolve_or_original(&self.profile.agents_rules),
+                pwd: resolve_or_original(&self.profile.root),
                 content,
             });
         }
@@ -254,12 +243,10 @@ impl SystemPromptBuilder {
 
     fn read_skills(&self) -> Result<Vec<SkillSnapshot>, PromptBuildError> {
         let mut skills = Vec::new();
-        if let Some(profile) = &self.profile {
-            skills.extend(
-                skills::scan(&profile.skills)
-                    .map_err(|error| PromptBuildError::Skills(error.to_string()))?,
-            );
-        }
+        skills.extend(
+            skills::scan(&self.profile.skills)
+                .map_err(|error| PromptBuildError::Skills(error.to_string()))?,
+        );
         let external = self
             .external_skill_dirs
             .read()
@@ -285,9 +272,7 @@ impl SystemPromptBuilder {
     }
 
     fn read_channels(&self) -> Vec<ChannelCapabilitySnapshot> {
-        self.profile.as_ref().map_or_else(Vec::new, |profile| {
-            ChannelCapabilitySnapshot::scan(&profile.root)
-        })
+        ChannelCapabilitySnapshot::scan(&self.profile.root)
     }
 }
 

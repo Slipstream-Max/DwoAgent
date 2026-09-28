@@ -39,7 +39,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use clap::ValueEnum;
 use dwo_agent_service::{ExecutionPlan, SessionListPage};
 use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
-use dwo_tools::{PlanEntry, PlanEntryPriority, PlanEntryStatus};
+use dwo_tools::{TodoEntry, TodoEntryPriority, TodoEntryStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -65,8 +65,6 @@ pub enum AcpProtocol {
 
 #[derive(Clone)]
 struct AcpRuntime {
-    // Retained only for the ACP v1 stdio shim, whose adapter remains IPC-only.
-    config_path: PathBuf,
     backend: AcpBackend,
     observers: Arc<Mutex<HashMap<String, Arc<SessionObserver>>>>,
     prompt_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<PromptCompletion>>>>,
@@ -358,16 +356,11 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let config_path = match &backend {
-        AcpBackend::Ipc { config_path } => config_path.clone(),
-        AcpBackend::Host { .. } => PathBuf::new(),
-    };
     let eof = CancellationToken::new();
     let stdin = EofReader::new(stdin, eof.clone()).compat();
     let stdout = stdout.compat_write();
     let transport = ByteStreams::new(stdout, stdin);
     let runtime = AcpRuntime {
-        config_path,
         backend,
         observers: Arc::new(Mutex::new(HashMap::new())),
         prompt_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -736,6 +729,11 @@ async fn run_prompt(
                         "endpoint_id": observer.endpoint_id,
                     }),
                 )
+                .await
+        }
+        Some(SlashCommand::Cancel) => {
+            runtime
+                .request("session.cancel", json!({"session_id": session_id}))
                 .await
         }
         Some(SlashCommand::Resume) => {
@@ -1487,8 +1485,8 @@ fn v2_plan_update_value(plan: &ExecutionPlan) -> SessionUpdate {
     )))
 }
 
-fn v1_plan_entry(entry: &PlanEntry) -> Value {
-    if entry.status == PlanEntryStatus::Cancelled {
+fn v1_plan_entry(entry: &TodoEntry) -> Value {
+    if entry.status == TodoEntryStatus::Cancelled {
         json!({
             "content":format!("[cancelled] {}", entry.content),
             "priority":entry.priority,
@@ -1500,17 +1498,17 @@ fn v1_plan_entry(entry: &PlanEntry) -> Value {
     }
 }
 
-fn v2_plan_entry(entry: &PlanEntry) -> AcpPlanEntry {
+fn v2_plan_entry(entry: &TodoEntry) -> AcpPlanEntry {
     let priority = match entry.priority {
-        PlanEntryPriority::High => AcpPlanEntryPriority::High,
-        PlanEntryPriority::Medium => AcpPlanEntryPriority::Medium,
-        PlanEntryPriority::Low => AcpPlanEntryPriority::Low,
+        TodoEntryPriority::High => AcpPlanEntryPriority::High,
+        TodoEntryPriority::Medium => AcpPlanEntryPriority::Medium,
+        TodoEntryPriority::Low => AcpPlanEntryPriority::Low,
     };
     let status = match entry.status {
-        PlanEntryStatus::Pending => AcpPlanEntryStatus::Pending,
-        PlanEntryStatus::InProgress => AcpPlanEntryStatus::InProgress,
-        PlanEntryStatus::Completed => AcpPlanEntryStatus::Completed,
-        PlanEntryStatus::Cancelled => AcpPlanEntryStatus::Other("cancelled".to_string()),
+        TodoEntryStatus::Pending => AcpPlanEntryStatus::Pending,
+        TodoEntryStatus::InProgress => AcpPlanEntryStatus::InProgress,
+        TodoEntryStatus::Completed => AcpPlanEntryStatus::Completed,
+        TodoEntryStatus::Cancelled => AcpPlanEntryStatus::Other("cancelled".to_string()),
     };
     AcpPlanEntry::new(&entry.content, priority, status)
 }
@@ -1552,13 +1550,7 @@ fn available_commands(options: ipc_schema::PromptDirectiveOptions) -> Vec<Availa
             "status",
             "Show the current session ID, model, and reasoning",
         ),
-        AvailableCommand::new(
-            "plan",
-            "Pause and plan together before acting, without writing code",
-        )
-        .input(AvailableCommandInput::Text(TextCommandInput::new(
-            "optional context",
-        ))),
+        AvailableCommand::new("cancel", "Cancel the active turn"),
     ];
     // ACP has free-text command input but no schema for completing individual arguments.
     // Publishing the directive and name together lets clients complete `/skill review `.
@@ -2438,6 +2430,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_status_resume_and_reloaded_cancel_control_the_daemon_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Hold local model requests open, without contacting any real provider.
+        let model_task = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                streams.push(listener.accept().await.unwrap().0);
+            }
+        });
+        std::fs::create_dir_all(root.path().join("resource/prompts")).unwrap();
+        std::fs::write(root.path().join("resource/prompts/System.md"), "Test agent").unwrap();
+        let config = root.path().join("profile.yaml");
+        std::fs::write(&config, format!("policyMode: full_access\nmodel:\n  default:\n    model: deepseek/deepseek-v4-pro\n  providers:\n    deepseek:\n      baseUrl: http://{address}/v1\n      apiKey: test\n")).unwrap();
+        let host = Host::build(&config).await.unwrap();
+        let id = host
+            .create_session(dwo_host::HostSessionOptions {
+                title: Some("Test".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (mut input, agent_input) = tokio::io::duplex(65536);
+        let (agent_output, output) = tokio::io::duplex(65536);
+        let mut output = BufReader::new(output);
+        let backend = AcpBackend::Host {
+            host: host.clone(),
+            client_id: "test".into(),
+        };
+        let acp_task = tokio::spawn(frontend_v1::run_with_backend_io(
+            backend.clone(),
+            agent_input,
+            agent_output,
+        ));
+        async fn send(input: &mut tokio::io::DuplexStream, value: Value) {
+            input
+                .write_all(format!("{value}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        async fn response(output: &mut BufReader<tokio::io::DuplexStream>, id: u64) -> Value {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(output.read_line(&mut line).await.unwrap(), 0);
+                    let value: Value = serde_json::from_str(&line).unwrap();
+                    if value["id"] == id {
+                        assert!(value.get("error").is_none(), "{value}");
+                        return value;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+        send(&mut input, json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":1,"clientCapabilities":{}}})).await;
+        response(&mut output, 1).await;
+        send(&mut input, json!({"jsonrpc":"2.0", "id":2, "method":"session/prompt", "params":{"sessionId":id,"prompt":[{"type":"text","text":"Wait for my instructions"}]}})).await;
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let s = backend
+                    .request("session.snapshot", json!({"session_id":id}))
+                    .await
+                    .unwrap();
+                if s["phase"] == "running" {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let turn = snapshot["active_turn_id"].clone();
+        // Zed Send now: cancel, wait for old prompt response, then /status.
+        send(
+            &mut input,
+            json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}}),
+        )
+        .await;
+        assert_eq!(
+            response(&mut output, 2).await["result"]["stopReason"],
+            "cancelled"
+        );
+        send(&mut input, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"/status"}]}})).await;
+        response(&mut output, 3).await;
+        tokio::time::sleep(SEND_NOW_GRACE_PERIOD + Duration::from_millis(100)).await;
+        let before = backend
+            .request("session.snapshot", json!({"session_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(before["active_turn_id"], turn);
+        // Manual compaction cannot race the running turn's context updates.
+        assert!(
+            backend
+                .request(
+                    "session.compact",
+                    json!({"session_id":id,"endpoint_id":"test"})
+                )
+                .await
+                .is_err()
+        );
+        send(&mut input, json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"/resume"}]}})).await;
+        response(&mut output, 4).await;
+        // Exercise the actor's own running-resume guard too.
+        backend
+            .request(
+                "session.resume-turn",
+                json!({"session_id":id,"endpoint_id":"test"}),
+            )
+            .await
+            .unwrap();
+        let after = backend
+            .request("session.snapshot", json!({"session_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(after["active_turn_id"], turn);
+        assert_eq!(
+            after["record"]["context"]["messages"],
+            before["record"]["context"]["messages"]
+        );
+        send(
+            &mut input,
+            json!({"jsonrpc":"2.0","id":5,"method":"session/close","params":{"sessionId":id}}),
+        )
+        .await;
+        response(&mut output, 5).await;
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), acp_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (mut input, agent_input) = tokio::io::duplex(65536);
+        let (agent_output, output) = tokio::io::duplex(65536);
+        let mut output = BufReader::new(output);
+        let acp_task = tokio::spawn(frontend_v1::run_with_backend_io(
+            backend.clone(),
+            agent_input,
+            agent_output,
+        ));
+        send(&mut input, json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":1,"clientCapabilities":{}}})).await;
+        response(&mut output, 1).await;
+        send(&mut input, json!({"jsonrpc":"2.0","id":6,"method":"session/load","params":{"sessionId":id,"cwd":before["record"]["info"]["cwd"],"mcpServers":[]}})).await;
+        response(&mut output, 6).await;
+        send(&mut input, json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"/cancel"}]}})).await;
+        response(&mut output, 7).await;
+        let idle = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let s = backend
+                    .request("session.snapshot", json!({"session_id":id}))
+                    .await
+                    .unwrap();
+                if s["phase"] == "idle" {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        backend
+            .request(
+                "session.resume-turn",
+                json!({"session_id":id,"endpoint_id":"test"}),
+            )
+            .await
+            .unwrap();
+        let resumed = backend
+            .request("session.snapshot", json!({"session_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(resumed["phase"], "running");
+        assert_ne!(resumed["active_turn_id"], turn);
+        // Environment refresh may update the system message; no extra message is appended.
+        let messages = resumed["record"]["context"]["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            idle["record"]["context"]["messages"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+        assert!(
+            !serde_json::to_string(messages)
+                .unwrap()
+                .contains("<resume>")
+        );
+        backend
+            .request("session.cancel", json!({"session_id":id}))
+            .await
+            .unwrap();
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), acp_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        host.shutdown().await;
+        model_task.abort();
+    }
+
+    #[tokio::test]
     async fn acp_exits_when_the_client_closes_stdin() {
         let (client_stdin, agent_stdin) = tokio::io::duplex(1024);
         let (agent_stdout, _client_stdout) = tokio::io::duplex(1024);
@@ -2588,10 +2783,13 @@ mod tests {
         assert_eq!(json["availableCommands"][1]["name"], "resume");
         assert_eq!(json["availableCommands"][2]["name"], "fork");
         assert_eq!(json["availableCommands"][3]["name"], "status");
-        assert_eq!(json["availableCommands"][4]["name"], "plan");
-        assert_eq!(
-            json["availableCommands"][4]["input"]["hint"],
-            "optional context"
+        assert_eq!(json["availableCommands"][4]["name"], "cancel");
+        assert!(
+            json["availableCommands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["name"] != "plan")
         );
         assert_eq!(json["availableCommands"][5]["name"], "skill review");
         assert_eq!(

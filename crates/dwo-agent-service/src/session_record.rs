@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwo_context::{ContentBlock, MessageContent, SessionContext};
-use dwo_tools::{PlanEntry, PlanEntryStatus, SessionMode};
+use dwo_tools::{SessionMode, TodoEntry, TodoEntryStatus};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -57,11 +57,11 @@ pub const DEFAULT_MAX_MODEL_STEPS: usize = 100;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     pub id: String,
-    pub entries: Vec<PlanEntry>,
+    pub entries: Vec<TodoEntry>,
 }
 
 impl ExecutionPlan {
-    pub fn new(entries: Vec<PlanEntry>) -> Self {
+    pub fn new(entries: Vec<TodoEntry>) -> Self {
         Self {
             id: format!("plan-{}", Uuid::new_v4()),
             entries,
@@ -76,7 +76,7 @@ impl ExecutionPlan {
         let mut plan = self.clone();
         for entry in &mut plan.entries {
             if !entry.status.is_terminal() {
-                entry.status = PlanEntryStatus::Cancelled;
+                entry.status = TodoEntryStatus::Cancelled;
             }
         }
         plan

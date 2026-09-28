@@ -4,19 +4,19 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-pub const MAX_PLAN_ENTRIES: usize = 50;
-pub const MAX_PLAN_CONTENT_CHARS: usize = 100;
+pub const MAX_TODO_ENTRIES: usize = 50;
+pub const MAX_TODO_CONTENT_CHARS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PlanAction {
+pub enum TodoAction {
     Get,
     Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PlanEntryPriority {
+pub enum TodoEntryPriority {
     High,
     Medium,
     Low,
@@ -24,14 +24,14 @@ pub enum PlanEntryPriority {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PlanEntryStatus {
+pub enum TodoEntryStatus {
     Pending,
     InProgress,
     Completed,
     Cancelled,
 }
 
-impl PlanEntryStatus {
+impl TodoEntryStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
     }
@@ -39,52 +39,52 @@ impl PlanEntryStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlanEntry {
+pub struct TodoEntry {
     pub content: String,
-    pub priority: PlanEntryPriority,
-    pub status: PlanEntryStatus,
+    pub priority: TodoEntryPriority,
+    pub status: TodoEntryStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlanRequest {
-    pub action: PlanAction,
+pub struct TodoRequest {
+    pub action: TodoAction,
     #[serde(default)]
-    pub entries: Vec<PlanEntry>,
+    pub entries: Vec<TodoEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanResponse {
+pub struct TodoResponse {
     pub updated: bool,
     pub cleared: bool,
-    pub entries: Vec<PlanEntry>,
+    pub entries: Vec<TodoEntry>,
 }
 
-pub type PlanHandler = Arc<
-    dyn Fn(PlanRequest) -> Pin<Box<dyn Future<Output = Result<PlanResponse, String>> + Send>>
+pub type TodoHandler = Arc<
+    dyn Fn(TodoRequest) -> Pin<Box<dyn Future<Output = Result<TodoResponse, String>> + Send>>
         + Send
         + Sync,
 >;
 
-pub fn validate_entries(entries: &mut [PlanEntry]) -> Result<(), String> {
-    if entries.len() > MAX_PLAN_ENTRIES {
-        return Err(format!("plan entries must not exceed {MAX_PLAN_ENTRIES}"));
+pub fn validate_entries(entries: &mut [TodoEntry]) -> Result<(), String> {
+    if entries.len() > MAX_TODO_ENTRIES {
+        return Err(format!("todo entries must not exceed {MAX_TODO_ENTRIES}"));
     }
     let mut in_progress = 0;
     for entry in entries {
         entry.content = entry.content.trim().to_string();
         if entry.content.is_empty() {
-            return Err("plan entry content must not be empty".to_string());
+            return Err("todo entry content must not be empty".to_string());
         }
-        if entry.content.chars().count() > MAX_PLAN_CONTENT_CHARS {
+        if entry.content.chars().count() > MAX_TODO_CONTENT_CHARS {
             return Err(format!(
-                "plan entry content must not exceed {MAX_PLAN_CONTENT_CHARS} characters"
+                "todo entry content must not exceed {MAX_TODO_CONTENT_CHARS} characters"
             ));
         }
-        in_progress += usize::from(entry.status == PlanEntryStatus::InProgress);
+        in_progress += usize::from(entry.status == TodoEntryStatus::InProgress);
     }
     if in_progress > 1 {
-        return Err("at most one plan entry can be in_progress".to_string());
+        return Err("at most one todo entry can be in_progress".to_string());
     }
     Ok(())
 }

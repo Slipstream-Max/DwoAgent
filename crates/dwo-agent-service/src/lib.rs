@@ -6,6 +6,7 @@ mod error;
 mod events;
 mod permission;
 mod profile;
+mod prompt;
 mod repository;
 mod session;
 mod session_record;

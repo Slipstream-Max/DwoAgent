@@ -40,13 +40,13 @@ niubash（`niu.exe`）；Unix 使用 `sh`。环境快照中的 `shell` 字段与
 结果中的 summary、failed 和 skipped 会列出成功数量、失败的操作与原因、以及被跳过的操作，
 便于模型只补发缺失的部分。
 
-## plan
+## todo
 
-读取或完整替换当前 Session 的执行计划。它只更新计划，不会启动另一轮模型调用。turn 结束仍有
-未完成计划时，daemon 会保存计划并等待新的 prompt 或 /resume。
+读取或完整替换当前 Session 的执行清单。它只更新清单，不会启动另一轮模型调用。turn 结束仍有
+未完成条目时，daemon 会保存清单并等待新的 prompt 或 /resume。
 
-计划条目包含 content、priority 和 status。status 可为 pending、in_progress、completed 或
-cancelled；清空 entries 就是清除计划。
+清单条目包含 content、priority 和 status。status 可为 pending、in_progress、completed 或
+cancelled；清空 entries 就是清除清单。
 
 ## 权限
 

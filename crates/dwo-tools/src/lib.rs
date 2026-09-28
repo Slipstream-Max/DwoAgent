@@ -5,7 +5,6 @@ mod exec;
 pub mod file_edit;
 pub mod images;
 pub mod manager;
-pub mod plan;
 pub mod policy;
 pub mod prompt;
 mod read_file;
@@ -14,17 +13,18 @@ pub mod schema;
 mod telemetry;
 pub mod terminal;
 mod text_encoding;
+pub mod todo;
 
 pub use call::{ParsedToolCall, ToolCall, ToolCallParseError, ToolIntent};
 pub use file_edit::FileEditManager;
 pub use manager::{
     ConfirmationDecision, ConfirmationHandler, ConfirmationRequest, ExecutionContext, ToolManager,
 };
-pub use plan::{
-    PlanAction, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanHandler, PlanRequest,
-    PlanResponse,
-};
 pub use policy::{Authorization, CommandRule, PolicyConfig, SessionMode, ToolPolicyEngine};
 pub use result::ToolResult;
 pub use telemetry::{ToolEvent, ToolEventHandler};
 pub use terminal::{TerminalId, TerminalManager};
+pub use todo::{
+    TodoAction, TodoEntry, TodoEntryPriority, TodoEntryStatus, TodoHandler, TodoRequest,
+    TodoResponse,
+};

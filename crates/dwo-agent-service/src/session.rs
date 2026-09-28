@@ -8,7 +8,7 @@ use dwo_context::{
     PendingContextMessage, SessionContext, SystemPromptBuilder,
 };
 use dwo_model_client::{ModelClient, ModelClientError, ModelReply, ModelSelection};
-use dwo_tools::{ConfirmationDecision, PlanAction, PlanRequest, PlanResponse, ToolManager};
+use dwo_tools::{ConfirmationDecision, TodoAction, TodoRequest, TodoResponse, ToolManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -131,10 +131,10 @@ pub(crate) enum ActorEvent {
         context: Box<SessionContext>,
         completed: oneshot::Sender<anyhow::Result<()>>,
     },
-    Plan {
+    Todo {
         turn_id: TurnId,
-        request: PlanRequest,
-        completed: oneshot::Sender<Result<PlanResponse, String>>,
+        request: TodoRequest,
+        completed: oneshot::Sender<Result<TodoResponse, String>>,
     },
     CompactionFinished {
         compaction_id: String,
@@ -679,6 +679,16 @@ impl SessionActor {
                 self.record.info.id.clone(),
             ));
         }
+        // Resume is an empty internal prompt. Check atomically inside the actor,
+        // before any context, expiry, or steering changes (including cancellation).
+        if matches!(&input, PromptInput::Internal { content } if content.is_empty())
+            && let Some(active) = &self.active
+        {
+            return Ok(PromptReceipt {
+                turn_id: active.id.clone(),
+                message_id: None,
+            });
+        }
         if self.phase == RuntimePhase::Cancelling {
             return Err(SessionServiceError::PromptCancelled(
                 self.record.info.id.clone(),
@@ -776,7 +786,7 @@ impl SessionActor {
         let mut context = ContextManager::new(self.record.context.clone());
         if is_user {
             context.append_user(content.clone());
-        } else {
+        } else if !content.is_empty() {
             context.append_internal(MessageKind::Runtime, content.clone());
         }
         context.refresh_usage(self.tools.schemas());
@@ -1139,6 +1149,11 @@ impl SessionActor {
         &mut self,
         origin: EndpointId,
     ) -> Result<CompactionAccepted, SessionServiceError> {
+        if self.phase != RuntimePhase::Idle {
+            return Err(SessionServiceError::SessionBusy(
+                self.record.info.id.clone(),
+            ));
+        }
         let previous_usage = self.usage_snapshot();
         let previous_model = self
             .record
@@ -1552,7 +1567,7 @@ impl SessionActor {
                 }
                 let _ = completed.send(result);
             }
-            ActorEvent::Plan {
+            ActorEvent::Todo {
                 turn_id,
                 request,
                 completed,
@@ -1563,8 +1578,8 @@ impl SessionActor {
                     .is_none_or(|active| active.id != turn_id)
                 {
                     Err("turn is no longer active".to_string())
-                } else if request.action == PlanAction::Get {
-                    Ok(plan_response(
+                } else if request.action == TodoAction::Get {
+                    Ok(todo_response(
                         false,
                         false,
                         self.record
@@ -1589,7 +1604,7 @@ impl SessionActor {
                         .as_ref()
                         .is_some_and(|plan| plan.entries == request.entries)
                     {
-                        let _ = completed.send(Ok(plan_response(false, false, request.entries)));
+                        let _ = completed.send(Ok(todo_response(false, false, request.entries)));
                         return ActorControl::Continue;
                     } else {
                         let mut plan = self
@@ -1614,7 +1629,7 @@ impl SessionActor {
                                     cleared,
                                 })
                                 .await;
-                            Ok(plan_response(true, cleared, plan.entries))
+                            Ok(todo_response(true, cleared, plan.entries))
                         }
                         Err(error) => Err(format!("persist plan: {error:#}")),
                     }
@@ -1931,8 +1946,8 @@ fn terminal_tool_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "canceled")
 }
 
-fn plan_response(updated: bool, cleared: bool, entries: Vec<dwo_tools::PlanEntry>) -> PlanResponse {
-    PlanResponse {
+fn todo_response(updated: bool, cleared: bool, entries: Vec<dwo_tools::TodoEntry>) -> TodoResponse {
+    TodoResponse {
         updated,
         cleared,
         entries,

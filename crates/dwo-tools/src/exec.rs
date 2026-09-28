@@ -158,9 +158,9 @@ pub(crate) async fn execute(
                     result.output
                 })
         }
-        ToolCall::Plan(request) => {
-            let Some(handler) = &context.plan else {
-                return result_error(&id, &name, "plan handler is not available");
+        ToolCall::Todo(request) => {
+            let Some(handler) = &context.todo else {
+                return result_error(&id, &name, "todo handler is not available");
             };
             handler(request)
                 .await

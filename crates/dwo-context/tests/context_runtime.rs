@@ -10,6 +10,12 @@ fn write(path: &std::path::Path, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
+fn minimal_profile(root: &std::path::Path) -> std::path::PathBuf {
+    let profile = root.join("profile");
+    write(&profile.join("resource/prompts/System.md"), "Test agent");
+    profile
+}
+
 #[test]
 fn responses_are_stored_item_first_and_provider_private_items_are_trimmed_on_switch() {
     let mut manager = ContextManager::new(SessionContext {
@@ -92,7 +98,7 @@ fn selection_normalization_permanently_removes_unsupported_images() {
 #[test]
 fn usage_estimates_the_complete_context_without_provider_token_fields() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
+    let builder = SystemPromptBuilder::new(minimal_profile(root.path()), root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     let tools = vec![json!({"type":"function","function":{"name":"terminal"}})];
 
@@ -142,7 +148,7 @@ fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
         "---\nname: demo\ndescription: Demo skill\n---\nInstructions",
     );
 
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone());
+    let builder = SystemPromptBuilder::new(profile.clone(), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     let prompt = manager.system_prompt();
     assert!(prompt.contains("Profile system prompt"));
@@ -195,7 +201,7 @@ fn prompt_discovers_project_agents_rules_and_skills() {
         "---\nname: shared\ndescription: Project shared skill\n---\nProject version",
     );
 
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone());
+    let builder = SystemPromptBuilder::new(profile.clone(), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     let prompt = manager.system_prompt();
     assert!(prompt.contains("resource rule"));
@@ -256,7 +262,7 @@ fn prompt_discovers_external_skill_dirs_and_applies_project_priority() {
     );
 
     let dirs = std::sync::Arc::new(std::sync::RwLock::new(vec![external.clone()]));
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone())
+    let builder = SystemPromptBuilder::new(profile.clone(), cwd.clone())
         .with_external_skill_dirs(dirs.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     let prompt = manager.system_prompt();
@@ -298,7 +304,7 @@ fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
         "You are an agent.",
     )
     .unwrap();
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd)
+    let builder = SystemPromptBuilder::new(profile.clone(), cwd)
         .with_channel_prompt("Channel command guidance");
     let mut manager = ContextManager::initialize(&builder).unwrap();
     assert!(manager.system_prompt().contains("<channels>"));
@@ -344,7 +350,7 @@ fn prompt_adds_and_removes_adapter_projected_channel_capabilities() {
 #[test]
 fn prompt_renders_command_guidance_in_separate_xml_blocks() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path())
+    let builder = SystemPromptBuilder::new(minimal_profile(root.path()), root.path())
         .with_tool_prompt("tool guidance")
         .with_subsession_prompt("subsession guidance")
         .with_automation_prompt("automation guidance")
@@ -371,7 +377,7 @@ fn retired_server_config_does_not_block_startup_or_trigger_environment_updates()
     let retired = profile.join("resource/mcp/mcp.json");
     write(&retired, "invalid old configuration");
     std::fs::create_dir_all(&cwd).unwrap();
-    let builder = SystemPromptBuilder::new(Some(profile), cwd);
+    let builder = SystemPromptBuilder::new(profile, cwd);
     let mut manager = ContextManager::initialize(&builder).unwrap();
     assert!(!manager.system_prompt().contains("<mcp>"));
     write(
@@ -399,7 +405,7 @@ fn content_blocks_round_trip_through_context_storage() {
 #[test]
 fn tool_batch_places_image_context_after_every_tool_result() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
+    let builder = SystemPromptBuilder::new(minimal_profile(root.path()), root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     manager.append_tool_batch(vec![
         ToolResultRecord {
@@ -430,7 +436,7 @@ fn tool_batch_places_image_context_after_every_tool_result() {
 #[test]
 fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
+    let builder = SystemPromptBuilder::new(minimal_profile(root.path()), root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     manager.append_user("inspect the project");
     manager.append_assistant_with_reasoning(
@@ -490,7 +496,7 @@ fn prompt_discovers_and_watches_workspace_rules() {
     );
     write(&workspace_rules, "workspace rule v1");
 
-    let builder = SystemPromptBuilder::new(Some(profile), cwd.clone());
+    let builder = SystemPromptBuilder::new(profile, cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     let prompt = manager.system_prompt();
     assert!(prompt.contains("workspace rule v1"));
@@ -527,7 +533,7 @@ fn prompt_watches_profile_rule_file_content_and_list_changes() {
     let profile_rules = std::sync::Arc::new(std::sync::RwLock::new(vec![
         dwo_context::ExternalRuleFile::new(first.clone(), profile.clone()),
     ]));
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd)
+    let builder = SystemPromptBuilder::new(profile.clone(), cwd)
         .with_external_rule_files(profile_rules.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     assert!(manager.system_prompt().contains("profile rule v1"));
@@ -553,7 +559,7 @@ fn prompt_watches_profile_rule_file_content_and_list_changes() {
 #[test]
 fn historical_and_reserved_users_share_one_token_budget() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
+    let builder = SystemPromptBuilder::new(minimal_profile(root.path()), root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     for index in 1..=4 {
         manager.append_user(format!("HEAD-{index}-{}-TAIL-{index}", "you".repeat(40)));
@@ -579,7 +585,7 @@ fn historical_and_reserved_users_share_one_token_budget() {
 #[test]
 fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
+    let builder = SystemPromptBuilder::new(minimal_profile(root.path()), root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     manager.append_user("inspect");
     manager.append_assistant(
@@ -614,7 +620,7 @@ fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
 #[test]
 fn compaction_projection_preserves_images_only_for_image_capable_models() {
     let root = tempfile::tempdir().unwrap();
-    let builder = SystemPromptBuilder::new(None, root.path());
+    let builder = SystemPromptBuilder::new(minimal_profile(root.path()), root.path());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     for index in 1..=2 {
         manager.append_user(MessageContent::blocks(vec![
@@ -683,7 +689,7 @@ fn compaction_rebuild_absorbs_current_rules_and_reestimates_usage() {
     std::fs::create_dir_all(&cwd).unwrap();
     write(&profile.join("resource/prompts/System.md"), "system v1");
     write(&cwd.join("AGENTS.md"), "cwd rules v1");
-    let builder = SystemPromptBuilder::new(Some(profile.clone()), cwd.clone());
+    let builder = SystemPromptBuilder::new(profile.clone(), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     manager.append_user("hello");
 

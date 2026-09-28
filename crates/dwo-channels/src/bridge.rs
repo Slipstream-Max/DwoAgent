@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -108,7 +109,7 @@ pub struct SessionBridge {
     replay_turns: usize,
     output_mode: ChannelOutputMode,
     selected_session_id: Mutex<Option<String>>,
-    session_choices: Mutex<Vec<String>>,
+    session_choices: Mutex<HashMap<Option<String>, Vec<super::ChannelSessionItem>>>,
     transport: Arc<dyn ConversationTransport>,
     observer: Mutex<Option<SessionObserver>>,
 }
@@ -130,7 +131,7 @@ impl SessionBridge {
             replay_turns,
             output_mode,
             selected_session_id: Mutex::new(selected_session_id),
-            session_choices: Mutex::new(Vec::new()),
+            session_choices: Mutex::new(HashMap::new()),
             transport,
             observer: Mutex::new(None),
         }
@@ -139,45 +140,66 @@ impl SessionBridge {
     pub async fn execute(&self, command: ChannelCommand) -> Result<Vec<String>> {
         let messages = match command {
             ChannelCommand::Help => vec![render_command_help()],
-            ChannelCommand::List => {
-                let records = self.host.list_sessions(true, None).await?;
+            ChannelCommand::List { scope, page } => {
+                let (project, page) = list_scope(scope, page)?;
+                let cached = self.session_choices.lock().await.get(&project).cloned();
+                let records = if page == 1 || cached.is_none() {
+                    self.host.list_channel_sessions(project.as_deref()).await?
+                } else {
+                    cached.unwrap()
+                };
+                const PAGE_SIZE: usize = 20;
+                let pages = records.len().div_ceil(PAGE_SIZE).max(1);
+                anyhow::ensure!(page <= pages, "Page {page} does not exist (1..={pages})");
                 let selected = self.selected_session_id.lock().await.clone();
-                let choices = records
-                    .iter()
-                    .map(|record| record.session_id.to_string())
-                    .collect::<Vec<_>>();
-                *self.session_choices.lock().await = choices;
-                let text = records
+                let mut lines = vec![format!(
+                    "{} — {page}/{pages}",
+                    project.as_deref().unwrap_or("Inbox")
+                )];
+                let mut section = None;
+                for (index, item) in records
                     .iter()
                     .enumerate()
-                    .map(|(index, record)| {
-                        format!(
-                            "{} {}. {} [{}]",
-                            if selected.as_deref() == Some(record.session_id.as_str()) {
-                                "*"
-                            } else {
-                                " "
-                            },
-                            index + 1,
-                            short_session_title(&record.title),
-                            short_session_id(&record.session_id),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                vec![if text.is_empty() {
-                    "No sessions".to_string()
-                } else {
-                    text
-                }]
+                    .skip((page - 1) * PAGE_SIZE)
+                    .take(PAGE_SIZE)
+                {
+                    if item.section != section {
+                        section = item.section.clone();
+                        if let Some(name) = &section {
+                            lines.push(format!("[{name}]"));
+                        }
+                    }
+                    let record = &item.session;
+                    lines.push(format!(
+                        "{} {}. {} [{}]",
+                        if selected.as_deref() == Some(record.session_id.as_str()) {
+                            "*"
+                        } else {
+                            " "
+                        },
+                        index + 1,
+                        short_session_title(&record.title),
+                        short_session_id(&record.session_id)
+                    ));
+                }
+                if records.is_empty() {
+                    lines.push("No sessions".into());
+                }
+                if page < pages {
+                    lines.push(match &project {
+                        Some(name) => format!("Next: /list \"{name}\" {}", page + 1),
+                        None => format!("Next: /list {}", page + 1),
+                    });
+                }
+                self.session_choices.lock().await.insert(project, records);
+                vec![lines.join("\n")]
             }
-            ChannelCommand::New { name, cwd } => {
-                let title = (!name.is_empty()).then(|| name.join(" "));
+            ChannelCommand::New { project, section } => {
                 let snapshot = self
                     .host
                     .create_session(SessionCreateRequest {
-                        title,
-                        cwd,
+                        project,
+                        section,
                         ..SessionCreateRequest::default()
                     })
                     .await?;
@@ -203,8 +225,15 @@ impl SessionBridge {
                     snapshot.record.info.id, snapshot.record.info.title
                 )]
             }
-            ChannelCommand::Use { session: reference } => {
-                let id = self.resolve_session_reference(&reference).await?;
+            ChannelCommand::Use {
+                session: reference,
+                number,
+            } => {
+                let id = if let Some(number) = number {
+                    self.resolve_list_number(Some(&reference), number).await?
+                } else {
+                    self.resolve_session_reference(&reference).await?
+                };
                 let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
                 self.select_session(&id).await?;
                 let subscription = self
@@ -228,11 +257,11 @@ impl SessionBridge {
             ChannelCommand::Del { session: reference } => {
                 let id = self.resolve_session_reference(&reference).await?;
                 let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
-                self.host.delete_session(&session_id).await?;
+                self.host.archive_session(&session_id).await?;
                 if self.selected_session_id.lock().await.as_deref() == Some(id.as_str()) {
                     self.set_selected_session(None).await?;
                 }
-                vec!["Session deleted".to_string()]
+                vec!["Session archived".to_string()]
             }
             ChannelCommand::Cancel => {
                 self.host
@@ -253,29 +282,70 @@ impl SessionBridge {
                 self.ensure_observer(&id).await?;
                 let _ = self
                     .host
-                    .prompt_internal(
-                        &id,
-                        MessageContent::text(
-                            "<resume>Continue the previous task from the current session state.</resume>",
-                        ),
-                    )
+                    .prompt_internal(&id, MessageContent::text(""))
                     .await?;
                 Vec::new()
             }
-            ChannelCommand::Model { name: model } => {
+            ChannelCommand::Model { name } => {
                 let id = self.selected_session_id().await?;
-                self.host
-                    .set_session_config(&id, SessionConfigUpdate::Model(model))
-                    .await?;
-                vec!["Model updated".to_string()]
+                let options = self.host.session_options(&id).await?;
+                if let Some(name) = name {
+                    let model = resolve_model(&options.models, &name)?;
+                    self.host
+                        .set_session_config(&id, SessionConfigUpdate::Model(model.id.clone()))
+                        .await?;
+                    vec![format!("Model: {}", model.id)]
+                } else {
+                    vec![render_models(&options)]
+                }
             }
             ChannelCommand::Reasoning { level } => {
-                let reasoning = (level != "off").then_some(level);
                 let id = self.selected_session_id().await?;
-                self.host
-                    .set_session_config(&id, SessionConfigUpdate::Reasoning(reasoning))
-                    .await?;
-                vec!["Reasoning updated".to_string()]
+                let options = self.host.session_options(&id).await?;
+                let model = options
+                    .models
+                    .iter()
+                    .find(|m| m.id == options.config.model)
+                    .context("Current model is unavailable")?;
+                if let Some(level) = level {
+                    anyhow::ensure!(
+                        model.reasoning.iter().any(|r| r.id == level),
+                        "Unsupported reasoning '{level}' for {}",
+                        model.id
+                    );
+                    self.host
+                        .set_session_config(&id, SessionConfigUpdate::Reasoning(Some(level)))
+                        .await?;
+                    let current = self.host.session_options(&id).await?;
+                    vec![format!(
+                        "Reasoning: {}",
+                        current
+                            .config
+                            .reasoning
+                            .as_deref()
+                            .unwrap_or(&model.default_reasoning)
+                    )]
+                } else {
+                    vec![format!(
+                        "Model: {}\nReasoning: {}\nSupported: {}",
+                        model.id,
+                        options
+                            .config
+                            .reasoning
+                            .as_deref()
+                            .unwrap_or(&model.default_reasoning),
+                        if model.reasoning.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            model
+                                .reasoning
+                                .iter()
+                                .map(|r| r.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    )]
+                }
             }
             ChannelCommand::Policy { mode } => {
                 let id = self.selected_session_id().await?;
@@ -407,13 +477,7 @@ impl SessionBridge {
             anyhow::bail!("Session reference must not be empty");
         }
         if let Ok(index) = reference.parse::<usize>() {
-            let choices = self.session_choices.lock().await;
-            let Some(id) = index.checked_sub(1).and_then(|index| choices.get(index)) else {
-                anyhow::bail!(
-                    "Session number {index} is not in the last /list result; send /list first"
-                );
-            };
-            return Ok(id.clone());
+            return self.resolve_list_number(None, index).await;
         }
         if let Ok(id) = SessionId::parse(reference.to_string()) {
             return Ok(id.to_string());
@@ -439,6 +503,15 @@ impl SessionBridge {
                     .join(", ")
             ),
         }
+    }
+
+    async fn resolve_list_number(&self, project: Option<&str>, number: usize) -> Result<String> {
+        let choices = self.session_choices.lock().await;
+        let id = choices
+            .get(&project.map(str::to_string))
+            .and_then(|rows| number.checked_sub(1).and_then(|i| rows.get(i)));
+        id.map(|item| item.session.session_id.to_string())
+            .context("Number is not in the saved list; run /list for this scope first")
     }
 
     async fn permission_request(&self, requested: Option<String>) -> Result<String> {
@@ -495,6 +568,74 @@ impl SessionBridge {
     }
 }
 
+fn list_scope(scope: Option<String>, page: Option<usize>) -> Result<(Option<String>, usize)> {
+    let (project, page) = match (scope, page) {
+        (None, None) => (None, 1),
+        (Some(scope), None) => match scope.parse::<usize>() {
+            Ok(page) => (None, page),
+            Err(_) => (Some(scope), 1),
+        },
+        (Some(project), Some(page)) => (Some(project), page),
+        (None, Some(_)) => anyhow::bail!("Page requires a scope"),
+    };
+    anyhow::ensure!(page > 0, "Page numbers start at 1");
+    Ok((project, page))
+}
+
+fn resolve_model<'a>(
+    models: &'a [dwo_protocol::SessionModelOption],
+    name: &str,
+) -> Result<&'a dwo_protocol::SessionModelOption> {
+    // A canonical provider/model ID is always an exact selection.
+    if let Some(model) = models.iter().find(|model| model.id == name) {
+        return Ok(model);
+    }
+    let matches: Vec<_> = models
+        .iter()
+        .filter(|m| {
+            format!("{}/{}", m.provider, m.name) == name
+                || m.name == name
+                || m.id.strip_prefix(&format!("{}/", m.provider)) == Some(name)
+        })
+        .collect();
+    match matches.as_slice() {
+        [model] => Ok(model),
+        [] => anyhow::bail!("Unknown model '{name}'; use /model to list models"),
+        _ => anyhow::bail!(
+            "Ambiguous model '{name}'; specify provider/model: {}",
+            matches
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn render_models(options: &dwo_protocol::SessionOptions) -> String {
+    let mut models: Vec<_> = options.models.iter().collect();
+    models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
+    let mut lines = vec![format!("Current model: {}", options.config.model)];
+    let mut provider = None;
+    for model in models {
+        if provider != Some(&model.provider) {
+            provider = Some(&model.provider);
+            lines.push(format!("[{}]", model.provider));
+        }
+        lines.push(format!(
+            "{} {} ({})",
+            if model.id == options.config.model {
+                "*"
+            } else {
+                " "
+            },
+            model.id,
+            model.name
+        ));
+    }
+    lines.join("\n")
+}
+
 fn short_session_title(title: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
@@ -518,6 +659,30 @@ fn session_id_matches(id: &SessionId, reference: &str) -> bool {
 #[cfg(test)]
 mod session_reference_tests {
     use super::*;
+
+    #[test]
+    fn list_pages_require_positive_numbers_and_keep_project_scope() {
+        assert_eq!(list_scope(None, None).unwrap(), (None, 1));
+        assert_eq!(list_scope(Some("2".into()), None).unwrap(), (None, 2));
+        assert_eq!(
+            list_scope(Some("Project".into()), Some(2)).unwrap(),
+            (Some("Project".into()), 2)
+        );
+        assert!(list_scope(Some("0".into()), None).is_err());
+    }
+
+    #[test]
+    fn duplicate_model_names_require_provider_qualification() {
+        let models: Vec<dwo_protocol::SessionModelOption> = serde_json::from_value(serde_json::json!([
+            {"id":"a/model", "name":"Shared", "provider":"a", "reasoning":[], "defaultReasoning":"auto"},
+            {"id":"b/model", "name":"Shared", "provider":"b", "reasoning":[], "defaultReasoning":"auto"}
+        ])).unwrap();
+        assert!(resolve_model(&models, "Shared").is_err());
+        assert!(resolve_model(&models, "model").is_err());
+        assert_eq!(resolve_model(&models, "a/model").unwrap().id, "a/model");
+        assert_eq!(resolve_model(&models, "b/Shared").unwrap().id, "b/model");
+        assert!(resolve_model(&models, "missing").is_err());
+    }
 
     #[test]
     fn short_ids_are_copyable_without_the_session_prefix() {

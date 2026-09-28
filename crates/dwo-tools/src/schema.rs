@@ -7,16 +7,16 @@ pub fn tool_schemas() -> Vec<Value> {
         terminal_schema(),
         read_file_schema(),
         file_edit_schema(),
-        plan_schema(),
+        todo_schema(),
     ]
 }
 
-pub fn plan_schema() -> Value {
+pub fn todo_schema() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "plan",
-            "description": "Read or replace the current session execution plan. This tool never starts another turn.",
+            "name": "todo",
+            "description": "Read or replace the current session todo list. This tool never starts another turn.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -161,8 +161,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_schema_requires_action_and_entries() {
-        let parameters = &plan_schema()["function"]["parameters"];
+    fn todo_schema_requires_action_and_entries() {
+        let parameters = &todo_schema()["function"]["parameters"];
         assert_eq!(parameters["required"], json!(["action", "entries"]));
         assert_eq!(
             parameters["properties"]["entries"]["items"]["additionalProperties"],

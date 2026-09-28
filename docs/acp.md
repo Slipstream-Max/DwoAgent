@@ -54,7 +54,7 @@ macOS/Linux: /home/<user>/.dwoagent/bin/dwo
 Zed 的旧 v1 Send now 会先发送 cancel 再发送替代 Prompt。Adapter 提供 500ms 配对窗口：同一
 连接和 Session 在窗口内收到新 Prompt 时，把它作为排队消息，不真正取消底层 Turn；没有后续
 Prompt 时，cancel 正常生效；如果连接在窗口内断开（关闭窗口或客户端），待生效的 cancel 会随
-连接一起丢弃，不会中断 daemon 中仍在运行的 Turn。这是唯一的 Zed 时序兼容行为。
+连接一起丢弃，不会中断 daemon 中仍在运行的 Turn。本地命令（例如 /status、/resume）会消耗配对 cancel 而不取消 Turn；显式 /cancel 除外。
 
 ## Session
 
@@ -89,13 +89,17 @@ Provider Hosted Tool 在远端执行，不经过本地工具权限确认，但�
 
 ## Slash Commands 和计划
 
-ACP 会发布 /compact、/resume、/fork、/status、/plan，以及当前 Catalog 中的
+ACP 会发布 /cancel、/compact、/resume、/fork、/status，以及当前 Catalog 中的
 /skill <name>。语法和消息平台差异见 [Slash Commands](slash-commands.md)。
 
-plan 工具的普通 Tool Lifecycle 不直接显示；ACP v2 使用 plan_update，v1 使用兼容的 plan
+todo 工具的普通 Tool Lifecycle 不直接显示；ACP v2 使用 plan_update，v1 使用兼容的 plan
 Session Update。计划不会自动启动下一 Turn，只有新 Prompt 或 /resume 会继续。
 
 ACP 协议自己的 session/resume 是重新连接已有 Session，不会调用模型；它和 /resume 不是一件事。
+/resume 在空闲时直接使用已有上下文启动 Turn，不追加提示消息；运行中静默忽略。
+
+v1 重新 load 可以恢复消息和工具事件，但没有 v2 的 state_update，客户端可能不恢复 Cancel 按钮。
+此时可发送 /cancel 停止后台任务。v2 会同步运行状态；按钮表现仍取决于客户端实现。
 
 ## 权限
 

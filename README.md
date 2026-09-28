@@ -27,7 +27,7 @@ OpenClaw 功能很全，代价是常驻内存、组件数量和整体复杂度�
 | 亮点 | 说明 |
 | --- | --- |
 | **Rust 原生实现** | daemon 和 agent loop 运行在同一个原生二进制中，基础 daemon 实际常驻内存约 `6 MB`，也能处理多个并行 session。内存占用会随活跃 session、channel 连接变化。 |
-| **克制的内置工具** | 直接执行的内置工具只有 terminal、read_file、file_edit 和 plan；更多能力通过 skills 和外部命令按需扩展。 |
+| **克制的内置工具** | 直接执行的内置工具只有 terminal、read_file、file_edit 和 todo；更多能力通过 skills 和外部命令按需扩展。 |
 | **模型与 Provider** | 内置 OpenAI、DeepSeek、Grok、Qwen、智谱等 Model List，统一走 Responses API；本地工具与 Provider 托管的 Web Search 可以出现在同一轮，并作为正常工具事件回放。 |
 | **多平台接入** | 本地支持 CLI 和 ACP（IDE），远程支持微信、Telegram、飞书/Lark、QQ Bot；WebSocket 另有 /acp 和 /dwo 两条独立入口；图片和文件也能进入 session。 |
 | **多端接力** | 同一个 session 可以同时被 CLI、ACP 和各个 channel 使用：任意已连接端点都能查看进度、取消任务、处理权限请求和继续发消息；运行中的新消息按 FIFO 排队，在模型响应或工具调用的边界加入当前 turn。 |

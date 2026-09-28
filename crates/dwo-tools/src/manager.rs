@@ -10,10 +10,10 @@ use serde_json::Value;
 use crate::ToolEventHandler;
 use crate::call::ParsedToolCall;
 use crate::file_edit::FileEditManager;
-use crate::plan::PlanHandler;
 use crate::policy::{SessionMode, ToolPolicyEngine};
 use crate::result::ToolResult;
 use crate::terminal::TerminalManager;
+use crate::todo::TodoHandler;
 
 pub type ConfirmationHandler = Arc<
     dyn Fn(ConfirmationRequest) -> Pin<Box<dyn Future<Output = ConfirmationDecision> + Send>>
@@ -41,7 +41,7 @@ pub struct ExecutionContext {
     pub confirmation: Option<ConfirmationHandler>,
     pub allow_image_input: bool,
     pub events: Option<ToolEventHandler>,
-    pub plan: Option<PlanHandler>,
+    pub todo: Option<TodoHandler>,
 }
 
 impl ExecutionContext {
@@ -51,7 +51,7 @@ impl ExecutionContext {
             confirmation: None,
             allow_image_input: false,
             events: None,
-            plan: None,
+            todo: None,
         }
     }
 }

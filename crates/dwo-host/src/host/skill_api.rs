@@ -182,7 +182,7 @@ pub(super) fn skill_snapshots(
             }
         })
         .collect();
-    SystemPromptBuilder::new(Some(profile_root.to_path_buf()), cwd.to_path_buf())
+    SystemPromptBuilder::new(profile_root.to_path_buf(), cwd.to_path_buf())
         .with_external_skill_dirs(Arc::new(RwLock::new(external_dirs)))
         .scan_skills()
 }

@@ -32,6 +32,14 @@ pub struct SessionCreateRequest {
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,
     pub from: Option<SessionId>,
+    pub project: Option<String>,
+    pub section: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ChannelSessionItem {
+    pub session: SessionListItem,
+    pub section: Option<String>,
 }
 
 #[async_trait]
@@ -44,6 +52,9 @@ pub trait ChannelHost: Send + Sync {
         all: bool,
         caller: Option<&SessionId>,
     ) -> Result<Vec<SessionListItem>>;
+    async fn list_channel_sessions(&self, project: Option<&str>)
+    -> Result<Vec<ChannelSessionItem>>;
+    async fn session_options(&self, id: &SessionId) -> Result<dwo_protocol::SessionOptions>;
     async fn create_session(&self, request: SessionCreateRequest) -> Result<SessionSnapshot>;
     async fn subscribe_session(
         &self,
@@ -52,7 +63,7 @@ pub trait ChannelHost: Send + Sync {
         checkpoint_cursor: Option<usize>,
     ) -> Result<SessionSubscription>;
     async fn session_snapshot(&self, id: &SessionId) -> Result<SessionSnapshot>;
-    async fn delete_session(&self, id: &SessionId) -> Result<()>;
+    async fn archive_session(&self, id: &SessionId) -> Result<()>;
     async fn cancel_session(&self, id: &SessionId, expected_turn_id: Option<TurnId>) -> Result<()>;
     async fn compact_session(
         &self,

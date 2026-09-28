@@ -14,6 +14,7 @@ chrono.workspace = true
 dwo-agent-service = { path = "../dwo-agent-service" }
 dwo-command = { path = "../dwo-command" }
 dwo-context = { path = "../dwo-context" }
+dwo-protocol = { path = "../dwo-protocol" }
 dwo-tools = { path = "../dwo-tools" }
 futures.workspace = true
 getrandom.workspace = true

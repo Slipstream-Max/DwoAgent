@@ -295,7 +295,7 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
             reasoning,
             tool_calls: active_tool_calls
                 .iter()
-                .filter(|call| call.tool_name != "plan")
+                .filter(|call| call.tool_name != "todo")
                 .chain(remote_tool_calls.iter())
                 .cloned()
                 .collect(),
@@ -342,7 +342,7 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
 
         for mut call in active_tool_calls
             .into_iter()
-            .filter(|call| call.tool_name != "plan")
+            .filter(|call| call.tool_name != "todo")
         {
             call.status = "in_progress".to_string();
             turn.emit(TurnUpdate::ToolChanged {
@@ -354,22 +354,22 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
         let mut execution = ExecutionContext::new(turn.config.borrow().mode);
         execution.confirmation = Some(turn.permission.confirmation_handler());
         execution.allow_image_input = model_step.allow_image_input;
-        let plan_actor = turn.actor.clone();
-        let plan_turn_id = turn.turn_id.clone();
-        execution.plan = Some(Arc::new(move |request| {
-            let actor = plan_actor.clone();
-            let turn_id = plan_turn_id.clone();
+        let todo_actor = turn.actor.clone();
+        let todo_turn_id = turn.turn_id.clone();
+        execution.todo = Some(Arc::new(move |request| {
+            let actor = todo_actor.clone();
+            let turn_id = todo_turn_id.clone();
             Box::pin(async move {
                 let (completed, wait) = oneshot::channel();
                 actor
-                    .send(ActorEvent::Plan {
+                    .send(ActorEvent::Todo {
                         turn_id,
                         request,
                         completed,
                     })
                     .map_err(|_| "session actor stopped".to_string())?;
                 wait.await
-                    .map_err(|_| "session actor dropped plan request".to_string())?
+                    .map_err(|_| "session actor dropped todo request".to_string())?
             })
         }));
         let actor = turn.actor.clone();
@@ -408,7 +408,7 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
                 status = result.output.get("status").and_then(|value| value.as_str()),
                 "tool call completed"
             );
-            if result.tool_name != "plan" {
+            if result.tool_name != "todo" {
                 turn.emit(TurnUpdate::ToolCompleted {
                     turn_id: turn.turn_id.clone(),
                     result: result.clone(),

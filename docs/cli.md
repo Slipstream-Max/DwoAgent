@@ -54,7 +54,7 @@ keep 将临时 Session 转为持久 Session。完整行为见 [Session](session.
 dwo project list
 dwo project get <project-id>
 dwo project create [name] --cwd <path>
-dwo project update <project-id> <name>
+dwo project update <project-id> [name] [--cwd <path>]
 dwo project delete <project-id>
 ~~~
 

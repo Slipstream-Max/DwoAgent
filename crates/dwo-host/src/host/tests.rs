@@ -502,3 +502,83 @@ async fn project_pwd_change_rebinds_all_sessions() {
     assert_eq!(PathBuf::from(project["pwd"].as_str().unwrap()), after);
     host.shutdown().await;
 }
+
+#[tokio::test]
+async fn failed_project_repair_keeps_the_link_and_retries_on_the_next_load() {
+    let root = tempfile::tempdir().unwrap();
+    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let project_pwd = root.path().join("retrying-project");
+    std::fs::create_dir_all(&project_pwd).unwrap();
+    let project = host
+        .handle_method(
+            "project.create",
+            json!({"name": "Retrying", "pwd": &project_pwd}),
+        )
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let session = host
+        .handle_method(
+            "session.new",
+            json!({
+                "title": "retrier",
+                "cwd": null,
+                "project_id": project_id,
+                "section_id": null,
+                "worktree_id": null,
+                "caller_session_id": null,
+            }),
+        )
+        .await
+        .unwrap();
+    let session_id = SessionId::parse(session["session_id"].as_str().unwrap().to_string())
+        .map_err(anyhow::Error::msg)
+        .unwrap();
+    let expected_project_dir = std::fs::canonicalize(&project_pwd).unwrap();
+
+    // Block the would-be project workspace with a regular file so the repair fails.
+    host.service.unload(&session_id).await.unwrap();
+    std::fs::remove_dir_all(&project_pwd).unwrap();
+    let blocked = root.path().join("runtime/workspaces").join(&project_id);
+    std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    std::fs::write(&blocked, "blocked").unwrap();
+
+    // The load still succeeds, served from a managed directory, and the record keeps
+    // pointing at the project so the next load retries.
+    host.service.load(&session_id).await.unwrap();
+    let snapshot = host.service.snapshot(&session_id).await.unwrap();
+    assert!(matches!(
+        snapshot.record.info.workspace,
+        SessionWorkspace::External { .. }
+    ));
+    let managed = std::fs::canonicalize(
+        root.path()
+            .join("runtime/workspaces")
+            .join(session_id.as_str()),
+    )
+    .unwrap();
+    assert_eq!(snapshot.record.info.cwd, managed);
+    let project = host
+        .handle_method("project.get", json!({"project_id": project_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        PathBuf::from(project["pwd"].as_str().unwrap()),
+        expected_project_dir
+    );
+
+    // Unblock and reload: the retry goes through and re-points the project and session.
+    std::fs::remove_file(&blocked).unwrap();
+    host.service.unload(&session_id).await.unwrap();
+    host.service.load(&session_id).await.unwrap();
+    let workspace =
+        std::fs::canonicalize(root.path().join("runtime/workspaces").join(&project_id)).unwrap();
+    let snapshot = host.service.snapshot(&session_id).await.unwrap();
+    assert_eq!(snapshot.record.info.cwd, workspace);
+    let project = host
+        .handle_method("project.get", json!({"project_id": project_id}))
+        .await
+        .unwrap();
+    assert_eq!(PathBuf::from(project["pwd"].as_str().unwrap()), workspace);
+    host.shutdown().await;
+}

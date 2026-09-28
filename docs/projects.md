@@ -80,6 +80,9 @@ Session 使用 Project root 或 Job 指定的 Worktree；Global Automation 可�
 全量重挂到新目录。没有 Project 归属的会话获得自己的 managed workspace
 （`runtime/workspaces/<session-id>`）。修改 Project pwd 时，其全部会话同样立即全量重挂到新目录。
 
+修复失败不会阻塞会话打开：本次加载临时使用该会话的 managed workspace 服务，会话保持与原
+Project 的关联不变，下次加载自动重试修复。
+
 ## Section 与归属
 
 ~~~text

@@ -475,32 +475,43 @@ impl SessionService {
                         .read()
                         .expect("session workspace repairer lock poisoned")
                         .clone();
-                    let repaired = match repairer {
+                    // A failed repair must not block this load: serve it from a managed
+                    // directory while keeping the record pointing at the project so the
+                    // next load retries the repair.
+                    enum Repair {
+                        Rebound(SessionWorkspace, PathBuf),
+                        Unavailable,
+                        Failed,
+                    }
+                    let repair = match repairer {
                         Some(repairer) => match repairer(record.info.id.clone()).await {
-                            Ok(repaired) => repaired,
+                            Ok(Some((workspace, path))) => Repair::Rebound(workspace, path),
+                            Ok(None) => Repair::Unavailable,
                             Err(error) => {
                                 tracing::warn!(
                                     session_id = %record.info.id,
                                     error = %error,
-                                    "workspace repair failed; falling back to a managed workspace"
+                                    "workspace repair failed; serving a managed workspace and \
+                                     retrying on the next load"
                                 );
-                                None
+                                Repair::Failed
                             }
                         },
-                        None => None,
+                        None => Repair::Unavailable,
                     };
-                    match repaired {
-                        Some((workspace, path)) => {
+                    match repair {
+                        Repair::Rebound(workspace, path) => {
                             workspace_repaired = record.info.workspace != workspace;
                             record.info.workspace = workspace;
                             std::fs::canonicalize(&path).map_err(anyhow::Error::from)?
                         }
-                        None => {
+                        Repair::Unavailable => {
                             workspace_repaired =
                                 !matches!(&record.info.workspace, SessionWorkspace::Managed);
                             record.info.workspace = SessionWorkspace::Managed;
                             self.repair_workspace(&record.info.id).await?
                         }
+                        Repair::Failed => self.repair_workspace(&record.info.id).await?,
                     }
                 }
             },

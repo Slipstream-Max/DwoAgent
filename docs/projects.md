@@ -14,7 +14,8 @@ runtime/
 |- automations/global/history.yaml
 |- sessions/<session-id>/...
 |- sessions/archive/<session-id>/...
-`- workspaces/<session-id>/      # 没有 Project/cwd 时自动创建
+|- workspaces/<session-id>/      # 没有 Project/cwd 时自动创建
+`- workspaces/<project-id>/      # Project 文件夹缺失时的兜底目录
 ~~~
 
 Project 的规则文件不放在 runtime 中，而是放在项目根目录：
@@ -70,6 +71,14 @@ Session 时根据调用参数和父 Session 解析 cwd，然后将归属写入 P
 固定 Automation Session 复用已有 Session 的 cwd 与 assignment。Project Automation 创建的新
 Session 使用 Project root 或 Job 指定的 Worktree；Global Automation 可以指定任意 `cwd`，
 也可以在没有 cwd 时使用 managed workspace。
+
+## 工作目录容错
+
+会话的 cwd 解析失败（目录不存在）时，Host 会修复：属于某个 Project 的会话重挂到该 Project
+的当前目录（Project pwd 或对应 Worktree 路径）；如果 Project 文件夹本身也不存在，Host 会在
+`runtime/workspaces/<project-id>` 新建兜底目录并把 Project 指向它，该 Project 的全部会话立即
+全量重挂到新目录。没有 Project 归属的会话获得自己的 managed workspace
+（`runtime/workspaces/<session-id>`）。修改 Project pwd 时，其全部会话同样立即全量重挂到新目录。
 
 ## Section 与归属
 

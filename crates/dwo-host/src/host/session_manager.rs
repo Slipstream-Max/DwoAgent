@@ -242,7 +242,7 @@ pub(super) fn ensure_policy_ceiling(requested: SessionMode, parent: SessionMode)
     Ok(())
 }
 
-fn project_directory(
+pub(crate) fn project_directory(
     project: &Project,
     section_id: Option<&str>,
     worktree_id: Option<String>,

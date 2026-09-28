@@ -203,10 +203,35 @@ impl ProjectService {
         projects.push(project.clone());
         Ok(project)
     }
-    pub fn update_project(&self, id: &str, name: String) -> Result<Project> {
-        let name = nonempty("project name", name)?;
-        self.mutate(id, |project| {
-            project.name = name;
+    pub fn update_project(
+        &self,
+        id: &str,
+        name: Option<String>,
+        pwd: Option<PathBuf>,
+    ) -> Result<Project> {
+        let name = name
+            .map(|name| nonempty("project name", name))
+            .transpose()?;
+        let pwd = pwd.map(|pwd| canonical_directory(&pwd)).transpose()?;
+        if let Some(pwd) = &pwd {
+            let projects = self.projects.read().expect("project lock poisoned");
+            if projects
+                .iter()
+                .any(|project| project.id != id && &project.pwd == pwd)
+            {
+                return Err(ProjectError::Invalid(format!(
+                    "a project already uses pwd: {}",
+                    pwd.display()
+                )));
+            }
+        }
+        self.mutate(id, move |project| {
+            if let Some(name) = name {
+                project.name = name;
+            }
+            if let Some(pwd) = pwd {
+                project.pwd = pwd;
+            }
             Ok(())
         })
     }
@@ -664,6 +689,59 @@ mod tests {
             store
                 .delete_section(&project.id, &project.default_section_id)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn update_project_repoints_pwd_and_validates() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProjectService::open(root.path().join("storage")).unwrap();
+        let first = root.path().join("one");
+        let second = root.path().join("two");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let project = store
+            .create(CreateProject {
+                name: None,
+                pwd: first.clone(),
+            })
+            .unwrap();
+        let other = store
+            .create(CreateProject {
+                name: None,
+                pwd: second.clone(),
+            })
+            .unwrap();
+        // A pwd already used by another project is rejected.
+        assert!(
+            store
+                .update_project(&project.id, None, Some(second.clone()))
+                .is_err()
+        );
+        // A missing directory is rejected.
+        assert!(
+            store
+                .update_project(&project.id, None, Some(root.path().join("missing")))
+                .is_err()
+        );
+        // Name and pwd can be updated independently.
+        store
+            .update_project(&project.id, Some("Renamed".into()), None)
+            .unwrap();
+        let renamed = store.get(&project.id).unwrap();
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.pwd, std::fs::canonicalize(&first).unwrap());
+        let third = root.path().join("three");
+        std::fs::create_dir_all(&third).unwrap();
+        let updated = store
+            .update_project(&project.id, None, Some(third.clone()))
+            .unwrap();
+        assert_eq!(updated.pwd, std::fs::canonicalize(&third).unwrap());
+        assert_eq!(other.pwd, std::fs::canonicalize(&second).unwrap());
+        let reopened = ProjectService::open(root.path().join("storage")).unwrap();
+        assert_eq!(
+            reopened.get(&project.id).unwrap().pwd,
+            std::fs::canonicalize(&third).unwrap()
         );
     }
 

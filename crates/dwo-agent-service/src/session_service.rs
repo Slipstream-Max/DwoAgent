@@ -1,7 +1,9 @@
 //! Session service lifecycle, persistence, and loaded-session orchestration.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -49,6 +51,15 @@ pub struct NewSession {
 pub type WorkspaceResolver =
     Arc<dyn Fn(&SessionId, &SessionWorkspace) -> anyhow::Result<PathBuf> + Send + Sync>;
 pub type SessionDeletionHook = Arc<dyn Fn(&SessionId, &SessionWorkspace) + Send + Sync>;
+
+pub type WorkspaceRepairer = Arc<
+    dyn Fn(
+            SessionId,
+        ) -> Pin<
+            Box<dyn Future<Output = anyhow::Result<Option<(SessionWorkspace, PathBuf)>>> + Send>,
+        > + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionListQuery {
@@ -122,6 +133,7 @@ pub struct SessionService {
     mutation_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
     workspace_resolver: WorkspaceResolver,
     deletion_hook: RwLock<Option<SessionDeletionHook>>,
+    workspace_repairer: RwLock<Option<WorkspaceRepairer>>,
 }
 
 struct ModelRuntime {
@@ -241,6 +253,7 @@ impl SessionService {
             mutation_locks: Mutex::new(HashMap::new()),
             workspace_resolver,
             deletion_hook: RwLock::new(None),
+            workspace_repairer: RwLock::new(None),
         })
     }
 
@@ -249,6 +262,13 @@ impl SessionService {
             .deletion_hook
             .write()
             .expect("session deletion hook lock poisoned") = Some(hook);
+    }
+
+    pub fn set_workspace_repairer(&self, repairer: WorkspaceRepairer) {
+        *self
+            .workspace_repairer
+            .write()
+            .expect("session workspace repairer lock poisoned") = Some(repairer);
     }
 
     /// Notify subscribers after the Host has published the new model options.
@@ -448,12 +468,40 @@ impl SessionService {
                         session_id = %record.info.id,
                         workspace = ?record.info.workspace,
                         error = %error,
-                        "session workspace missing; re-pointing to a managed workspace"
+                        "session workspace missing; repairing"
                     );
-                    workspace_repaired =
-                        !matches!(&record.info.workspace, SessionWorkspace::Managed);
-                    record.info.workspace = SessionWorkspace::Managed;
-                    self.repair_workspace(&record.info.id).await?
+                    let repairer = self
+                        .workspace_repairer
+                        .read()
+                        .expect("session workspace repairer lock poisoned")
+                        .clone();
+                    let repaired = match repairer {
+                        Some(repairer) => match repairer(record.info.id.clone()).await {
+                            Ok(repaired) => repaired,
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id = %record.info.id,
+                                    error = %error,
+                                    "workspace repair failed; falling back to a managed workspace"
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    match repaired {
+                        Some((workspace, path)) => {
+                            workspace_repaired = record.info.workspace != workspace;
+                            record.info.workspace = workspace;
+                            std::fs::canonicalize(&path).map_err(anyhow::Error::from)?
+                        }
+                        None => {
+                            workspace_repaired =
+                                !matches!(&record.info.workspace, SessionWorkspace::Managed);
+                            record.info.workspace = SessionWorkspace::Managed;
+                            self.repair_workspace(&record.info.id).await?
+                        }
+                    }
                 }
             },
         };
@@ -776,6 +824,47 @@ impl SessionService {
         handle
             .set_workspace(workspace, cwd, tools, prompt_builder)
             .await
+    }
+
+    /// Re-point a project-owned session onto its project's current directory.
+    ///
+    /// Unlike [`Self::set_workspace`], this never spawns a session that is not
+    /// loaded; persisted records are updated in place.
+    pub async fn rebind_workspace(
+        &self,
+        id: &SessionId,
+        workspace: SessionWorkspace,
+        cwd: PathBuf,
+    ) -> Result<(), SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
+        let cwd = std::fs::canonicalize(&cwd).map_err(anyhow::Error::from)?;
+        let handle = self.loaded.lock().await.handles.get(id).cloned();
+        if let Some(handle) = handle.filter(|handle| !handle.is_terminated()) {
+            let record = handle.snapshot().await?.record;
+            let is_root = record.info.parent_session_id.is_none();
+            let prompt_builder = self.prompt_builder(cwd.clone(), is_root);
+            let tools = Arc::new(ToolManager::new_with_environment(
+                cwd.clone(),
+                self.policy.clone(),
+                self.file_edit.clone(),
+                [("DWO_SESSION_ID".to_string(), id.to_string())],
+            )?);
+            handle
+                .set_workspace(workspace, cwd, tools, prompt_builder)
+                .await
+        } else {
+            let mut record = self
+                .repository
+                .load(id)
+                .await?
+                .ok_or_else(|| SessionServiceError::SessionNotFound(id.clone()))?;
+            record.info.workspace = workspace;
+            record.info.cwd = cwd;
+            self.repository.save(&record).await?;
+            Ok(())
+        }
     }
 
     fn resolve_workspace(

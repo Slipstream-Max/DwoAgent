@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
@@ -271,6 +273,61 @@ impl Host {
             PolicyConfig::default(),
             workspace_resolver,
         )?);
+        let repair_projects = projects.clone();
+        let repair_service = service.clone();
+        let repair_root = profile_root.clone();
+        service.set_workspace_repairer(Arc::new(
+            move |session_id: SessionId| -> Pin<
+                Box<dyn Future<Output = Result<Option<(SessionWorkspace, PathBuf)>>> + Send>,
+            > {
+                let projects = repair_projects.clone();
+                let service = repair_service.clone();
+                let root = repair_root.clone();
+                Box::pin(async move {
+                    let Some((project, assignment)) = projects.locate_session(session_id.as_str())
+                    else {
+                        return Ok(None);
+                    };
+                    let Ok((target, _)) = session_manager::project_directory(
+                        &project,
+                        Some(&assignment.section_id),
+                        assignment.worktree_id.clone(),
+                    ) else {
+                        return Ok(None);
+                    };
+                    if target.is_dir() {
+                        return Ok(Some((
+                            SessionWorkspace::External {
+                                pwd: target.clone(),
+                            },
+                            target,
+                        )));
+                    }
+                    if project.pwd.is_dir() {
+                        return Ok(Some((
+                            SessionWorkspace::External {
+                                pwd: project.pwd.clone(),
+                            },
+                            project.pwd.clone(),
+                        )));
+                    }
+                    // The project folder is gone: put the project on a fresh workspace and
+                    // re-hang every remaining session of the project onto it.
+                    let workspace = project_workspace_path(&root, &project.id);
+                    tokio::fs::create_dir_all(&workspace).await?;
+                    let updated =
+                        projects.update_project(&project.id, None, Some(workspace.clone()))?;
+                    rehang_project_sessions(&projects, &service, &updated.id, Some(&session_id))
+                        .await?;
+                    Ok(Some((
+                        SessionWorkspace::External {
+                            pwd: workspace.clone(),
+                        },
+                        workspace,
+                    )))
+                })
+            },
+        ));
         let shutdown = CancellationToken::new();
         let cleanup_projects = projects.clone();
         let cleanup_root = profile_root.clone();
@@ -589,6 +646,54 @@ pub(crate) fn managed_workspace_path(profile_root: &Path, session_id: &SessionId
     profile_root
         .join("runtime/workspaces")
         .join(session_id.as_str())
+}
+
+/// Workspace fallback for a project whose folder disappeared.
+pub(crate) fn project_workspace_path(profile_root: &Path, project_id: &str) -> PathBuf {
+    profile_root.join("runtime/workspaces").join(project_id)
+}
+
+/// Re-hang every session of a project onto its resolved project directory.
+pub(crate) async fn rehang_project_sessions(
+    projects: &ProjectService,
+    service: &SessionService,
+    project_id: &str,
+    skip: Option<&SessionId>,
+) -> Result<()> {
+    let project = projects.get(project_id)?;
+    for assignment in &project.session_assignments {
+        let Ok(session_id) = SessionId::parse(assignment.session_id.clone()) else {
+            continue;
+        };
+        if skip.is_some_and(|skip| skip == &session_id) {
+            continue;
+        }
+        let Ok((dir, _)) = session_manager::project_directory(
+            &project,
+            Some(&assignment.section_id),
+            assignment.worktree_id.clone(),
+        ) else {
+            continue;
+        };
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Err(error) = service
+            .rebind_workspace(
+                &session_id,
+                SessionWorkspace::External { pwd: dir.clone() },
+                dir,
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "project session rebind failed"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_resource_name(name: &str) -> Result<()> {

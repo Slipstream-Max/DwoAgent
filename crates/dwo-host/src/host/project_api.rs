@@ -21,7 +21,8 @@ struct CreateProjectParam {
 #[derive(Deserialize)]
 struct UpdateProjectParam {
     project_id: String,
-    name: String,
+    name: Option<String>,
+    pwd: Option<PathBuf>,
 }
 #[derive(Deserialize)]
 struct ProjectRuleParam {
@@ -112,7 +113,21 @@ impl Host {
             }
             "project.update" => {
                 let p: UpdateProjectParam = serde_json::from_value(params)?;
-                let project = self.projects.update_project(&p.project_id, p.name)?;
+                anyhow::ensure!(
+                    p.name.is_some() || p.pwd.is_some(),
+                    "project.update requires name or pwd"
+                );
+                let previous = self.projects.get(&p.project_id)?;
+                let project = self.projects.update_project(&p.project_id, p.name, p.pwd)?;
+                if project.pwd != previous.pwd {
+                    super::rehang_project_sessions(
+                        &self.projects,
+                        &self.service,
+                        &project.id,
+                        None,
+                    )
+                    .await?;
+                }
                 self.project_changed(&p.project_id, "update").await;
                 Ok(serde_json::to_value(project)?)
             }

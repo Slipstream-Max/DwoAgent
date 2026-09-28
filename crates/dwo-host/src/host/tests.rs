@@ -334,3 +334,171 @@ async fn missing_external_workspace_is_tolerated_in_list_and_repaired_on_load() 
     assert!(snapshot.record.info.cwd.is_dir());
     host.shutdown().await;
 }
+
+#[tokio::test]
+async fn project_folder_loss_relocates_the_project_and_rebinds_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let project_pwd = root.path().join("project-root");
+    std::fs::create_dir_all(&project_pwd).unwrap();
+    let project = host
+        .handle_method(
+            "project.create",
+            json!({"name": "Relocated", "pwd": &project_pwd}),
+        )
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let first = host
+        .handle_method(
+            "session.new",
+            json!({
+                "title": "first",
+                "cwd": null,
+                "project_id": project_id,
+                "section_id": null,
+                "worktree_id": null,
+                "caller_session_id": null,
+            }),
+        )
+        .await
+        .unwrap();
+    let first_id = SessionId::parse(first["session_id"].as_str().unwrap().to_string())
+        .map_err(anyhow::Error::msg)
+        .unwrap();
+    let second = host
+        .handle_method(
+            "session.new",
+            json!({
+                "title": "second",
+                "cwd": null,
+                "project_id": project_id,
+                "section_id": null,
+                "worktree_id": null,
+                "caller_session_id": null,
+            }),
+        )
+        .await
+        .unwrap();
+    let second_id = SessionId::parse(second["session_id"].as_str().unwrap().to_string())
+        .map_err(anyhow::Error::msg)
+        .unwrap();
+    let expected_project_dir = std::fs::canonicalize(&project_pwd).unwrap();
+    assert_eq!(
+        host.service
+            .snapshot(&first_id)
+            .await
+            .unwrap()
+            .record
+            .info
+            .cwd,
+        expected_project_dir
+    );
+
+    // The project folder disappears; opening one session relocates the project.
+    host.service.unload(&first_id).await.unwrap();
+    host.service.unload(&second_id).await.unwrap();
+    std::fs::remove_dir_all(&project_pwd).unwrap();
+    host.service.load(&first_id).await.unwrap();
+
+    let workspace =
+        std::fs::canonicalize(root.path().join("runtime/workspaces").join(&project_id)).unwrap();
+    assert!(workspace.is_dir());
+    assert_eq!(
+        host.service
+            .snapshot(&first_id)
+            .await
+            .unwrap()
+            .record
+            .info
+            .cwd,
+        workspace
+    );
+    assert_eq!(
+        host.service
+            .snapshot(&second_id)
+            .await
+            .unwrap()
+            .record
+            .info
+            .cwd,
+        workspace
+    );
+    let project = host
+        .handle_method("project.get", json!({"project_id": project_id}))
+        .await
+        .unwrap();
+    assert_eq!(PathBuf::from(project["pwd"].as_str().unwrap()), workspace);
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_pwd_change_rebinds_all_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let first_dir = root.path().join("project-one");
+    let second_dir = root.path().join("project-two");
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let project = host
+        .handle_method(
+            "project.create",
+            json!({"name": "Moving", "pwd": &first_dir}),
+        )
+        .await
+        .unwrap();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let session = host
+        .handle_method(
+            "session.new",
+            json!({
+                "title": "mover",
+                "cwd": null,
+                "project_id": project_id,
+                "section_id": null,
+                "worktree_id": null,
+                "caller_session_id": null,
+            }),
+        )
+        .await
+        .unwrap();
+    let session_id = SessionId::parse(session["session_id"].as_str().unwrap().to_string())
+        .map_err(anyhow::Error::msg)
+        .unwrap();
+    let before = std::fs::canonicalize(&first_dir).unwrap();
+    assert_eq!(
+        host.service
+            .snapshot(&session_id)
+            .await
+            .unwrap()
+            .record
+            .info
+            .cwd,
+        before
+    );
+
+    host.handle_method(
+        "project.update",
+        json!({"project_id": project_id, "name": null, "pwd": &second_dir}),
+    )
+    .await
+    .unwrap();
+
+    let after = std::fs::canonicalize(&second_dir).unwrap();
+    assert_eq!(
+        host.service
+            .snapshot(&session_id)
+            .await
+            .unwrap()
+            .record
+            .info
+            .cwd,
+        after
+    );
+    let project = host
+        .handle_method("project.get", json!({"project_id": project_id}))
+        .await
+        .unwrap();
+    assert_eq!(PathBuf::from(project["pwd"].as_str().unwrap()), after);
+    host.shutdown().await;
+}

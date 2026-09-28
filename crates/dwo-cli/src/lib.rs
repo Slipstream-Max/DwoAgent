@@ -236,7 +236,9 @@ enum ProjectCommand {
     },
     Update {
         project: String,
-        name: String,
+        name: Option<String>,
+        #[arg(long)]
+        pwd: Option<PathBuf>,
     },
     Worktree {
         #[command(subcommand)]
@@ -1082,9 +1084,9 @@ async fn run_project(command: ProjectCommand, config_path: &Path) -> Result<()> 
             ("project.create", json!({"name": name, "pwd": cwd}))
         }
         ProjectCommand::Delete { project } => ("project.delete", json!({"project_id": project})),
-        ProjectCommand::Update { project, name } => (
+        ProjectCommand::Update { project, name, pwd } => (
             "project.update",
-            json!({"project_id": project, "name": name}),
+            json!({"project_id": project, "name": name, "pwd": pwd}),
         ),
         ProjectCommand::Worktree { command } => match command {
             WorktreeCommand::List { project } => {

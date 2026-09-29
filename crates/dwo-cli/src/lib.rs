@@ -43,6 +43,8 @@ enum Command {
         purge: bool,
     },
     Serve,
+    /// Bridge management JSON lines to an already running daemon over IPC.
+    Rpc,
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -457,6 +459,16 @@ where
         }
         Command::Serve => {
             serve(config_path).await?;
+        }
+        Command::Rpc => {
+            if let Err(error) = ipc::bridge_stdio(&config_path).await {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "dwo rpc: {error:#}");
+                // Tokio's stdin uses an uncancellable blocking read. On an IPC
+                // failure the CLI must exit rather than wait for stdin during
+                // runtime teardown. This terminates only this bridge process.
+                std::process::exit(1);
+            }
         }
         Command::Daemon { command } => match command {
             DaemonCommand::Start => daemon_start(&config_path).await?,
@@ -1566,6 +1578,15 @@ model:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_rpc_bridge_without_runtime_options() {
+        assert!(matches!(
+            Cli::try_parse_from(["dwo", "rpc"]).unwrap().command,
+            Command::Rpc
+        ));
+        assert!(Cli::try_parse_from(["dwo", "rpc", "--start"]).is_err());
+    }
 
     #[test]
     fn parses_session_list_paging_and_scopes() {

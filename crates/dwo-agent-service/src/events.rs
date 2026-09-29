@@ -241,6 +241,21 @@ pub enum SessionEventPayload {
     Closing,
 }
 
+/// Runtime-only terminal state at the enclosing snapshot's sequence watermark.
+/// Output is a retained byte suffix, never decoded or consumed by model polling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalView {
+    pub terminal_id: String,
+    pub tool_call_id: String,
+    pub command: String,
+    pub cwd: PathBuf,
+    /// Base64-encoded retained raw bytes; compact enough for snapshot transport.
+    pub output: String,
+    pub dropped_bytes: u64,
+    pub status: String,
+    pub exit_code: Option<i32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub record: SessionRecord,
@@ -253,6 +268,9 @@ pub struct SessionSnapshot {
     pub partial_message: String,
     pub active_tool_calls: Vec<ActiveToolCall>,
     pub pending_permission: Option<PendingPermission>,
+    /// Missing on older hosts. Empty after actor reload; not persisted to disk.
+    #[serde(default)]
+    pub terminal_views: Vec<TerminalView>,
     pub seq: u64,
 }
 

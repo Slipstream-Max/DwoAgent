@@ -172,6 +172,8 @@ fn default_event_limit() -> usize {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigUpdateParam {
     #[serde(default)]
+    policy_mode: Option<SessionMode>,
+    #[serde(default)]
     max_model_steps: Option<usize>,
     #[serde(default)]
     logging: Option<dwo_agent_service::LoggingConfig>,
@@ -221,11 +223,16 @@ struct SessionOptionSnapshot {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigSnapshot {
     policy: SessionMode,
+    policy_mode: SessionMode,
     default_model: String,
     default_reasoning: Option<String>,
     models: Vec<SessionModelOption>,
     max_model_steps: usize,
     session_count: usize,
+    logging: dwo_agent_service::LoggingConfig,
+    external_skills_dirs: Vec<PathBuf>,
+    external_rule_files: Vec<PathBuf>,
+    compaction_trigger_ratio: f64,
 }
 
 impl Host {

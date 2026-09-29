@@ -14,6 +14,9 @@ use dwo_host::Host;
 use dwo_host::HostSessionOptions;
 use dwo_protocol::{RpcError, RpcEvent, RpcRequest, RpcResponse, RpcRoute};
 
+mod stdio;
+pub use stdio::bridge_stdio;
+
 pub fn endpoint(_config_path: &Path) -> String {
     #[cfg(windows)]
     {
@@ -305,7 +308,12 @@ where
             )
             .await?;
             loop {
-                match receiver.recv().await {
+                // A quiet subscriber must release its pipe even when no new event arrives.
+                let event = tokio::select! {
+                    event = receiver.recv() => event,
+                    _ = lines.next_line() => break,
+                };
+                match event {
                     Ok(event) if event_name.as_deref().is_none_or(|name| name == event.event) => {
                         write_json_line(
                             &mut write,
@@ -687,6 +695,43 @@ model:
         drop(events);
         server_task.abort();
         let _ = server_task.await;
+        host.shutdown_token().cancel();
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_management_subscription_detaches_on_eof_without_host_shutdown() {
+        let profile = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(profile.path()))
+            .await
+            .unwrap();
+        let (client, server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn(handle_connection(server, host.clone()));
+        let (read, mut write) = tokio::io::split(client);
+        write_json_line(
+            &mut write,
+            &RpcRequest::new(RpcRoute::Dwo, "event.subscribe", json!({})),
+        )
+        .await
+        .unwrap();
+        let mut lines = BufReader::new(read).lines();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        write.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !host.shutdown_token().is_cancelled(),
+            "disconnect must not shut down the Host"
+        );
         host.shutdown_token().cancel();
         host.shutdown().await;
     }

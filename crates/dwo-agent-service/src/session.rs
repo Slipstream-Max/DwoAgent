@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +21,7 @@ use crate::error::SessionServiceError;
 use crate::events::{
     ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, CompactionTrigger, FileChange,
     NotificationLevel, RuntimePhase, SessionEvent, SessionEventPayload, SessionNotification,
-    SessionSnapshot, SessionSubscription, SessionUsageSnapshot, project_tool_call,
+    SessionSnapshot, SessionSubscription, SessionUsageSnapshot, TerminalView, project_tool_call,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::repository::SessionRepository;
@@ -420,6 +421,173 @@ struct ActiveCompaction {
     origin: EndpointId,
 }
 
+const TERMINAL_VIEW_BYTES: usize = 256 * 1024;
+const TERMINAL_VIEWS_TOTAL_BYTES: usize = 1024 * 1024;
+const TERMINAL_VIEW_COUNT: usize = 64;
+const TERMINAL_VIEW_METADATA_BYTES: usize = 16 * 1024;
+const TERMINAL_VIEWS_METADATA_BYTES: usize = 64 * 1024;
+
+/// Owned exclusively by the actor, so retention and subscription use the same
+/// ordering. Reading TerminalManager here would race queued telemetry and could
+/// include bytes newer than snapshot.seq (and its accessor renders lossy text).
+#[derive(Default)]
+struct TerminalViewCache {
+    // Least recently updated first. Keep metadata even when its bytes are trimmed.
+    views: VecDeque<CachedTerminalView>,
+}
+
+struct CachedTerminalView {
+    terminal_id: String,
+    tool_call_id: String,
+    command: String,
+    cwd: std::path::PathBuf,
+    output: VecDeque<u8>,
+    dropped_bytes: u64,
+    status: String,
+    exit_code: Option<i32>,
+}
+
+impl TerminalViewCache {
+    fn observe(&mut self, event: &dwo_tools::ToolEvent) {
+        use dwo_tools::ToolEvent;
+        match event {
+            ToolEvent::TerminalOpened {
+                tool_call_id,
+                terminal_id,
+                command,
+                cwd,
+            } => {
+                if self
+                    .views
+                    .iter()
+                    .any(|view| view.terminal_id == *terminal_id)
+                {
+                    return;
+                }
+                // Bound metadata too; opaque IDs and paths must not be truncated.
+                // Oversized entries remain available through transcript fallback.
+                let metadata_bytes = terminal_id
+                    .len()
+                    .saturating_add(tool_call_id.len())
+                    .saturating_add(command.len())
+                    .saturating_add(cwd.as_os_str().len());
+                if metadata_bytes > TERMINAL_VIEW_METADATA_BYTES {
+                    return;
+                }
+                while self.views.len() == TERMINAL_VIEW_COUNT
+                    || self
+                        .views
+                        .iter()
+                        .map(|view| {
+                            view.terminal_id.len()
+                                + view.tool_call_id.len()
+                                + view.command.len()
+                                + view.cwd.as_os_str().len()
+                        })
+                        .sum::<usize>()
+                        + metadata_bytes
+                        > TERMINAL_VIEWS_METADATA_BYTES
+                {
+                    let index = self
+                        .views
+                        .iter()
+                        .position(|view| view.status != "running")
+                        .unwrap_or(0);
+                    self.views.remove(index);
+                }
+                self.views.push_back(CachedTerminalView {
+                    terminal_id: terminal_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                    output: VecDeque::new(),
+                    dropped_bytes: 0,
+                    status: "running".into(),
+                    exit_code: None,
+                });
+            }
+            ToolEvent::TerminalOutput { terminal_id, data } => {
+                let Some(index) = self
+                    .views
+                    .iter()
+                    .position(|view| view.terminal_id == *terminal_id)
+                else {
+                    return;
+                };
+                let mut view = self.views.remove(index).expect("located terminal view");
+                // Trim before extending: a single oversized chunk must not allocate
+                // beyond the per-terminal budget. Do not align or decode UTF-8/ANSI.
+                let incoming = data.len().min(TERMINAL_VIEW_BYTES);
+                let remove = (view.output.len() + incoming).saturating_sub(TERMINAL_VIEW_BYTES);
+                Self::trim(&mut view, remove);
+                view.dropped_bytes = view
+                    .dropped_bytes
+                    .saturating_add((data.len() - incoming) as u64);
+                view.output.extend(&data[data.len() - incoming..]);
+                self.views.push_back(view);
+                let mut excess = self
+                    .views
+                    .iter()
+                    .map(|view| view.output.len())
+                    .sum::<usize>()
+                    .saturating_sub(TERMINAL_VIEWS_TOTAL_BYTES);
+                for view in &mut self.views {
+                    if excess == 0 {
+                        break;
+                    }
+                    let remove = excess.min(view.output.len());
+                    Self::trim(view, remove);
+                    view.output.shrink_to_fit();
+                    excess -= remove;
+                }
+            }
+            ToolEvent::TerminalExited {
+                terminal_id,
+                exit_code,
+                status,
+            } => {
+                if let Some(index) = self
+                    .views
+                    .iter()
+                    .position(|view| view.terminal_id == *terminal_id)
+                {
+                    let mut view = self.views.remove(index).expect("located terminal view");
+                    view.exit_code = *exit_code;
+                    view.status = status.chars().take(64).collect();
+                    self.views.push_back(view);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn trim(view: &mut CachedTerminalView, count: usize) {
+        view.output.drain(..count);
+        view.dropped_bytes = view.dropped_bytes.saturating_add(count as u64);
+    }
+
+    fn snapshot(&self) -> Vec<TerminalView> {
+        self.views
+            .iter()
+            .map(|view| TerminalView {
+                terminal_id: view.terminal_id.clone(),
+                tool_call_id: view.tool_call_id.clone(),
+                command: view.command.clone(),
+                cwd: view.cwd.clone(),
+                output: encode_terminal_bytes(&view.output),
+                dropped_bytes: view.dropped_bytes,
+                status: view.status.clone(),
+                exit_code: view.exit_code,
+            })
+            .collect()
+    }
+}
+
+fn encode_terminal_bytes(bytes: &VecDeque<u8>) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes.iter().copied().collect::<Vec<_>>())
+}
+
 pub(crate) struct SessionActor {
     record: SessionRecord,
     transcript: Vec<ClientTranscriptEvent>,
@@ -434,6 +602,7 @@ pub(crate) struct SessionActor {
     config_tx: watch::Sender<SessionConfig>,
     events: broadcast::Sender<SessionEvent>,
     seq: u64,
+    terminal_views: TerminalViewCache,
     phase: RuntimePhase,
     active: Option<ActiveTurnState>,
     active_compaction: Option<ActiveCompaction>,
@@ -490,6 +659,7 @@ impl SessionActor {
             config_tx,
             events,
             seq: 0,
+            terminal_views: TerminalViewCache::default(),
             phase: RuntimePhase::Idle,
             active: None,
             active_compaction: None,
@@ -1422,75 +1592,80 @@ impl SessionActor {
                                 .await;
                         }
                     }
-                    TurnUpdate::ToolTelemetry { turn_id, event } => match event {
-                        dwo_tools::ToolEvent::TerminalOpened {
-                            tool_call_id,
-                            terminal_id,
-                            command,
-                            cwd,
-                        } => {
-                            let _ = self
-                                .record_event(SessionEventPayload::TerminalOpened {
-                                    turn_id,
-                                    tool_call_id,
-                                    terminal_id,
-                                    command,
-                                    cwd,
-                                })
-                                .await;
-                        }
-                        dwo_tools::ToolEvent::TerminalOutput { terminal_id, data } => {
-                            self.broadcast_event(SessionEventPayload::TerminalOutput {
-                                turn_id,
+                    TurnUpdate::ToolTelemetry { turn_id, event } => {
+                        // Retain even without subscribers or an active model turn.
+                        // This also survives a transcript persistence failure.
+                        self.terminal_views.observe(&event);
+                        match event {
+                            dwo_tools::ToolEvent::TerminalOpened {
+                                tool_call_id,
                                 terminal_id,
-                                data,
-                            });
-                        }
-                        dwo_tools::ToolEvent::TerminalExited {
-                            terminal_id,
-                            exit_code,
-                            status,
-                        } => {
-                            let _ = self
-                                .record_event(SessionEventPayload::TerminalExited {
+                                command,
+                                cwd,
+                            } => {
+                                let _ = self
+                                    .record_event(SessionEventPayload::TerminalOpened {
+                                        turn_id,
+                                        tool_call_id,
+                                        terminal_id,
+                                        command,
+                                        cwd,
+                                    })
+                                    .await;
+                            }
+                            dwo_tools::ToolEvent::TerminalOutput { terminal_id, data } => {
+                                self.broadcast_event(SessionEventPayload::TerminalOutput {
                                     turn_id,
                                     terminal_id,
-                                    exit_code,
-                                    status,
-                                })
-                                .await;
+                                    data,
+                                });
+                            }
+                            dwo_tools::ToolEvent::TerminalExited {
+                                terminal_id,
+                                exit_code,
+                                status,
+                            } => {
+                                let _ = self
+                                    .record_event(SessionEventPayload::TerminalExited {
+                                        turn_id,
+                                        terminal_id,
+                                        exit_code,
+                                        status,
+                                    })
+                                    .await;
+                            }
+                            dwo_tools::ToolEvent::FileRead { tool_call_id, path } => {
+                                let _ = self
+                                    .record_event(SessionEventPayload::FileRead {
+                                        turn_id,
+                                        tool_call_id,
+                                        path,
+                                    })
+                                    .await;
+                            }
+                            dwo_tools::ToolEvent::FileChanged {
+                                tool_call_id,
+                                changes,
+                                patch,
+                            } => {
+                                let _ = self
+                                    .record_event(SessionEventPayload::FileChanged {
+                                        turn_id,
+                                        tool_call_id,
+                                        changes: changes
+                                            .into_iter()
+                                            .map(|change| FileChange {
+                                                path: change.path,
+                                                kind: change.kind.to_string(),
+                                                moved_to: change.moved_to,
+                                            })
+                                            .collect(),
+                                        patch,
+                                    })
+                                    .await;
+                            }
                         }
-                        dwo_tools::ToolEvent::FileRead { tool_call_id, path } => {
-                            let _ = self
-                                .record_event(SessionEventPayload::FileRead {
-                                    turn_id,
-                                    tool_call_id,
-                                    path,
-                                })
-                                .await;
-                        }
-                        dwo_tools::ToolEvent::FileChanged {
-                            tool_call_id,
-                            changes,
-                            patch,
-                        } => {
-                            let _ = self
-                                .record_event(SessionEventPayload::FileChanged {
-                                    turn_id,
-                                    tool_call_id,
-                                    changes: changes
-                                        .into_iter()
-                                        .map(|change| FileChange {
-                                            path: change.path,
-                                            kind: change.kind.to_string(),
-                                            moved_to: change.moved_to,
-                                        })
-                                        .collect(),
-                                    patch,
-                                })
-                                .await;
-                        }
-                    },
+                    }
                     TurnUpdate::Finished { turn_id, outcome } => {
                         if self
                             .active
@@ -1829,6 +2004,7 @@ impl SessionActor {
                 .map(|active| active.tools.clone())
                 .unwrap_or_default(),
             pending_permission: self.permission.snapshot(),
+            terminal_views: self.terminal_views.snapshot(),
             seq: self.seq,
         }
     }
@@ -1971,6 +2147,331 @@ fn reasoning_mode_rank(mode: &str) -> u8 {
         "xhigh" => 6,
         "max" => 7,
         _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod terminal_view_tests {
+    use super::*;
+    use dwo_tools::ToolEvent;
+
+    fn opened(id: &str) -> ToolEvent {
+        ToolEvent::TerminalOpened {
+            tool_call_id: format!("run-{id}"),
+            terminal_id: id.into(),
+            command: "example".into(),
+            cwd: std::env::current_dir().unwrap(),
+        }
+    }
+
+    fn output(id: &str, data: &[u8]) -> ToolEvent {
+        ToolEvent::TerminalOutput {
+            terminal_id: id.into(),
+            data: data.into(),
+        }
+    }
+
+    fn actor() -> SessionActor {
+        let cwd = std::env::current_dir().unwrap();
+        let record = SessionRecord::new(
+            crate::SessionId::new(),
+            "terminal cache test".into(),
+            SessionWorkspace::External { pwd: cwd.clone() },
+            cwd.clone(),
+            dwo_tools::SessionMode::FullAccess,
+            crate::SessionLlmSettings::default(),
+        );
+        let (_, requests) = mpsc::channel(8);
+        let (actor_tx, actor_events) = mpsc::unbounded_channel();
+        let (config_tx, _) = watch::channel(record.config());
+        let (events, _) = broadcast::channel(1024);
+        // No providers exist in this client, so these tests cannot call a model.
+        let model = crate::ConfiguredModelClient::from_resolved(crate::ModelClientConfig {
+            default_model: "test".into(),
+            default_reasoning: None,
+            providers: Default::default(),
+            models: Default::default(),
+        })
+        .unwrap();
+        SessionActor {
+            record,
+            transcript: Vec::new(),
+            repository: Arc::new(crate::MemorySessionRepository::default()),
+            model,
+            tools: Arc::new(
+                ToolManager::new(
+                    cwd.clone(),
+                    Arc::new(dwo_tools::ToolPolicyEngine::new(Default::default())),
+                    Arc::new(dwo_tools::FileEditManager::new()),
+                )
+                .unwrap(),
+            ),
+            prompt_builder: SystemPromptBuilder::new(cwd.clone(), cwd),
+            requests,
+            actor_tx,
+            actor_events,
+            expiry_timer: None,
+            config_tx,
+            events,
+            seq: 0,
+            terminal_views: TerminalViewCache::default(),
+            phase: RuntimePhase::Idle,
+            active: None,
+            active_compaction: None,
+            permission: PermissionState::default(),
+            closing_response: None,
+            title_cancellation: None,
+            max_model_steps: Arc::new(AtomicUsize::new(1)),
+            deletion_hook: None,
+            terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    async fn telemetry(actor: &mut SessionActor, event: ToolEvent) {
+        actor
+            .handle_event(ActorEvent::Turn(TurnUpdate::ToolTelemetry {
+                turn_id: TurnId::parse("turn-terminal-test").unwrap(),
+                event,
+            }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn closed_gui_bytes_and_post_watermark_chunks_are_retained_once() {
+        let mut actor = actor();
+        actor.repository.save(&actor.record).await.unwrap();
+        // No GUI or model turn is active. The background terminal still emits.
+        telemetry(&mut actor, opened("term")).await;
+        let prefix = b"\x1b[31m\xff\0\xe4\xb8";
+        telemetry(&mut actor, output("term", prefix)).await;
+        assert_eq!(actor.events.receiver_count(), 0);
+        assert!(
+            !actor
+                .transcript
+                .iter()
+                .any(|event| matches!(event.payload, SessionEventPayload::TerminalOutput { .. }))
+        );
+        let (response, wait) = oneshot::channel();
+        actor
+            .handle_request(SessionRequest::Subscribe {
+                checkpoint_cursor: Some(usize::MAX),
+                response,
+            })
+            .await;
+        let (snapshot, source) = wait.await.unwrap();
+        assert!(snapshot.transcript.is_empty());
+        assert_eq!(snapshot.terminal_views[0].output, "G1szMW3/AOS4");
+        assert_eq!(snapshot.terminal_views[0].status, "running");
+        let watermark = snapshot.seq;
+        assert_eq!(watermark, 2);
+        // Output queued immediately after subscription must not leak into the snapshot.
+        let suffix = b"\xad\x1b[0mtail";
+        telemetry(&mut actor, output("term", suffix)).await;
+        telemetry(
+            &mut actor,
+            ToolEvent::TerminalExited {
+                terminal_id: "term".into(),
+                exit_code: None,
+                status: "killed".into(),
+            },
+        )
+        .await;
+        let mut subscription =
+            crate::events::subscription(snapshot, source, actor.record.info.id.clone());
+        let event = tokio::time::timeout(Duration::from_secs(1), subscription.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.seq, watermark + 1);
+        let SessionEventPayload::TerminalOutput { data, .. } = event.payload else {
+            panic!("expected output")
+        };
+        let mut restored = prefix.to_vec();
+        restored.extend(data);
+        assert_eq!(restored, [prefix.as_slice(), suffix.as_slice()].concat());
+        let exit = tokio::time::timeout(Duration::from_secs(1), subscription.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit.seq, watermark + 2);
+        assert!(matches!(
+            exit.payload,
+            SessionEventPayload::TerminalExited { .. }
+        ));
+        assert!(subscription.events.try_recv().is_err());
+        let first = actor.snapshot();
+        let second = actor.snapshot();
+        assert_eq!(
+            first.terminal_views[0].output,
+            encode_terminal_bytes(&restored.into())
+        );
+        assert_eq!(
+            first.terminal_views[0].output,
+            second.terminal_views[0].output
+        );
+        assert_eq!(first.terminal_views[0].status, "killed");
+        assert_eq!(first.terminal_views[0].exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn older_snapshot_without_terminal_views_still_deserializes() {
+        let mut actor = actor();
+        telemetry(&mut actor, opened("term")).await;
+        telemetry(&mut actor, output("term", &[0xff, 0, 0xe4, 0xb8])).await;
+        let mut value = serde_json::to_value(actor.snapshot()).unwrap();
+        let restored: SessionSnapshot = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            restored.terminal_views[0].output,
+            encode_terminal_bytes(&VecDeque::from([0xff, 0, 0xe4, 0xb8]))
+        );
+        value.as_object_mut().unwrap().remove("terminal_views");
+        let legacy: SessionSnapshot = serde_json::from_value(value).unwrap();
+        assert!(legacy.terminal_views.is_empty());
+    }
+
+    #[test]
+    fn cache_bounds_bytes_without_decoding_or_losing_drop_counts() {
+        let mut cache = TerminalViewCache::default();
+        cache.observe(&opened("term"));
+        cache.observe(&output("term", b"old"));
+        let mut large = vec![b'x'; TERMINAL_VIEW_BYTES + 2];
+        large[2..6].copy_from_slice(&[0xb8, 0xad, 0xff, 0x1b]);
+        cache.observe(&output("term", &large));
+        let view = &cache.views[0];
+        assert_eq!(view.output, &large[2..]);
+        assert_eq!(view.dropped_bytes, 5);
+        assert!(view.output.capacity() <= TERMINAL_VIEW_BYTES);
+        // Snapshots are independent replacements; reading one consumes nothing.
+        let snapshot = cache.snapshot();
+        cache.observe(&output("term", b"tail"));
+        assert_eq!(
+            snapshot[0].output,
+            encode_terminal_bytes(&VecDeque::from(large[2..].to_vec()))
+        );
+        assert_eq!(cache.views[0].dropped_bytes, 9);
+    }
+
+    #[test]
+    fn cache_bounds_total_output_and_keeps_trimmed_terminal_metadata() {
+        let mut cache = TerminalViewCache::default();
+        let count = TERMINAL_VIEWS_TOTAL_BYTES / TERMINAL_VIEW_BYTES + 1;
+        for index in 0..count {
+            let id = index.to_string();
+            cache.observe(&opened(&id));
+            cache.observe(&output(&id, &vec![index as u8; TERMINAL_VIEW_BYTES]));
+        }
+        assert_eq!(cache.views.len(), count);
+        assert_eq!(
+            cache
+                .views
+                .iter()
+                .map(|view| view.output.len())
+                .sum::<usize>(),
+            TERMINAL_VIEWS_TOTAL_BYTES
+        );
+        assert_eq!(
+            cache
+                .views
+                .iter()
+                .map(|view| view.output.capacity())
+                .sum::<usize>(),
+            TERMINAL_VIEWS_TOTAL_BYTES
+        );
+        assert!(cache.views[0].output.is_empty());
+        assert_eq!(cache.views[0].dropped_bytes, TERMINAL_VIEW_BYTES as u64);
+        cache.observe(&output("0", b"new"));
+        assert_eq!(cache.views.back().unwrap().output, b"new".as_slice());
+        assert_eq!(cache.views[0].terminal_id, "1");
+        assert_eq!(cache.views[0].dropped_bytes, 3);
+    }
+
+    #[test]
+    fn cache_evicts_exited_views_first_and_bounds_metadata() {
+        let mut cache = TerminalViewCache::default();
+        for index in 0..TERMINAL_VIEW_COUNT {
+            cache.observe(&opened(&index.to_string()));
+        }
+        cache.observe(&ToolEvent::TerminalExited {
+            terminal_id: "1".into(),
+            exit_code: Some(7),
+            status: "error".into(),
+        });
+        assert_eq!(cache.views.back().unwrap().exit_code, Some(7));
+        cache.observe(&opened("new"));
+        assert_eq!(cache.views.len(), TERMINAL_VIEW_COUNT);
+        assert!(cache.views.iter().any(|view| view.terminal_id == "0"));
+        assert!(!cache.views.iter().any(|view| view.terminal_id == "1"));
+        cache.observe(&opened("newer"));
+        assert!(!cache.views.iter().any(|view| view.terminal_id == "0"));
+        // Late telemetry cannot resurrect an evicted view with a false byte offset.
+        cache.observe(&output("0", b"late"));
+        assert!(!cache.views.iter().any(|view| view.terminal_id == "0"));
+        let mut oversized = opened("oversized");
+        if let ToolEvent::TerminalOpened { command, .. } = &mut oversized {
+            *command = "x".repeat(TERMINAL_VIEW_METADATA_BYTES + 1);
+        }
+        cache.observe(&oversized);
+        assert!(
+            !cache
+                .views
+                .iter()
+                .any(|view| view.terminal_id == "oversized")
+        );
+    }
+
+    #[test]
+    fn base64_encodes_padding_binary_and_wrapped_deques() {
+        for (bytes, encoded) in [
+            (b"".as_slice(), ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+            (&[0xff, 0, 0xe4, 0xb8], "/wDkuA=="),
+        ] {
+            assert_eq!(
+                encode_terminal_bytes(&VecDeque::from(bytes.to_vec())),
+                encoded
+            );
+        }
+        let mut wrapped = VecDeque::with_capacity(6);
+        wrapped.extend(b"xxxfoo");
+        wrapped.drain(..3);
+        wrapped.extend(b"bar");
+        assert!(!wrapped.as_slices().1.is_empty());
+        assert_eq!(encode_terminal_bytes(&wrapped), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn terminal_snapshot_wire_budget_leaves_room_below_four_mib() {
+        let mut cache = TerminalViewCache::default();
+        for index in 0..TERMINAL_VIEW_COUNT {
+            let id = index.to_string();
+            let mut event = opened(&id);
+            if let ToolEvent::TerminalOpened { command, .. } = &mut event {
+                // Control characters require six bytes each in JSON strings.
+                *command = "\0".repeat(8 * 1024);
+            }
+            cache.observe(&event);
+            cache.observe(&output(&id, &vec![0xff; TERMINAL_VIEW_BYTES]));
+        }
+        assert!(cache.views.len() < TERMINAL_VIEW_COUNT);
+        assert_eq!(
+            cache
+                .views
+                .iter()
+                .map(|view| view.output.len())
+                .sum::<usize>(),
+            TERMINAL_VIEWS_TOTAL_BYTES
+        );
+        let wire = serde_json::to_vec(&cache.snapshot()).unwrap();
+        assert!(
+            wire.len() < 2 * 1024 * 1024,
+            "terminal views used {} bytes",
+            wire.len()
+        );
     }
 }
 

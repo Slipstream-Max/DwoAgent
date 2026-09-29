@@ -22,8 +22,8 @@ use agent_client_protocol::schema::v2::{
     SessionDeleteCapabilities, SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StateUpdate,
     StopReason, Terminal, TerminalExitStatus, TerminalOutput, TerminalOutputChunk, TerminalUpdate,
-    TextCommandInput, TextContent, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
-    ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
+    TextCommandInput, TextContent, ToolCallContent, ToolCallContentChunk, ToolCallId,
+    ToolCallStatus, ToolCallUpdate, ToolKind, UpdateSessionNotification, UsageUpdate, UserMessage,
 };
 use agent_client_protocol::schema::v2::{
     PlanEntry as AcpPlanEntry, PlanEntryPriority as AcpPlanEntryPriority,
@@ -37,7 +37,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::ValueEnum;
-use dwo_agent_service::{ExecutionPlan, SessionListPage};
+use dwo_agent_service::{ExecutionPlan, SessionListItem, SessionListPage};
 use dwo_context::{ContentBlock as DwoContentBlock, MessageContent};
 use dwo_tools::{TodoEntry, TodoEntryPriority, TodoEntryStatus};
 use serde::{Deserialize, Serialize};
@@ -473,18 +473,7 @@ where
                     Ok(value) => {
                         let page: SessionListPage =
                             serde_json::from_value(value).unwrap_or_default();
-                        let sessions = page
-                            .sessions
-                            .into_iter()
-                            .map(|session| {
-                                SessionInfo::new(
-                                    SessionId::new(session.session_id.as_str()),
-                                    session.cwd,
-                                )
-                                .title(session.title)
-                                .updated_at(timestamp_rfc3339(session.updated_at))
-                            })
-                            .collect();
+                        let sessions = page.sessions.into_iter().map(session_list_info).collect();
                         let response = ListSessionsResponse::new(sessions);
                         let response = page.next_cursor.map_or(response.clone(), |cursor| {
                             response.next_cursor(cursor.to_string())
@@ -871,21 +860,18 @@ async fn prepare_observer(
 ) -> Result<PreparedObserver> {
     let mut observers = runtime.observers.lock().await;
     if let Some(observer) = observers.get(session_id).cloned() {
-        drop(observers);
-        let snapshot = if replay {
-            Some(json!({"snapshot": runtime.request(
-                "session.snapshot",
-                json!({"session_id": session_id}),
-            ).await?}))
-        } else {
-            None
-        };
-        return Ok(PreparedObserver {
-            observer,
-            snapshot,
-            replay,
-            events: None,
-        });
+        if !replay {
+            return Ok(PreparedObserver {
+                observer,
+                snapshot: None,
+                replay,
+                events: None,
+            });
+        }
+        // A standalone snapshot can overlap queued events on the old stream.
+        // Replaying must always acquire a fresh actor snapshot + subscription.
+        observers.remove(session_id);
+        observer.shutdown.cancel();
     }
 
     let endpoint_id = format!("acp-{}", Uuid::new_v4());
@@ -999,6 +985,9 @@ async fn activate_observer(
         {
             let forwarding = async {
                 while let Some(frame) = events.recv().await {
+                    if observer_shutdown.is_cancelled() {
+                        break;
+                    }
                     handle_session_event(
                         &observer_runtime,
                         &observer_cx,
@@ -1055,6 +1044,7 @@ async fn handle_session_event(
         return;
     }
     match kind {
+        "step_snapshot" => send_step_snapshot(cx, session_id, &payload["step"]),
         "assistant_delta" => {
             if let (Some(message_id), Some(delta)) = (
                 payload.get("message_id").and_then(Value::as_str),
@@ -1801,27 +1791,39 @@ fn send_tool_started(cx: &AcpConnection, session_id: &str, payload: &Value) {
 }
 
 fn send_tool_updated(cx: &AcpConnection, session_id: &str, payload: &Value) {
-    send_update(
-        cx,
-        session_id,
-        SessionUpdate::ToolCallUpdate(tool_started(payload)),
-    );
+    let mut update = tool_started(payload);
+    if cx.protocol == AcpProtocol::V2 {
+        // A lifecycle/input refresh must not replace previously appended diffs
+        // or terminal references, nor reset a more specific kind to `other`.
+        update.content = Default::default();
+        update.kind = Default::default();
+    }
+    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
 }
 
 fn send_tool_completed(cx: &AcpConnection, session_id: &str, payload: &Value) {
-    let result = &payload["result"];
-    if result["tool_name"].as_str() == Some("terminal")
-        && let Some(terminal_id) = result["output"]["terminal_id"].as_str()
-    {
-        let mut terminal = TerminalUpdate::new(terminal_id.to_string());
-        if let Some(output) = result["output"]["output"].as_str() {
-            terminal = terminal.output(TerminalOutput::new(
-                base64::engine::general_purpose::STANDARD.encode(output.as_bytes()),
-            ));
+    // Terminal tool output is only the unread (possibly truncated/lossy) poll
+    // result. It is neither an authoritative snapshot nor a new stream chunk.
+    // The terminal's byte stream and exit event are delivered independently.
+    send_tool_patch(cx, session_id, tool_completed(payload));
+}
+
+fn send_tool_patch(cx: &AcpConnection, session_id: &str, mut update: ToolCallUpdate) {
+    if cx.protocol == AcpProtocol::V2 {
+        let content = std::mem::take(&mut update.content);
+        if let agent_client_protocol::schema::MaybeUndefined::Value(content) = content {
+            for item in content {
+                send_update(
+                    cx,
+                    session_id,
+                    SessionUpdate::ToolCallContentChunk(ToolCallContentChunk::new(
+                        update.tool_call_id.clone(),
+                        item,
+                    )),
+                );
+            }
         }
-        send_update(cx, session_id, SessionUpdate::TerminalUpdate(terminal));
     }
-    let update = tool_completed(payload);
     send_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
 }
 
@@ -1834,14 +1836,12 @@ fn send_terminal_opened(cx: &AcpConnection, session_id: &str, payload: &Value) {
     }
     send_update(cx, session_id, SessionUpdate::TerminalUpdate(terminal));
     if let Some(tool_call_id) = payload["tool_call_id"].as_str() {
-        send_update(
+        send_tool_patch(
             cx,
             session_id,
-            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id.to_string()).content(
-                vec![ToolCallContent::Terminal(Terminal::new(
-                    terminal_id.to_string(),
-                ))],
-            )),
+            ToolCallUpdate::new(tool_call_id.to_string()).content(vec![ToolCallContent::Terminal(
+                Terminal::new(terminal_id.to_string()),
+            )]),
         );
     }
 }
@@ -1936,7 +1936,7 @@ fn send_file_changed(cx: &AcpConnection, session_id: &str, payload: &Value) {
         .kind(ToolKind::Edit)
         .status(ToolCallStatus::Completed)
         .content(vec![ToolCallContent::Diff(diff)]);
-    send_update(cx, session_id, SessionUpdate::ToolCallUpdate(update));
+    send_tool_patch(cx, session_id, update);
 }
 
 fn tool_started(payload: &Value) -> ToolCallUpdate {
@@ -1953,8 +1953,19 @@ fn tool_started(payload: &Value) -> ToolCallUpdate {
         .kind(tool_kind())
         .status(acp_tool_status(call.get("status").and_then(Value::as_str)))
         .raw_input(raw_input.clone());
-    if let Some(text) = render_tool_input(name, &raw_input) {
-        tool = tool.content(text_content(text));
+    let mut content = render_tool_input(name, &raw_input)
+        .map(text_content)
+        .unwrap_or_default();
+    // Poll/input/kill calls reuse an existing terminal and have no new
+    // terminal_opened event of their own.
+    if name == "terminal"
+        && let Some(id) = raw_input.get("terminal_id").and_then(Value::as_str)
+        && !id.is_empty()
+    {
+        content.push(ToolCallContent::Terminal(Terminal::new(id)));
+    }
+    if !content.is_empty() {
+        tool = tool.content(content);
     }
     tool
 }
@@ -2112,11 +2123,177 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
             }
         }
     }
+    replay_terminal_outputs(cx, session_id, snapshot);
     replay_snapshot_state(cx, session_id, snapshot);
 }
 
+/// Prefer actor-retained raw bytes at snapshot.seq. Transcript reconstruction is
+/// only a fallback for old hosts, reloaded actors, or evicted terminal views.
+/// Poll results are never mixed with a retained byte suffix or live chunks.
+fn replay_terminal_outputs(cx: &AcpConnection, session_id: &str, snapshot: &Value) {
+    if cx.protocol != AcpProtocol::V2 {
+        return;
+    }
+    let mut retained = HashSet::new();
+    if let Some(views) = snapshot.get("terminal_views").and_then(Value::as_array) {
+        for view in views {
+            let (Some(id), Some(data)) = (view["terminal_id"].as_str(), view["output"].as_str())
+            else {
+                continue;
+            };
+            if base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .is_err()
+            {
+                continue;
+            }
+            retained.insert(id);
+            let dropped = view["dropped_bytes"].as_u64().unwrap_or(0);
+            let output = TerminalOutput::new(data).meta(serde_json::Map::from_iter([(
+                "dwo".into(),
+                json!({
+                    "droppedBytes": dropped,
+                    "truncated": dropped != 0,
+                    "snapshotSeq": snapshot["seq"],
+                }),
+            )]));
+            let mut terminal = TerminalUpdate::new(id).output(output);
+            if let Some(command) = view["command"].as_str() {
+                terminal = terminal.command(command.to_string());
+            }
+            if let Some(cwd) = view["cwd"].as_str() {
+                terminal = terminal.cwd(PathBuf::from(cwd));
+            }
+            if view["status"]
+                .as_str()
+                .is_some_and(|status| status != "running")
+            {
+                let mut exit = TerminalExitStatus::new();
+                if let Some(code) = view["exit_code"]
+                    .as_i64()
+                    .and_then(|code| u32::try_from(code).ok())
+                {
+                    exit = exit.exit_code(code);
+                }
+                terminal = terminal.exit_status(exit);
+            } else {
+                // Explicitly clear any stale exit patch on repeated replay.
+                terminal = terminal.exit_status(None);
+            }
+            send_update(cx, session_id, SessionUpdate::TerminalUpdate(terminal));
+        }
+    }
+    let Some(transcript) = snapshot.get("transcript").and_then(Value::as_array) else {
+        return;
+    };
+    let mut outputs: HashMap<&str, (Vec<u8>, Vec<u8>, bool)> = HashMap::new();
+    for event in transcript {
+        let payload = &event["payload"];
+        let terminal_id = payload["terminal_id"].as_str().or_else(|| {
+            payload
+                .pointer("/result/output/terminal_id")
+                .and_then(Value::as_str)
+        });
+        if terminal_id.is_some_and(|id| retained.contains(id)) {
+            continue;
+        }
+        match payload["kind"].as_str() {
+            Some("terminal_opened") => {
+                if let Some(id) = payload["terminal_id"].as_str() {
+                    outputs.entry(id).or_default();
+                }
+            }
+            Some("terminal_output") => {
+                if let (Some(id), Some(data)) =
+                    (payload["terminal_id"].as_str(), payload["data"].as_array())
+                {
+                    let (bytes, _, streamed) = outputs.entry(id).or_default();
+                    *streamed = true;
+                    bytes.extend(
+                        data.iter()
+                            .filter_map(Value::as_u64)
+                            .filter_map(|b| u8::try_from(b).ok()),
+                    );
+                }
+            }
+            Some("tool_completed") => {
+                let result = &payload["result"];
+                if result["tool_name"].as_str() == Some("terminal")
+                    && let Some(id) = result["output"]["terminal_id"].as_str()
+                    && let Some(text) = result["output"]["output"].as_str()
+                {
+                    outputs
+                        .entry(id)
+                        .or_default()
+                        .1
+                        .extend_from_slice(text.as_bytes());
+                }
+            }
+            _ => {}
+        }
+    }
+    for (id, (bytes, text, streamed)) in outputs {
+        if retained.contains(id) {
+            continue;
+        }
+        send_update(
+            cx,
+            session_id,
+            SessionUpdate::TerminalUpdate(TerminalUpdate::new(id).output(TerminalOutput::new(
+                base64::engine::general_purpose::STANDARD.encode(if streamed {
+                    bytes
+                } else {
+                    text
+                }),
+            ))),
+        );
+    }
+}
+
+fn session_list_info(session: SessionListItem) -> SessionInfo {
+    let mut info = SessionInfo::new(SessionId::new(session.session_id.as_str()), session.cwd)
+        .title(session.title)
+        .updated_at(timestamp_rfc3339(session.updated_at));
+    // ACP has no child-agent update variant. Keep children discoverable as
+    // ordinary sessions, with optional lineage in the standard metadata slot.
+    if session.parent_session_id.is_some() || session.forked_from.is_some() {
+        info = info.meta(serde_json::Map::from_iter([(
+            "dwo".to_string(),
+            json!({
+                "parentSessionId": session.parent_session_id,
+                "forkedFrom": session.forked_from,
+            }),
+        )]));
+    }
+    info
+}
+
 fn replay_snapshot_state(cx: &AcpConnection, session_id: &str, snapshot: &Value) {
-    if let Some(plan) = snapshot.pointer("/record/current_plan") {
+    if let Some(step) = snapshot.get("active_step") {
+        send_step_snapshot(cx, session_id, step);
+    }
+    let current_plan = snapshot
+        .pointer("/record/current_plan")
+        .filter(|plan| !plan.is_null());
+    if cx.protocol == AcpProtocol::V2 {
+        // Plans are keyed by planId, so an empty synthetic plan cannot clear
+        // a previously displayed plan. Clear known historical IDs explicitly.
+        let current_id = current_plan.and_then(|plan| plan["id"].as_str());
+        let mut cleared = HashSet::new();
+        if let Some(transcript) = snapshot.get("transcript").and_then(Value::as_array) {
+            for event in transcript {
+                let payload = &event["payload"];
+                if payload["kind"].as_str() == Some("plan_updated")
+                    && let Some(id) = payload["plan"]["id"].as_str()
+                    && Some(id) != current_id
+                    && cleared.insert(id)
+                {
+                    send_plan_update(cx, session_id, &json!({"id":id, "entries":[]}), true);
+                }
+            }
+        }
+    }
+    if let Some(plan) = current_plan {
         send_plan_update(cx, session_id, plan, false);
     } else {
         send_plan_update(
@@ -2140,6 +2317,35 @@ fn replay_snapshot_state(cx: &AcpConnection, session_id: &str, snapshot: &Value)
             ),
         ),
         _ => send_state(cx, session_id, StateUpdate::Idle(IdleStateUpdate::new())),
+    }
+}
+
+fn send_step_snapshot(cx: &AcpConnection, session_id: &str, step: &Value) {
+    if cx.protocol != AcpProtocol::V2 {
+        return;
+    }
+    // The daemon coalesces live deltas and retains a camelCase step snapshot.
+    // v2 message snapshots replace earlier chunks with the same message ID.
+    if let (Some(id), Some(text)) = (step["messageId"].as_str(), step["response"].as_str()) {
+        send_update(
+            cx,
+            session_id,
+            SessionUpdate::AgentMessage(
+                AgentMessage::new(id).content(vec![ContentBlock::Text(TextContent::new(text))]),
+            ),
+        );
+    }
+    if let (Some(id), Some(text)) = (
+        step["thoughtMessageId"].as_str(),
+        step["reasoning"].as_str(),
+    ) {
+        send_update(
+            cx,
+            session_id,
+            SessionUpdate::AgentThought(
+                AgentThought::new(id).content(vec![ContentBlock::Text(TextContent::new(text))]),
+            ),
+        );
     }
 }
 
@@ -2272,6 +2478,614 @@ mod tests {
         BlobResourceContents, EmbeddedResource, ImageContent, TextResourceContents,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// Exercise real SDK serialization over JSON-RPC, then deserialize with the
+    /// same standard schema a GUI uses. No daemon or model is contacted.
+    async fn capture_v2_updates(
+        emit: impl Fn(&AcpConnection) + Send + Sync + 'static,
+    ) -> Vec<Value> {
+        let (mut input, agent_input) = tokio::io::duplex(65536);
+        let (agent_output, output) = tokio::io::duplex(65536);
+        let eof = CancellationToken::new();
+        let transport = ByteStreams::new(
+            agent_output.compat_write(),
+            EofReader::new(agent_input, eof.clone()).compat(),
+        );
+        let agent = Agent.v2().on_receive_request(
+            async move |request: InitializeRequest,
+                        responder: Responder<InitializeResponse>,
+                        cx: ConnectionTo<Client>| {
+                let cx = AcpConnection::new(AcpProtocol::V2, cx);
+                emit(&cx);
+                send_update(
+                    &cx,
+                    "test",
+                    SessionUpdate::AgentMessage(AgentMessage::new("test-done")),
+                );
+                responder.respond(InitializeResponse::new(
+                    request.protocol_version,
+                    Implementation::new("test", "1"),
+                ))
+            },
+            on_receive_request!(),
+        );
+        let task = tokio::spawn(connect_until_eof(agent, transport, eof));
+        input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":2,\"info\":{\"name\":\"test\",\"version\":\"1\"},\"capabilities\":{}}}\n").await.unwrap();
+        let mut output = BufReader::new(output);
+        let updates = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut updates = Vec::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(output.read_line(&mut line).await.unwrap(), 0);
+                let value: Value = serde_json::from_str(&line).unwrap();
+                assert!(value.get("error").is_none(), "{value}");
+                if value["method"] != "session/update" {
+                    continue;
+                }
+                let notification: UpdateSessionNotification =
+                    serde_json::from_value(value["params"].clone()).unwrap();
+                assert_eq!(serde_json::to_value(notification).unwrap(), value["params"]);
+                let update = value["params"]["update"].clone();
+                if update["messageId"] == "test-done" {
+                    break updates;
+                }
+                updates.push(update);
+            }
+        })
+        .await
+        .unwrap();
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        updates
+    }
+
+    fn project_tool(updates: &[Value], id: &str) -> Value {
+        let mut stored = ToolCallUpdate::new(id);
+        for value in updates {
+            match serde_json::from_value::<SessionUpdate>(value.clone()).unwrap() {
+                SessionUpdate::ToolCallUpdate(update) if update.tool_call_id.to_string() == id => {
+                    stored.apply_update(update)
+                }
+                SessionUpdate::ToolCallContentChunk(chunk)
+                    if chunk.tool_call_id.to_string() == id =>
+                {
+                    let mut content = std::mem::take(&mut stored.content)
+                        .take()
+                        .unwrap_or_default();
+                    content.push(chunk.content);
+                    stored = stored.content(content);
+                }
+                _ => {}
+            }
+        }
+        serde_json::to_value(stored).unwrap()
+    }
+
+    fn project_terminal(updates: &[Value], id: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        for value in updates.iter().filter(|value| value["terminalId"] == id) {
+            match value["sessionUpdate"].as_str() {
+                Some("terminal_update") => {
+                    if let Some(data) = value["output"]["data"].as_str() {
+                        output = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .unwrap();
+                    }
+                }
+                Some("terminal_output_chunk") => output.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(value["data"].as_str().unwrap())
+                        .unwrap(),
+                ),
+                _ => {}
+            }
+        }
+        output
+    }
+
+    fn edit_events() -> Vec<Value> {
+        let cwd = std::env::current_dir().unwrap();
+        vec![
+            json!({"kind":"tool_started", "call":{"tool_call_id":"edit", "tool_name":"file_edit", "raw_input":{"patch":"patch input"}}}),
+            json!({"kind":"file_changed", "tool_call_id":"edit", "patch":"diff --git a/a b/a\n", "changes":[
+                {"kind":"add", "path":cwd.join("a")},
+                {"kind":"update", "path":cwd.join("b")},
+                {"kind":"delete", "path":cwd.join("c")},
+                {"kind":"move", "path":cwd.join("d"), "movedTo":cwd.join("e")}
+            ]}),
+            json!({"kind":"tool_updated", "call":{"tool_call_id":"edit", "tool_name":"file_edit", "status":"completed", "raw_input":{"patch":"refreshed input"}}}),
+            json!({"kind":"file_changed", "tool_call_id":"edit", "changes":[{"kind":"update", "path":cwd.join("f")}]}),
+            json!({"kind":"tool_completed", "result":{"tool_call_id":"edit", "tool_name":"file_edit", "output":{"status":"partial", "summary":"one operation failed"}}}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn v2_live_and_replayed_multi_file_diffs_survive_completion_and_refresh() {
+        let live = capture_v2_updates(|cx| {
+            for payload in edit_events() {
+                match payload["kind"].as_str().unwrap() {
+                    "tool_started" => send_tool_started(cx, "test", &payload),
+                    "tool_updated" => send_tool_updated(cx, "test", &payload),
+                    "file_changed" => send_file_changed(cx, "test", &payload),
+                    "tool_completed" => send_tool_completed(cx, "test", &payload),
+                    _ => unreachable!(),
+                }
+            }
+        })
+        .await;
+        let replay = capture_v2_updates(|cx| replay_snapshot(cx, "test", &json!({"snapshot":{
+            "record":{}, "phase":"idle", "transcript":edit_events().into_iter().map(|payload| json!({"payload":payload})).collect::<Vec<_>>()
+        }}))).await;
+        let tool = project_tool(&live, "edit");
+        assert_eq!(tool, project_tool(&replay, "edit"));
+        assert_eq!(tool["kind"], "edit");
+        assert_eq!(tool["rawOutput"]["status"], "partial");
+        let diffs: Vec<_> = tool["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "diff")
+            .collect();
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(diffs[0]["changes"].as_array().unwrap().len(), 4);
+        assert_eq!(diffs[0]["changes"][3]["operation"], "move");
+        assert!(
+            diffs[0]["changes"][3]["oldPath"]
+                .as_str()
+                .unwrap()
+                .ends_with('d')
+        );
+        assert!(
+            diffs[0]["changes"][3]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with('e')
+        );
+        assert_eq!(diffs[0]["patch"]["format"], "git_patch");
+        assert_eq!(diffs[0]["patch"]["text"], "diff --git a/a b/a\n");
+        let completion = live
+            .iter()
+            .rev()
+            .find(|u| u["sessionUpdate"] == "tool_call_update")
+            .unwrap();
+        assert!(completion.get("content").is_none());
+        assert!(
+            tool["content"].as_array().unwrap().last().unwrap()["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("one operation failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_terminal_completion_never_replaces_or_duplicates_streamed_bytes() {
+        let updates = capture_v2_updates(|cx| {
+            send_tool_started(cx, "test", &json!({"call":{"tool_call_id":"run", "tool_name":"terminal", "raw_input":{"command":"example"}}}));
+            send_terminal_opened(cx, "test", &json!({"tool_call_id":"run", "terminal_id":"term", "command":"example", "cwd":std::env::current_dir().unwrap()}));
+            // Include non-UTF8 and an ANSI escape sequence: live output is bytes.
+            send_terminal_output(cx, "test", &json!({"terminal_id":"term", "data":[27,91,51,49,109,255,10]}));
+            send_tool_completed(cx, "test", &json!({"result":{"tool_call_id":"run", "tool_name":"terminal", "output":{"terminal_id":"term", "status":"running", "output":"lossy first poll"}}}));
+            send_tool_started(cx, "test", &json!({"call":{"tool_call_id":"poll", "tool_name":"terminal", "raw_input":{"terminal_id":"term"}}}));
+            send_terminal_output(cx, "test", &json!({"terminal_id":"term", "data":[116,97,105,108]}));
+            send_tool_updated(cx, "test", &json!({"call":{"tool_call_id":"run", "tool_name":"terminal", "status":"completed"}}));
+            send_terminal_exited(cx, "test", &json!({"terminal_id":"term", "exit_code":7}));
+            send_tool_completed(cx, "test", &json!({"result":{"tool_call_id":"poll", "tool_name":"terminal", "output":{"terminal_id":"term", "status":"error", "output":"tail"}}}));
+        }).await;
+        assert_eq!(
+            project_terminal(&updates, "term"),
+            [27, 91, 51, 49, 109, 255, 10, 116, 97, 105, 108]
+        );
+        assert!(
+            updates
+                .iter()
+                .filter(|u| u["sessionUpdate"] == "terminal_update")
+                .all(|u| u.get("output").is_none())
+        );
+        assert!(updates.iter().any(|u| u["exitStatus"]["exitCode"] == 7));
+        for id in ["run", "poll"] {
+            let tool = project_tool(&updates, id);
+            assert_eq!(
+                tool["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| item["type"] == "terminal" && item["terminalId"] == "term")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(project_tool(&updates, "poll")["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn v2_replay_restores_retained_poll_output_before_new_live_chunks() {
+        for with_byte_events in [false, true] {
+            let updates = capture_v2_updates(move |cx| {
+                let mut transcript = vec![
+                    json!({"payload":{"kind":"terminal_opened", "terminal_id":"term", "tool_call_id":"run", "command":"example"}}),
+                    json!({"payload":{"kind":"tool_completed", "result":{"tool_name":"terminal", "tool_call_id":"run", "output":{"terminal_id":"term", "output":"first\n"}}}}),
+                    json!({"payload":{"kind":"tool_completed", "result":{"tool_name":"terminal", "tool_call_id":"poll", "output":{"terminal_id":"term", "output":"second\n"}}}}),
+                ];
+                if with_byte_events {
+                    transcript.push(json!({"payload":{"kind":"terminal_output", "terminal_id":"term", "data":[255,0,10]}}));
+                }
+                let snapshot = json!({"snapshot":{"record":{"current_plan":null}, "transcript":transcript, "phase":"running", "active_step":{
+                    "messageId":"partial", "thoughtMessageId":"thought", "response":"retained response", "reasoning":"retained reasoning"
+                }}});
+                // Replaying from start replaces retained output, not appends it twice.
+                replay_snapshot(cx, "test", &snapshot);
+                replay_snapshot(cx, "test", &snapshot);
+                send_terminal_output(cx, "test", &json!({"terminal_id":"term", "data":[110,101,119]}));
+                send_tool_completed(cx, "test", &json!({"result":{"tool_name":"terminal", "tool_call_id":"last", "output":{"terminal_id":"term", "output":"new"}}}));
+            }).await;
+            let expected = if with_byte_events {
+                b"\xff\0\nnew".as_slice()
+            } else {
+                b"first\nsecond\nnew".as_slice()
+            };
+            assert_eq!(project_terminal(&updates, "term"), expected);
+            assert!(
+                updates
+                    .iter()
+                    .any(|u| u["sessionUpdate"] == "state_update" && u["state"] == "running")
+            );
+            assert!(
+                updates
+                    .iter()
+                    .any(|u| u["sessionUpdate"] == "plan_update"
+                        && u["plan"]["entries"] == json!([]))
+            );
+            assert!(updates.iter().any(|u| u["sessionUpdate"] == "agent_message"
+                && u["messageId"] == "partial"
+                && u["content"][0]["text"] == "retained response"));
+        }
+    }
+
+    #[test]
+    fn v2_child_sessions_keep_lineage_in_standard_optional_metadata() {
+        let item = serde_json::from_value::<SessionListItem>(json!({
+            "sessionId":"session-child", "cwd":std::env::current_dir().unwrap(), "title":"Child", "updatedAt":0,
+            "status":"running", "model":"test", "reasoning":null, "policy":"full_access",
+            "parentSessionId":"session-parent", "forkedFrom":"session-source"
+        })).unwrap();
+        let value = serde_json::to_value(session_list_info(item)).unwrap();
+        assert_eq!(value["sessionId"], "session-child");
+        assert_eq!(value["_meta"]["dwo"]["parentSessionId"], "session-parent");
+        assert_eq!(value["_meta"]["dwo"]["forkedFrom"], "session-source");
+        assert!(value.get("parentSessionId").is_none());
+        serde_json::from_value::<SessionInfo>(value).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_replay_prefers_actor_bytes_then_appends_post_watermark_output() {
+        let updates = capture_v2_updates(|cx| {
+            let snapshot = json!({"snapshot": {
+                "record": {}, "phase": "running", "seq": 42,
+                "terminal_views": [
+                    {"terminal_id":"term", "tool_call_id":"run", "command":"example",
+                     "cwd":std::env::current_dir().unwrap(), "output":"G1szMW3/AOS4",
+                     "dropped_bytes":17, "status":"running", "exit_code":null},
+                    {"terminal_id":"empty", "command":"empty", "output":"", "dropped_bytes":12, "status":"running"},
+                    {"terminal_id":"exited", "command":"exit", "output":"Bw==", "status":"error", "exit_code":7},
+                    {"terminal_id":"killed", "output":"", "status":"killed", "exit_code":null}
+                ],
+                "transcript":[
+                    {"payload":{"kind":"terminal_opened", "tool_call_id":"run", "terminal_id":"term", "command":"example"}},
+                    {"payload":{"kind":"terminal_output", "terminal_id":"term", "data":[100,117,112]}},
+                    {"payload":{"kind":"tool_completed", "result":{"tool_name":"terminal", "tool_call_id":"run", "output":{"terminal_id":"term", "output":"lossy poll"}}}},
+                    {"payload":{"kind":"tool_completed", "result":{"tool_name":"terminal", "tool_call_id":"poll", "output":{"terminal_id":"empty", "output":"must not reappear"}}}},
+                    {"payload":{"kind":"tool_completed", "result":{"tool_name":"terminal", "tool_call_id":"old", "output":{"terminal_id":"evicted", "output":"fallback"}}}}
+                ]
+            }});
+            // Full replay replaces previous bytes, including an authoritative empty suffix.
+            replay_snapshot(cx, "test", &snapshot);
+            replay_snapshot(cx, "test", &snapshot);
+            send_terminal_output(cx, "test", &json!({"terminal_id":"term", "data":[173,27,91,48,109]}));
+            send_tool_completed(cx, "test", &json!({"result":{"tool_name":"terminal", "tool_call_id":"later", "output":{"terminal_id":"term", "output":"duplicate poll"}}}));
+        }).await;
+        assert_eq!(
+            project_terminal(&updates, "term"),
+            b"\x1b[31m\xff\0\xe4\xb8\xad\x1b[0m"
+        );
+        assert_eq!(project_terminal(&updates, "empty"), b"");
+        assert_eq!(project_terminal(&updates, "evicted"), b"fallback");
+        assert_eq!(project_terminal(&updates, "exited"), [7]);
+        let snapshots: Vec<_> = updates
+            .iter()
+            .filter(|update| update["terminalId"] == "term" && update.get("output").is_some())
+            .collect();
+        assert_eq!(snapshots.len(), 2);
+        for snapshot in snapshots {
+            assert_eq!(
+                snapshot["output"]["_meta"]["dwo"],
+                json!({"droppedBytes":17, "truncated":true, "snapshotSeq":42})
+            );
+            assert_eq!(snapshot["command"], "example");
+            assert!(snapshot["cwd"].is_string());
+            assert!(snapshot.get("exitStatus").unwrap().is_null());
+        }
+        assert!(updates.iter().any(
+            |update| update["terminalId"] == "exited" && update["exitStatus"]["exitCode"] == 7
+        ));
+        assert!(updates.iter().any(|update| update["terminalId"] == "killed" && update["exitStatus"] == json!({})));
+        assert!(
+            project_tool(&updates, "run")["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "terminal")
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_actor_terminal_views_replay_without_transcript() {
+        let updates = capture_v2_updates(|cx| {
+            replay_snapshot(
+                cx,
+                "test",
+                &json!({"snapshot": {
+                    "record": {}, "seq": 1, "terminal_views": [{
+                        "terminal_id":"term", "command":"example", "output":"/+S4",
+                        "dropped_bytes":0, "status":"running", "exit_code":null
+                    }]
+                }}),
+            )
+        })
+        .await;
+        assert_eq!(project_terminal(&updates, "term"), [255, 228, 184]);
+        assert!(
+            updates
+                .iter()
+                .any(|update| update["output"]["_meta"]["dwo"]["truncated"] == false)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_plan_replay_uses_current_plan_instead_of_historical_updates() {
+        let updates = capture_v2_updates(|cx| {
+            replay_snapshot(cx, "test", &json!({"snapshot":{
+                "record":{"current_plan":{"id":"current", "entries":[{"content":"Current task", "status":"in_progress", "priority":"high"}]}},
+                "transcript":[{"payload":{"kind":"plan_updated", "plan":{"id":"old", "entries":[]}}}],
+                "phase":"running"
+            }}));
+            send_plan_update(cx, "test", &json!({"id":"current", "entries":[{"content":"Current task", "status":"completed", "priority":"high"}]}), true);
+        }).await;
+        let plans: Vec<_> = updates
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "plan_update")
+            .collect();
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0]["plan"]["planId"], "old");
+        assert_eq!(plans[0]["plan"]["entries"], json!([]));
+        assert_eq!(plans[1]["plan"]["planId"], "current");
+        assert_eq!(plans[1]["plan"]["entries"][0]["status"], "in_progress");
+        assert_eq!(plans[2]["plan"]["planId"], "current");
+        assert_eq!(plans[2]["plan"]["entries"], json!([]));
+
+        let cleared = capture_v2_updates(|cx| replay_snapshot(cx, "test", &json!({"snapshot":{
+            "record":{"current_plan":null}, "phase":"idle",
+            "transcript":[{"payload":{"kind":"plan_updated", "plan":{"id":"current", "entries":[{"content":"stale task", "status":"in_progress", "priority":"high"}]}}}]
+        }}))).await;
+        assert!(
+            cleared
+                .iter()
+                .any(|u| u["plan"]["planId"] == "current" && u["plan"]["entries"] == json!([]))
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_resumed_running_session_accepts_steering_slashes_and_cancel() {
+        async fn send(input: &mut tokio::io::DuplexStream, value: Value) {
+            input
+                .write_all(format!("{value}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        async fn until(
+            output: &mut BufReader<tokio::io::DuplexStream>,
+            predicate: impl Fn(&Value) -> bool,
+        ) -> Value {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(output.read_line(&mut line).await.unwrap(), 0);
+                    let value: Value = serde_json::from_str(&line).unwrap();
+                    if predicate(&value) {
+                        return value;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Local stub holds responses open so the turn stays running. No real
+        // provider, installed daemon, or user configuration is used.
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = requests.clone();
+        let model_task = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                streams.push(listener.accept().await.unwrap().0);
+                received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        std::fs::create_dir_all(root.path().join("resource/prompts")).unwrap();
+        std::fs::write(root.path().join("resource/prompts/System.md"), "Test agent").unwrap();
+        let config = root.path().join("profile.yaml");
+        std::fs::write(&config, format!("policyMode: full_access\nmodel:\n  default:\n    model: deepseek/deepseek-v4-pro\n  providers:\n    deepseek:\n      baseUrl: http://{address}/v1\n      apiKey: test\n")).unwrap();
+        let host = Host::build(&config).await.unwrap();
+        let id = host
+            .create_session(dwo_host::HostSessionOptions {
+                title: Some("ACP v2 controls".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let backend = AcpBackend::Host {
+            host: host.clone(),
+            client_id: "test-v2".into(),
+        };
+        backend
+            .request(
+                "session.prompt",
+                json!({"session_id":id, "endpoint_id":"other-client", "message":"Wait"}),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let before = backend
+            .request("session.snapshot", json!({"session_id":id}))
+            .await
+            .unwrap();
+        let turn = before["active_turn_id"].clone();
+        assert_eq!(before["phase"], "running");
+        let request_count = requests.load(std::sync::atomic::Ordering::SeqCst);
+        let (mut input, agent_input) = tokio::io::duplex(65536);
+        let (agent_output, output) = tokio::io::duplex(65536);
+        let mut output = BufReader::new(output);
+        let acp_task = tokio::spawn(run_with_backend_io(
+            backend.clone(),
+            agent_input,
+            agent_output,
+        ));
+        send(&mut input, json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":2, "info":{"name":"test", "version":"1"}, "capabilities":{}}})).await;
+        assert!(
+            until(&mut output, |v| v["id"] == 1)
+                .await
+                .get("error")
+                .is_none()
+        );
+        send(
+            &mut input,
+            json!({"jsonrpc":"2.0", "id":2, "method":"session/resume", "params":{
+                "sessionId":id, "cwd":before["record"]["info"]["cwd"], "replayFrom":{"type":"start"}
+            }}),
+        )
+        .await;
+        assert!(
+            until(&mut output, |v| v["id"] == 2)
+                .await
+                .get("error")
+                .is_none()
+        );
+        until(&mut output, |v| v["params"]["update"]["state"] == "running").await;
+        let commands = until(&mut output, |v| {
+            v["params"]["update"]["sessionUpdate"] == "available_commands_update"
+        })
+        .await;
+        for name in ["cancel", "compact", "resume", "fork", "status"] {
+            assert!(
+                commands["params"]["update"]["availableCommands"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command["name"] == name)
+            );
+        }
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            request_count
+        );
+        for (request_id, text, fails) in [
+            (3, "/status", false),
+            (4, "/resume", false),
+            (5, "/compact", true),
+            (6, "/fork", true),
+            (7, "Steer the running turn", false),
+        ] {
+            send(&mut input, json!({"jsonrpc":"2.0", "id":request_id, "method":"session/prompt", "params":{"sessionId":id, "prompt":[{"type":"text", "text":text}]}})).await;
+            let response = until(&mut output, |v| v["id"] == request_id).await;
+            assert_eq!(response.get("error").is_some(), fails, "{text}: {response}");
+        }
+        let after = backend
+            .request("session.snapshot", json!({"session_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(after["active_turn_id"], turn);
+        assert_eq!(after["phase"], "running");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            request_count
+        );
+        assert!(
+            after["transcript"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["payload"]["kind"] == "user_prompt_submitted"
+                    && content_text(&event["payload"]["content"])
+                        .contains("Steer the running turn"))
+        );
+        send(
+            &mut input,
+            json!({"jsonrpc":"2.0", "method":"session/cancel", "params":{"sessionId":id}}),
+        )
+        .await;
+        let cancelled = until(&mut output, |v| v["params"]["update"]["state"] == "idle").await;
+        assert_eq!(cancelled["params"]["update"]["stopReason"], "cancelled");
+        let idle = backend
+            .request("session.snapshot", json!({"session_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(idle["phase"], "idle");
+        assert!(idle["active_turn_id"].is_null());
+        send(&mut input, json!({"jsonrpc":"2.0", "id":8, "method":"session/prompt", "params":{"sessionId":id, "prompt":[{"type":"text", "text":"/resume"}]}})).await;
+        assert!(
+            until(&mut output, |v| v["id"] == 8)
+                .await
+                .get("error")
+                .is_none()
+        );
+        let resumed = backend
+            .request("session.snapshot", json!({"session_id":id}))
+            .await
+            .unwrap();
+        assert_eq!(resumed["phase"], "running");
+        assert_ne!(resumed["active_turn_id"], turn);
+        send(&mut input, json!({"jsonrpc":"2.0", "id":9, "method":"session/prompt", "params":{"sessionId":id, "prompt":[{"type":"text", "text":"/cancel"}]}})).await;
+        assert!(
+            until(&mut output, |v| v["id"] == 9)
+                .await
+                .get("error")
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if backend
+                    .request("session.snapshot", json!({"session_id":id}))
+                    .await
+                    .unwrap()["phase"]
+                    == "idle"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), acp_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        host.shutdown().await;
+        model_task.abort();
+    }
 
     #[test]
     fn pending_cancel_is_consumed_only_by_the_same_session() {

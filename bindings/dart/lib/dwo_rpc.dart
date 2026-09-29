@@ -4,6 +4,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+part 'src/stdio_transport.dart';
+
 typedef JsonObject = Map<String, Object?>;
 
 abstract interface class DwoTransport {
@@ -23,7 +25,7 @@ final class DwoRawSubscription {
 
 final class DwoWebSocketTransport implements DwoTransport {
   DwoWebSocketTransport._(this._socket, this._timeout) {
-    _socket.listen(
+    _socketSubscription = _socket.listen(
       _onMessage,
       onError: _onError,
       onDone: _onDone,
@@ -34,8 +36,11 @@ final class DwoWebSocketTransport implements DwoTransport {
   final WebSocket _socket;
   final Duration _timeout;
   final Map<String, Completer<JsonObject>> _pending = {};
-  final List<StreamController<JsonObject>> _subscriptions = [];
+  late final StreamSubscription<dynamic> _socketSubscription;
+  StreamController<JsonObject>? _events;
+  bool _subscribed = false;
   bool _closed = false;
+  Future<void>? _closing;
 
   static Future<DwoWebSocketTransport> connect(
     Uri endpoint, {
@@ -45,10 +50,24 @@ final class DwoWebSocketTransport implements DwoTransport {
     if (endpoint.path != '/dwo') {
       throw ArgumentError.value(endpoint, 'endpoint', 'path must be /dwo');
     }
-    final socket = await WebSocket.connect(
+    if (timeout <= Duration.zero) {
+      throw ArgumentError.value(timeout, 'timeout', 'must be positive');
+    }
+    var abandoned = false;
+    final connecting = WebSocket.connect(
       endpoint.toString(),
       headers: {'Authorization': 'Bearer $managementToken'},
     );
+    // Future.timeout does not cancel the handshake. Dispose of late sockets too.
+    unawaited(connecting.then<void>((socket) {
+      if (abandoned) {
+        unawaited(socket.close().then<void>((_) {}, onError: (Object _) {}));
+      }
+    }, onError: (Object _) {}));
+    final socket = await connecting.timeout(timeout, onTimeout: () {
+      abandoned = true;
+      throw TimeoutException('Connecting Dwo WebSocket timed out', timeout);
+    });
     return DwoWebSocketTransport._(socket, timeout);
   }
 
@@ -64,50 +83,77 @@ final class DwoWebSocketTransport implements DwoTransport {
     if (_pending.containsKey(id)) {
       throw StateError('Dwo request id is already pending: $id');
     }
+    final encoded = jsonEncode(envelope);
     final completer = Completer<JsonObject>();
     _pending[id] = completer;
-    _socket.add(jsonEncode(envelope));
+    final response = completer.future.timeout(_timeout);
     try {
-      return await completer.future.timeout(_timeout);
+      try {
+        _socket.add(encoded);
+      } catch (error, stackTrace) {
+        _failAll(error, stackTrace);
+      }
+      return await response;
     } finally {
-      _pending.remove(id);
+      if (identical(_pending[id], completer)) _pending.remove(id);
     }
   }
 
   @override
   Future<DwoRawSubscription> subscribe(JsonObject envelope) async {
+    if (_closed) throw StateError('Dwo WebSocket transport is closed');
+    if (envelope['method'] != 'event.subscribe') {
+      throw ArgumentError('Dwo WebSocket subscriptions require event.subscribe');
+    }
+    // Notifications carry no subscription id. Keep one subscription for the
+    // connection's lifetime, including after its local listener is cancelled.
+    if (_subscribed) {
+      throw StateError('Dwo WebSocket transport supports one event subscription');
+    }
+    _subscribed = true;
     late final StreamController<JsonObject> controller;
     controller = StreamController<JsonObject>(
       onCancel: () {
-        _subscriptions.remove(controller);
+        if (identical(_events, controller)) _events = null;
+        unawaited(controller.close());
       },
     );
-    _subscriptions.add(controller);
+    // Register before sending: events can arrive before the reply or listener.
+    _events = controller;
     try {
       final response = await request(envelope);
+      if (response.containsKey('error')) {
+        _events = null;
+        unawaited(controller.close());
+      }
       return DwoRawSubscription(response, controller.stream);
     } catch (_) {
-      _subscriptions.remove(controller);
-      await controller.close();
+      _events = null;
+      unawaited(controller.close());
+      // A timed-out subscription may still be active at the remote endpoint.
+      await close();
       rethrow;
     }
   }
 
   void _onMessage(Object? message) {
+    if (_closed) return;
     try {
-      final decoded = jsonDecode(message as String);
+      if (message is! String) {
+        throw const FormatException('Dwo frame must be JSON text');
+      }
+      final decoded = jsonDecode(message);
       if (decoded is! Map) {
         throw const FormatException('Dwo frame must be a JSON object');
       }
       final frame = Map<String, Object?>.from(decoded);
       final id = frame['id'];
       if (id is String) {
-        _pending[id]?.complete(frame);
+        // Remove before completion so duplicate and late replies are harmless.
+        _pending.remove(id)?.complete(frame);
         return;
       }
-      for (final subscription in List.of(_subscriptions)) {
-        subscription.add(frame);
-      }
+      _events?.add(frame);
     } catch (error, stackTrace) {
       _failAll(error, stackTrace);
     }
@@ -118,30 +164,41 @@ final class DwoWebSocketTransport implements DwoTransport {
   }
 
   void _onDone() {
-    _closed = true;
     _failAll(StateError('Dwo WebSocket closed'), StackTrace.current);
   }
 
   void _failAll(Object error, StackTrace stackTrace) {
-    for (final completer in _pending.values) {
-      if (!completer.isCompleted) {
-        completer.completeError(error, stackTrace);
-      }
-    }
-    for (final subscription in List.of(_subscriptions)) {
-      subscription.addError(error, stackTrace);
-    }
+    if (_closed) return;
+    unawaited(_closing ??= _dispose(error, stackTrace, notifyEvents: true));
   }
 
   @override
-  Future<void> close() async {
-    if (_closed) return;
+  Future<void> close() => _closing ??= _dispose(
+        StateError('Dwo WebSocket transport is closed'),
+        StackTrace.current,
+      );
+
+  Future<void> _dispose(Object error, StackTrace stackTrace,
+      {bool notifyEvents = false}) async {
     _closed = true;
-    await _socket.close();
-    for (final subscription in List.of(_subscriptions)) {
-      await subscription.close();
+    for (final completer in _pending.values) {
+      completer.completeError(error, stackTrace);
     }
-    _subscriptions.clear();
+    _pending.clear();
+    final events = _events;
+    _events = null;
+    if (events != null) {
+      if (notifyEvents) events.addError(error, stackTrace);
+      // Unlistened or paused streams must not hold transport disposal open.
+      unawaited(events.close());
+    }
+    try {
+      await _socket.close().timeout(_timeout);
+    } catch (_) {
+      // Pending calls already have the terminal cause; cleanup is best effort.
+    } finally {
+      await _socketSubscription.cancel();
+    }
   }
 }
 
@@ -271,6 +328,25 @@ final class DwoEventSubscription {
   final Stream<DwoEvent> events;
 }
 
+final class DwoSessionPage {
+  const DwoSessionPage({required this.sessions, required this.nextCursor});
+
+  factory DwoSessionPage.fromJson(JsonObject json) {
+    final cursor = json['nextCursor'];
+    if (cursor != null && (cursor is! int || cursor < 0)) {
+      throw const FormatException(
+          'nextCursor must be a non-negative integer or null');
+    }
+    return DwoSessionPage(
+      sessions: json.objectList('sessions'),
+      nextCursor: cursor as int?,
+    );
+  }
+
+  final List<JsonObject> sessions;
+  final int? nextCursor;
+}
+
 final class DwoRpcClient {
   DwoRpcClient(this.transport);
 
@@ -306,8 +382,41 @@ final class DwoRpcClient {
   Future<JsonObject> updateConfig(JsonObject update, {String? requestId}) =>
       call('config.update', params: update, requestId: requestId);
 
-  Future<List<JsonObject>> sessions({bool all = true}) async =>
-      _objectArray(await callValue('session.list', params: {'all': all}));
+  /// Read every page, preserving the list-returning convenience API.
+  Future<List<JsonObject>> sessions({bool all = true, int limit = 100}) async {
+    final sessions = <JsonObject>[];
+    final seen = <int>{};
+    int? cursor;
+    do {
+      final page = await sessionsPage(all: all, cursor: cursor, limit: limit);
+      sessions.addAll(page.sessions);
+      final next = page.nextCursor;
+      if (next != null &&
+          (!seen.add(next) || (cursor != null && next <= cursor))) {
+        throw const FormatException('session.list cursor did not advance');
+      }
+      cursor = next;
+    } while (cursor != null);
+    return sessions;
+  }
+
+  Future<DwoSessionPage> sessionsPage({
+    bool all = true,
+    int? cursor,
+    int limit = 100,
+  }) async {
+    if (limit <= 0)
+      throw ArgumentError.value(limit, 'limit', 'must be positive');
+    if (cursor != null && cursor < 0) {
+      throw ArgumentError.value(cursor, 'cursor', 'must be non-negative');
+    }
+    return DwoSessionPage.fromJson(await call('session.list', params: {
+      'all': all,
+      'limit': limit,
+      // Host's ListSessionParam accepts a string, while its page returns an int.
+      if (cursor != null) 'cursor': cursor.toString(),
+    }));
+  }
 
   Future<JsonObject> sessionStatus(String sessionId) =>
       call('session.status', params: {'session_id': sessionId});
@@ -417,8 +526,7 @@ final class DwoRpcClient {
   Future<JsonObject> uninstallSkill(String name, {String? requestId}) =>
       call('skill.uninstall', params: {'name': name}, requestId: requestId);
 
-  Future<List<JsonObject>> automations(String projectId) async =>
-      _objectArray(
+  Future<List<JsonObject>> automations(String projectId) async => _objectArray(
         await callValue('automation.list', params: {'project_id': projectId}),
       );
 
@@ -426,37 +534,40 @@ final class DwoRpcClient {
     String projectId,
     JsonObject job, {
     String? requestId,
-  }) => call(
-    'automation.add',
-    params: {'project_id': projectId, 'job': job},
-    requestId: requestId,
-  );
+  }) =>
+      call(
+        'automation.add',
+        params: {'project_id': projectId, 'job': job},
+        requestId: requestId,
+      );
 
   Future<JsonObject> updateAutomation(
     String projectId,
     String name,
     JsonObject update, {
     String? requestId,
-  }) => call(
-    'automation.update',
-    params: {'project_id': projectId, 'name': name, ...update},
-    requestId: requestId,
-  );
+  }) =>
+      call(
+        'automation.update',
+        params: {'project_id': projectId, 'name': name, ...update},
+        requestId: requestId,
+      );
 
   Future<JsonObject> runAutomation(
     String projectId,
     String job, {
     String? callerSessionId,
     String? requestId,
-  }) => call(
-    'automation.run',
-    params: {
-      'project_id': projectId,
-      'job': job,
-      if (callerSessionId != null) 'caller_session_id': callerSessionId,
-    },
-    requestId: requestId,
-  );
+  }) =>
+      call(
+        'automation.run',
+        params: {
+          'project_id': projectId,
+          'job': job,
+          if (callerSessionId != null) 'caller_session_id': callerSessionId,
+        },
+        requestId: requestId,
+      );
 
   Future<JsonObject> websocketStatus() => call('websocket.status');
 
@@ -465,11 +576,12 @@ final class DwoRpcClient {
   Future<JsonObject> updateWebsocketConfig(
     JsonObject config, {
     String? requestId,
-  }) => call(
-    'websocket.config',
-    params: {'config': config},
-    requestId: requestId,
-  );
+  }) =>
+      call(
+        'websocket.config',
+        params: {'config': config},
+        requestId: requestId,
+      );
 
   Future<JsonObject> setWebsocketEnabled(
     bool enabled, {

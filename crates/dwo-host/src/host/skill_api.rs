@@ -32,6 +32,7 @@ impl Host {
         let action = method.strip_prefix("skill.").unwrap_or_default();
         match action {
             "list" => self.skill_list(),
+            "get" => self.skill_get(params),
             "enable" | "disable" => {
                 let name = params
                     .get("name")
@@ -67,6 +68,34 @@ impl Host {
         let active = skill_snapshots(&self.profile_root, &external, &self.profile_root)?;
         let disabled = list_skill_names(&self.profile_root.join("resource/skills/.disabled"))?;
         Ok(json!({"skills": active, "disabled": disabled}))
+    }
+
+    /// Only expose SKILL.md files discovered in the configured skill roots.
+    fn skill_get(&self, params: Value) -> Result<Value> {
+        let requested_path = params.get("path").and_then(Value::as_str);
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let listed = self.skill_list()?;
+        for skill in listed["skills"].as_array().into_iter().flatten() {
+            if requested_path.map_or_else(
+                || skill["name"].as_str() == Some(name),
+                |path| skill["path"].as_str() == Some(path),
+            ) {
+                let path = skill["path"].as_str().unwrap();
+                return Ok(json!({"path": path, "content": std::fs::read_to_string(path)?}));
+            }
+        }
+        anyhow::ensure!(requested_path.is_none(), "skill not found");
+        validate_skill_name(name)?;
+        let root = self.profile_root.join("resource/skills/.disabled");
+        let path = root.join(name).join("SKILL.md").canonicalize()?;
+        anyhow::ensure!(
+            path.starts_with(root.canonicalize()?),
+            "skill path escapes root"
+        );
+        Ok(json!({"path": path, "content": std::fs::read_to_string(&path)?}))
     }
 
     pub(crate) async fn skill_set_enabled(&self, name: String, enabled: bool) -> Result<Value> {

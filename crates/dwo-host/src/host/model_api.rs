@@ -249,9 +249,17 @@ impl Host {
     pub(crate) async fn provider_upsert(
         self: &Arc<Self>,
         name: String,
-        provider: dwo_agent_service::AgentProviderConfig,
+        mut provider: dwo_agent_service::AgentProviderConfig,
     ) -> Result<Value> {
         self.edit_profile(|profile| {
+            // Redacted list responses must not erase an existing credential.
+            if provider.api_key.is_none() {
+                provider.api_key = profile
+                    .model
+                    .providers
+                    .get(&name)
+                    .and_then(|existing| existing.api_key.clone());
+            }
             profile
                 .model
                 .providers

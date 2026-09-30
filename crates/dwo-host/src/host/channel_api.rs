@@ -210,10 +210,6 @@ impl Host {
         let yaml: serde_yaml::Value = serde_json::from_value(config)?;
         anyhow::ensure!(yaml.is_mapping(), "channel config must be an object");
         self.edit_profile(|profile| {
-            anyhow::ensure!(
-                profile.channels.contains_key(&name),
-                "channel is not configured"
-            );
             profile.channels.insert(name.clone(), yaml.clone());
             Ok(())
         })

@@ -211,6 +211,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     ),
     command("automation.run", MethodRoute::Dwo, Some("automation.run")),
     query("skill.list", MethodRoute::Dwo),
+    query("skill.get", MethodRoute::Dwo),
     command("skill.enable", MethodRoute::Dwo, Some("skill.changed")),
     command("skill.disable", MethodRoute::Dwo, Some("skill.changed")),
     command("skill.install", MethodRoute::Dwo, Some("skill.changed")),

@@ -97,6 +97,54 @@ async fn stream_with_reasoning(
 
 #[tokio::test]
 #[ignore = "requires DEEPSEEK_API_KEY and consumes API quota"]
+async fn deepseek_responses_usage_calibrates_context_tokens() {
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: deepseek/deepseek-v4-flash
+providers:
+  deepseek:
+    apiKeyEnv: DEEPSEEK_API_KEY
+    models:
+      deepseek-v4-flash:
+        profile: deepseek/deepseek-flash
+        maxOutputTokens: 2048
+        defaultReasoningEffort: low
+        hostedTools: []
+"#,
+    )
+    .unwrap();
+    let client = ConfiguredModelClient::new(&ModelCatalog::builtin().unwrap(), &agent).unwrap();
+    let messages = vec![
+        ContextMessage::system("Follow the user's instruction."),
+        ContextMessage::user("Reply with exactly OK."),
+    ];
+    let reply = stream(&client, "deepseek/deepseek-v4-flash", &messages, &[]).await;
+    assert!(reply.usage.input_tokens > 0);
+    assert!(reply.usage.output_tokens > 0);
+    assert_eq!(
+        reply.usage.total_tokens,
+        reply.usage.input_tokens + reply.usage.output_tokens
+    );
+    let mut context = ContextManager::new(SessionContext {
+        messages,
+        ..SessionContext::default()
+    });
+    context.normalize_for_selection("deepseek/deepseek", None, true);
+    context.append_response_items("deepseek/deepseek", reply.context_output_items());
+    context.record_model_usage(reply.usage.total_tokens, &[]);
+    let snapshot = context.checkpoint(&[]);
+    assert_eq!(snapshot.usage.current_tokens, reply.usage.total_tokens);
+    let restored = serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+    assert_eq!(
+        ContextManager::new(restored).refresh_usage(&[]),
+        reply.usage.total_tokens
+    );
+    println!("DeepSeek Responses usage: {:?}", reply.usage);
+}
+
+#[tokio::test]
+#[ignore = "requires DEEPSEEK_API_KEY and consumes API quota"]
 async fn deepseek_responses_supports_hosted_search_and_local_function_round_trip() {
     let agent = AgentModelConfig::from_yaml(
         r#"

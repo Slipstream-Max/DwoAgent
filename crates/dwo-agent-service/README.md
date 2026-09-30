@@ -55,6 +55,12 @@ state. If a persisted title is empty, list/load repairs it from the first user
 prompt in the transcript, normalized and capped at 10 Unicode characters. A
 session with no history applies the same rule when its next prompt arrives.
 
+Session usage uses the latest Responses `total_tokens` value after each model
+reply. The reported count survives checkpoints and reloads; only context added
+after that reply is estimated until the next response. Without reported usage,
+or after context replacement, the runtime estimates the complete context.
+This count describes the current context rather than cumulative billed tokens.
+
 ## Runtime ownership
 
 ```text

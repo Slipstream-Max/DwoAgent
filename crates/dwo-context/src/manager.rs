@@ -11,9 +11,13 @@ use crate::{
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUsage {
-    /// Estimated tokens in the complete model request context.
+    /// Provider-reported context tokens plus estimated changes since the response.
     #[serde(default)]
     pub current_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens_at_last_response: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
 }
@@ -222,6 +226,13 @@ impl ContextManager {
         self.context.usage.last_model = Some(model.into());
     }
 
+    pub fn record_model_usage(&mut self, total_tokens: u64, tools: &[Value]) {
+        self.context.usage.total_tokens = (total_tokens > 0).then_some(total_tokens);
+        self.context.usage.estimated_tokens_at_last_response = (total_tokens > 0)
+            .then(|| self.message_tokens.saturating_add(estimate_tool_tokens(tools)));
+        self.refresh_usage(tools);
+    }
+
     /// Permanently normalize stored model context for the selected provider and
     /// input capabilities. Returns whether any persisted item changed.
     pub fn normalize_for_selection(
@@ -267,9 +278,19 @@ impl ContextManager {
     }
 
     pub fn refresh_usage(&mut self, tools: &[Value]) -> u64 {
-        let tokens = self
+        let estimate = self
             .message_tokens
             .saturating_add(estimate_tool_tokens(tools));
+        let tokens = match (
+            self.context.usage.total_tokens,
+            self.context.usage.estimated_tokens_at_last_response,
+        ) {
+            (Some(total), Some(baseline)) if estimate >= baseline => {
+                total.saturating_add(estimate - baseline)
+            }
+            (Some(total), Some(baseline)) => total.saturating_sub(baseline - estimate),
+            _ => estimate,
+        };
         self.context.usage.current_tokens = tokens;
         tokens
     }
@@ -345,6 +366,8 @@ impl ContextManager {
     }
 
     fn recalculate_message_tokens(&mut self) {
+        self.context.usage.total_tokens = None;
+        self.context.usage.estimated_tokens_at_last_response = None;
         self.message_tokens = self
             .context
             .messages

@@ -128,6 +128,71 @@ fn usage_estimates_the_complete_context_without_provider_token_fields() {
 }
 
 #[test]
+fn reported_usage_survives_checkpoints_and_only_estimates_new_context() {
+    let mut manager = ContextManager::new(SessionContext {
+        messages: vec![
+            ContextMessage::system("system"),
+            ContextMessage::user("question"),
+        ],
+        ..SessionContext::default()
+    });
+    let tools = vec![json!({"type":"function","function":{"name":"terminal"}})];
+    manager.normalize_for_selection("deepseek", None, true);
+    manager.append_response_items(
+        "deepseek",
+        vec![json!({
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":"OK"}]
+        })],
+    );
+    manager.record_model_success("deepseek/deepseek-flash");
+    manager.record_model_usage(67, &tools);
+
+    assert_eq!(manager.refresh_usage(&tools), 67);
+    assert_eq!(manager.checkpoint(&tools).usage.current_tokens, 67);
+    assert!(!manager.compaction_due(68, &tools));
+    assert!(manager.compaction_due(67, &tools));
+    let snapshot = serde_json::to_value(manager.checkpoint(&tools)).unwrap();
+    let restored = serde_json::from_value(snapshot).unwrap();
+    let mut manager = ContextManager::new(restored);
+    assert!(!manager.normalize_for_selection("deepseek", None, true));
+    assert_eq!(manager.refresh_usage(&tools), 67);
+
+    let baseline = estimate_context_tokens(manager.model_messages(), &tools);
+    manager.append_user("follow up question");
+    let expected = 67 + estimate_context_tokens(manager.model_messages(), &tools) - baseline;
+    assert_eq!(manager.refresh_usage(&tools), expected);
+    assert_eq!(manager.checkpoint(&tools).usage.current_tokens, expected);
+
+    manager.append_assistant("another answer", Vec::new());
+    manager.record_model_usage(101, &tools);
+    assert_eq!(manager.checkpoint(&tools).usage.current_tokens, 101);
+
+    assert!(manager.normalize_for_selection("openai", None, true));
+    assert_eq!(
+        manager.refresh_usage(&tools),
+        estimate_context_tokens(manager.model_messages(), &tools)
+    );
+    assert_eq!(manager.context().usage.total_tokens, None);
+}
+
+#[test]
+fn missing_reported_usage_falls_back_to_the_complete_context_estimate() {
+    let mut manager = ContextManager::new(SessionContext::default());
+    manager.append_user("question");
+    manager.append_assistant("answer", Vec::new());
+    manager.record_model_usage(67, &[]);
+    manager.append_user("follow up");
+    manager.append_assistant("next answer", Vec::new());
+    manager.record_model_usage(0, &[]);
+    assert_eq!(manager.context().usage.total_tokens, None);
+    assert_eq!(
+        manager.checkpoint(&[]).usage.current_tokens,
+        estimate_context_tokens(manager.model_messages(), &[])
+    );
+}
+
+#[test]
 fn prompt_uses_and_watches_only_profile_and_initial_cwd_agents_files() {
     let root = tempfile::tempdir().unwrap();
     let profile = root.path().join("profile");
@@ -692,6 +757,7 @@ fn compaction_rebuild_absorbs_current_rules_and_reestimates_usage() {
     let builder = SystemPromptBuilder::new(profile.clone(), cwd.clone());
     let mut manager = ContextManager::initialize(&builder).unwrap();
     manager.append_user("hello");
+    manager.record_model_usage(99_999, &[]);
 
     write(&profile.join("resource/prompts/System.md"), "system v2");
     write(&cwd.join("AGENTS.md"), "cwd rules v2");
@@ -705,5 +771,10 @@ fn compaction_rebuild_absorbs_current_rules_and_reestimates_usage() {
     assert!(manager.system_prompt().contains("cwd rules v2"));
     assert!(!manager.system_prompt().contains("cwd rules v1"));
     assert!(manager.context().usage.current_tokens > 0);
+    assert_eq!(manager.context().usage.total_tokens, None);
+    assert_eq!(
+        manager.context().usage.current_tokens,
+        estimate_context_tokens(manager.model_messages(), &[])
+    );
     assert_eq!(manager.refresh_environment(&builder).unwrap(), 0);
 }

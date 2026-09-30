@@ -288,6 +288,8 @@ async fn run_inner(turn: &mut TurnExecution) -> TurnOutcome {
             .append_response_items(model_step.provider.clone(), response.context_output_items());
         turn.context
             .record_model_success(model_step.selection.model.clone());
+        turn.context
+            .record_model_usage(response.usage.total_tokens, turn.tools.schemas());
         let reasoning = response.transcript_reasoning();
         turn.emit(TurnUpdate::AssistantCompleted {
             turn_id: turn.turn_id.clone(),

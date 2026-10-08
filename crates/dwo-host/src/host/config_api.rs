@@ -9,7 +9,6 @@ impl Host {
             default_model,
             default_reasoning,
             models,
-            max_model_steps,
             logging,
             external_skills_dirs,
             external_rule_files,
@@ -21,7 +20,6 @@ impl Host {
                 profile.config.model.default.model.clone(),
                 profile.config.model.default.reasoning.clone(),
                 profile.model_options.clone(),
-                profile.config.max_model_steps,
                 profile.config.logging.clone(),
                 profile.config.external_skills_dirs.clone(),
                 profile.config.external_rule_files.clone(),
@@ -34,7 +32,6 @@ impl Host {
             default_model,
             default_reasoning,
             models,
-            max_model_steps,
             session_count,
             logging,
             external_skills_dirs,
@@ -50,9 +47,6 @@ impl Host {
         self.edit_profile(|profile| {
             if let Some(policy_mode) = params.policy_mode {
                 profile.policy_mode = policy_mode;
-            }
-            if let Some(max_model_steps) = params.max_model_steps {
-                profile.max_model_steps = max_model_steps;
             }
             if let Some(logging) = params.logging {
                 profile.logging = logging;
@@ -90,7 +84,6 @@ mod tests {
             "config.update",
             json!({
                 "policyMode": "watch",
-                "maxModelSteps": 25,
                 "logging": {"level": "debug", "retentionDays": 7},
                 "externalSkillsDirs": [],
                 "externalRuleFiles": []
@@ -101,7 +94,6 @@ mod tests {
         let snapshot = serde_json::to_value(host.config_snapshot(1)).unwrap();
         assert_eq!(snapshot["policy"], "watch");
         assert_eq!(snapshot["policyMode"], "watch");
-        assert_eq!(snapshot["maxModelSteps"], 25);
         assert_eq!(snapshot["logging"]["retentionDays"], 7);
         assert_eq!(snapshot["externalSkillsDirs"], json!([]));
         assert!(snapshot["compactionTriggerRatio"].is_number());

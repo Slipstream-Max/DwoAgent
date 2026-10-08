@@ -271,6 +271,10 @@ pub struct SessionSnapshot {
     /// Missing on older hosts. Empty after actor reload; not persisted to disk.
     #[serde(default)]
     pub terminal_views: Vec<TerminalView>,
+    /// Terminals the running daemon can still reach. A restart starts empty, so
+    /// replay never presents a terminal lost with a previous process as running.
+    #[serde(default)]
+    pub live_terminal_ids: Vec<String>,
     pub seq: u64,
 }
 

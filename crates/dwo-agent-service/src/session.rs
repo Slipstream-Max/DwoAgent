@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use dwo_context::{
@@ -603,13 +603,15 @@ pub(crate) struct SessionActor {
     events: broadcast::Sender<SessionEvent>,
     seq: u64,
     terminal_views: TerminalViewCache,
+    /// Terminal ids this daemon process can still reach. Fed by the same ordered
+    /// telemetry stream as the view cache; empty until terminals open.
+    live_terminals: HashSet<String>,
     phase: RuntimePhase,
     active: Option<ActiveTurnState>,
     active_compaction: Option<ActiveCompaction>,
     permission: PermissionState,
     closing_response: Option<oneshot::Sender<Result<(), SessionServiceError>>>,
     title_cancellation: Option<CancellationToken>,
-    max_model_steps: Arc<AtomicUsize>,
     deletion_hook: Option<SessionDeletionHook>,
     terminated: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -619,7 +621,6 @@ pub(crate) struct SessionActorDependencies {
     pub(crate) model: Arc<dyn ModelClient>,
     pub(crate) tools: Arc<ToolManager>,
     pub(crate) prompt_builder: SystemPromptBuilder,
-    pub(crate) max_model_steps: Arc<AtomicUsize>,
     pub(crate) deletion_hook: Option<SessionDeletionHook>,
 }
 
@@ -634,7 +635,6 @@ impl SessionActor {
             model,
             tools,
             prompt_builder,
-            max_model_steps,
             deletion_hook,
         } = dependencies;
         let id = record.info.id.clone();
@@ -650,7 +650,6 @@ impl SessionActor {
             model,
             tools,
             prompt_builder,
-            max_model_steps,
             deletion_hook,
             requests: request_rx,
             actor_tx,
@@ -660,6 +659,7 @@ impl SessionActor {
             events,
             seq: 0,
             terminal_views: TerminalViewCache::default(),
+            live_terminals: HashSet::new(),
             phase: RuntimePhase::Idle,
             active: None,
             active_compaction: None,
@@ -1024,7 +1024,6 @@ impl SessionActor {
             model: self.model.clone(),
             tools: self.tools.clone(),
             config: self.config_tx.subscribe(),
-            max_model_steps: self.max_model_steps.load(Ordering::Acquire),
             permission,
             cancellation,
             steer: steer_rx,
@@ -1069,18 +1068,21 @@ impl SessionActor {
                 mode: Some(mode),
                 model: None,
                 reasoning: None,
+                regenerate_title: None,
             },
             SessionConfigUpdate::Model(model) => SessionUpdate {
                 title: None,
                 mode: None,
                 model: Some(model),
                 reasoning: None,
+                regenerate_title: None,
             },
             SessionConfigUpdate::Reasoning(reasoning) => SessionUpdate {
                 title: None,
                 mode: None,
                 model: None,
                 reasoning: Some(reasoning),
+                regenerate_title: None,
             },
         };
         self.set_session(update).await
@@ -1097,6 +1099,7 @@ impl SessionActor {
             mode,
             model,
             reasoning,
+            regenerate_title,
         } = update;
         let title_changed = title
             .as_deref()
@@ -1178,6 +1181,9 @@ impl SessionActor {
         }
         if model_changed {
             self.emit_usage_changed();
+        }
+        if regenerate_title == Some(true) {
+            self.spawn_title_regeneration()?;
         }
         Ok(())
     }
@@ -1593,6 +1599,18 @@ impl SessionActor {
                         }
                     }
                     TurnUpdate::ToolTelemetry { turn_id, event } => {
+                        // A terminal is reachable from its open until its exit
+                        // is observed; replay uses this set to separate live
+                        // terminals from ones lost with a previous process.
+                        match &event {
+                            dwo_tools::ToolEvent::TerminalOpened { terminal_id, .. } => {
+                                self.live_terminals.insert(terminal_id.clone());
+                            }
+                            dwo_tools::ToolEvent::TerminalExited { terminal_id, .. } => {
+                                self.live_terminals.remove(terminal_id);
+                            }
+                            _ => {}
+                        }
                         // Retain even without subscribers or an active model turn.
                         // This also survives a transcript persistence failure.
                         self.terminal_views.observe(&event);
@@ -1677,6 +1695,7 @@ impl SessionActor {
                         self.active.take().expect("active turn was checked");
                         self.permission.reject("turn finished");
                         self.phase = RuntimePhase::Idle;
+                        self.record.info.last_turn_finished_at_ms = Some(current_time_ms());
                         if self.record.info.ephemeral {
                             self.record.info.completed |= matches!(outcome, TurnOutcome::Completed);
                             self.record.info.delete_after_ms =
@@ -1708,6 +1727,18 @@ impl SessionActor {
                                     turn_id: turn_id.clone(),
                                     error: error.clone(),
                                 })
+                            }
+                        }
+                        // 终态时间落盘：清单接口（session.list）直接读它，
+                        // GUI 的轮询不用为每条会话翻 transcript。
+                        if !self.record.info.ephemeral {
+                            if let Err(error) = self.repository.save(&self.record).await {
+                                tracing::error!(
+                                    event = "session.turn_finished_save_failed",
+                                    session_id = %self.record.info.id,
+                                    error = %error,
+                                    "persist turn finish time failed"
+                                );
                             }
                         }
                         if let Some(response) = self.closing_response.take() {
@@ -1976,6 +2007,39 @@ impl SessionActor {
         });
     }
 
+    /// 按需重新生成标题（`session.set` 的 `regenerate_title`）：拿 transcript
+    /// 里第一条用户消息当素材，走创建时自动标题同一套生成任务与落地保护
+    /// （生成期间标题被改过就丢弃结果）。
+    fn spawn_title_regeneration(&mut self) -> Result<(), SessionServiceError> {
+        let source = self
+            .transcript
+            .iter()
+            .find_map(|event| match &event.payload {
+                SessionEventPayload::UserPromptSubmitted { content, .. } => title_source(content),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                SessionServiceError::InvalidConfig(format!(
+                    "session {} has no user message to generate a title from",
+                    self.record.info.id
+                ))
+            })?;
+        if let Some(in_flight) = self.title_cancellation.take() {
+            in_flight.cancel();
+        }
+        self.title_cancellation = Some(spawn_title_generation(
+            self.model.clone(),
+            ModelSelection {
+                model: self.record.llm.model.clone(),
+                reasoning: None,
+            },
+            self.actor_tx.clone(),
+            source,
+            self.record.info.title.clone(),
+        ));
+        Ok(())
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             record: self.record.clone(),
@@ -2005,6 +2069,11 @@ impl SessionActor {
                 .unwrap_or_default(),
             pending_permission: self.permission.snapshot(),
             terminal_views: self.terminal_views.snapshot(),
+            live_terminal_ids: {
+                let mut ids: Vec<String> = self.live_terminals.iter().cloned().collect();
+                ids.sort();
+                ids
+            },
             seq: self.seq,
         }
     }
@@ -2215,13 +2284,13 @@ mod terminal_view_tests {
             events,
             seq: 0,
             terminal_views: TerminalViewCache::default(),
+            live_terminals: HashSet::new(),
             phase: RuntimePhase::Idle,
             active: None,
             active_compaction: None,
             permission: PermissionState::default(),
             closing_response: None,
             title_cancellation: None,
-            max_model_steps: Arc::new(AtomicUsize::new(1)),
             deletion_hook: None,
             terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -2242,6 +2311,7 @@ mod terminal_view_tests {
         actor.repository.save(&actor.record).await.unwrap();
         // No GUI or model turn is active. The background terminal still emits.
         telemetry(&mut actor, opened("term")).await;
+        assert_eq!(actor.snapshot().live_terminal_ids, ["term"]);
         let prefix = b"\x1b[31m\xff\0\xe4\xb8";
         telemetry(&mut actor, output("term", prefix)).await;
         assert_eq!(actor.events.receiver_count(), 0);
@@ -2276,6 +2346,7 @@ mod terminal_view_tests {
             },
         )
         .await;
+        assert!(actor.snapshot().live_terminal_ids.is_empty());
         let mut subscription =
             crate::events::subscription(snapshot, source, actor.record.info.id.clone());
         let event = tokio::time::timeout(Duration::from_secs(1), subscription.events.recv())

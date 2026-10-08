@@ -100,6 +100,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     query("session.read", MethodRoute::Dwo),
     command("session.delete", MethodRoute::Both, None),
     command("session.archive", MethodRoute::Dwo, None),
+    command("session.unarchive", MethodRoute::Dwo, None),
     command("session.keep", MethodRoute::Dwo, None),
     command("session.close", MethodRoute::Both, None),
     command("session.set_config_option", MethodRoute::Acp, None),
@@ -376,6 +377,8 @@ mod tests {
     fn route_registry_keeps_chat_on_acp() {
         assert!(method_allowed("acp", "session.prompt"));
         assert!(!method_allowed("dwo", "session.prompt"));
+        assert!(method_allowed("dwo", "session.archive"));
+        assert!(method_allowed("dwo", "session.unarchive"));
         assert!(method_allowed("dwo", "channel.telegram.status"));
         assert!(method_allowed("dwo", "websocket.status"));
         assert!(!method_allowed("dwo", "channel.unknown.status"));

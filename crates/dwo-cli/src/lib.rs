@@ -131,6 +131,9 @@ enum SessionCommand {
     Archive {
         id: String,
     },
+    Unarchive {
+        id: String,
+    },
     Move {
         id: String,
         #[arg(long)]
@@ -148,6 +151,9 @@ enum SessionCommand {
         model: Option<String>,
         #[arg(long)]
         reasoning: Option<String>,
+        /// 让模型按会话的第一条用户消息重新生成标题。
+        #[arg(long)]
+        regenerate_title: bool,
     },
     Status {
         id: String,
@@ -938,6 +944,12 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                 ipc::request_dwo(config_path, "session.archive", json!({"session_id": id})).await?;
             render::write_value(&value)?;
         }
+        SessionCommand::Unarchive { id } => {
+            let value =
+                ipc::request_dwo(config_path, "session.unarchive", json!({"session_id": id}))
+                    .await?;
+            render::write_value(&value)?;
+        }
         SessionCommand::Move {
             id,
             project,
@@ -959,9 +971,14 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
             policy,
             model,
             reasoning,
+            regenerate_title,
         } => {
             anyhow::ensure!(
-                title.is_some() || policy.is_some() || model.is_some() || reasoning.is_some(),
+                title.is_some()
+                    || policy.is_some()
+                    || model.is_some()
+                    || reasoning.is_some()
+                    || regenerate_title,
                 "session set requires at least one field"
             );
             let policy = policy
@@ -971,16 +988,50 @@ async fn run_session(command: SessionCommand, config_path: &Path) -> Result<()> 
                 config_path,
                 "session.set",
                 json!({
-                    "session_id": id,
+                    "session_id": &id,
                     "caller_session_id": current_session_id(),
                     "title": title,
                     "policy": policy,
                     "model": model,
                     "reasoning": reasoning,
+                    "regenerate_title": regenerate_title,
                 }),
             )
             .await?;
             render::write_value(&value)?;
+            if regenerate_title {
+                // 生成是后台任务：等新标题落回再退出，最多 15 秒。
+                let previous = value
+                    .pointer("/session/info/title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        output::line(format_args!(
+                            "标题生成中，稍后用 `dwo session status {id}` 查看"
+                        ))?;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let status = ipc::request_dwo(
+                        config_path,
+                        "session.status",
+                        json!({"session_id": &id}),
+                    )
+                    .await?;
+                    let current = status
+                        .pointer("/record/info/title")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if current != previous {
+                        if let Some(title) = &current {
+                            output::line(format_args!("title: {title}"))?;
+                        }
+                        break;
+                    }
+                }
+            }
         }
         SessionCommand::Status { id, json } => {
             let value =
@@ -1531,7 +1582,6 @@ async fn bind_qq(config_path: &Path) -> Result<()> {
 }
 
 const DEFAULT_PROFILE: &str = r#"policyMode: confirm
-maxModelSteps: 100
 externalSkillsDirs: []
 logging:
   level: info

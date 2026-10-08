@@ -2135,6 +2135,11 @@ fn replay_terminal_outputs(cx: &AcpConnection, session_id: &str, snapshot: &Valu
         return;
     }
     let mut retained = HashSet::new();
+    let live: HashSet<&str> = snapshot
+        .get("live_terminal_ids")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     if let Some(views) = snapshot.get("terminal_views").and_then(Value::as_array) {
         for view in views {
             let (Some(id), Some(data)) = (view["terminal_id"].as_str(), view["output"].as_str())
@@ -2187,6 +2192,7 @@ fn replay_terminal_outputs(cx: &AcpConnection, session_id: &str, snapshot: &Valu
         return;
     };
     let mut outputs: HashMap<&str, (Vec<u8>, Vec<u8>, bool)> = HashMap::new();
+    let mut exited = HashSet::new();
     for event in transcript {
         let payload = &event["payload"];
         let terminal_id = payload["terminal_id"].as_str().or_else(|| {
@@ -2229,6 +2235,11 @@ fn replay_terminal_outputs(cx: &AcpConnection, session_id: &str, snapshot: &Valu
                         .extend_from_slice(text.as_bytes());
                 }
             }
+            Some("terminal_exited") => {
+                if let Some(id) = payload["terminal_id"].as_str() {
+                    exited.insert(id);
+                }
+            }
             _ => {}
         }
     }
@@ -2247,6 +2258,18 @@ fn replay_terminal_outputs(cx: &AcpConnection, session_id: &str, snapshot: &Valu
                 }),
             ))),
         );
+        // Nobody can reach this terminal and the transcript never saw it exit
+        // (daemon restart, killed owner): close it so replay cannot keep it
+        // running forever. Live terminals and replayed exits are left alone.
+        if !exited.contains(id) && !live.contains(id) {
+            send_update(
+                cx,
+                session_id,
+                SessionUpdate::TerminalUpdate(
+                    TerminalUpdate::new(id).exit_status(TerminalExitStatus::new()),
+                ),
+            );
+        }
     }
 }
 
@@ -2842,6 +2865,59 @@ mod tests {
                 .iter()
                 .any(|update| update["output"]["_meta"]["dwo"]["truncated"] == false)
         );
+    }
+
+    #[tokio::test]
+    async fn v2_replay_closes_terminals_the_running_daemon_cannot_reach() {
+        let updates = capture_v2_updates(|cx| {
+            replay_snapshot(
+                cx,
+                "test",
+                &json!({"snapshot": {
+                    "record": {}, "seq": 1, "phase": "idle",
+                    "live_terminal_ids": ["alive"],
+                    "transcript": [
+                        {"payload":{"kind":"terminal_opened", "tool_call_id":"lost", "terminal_id":"lost", "command":"grep"}},
+                        {"payload":{"kind":"terminal_output", "terminal_id":"lost", "data":[104,105]}},
+                        {"payload":{"kind":"terminal_opened", "tool_call_id":"alive", "terminal_id":"alive", "command":"serve"}},
+                        {"payload":{"kind":"terminal_output", "terminal_id":"alive", "data":[111,107]}},
+                        {"payload":{"kind":"terminal_opened", "tool_call_id":"done", "terminal_id":"done", "command":"run"}},
+                        {"payload":{"kind":"terminal_output", "terminal_id":"done", "data":[121,101]}},
+                        {"payload":{"kind":"terminal_exited", "terminal_id":"done", "exit_code":0, "status":"completed"}}
+                    ]
+                }}),
+            )
+        })
+        .await;
+        for value in &updates {
+            serde_json::from_value::<SessionUpdate>(value.clone()).unwrap();
+        }
+        assert_eq!(project_terminal(&updates, "lost"), b"hi");
+        assert_eq!(project_terminal(&updates, "alive"), b"ok");
+        // Lost: no transcript exit and nobody can reach it, so it is closed.
+        assert!(
+            updates
+                .iter()
+                .any(|update| update["terminalId"] == "lost" && update["exitStatus"] == json!({}))
+        );
+        // Alive: the daemon still owns it; replay must leave it running.
+        assert!(
+            !updates.iter().any(
+                |update| update["terminalId"] == "alive" && update.get("exitStatus").is_some()
+            )
+        );
+        // Already exited: its own exit code replays exactly once.
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|update| update["terminalId"] == "done"
+                    && update.get("exitStatus").is_some())
+                .count(),
+            1
+        );
+        assert!(updates.iter().any(
+            |update| update["terminalId"] == "done" && update["exitStatus"]["exitCode"] == 0
+        ));
     }
 
     #[tokio::test]

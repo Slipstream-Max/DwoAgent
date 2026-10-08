@@ -133,6 +133,7 @@ struct SessionSetParam {
     policy: Option<SessionMode>,
     model: Option<String>,
     reasoning: Option<String>,
+    regenerate_title: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +165,12 @@ impl Host {
         let _lifecycle = self.sessions.lifecycle.lock().await;
         self.service.archive(id).await?;
         self.projects.unassign_session(id.as_str())?;
+        Ok(())
+    }
+
+    pub async fn unarchive_session(&self, id: &SessionId) -> Result<()> {
+        let _lifecycle = self.sessions.lifecycle.lock().await;
+        self.service.unarchive(id).await?;
         Ok(())
     }
 
@@ -306,6 +313,11 @@ impl Host {
                 let id = parse_session(params)?;
                 self.archive_session(&id).await?;
                 Ok(json!({"archived": true}))
+            }
+            "session.unarchive" => {
+                let id = parse_session(params)?;
+                self.unarchive_session(&id).await?;
+                Ok(json!({"unarchived": true}))
             }
             "session.keep" => {
                 let id = parse_session(params)?;
@@ -459,7 +471,8 @@ impl Host {
                     params.title.is_some()
                         || params.policy.is_some()
                         || params.model.is_some()
-                        || params.reasoning.is_some(),
+                        || params.reasoning.is_some()
+                        || params.regenerate_title == Some(true),
                     "session.set requires at least one field"
                 );
                 let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
@@ -487,6 +500,7 @@ impl Host {
                             mode: params.policy,
                             model: params.model,
                             reasoning: params.reasoning.map(Some),
+                            regenerate_title: params.regenerate_title,
                         },
                     )
                     .await?;
@@ -1155,6 +1169,28 @@ mod tests {
             SessionWorkspace::External {
                 pwd: std::fs::canonicalize(root.path()).unwrap()
             }
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_regenerate_title_without_messages_reports_a_clear_error() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let id = host
+            .create_session(HostSessionOptions::default())
+            .await
+            .unwrap();
+        let error = host
+            .handle_method(
+                "session.set",
+                json!({"session_id": id.to_string(), "regenerate_title": true}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no user message"),
+            "unexpected error: {error}"
         );
         host.shutdown().await;
     }

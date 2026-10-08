@@ -28,6 +28,7 @@ pub trait SessionRepository: Send + Sync {
     async fn list(&self) -> Result<Vec<SessionRecord>>;
     async fn delete(&self, id: &SessionId) -> Result<bool>;
     async fn archive(&self, id: &SessionId) -> Result<bool>;
+    async fn unarchive(&self, id: &SessionId) -> Result<bool>;
     async fn is_archived(&self, id: &SessionId) -> Result<bool>;
     async fn list_archived(&self) -> Result<Vec<SessionRecord>>;
     async fn append_transcript_event(
@@ -90,6 +91,13 @@ impl SessionRepository for MemorySessionRepository {
         }
         self.archived.write().await.insert(id.clone());
         Ok(true)
+    }
+
+    async fn unarchive(&self, id: &SessionId) -> Result<bool> {
+        if self.archived.write().await.remove(id) {
+            return Ok(true);
+        }
+        Ok(self.records.read().await.contains_key(id))
     }
 
     async fn is_archived(&self, id: &SessionId) -> Result<bool> {
@@ -168,6 +176,8 @@ struct PersistedSessionInfo {
     completed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delete_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_turn_finished_at_ms: Option<u64>,
 }
 
 impl PersistedSessionInfo {
@@ -184,6 +194,7 @@ impl PersistedSessionInfo {
             ephemeral: info.ephemeral,
             completed: info.completed,
             delete_after_ms: info.delete_after_ms,
+            last_turn_finished_at_ms: info.last_turn_finished_at_ms,
         }
     }
 
@@ -201,6 +212,7 @@ impl PersistedSessionInfo {
             ephemeral: self.ephemeral,
             completed: self.completed,
             delete_after_ms: self.delete_after_ms,
+            last_turn_finished_at_ms: self.last_turn_finished_at_ms,
         }
     }
 }
@@ -439,6 +451,31 @@ impl SessionRepository for FsSessionRepository {
         Ok(true)
     }
 
+    async fn unarchive(&self, id: &SessionId) -> Result<bool> {
+        let lock = self.session_lock(id).await;
+        let _write = lock.lock().await;
+        if !self.archived.read().await.contains(id) {
+            // 不在归档集合里：会话还在根目录就当已经恢复过（幂等）。
+            return Ok(self.find_dir(id).await.is_some());
+        }
+        let Some(session_dir) = self.find_dir(id).await else {
+            return Ok(false);
+        };
+        let relative = session_dir
+            .strip_prefix(&self.archive_root)
+            .context("archived session path is outside archive root")?;
+        let target = self.root.join(relative);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        dwo_file_guard::release_tree(&session_dir);
+        tokio::fs::rename(&session_dir, &target).await?;
+        self.paths.write().await.insert(id.clone(), target);
+        self.archived.write().await.remove(id);
+        self.remove_empty_date_directories(&session_dir).await?;
+        Ok(true)
+    }
+
     async fn is_archived(&self, id: &SessionId) -> Result<bool> {
         Ok(self.archived.read().await.contains(id))
     }
@@ -624,7 +661,6 @@ mod tests {
             serde_json::from_slice(&std::fs::read(session_dir.join(SESSION_META_FILE)).unwrap())
                 .unwrap();
         assert!(metadata.get("context").is_none());
-        assert!(metadata.get("max_model_steps").is_none());
         assert!(metadata["info"].get("cwd").is_none());
         assert!(metadata["info"].get("workspaceId").is_none());
         assert!(metadata["info"].get("worktreeId").is_none());

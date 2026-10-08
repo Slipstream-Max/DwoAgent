@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -110,6 +109,10 @@ pub struct SessionListItem {
     pub parent_session_id: Option<SessionId>,
     /// fork 来源（`session prompt --from X`）；`session list --forked` 靠它筛。
     pub forked_from: Option<SessionId>,
+    /// 最后一个终态回合结束的毫秒时间戳；没跑完过回合（或老会话记录）是
+    /// `None`，客户端可以退回 `updated_at`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_finished_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -127,7 +130,6 @@ pub struct SessionService {
     profile_root: PathBuf,
     external_skill_dirs: Arc<RwLock<Vec<PathBuf>>>,
     external_rule_files: Arc<RwLock<Vec<ExternalRuleFile>>>,
-    max_model_steps: Arc<AtomicUsize>,
     loaded: Mutex<LoadedSessionRegistry>,
     session_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
     mutation_locks: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
@@ -247,7 +249,6 @@ impl SessionService {
             profile_root: profile.root,
             external_skill_dirs: Arc::new(RwLock::new(profile.external_skill_dirs)),
             external_rule_files: Arc::new(RwLock::new(profile.external_rule_files)),
-            max_model_steps: Arc::new(AtomicUsize::new(profile.config.max_model_steps)),
             loaded: Mutex::new(LoadedSessionRegistry::default()),
             session_locks: Mutex::new(HashMap::new()),
             mutation_locks: Mutex::new(HashMap::new()),
@@ -292,8 +293,6 @@ impl SessionService {
             .external_rule_files
             .write()
             .expect("external rule files lock poisoned") = profile.external_rule_files;
-        self.max_model_steps
-            .store(profile.config.max_model_steps, Ordering::Release);
         Ok(())
     }
 
@@ -561,7 +560,6 @@ impl SessionService {
                 model: self.model.clone(),
                 tools,
                 prompt_builder,
-                max_model_steps: self.max_model_steps.clone(),
                 deletion_hook: self
                     .deletion_hook
                     .read()
@@ -637,6 +635,7 @@ impl SessionService {
                 policy: record.info.mode,
                 parent_session_id: record.info.parent_session_id.clone(),
                 forked_from: record.info.forked_from.clone(),
+                last_turn_finished_at_ms: record.info.last_turn_finished_at_ms,
             });
         }
         Ok(SessionListPage {
@@ -717,6 +716,17 @@ impl SessionService {
         self.unload(id).await?;
         let archived = self.repository.archive(id).await?;
         if !archived {
+            return Err(SessionServiceError::SessionNotFound(id.clone()));
+        }
+        Ok(())
+    }
+
+    /// 把归档的会话恢复回活跃列表（`session.unarchive`）：文件搬回根目录，
+    /// 下次用到时按需重新加载。
+    pub async fn unarchive(&self, id: &SessionId) -> Result<(), SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        if !self.repository.unarchive(id).await? {
             return Err(SessionServiceError::SessionNotFound(id.clone()));
         }
         Ok(())

@@ -4,6 +4,7 @@ pub mod atomic_file;
 mod compaction;
 mod error;
 mod events;
+mod model_request;
 mod permission;
 mod profile;
 mod prompt;
@@ -11,6 +12,8 @@ mod repository;
 mod session;
 mod session_record;
 mod session_service;
+mod tool_calls;
+mod tool_exec;
 mod turn;
 
 pub use dwo_context::{
@@ -40,8 +43,8 @@ pub use profile::{
 pub use repository::{FsSessionRepository, MemorySessionRepository, SessionRepository};
 pub use session::{CompactionAccepted, EndpointId, MessageId, PromptAccepted, SessionHandle};
 pub use session_record::{
-    DEFAULT_MAX_MODEL_STEPS, ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionId,
-    SessionInfo, SessionLlmSettings, SessionRecord, SessionUpdate, SessionWorkspace,
+    ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionId, SessionInfo, SessionLlmSettings,
+    SessionRecord, SessionUpdate, SessionWorkspace,
 };
 pub use session_service::{
     NewSession, SessionDeletionHook, SessionListItem, SessionListPage, SessionListQuery,

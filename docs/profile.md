@@ -8,7 +8,6 @@ Profile 是 daemon 的运行配置，默认位置是 ~/.dwoagent/profile.yaml。
 
 ~~~yaml
 policyMode: confirm
-maxModelSteps: 100
 externalSkillsDirs: []
 externalRuleFiles: []
 
@@ -67,7 +66,6 @@ Profile 使用 camelCase 字段名并拒绝未知字段。daemon 修改配置时
 | 字段 | 必填 | 默认值 | 作用 |
 | --- | --- | --- | --- |
 | policyMode | 是 | 无 | 新 Session 的权限：full_access、confirm 或 watch |
-| maxModelSteps | 否 | 100 | 单个 turn 最多执行的 model step；0 表示不限，或使用 5..=200 |
 | logging | 否 | info / 14 天 | JSONL 日志配置 |
 | externalSkillsDirs | 否 | [] | 额外 Skill 目录；相对路径相对 Profile 根目录 |
 | externalRuleFiles | 否 | [] | 额外规则文件；相对路径相对 Profile 根目录 |

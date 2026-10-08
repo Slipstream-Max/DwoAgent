@@ -8,14 +8,11 @@ use dwo_tools::SessionMode;
 use serde::{Deserialize, Serialize};
 
 use crate::SessionServiceError;
-use crate::session_record::DEFAULT_MAX_MODEL_STEPS;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentProfileConfig {
     pub policy_mode: SessionMode,
-    #[serde(default = "default_max_model_steps")]
-    pub max_model_steps: usize,
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
@@ -103,10 +100,6 @@ fn default_retention_days() -> usize {
     14
 }
 
-fn default_max_model_steps() -> usize {
-    DEFAULT_MAX_MODEL_STEPS
-}
-
 #[derive(Debug, Clone)]
 pub struct LoadedAgentProfile {
     pub root: PathBuf,
@@ -189,11 +182,6 @@ impl AgentProfileConfig {
                 "logging.retentionDays must be between 1 and 365".to_string(),
             ));
         }
-        if self.max_model_steps != 0 && !(5..=200).contains(&self.max_model_steps) {
-            return Err(SessionServiceError::InvalidConfig(
-                "maxModelSteps must be 0 (unlimited) or between 5 and 200".to_string(),
-            ));
-        }
         self.websocket
             .validate()
             .map_err(SessionServiceError::InvalidConfig)?;
@@ -215,19 +203,6 @@ impl AgentProfileConfig {
 mod tests {
     use super::*;
 
-    fn profile_yaml(model: &str) -> String {
-        format!(
-            r#"
-policyMode: confirm
-model:
-  default:
-    model: {model}
-  providers:
-    deepseek:
-"#
-        )
-    }
-
     #[test]
     fn profile_rejects_invalid_log_retention() {
         let error = AgentProfileConfig::from_yaml(
@@ -245,36 +220,6 @@ model:
         .unwrap_err();
 
         assert!(error.to_string().contains("logging.retentionDays"));
-    }
-
-    #[test]
-    fn profile_max_model_steps_defaults_and_accepts_bounds() {
-        let default =
-            AgentProfileConfig::from_yaml(&profile_yaml("deepseek/deepseek-v4-pro")).unwrap();
-        assert_eq!(default.max_model_steps, 100);
-
-        for value in [0, 5, 200] {
-            let source = profile_yaml("deepseek/deepseek-v4-pro").replacen(
-                "policyMode: confirm",
-                &format!("policyMode: confirm\nmaxModelSteps: {value}"),
-                1,
-            );
-            let profile = AgentProfileConfig::from_yaml(&source).unwrap();
-            assert_eq!(profile.max_model_steps, value);
-        }
-    }
-
-    #[test]
-    fn profile_rejects_out_of_range_max_model_steps() {
-        for value in [4, 201] {
-            let source = profile_yaml("deepseek/deepseek-v4-pro").replacen(
-                "policyMode: confirm",
-                &format!("policyMode: confirm\nmaxModelSteps: {value}"),
-                1,
-            );
-            let error = AgentProfileConfig::from_yaml(&source).unwrap_err();
-            assert!(error.to_string().contains("maxModelSteps"));
-        }
     }
 
     #[test]

@@ -631,6 +631,8 @@ mod tests {
             partial_message: "ignored partial answer".to_string(),
             active_tool_calls: Vec::new(),
             pending_permission: None,
+            terminal_views: Vec::new(),
+            live_terminal_ids: Vec::new(),
             seq: 1,
         };
 

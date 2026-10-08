@@ -174,8 +174,6 @@ pub(crate) struct ConfigUpdateParam {
     #[serde(default)]
     policy_mode: Option<SessionMode>,
     #[serde(default)]
-    max_model_steps: Option<usize>,
-    #[serde(default)]
     logging: Option<dwo_agent_service::LoggingConfig>,
     #[serde(default)]
     external_skills_dirs: Option<Vec<PathBuf>>,
@@ -227,7 +225,6 @@ pub(crate) struct ConfigSnapshot {
     default_model: String,
     default_reasoning: Option<String>,
     models: Vec<SessionModelOption>,
-    max_model_steps: usize,
     session_count: usize,
     logging: dwo_agent_service::LoggingConfig,
     external_skills_dirs: Vec<PathBuf>,

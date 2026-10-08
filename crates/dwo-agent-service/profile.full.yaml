@@ -7,9 +7,6 @@
 # full_access | confirm | watch
 policyMode: confirm
 
-# Maximum model steps in one agent turn. 0 means unlimited; valid finite range is 5..=200.
-maxModelSteps: 100
-
 # Additional skills directories. Relative paths are resolved from this profile root.
 externalSkillsDirs: []
 

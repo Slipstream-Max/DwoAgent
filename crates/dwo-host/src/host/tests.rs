@@ -272,6 +272,15 @@ async fn runtime_state_files_stay_locked_while_the_host_runs() {
     host.handle_method("session.archive", json!({"session_id": session_id}))
         .await
         .unwrap();
+    // 恢复回根目录：文件回到原路径，且此刻删除又会被「先归档」拦下。
+    host.handle_method("session.unarchive", json!({"session_id": session_id}))
+        .await
+        .unwrap();
+    assert!(session_file.exists());
+    assert!(host.delete_session(&session_id).await.is_err());
+    host.handle_method("session.archive", json!({"session_id": session_id}))
+        .await
+        .unwrap();
     host.delete_session(&session_id).await.unwrap();
     assert!(!session_file.exists());
 

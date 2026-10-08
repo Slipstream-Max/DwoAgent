@@ -52,8 +52,6 @@ macro_rules! string_id {
 
 string_id!(SessionId, "session-");
 
-pub const DEFAULT_MAX_MODEL_STEPS: usize = 100;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     pub id: String,
@@ -115,6 +113,10 @@ pub struct SessionInfo {
     pub completed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_after_ms: Option<u64>,
+    /// 最后一个终态回合（完成 / 取消 / 失败）结束的毫秒时间戳。
+    /// 清单接口（`SessionListItem`）直接读它，GUI 的时间档 / 分组不用翻 transcript。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_finished_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +155,9 @@ pub struct SessionUpdate {
     pub mode: Option<SessionMode>,
     pub model: Option<String>,
     pub reasoning: Option<Option<String>>,
+    /// `Some(true)`：让模型按会话的第一条用户消息重新生成标题
+    /// （`session.set` 的 `regenerate_title`）。
+    pub regenerate_title: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +230,7 @@ impl SessionRecord {
                 ephemeral: false,
                 completed: false,
                 delete_after_ms: None,
+                last_turn_finished_at_ms: None,
             },
             llm,
             context: SessionContext::default(),

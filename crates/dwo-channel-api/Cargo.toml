@@ -1,0 +1,14 @@
+[package]
+name = "dwo-channel-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dwo-agent-service = { path = "../dwo-agent-service" }
+dwo-protocol = { path = "../dwo-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true

@@ -14,7 +14,7 @@ use teloxide::prelude::*;
 use teloxide::types::{FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
 use tokio::sync::Mutex;
 
-use super::ChannelHost;
+use super::{ChannelBindingProgress, ChannelHost, ChannelManager, ChannelPollParams};
 use dwo_command::{command_descriptions, parse_command, routes_to_channel_command};
 
 use super::ChannelKind;
@@ -24,8 +24,7 @@ use super::attachments::{
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::gateway::{
-    ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
-    ChannelStarter, PreparedChannel,
+    ChannelAdapter, ChannelBinder, ChannelRuntime, ChannelStarter, PreparedChannel,
 };
 use super::manager::{TelegramChannelState, telegram_bot};
 use super::permission::{
@@ -47,19 +46,23 @@ pub struct TelegramAdapter;
 
 #[async_trait]
 impl ChannelBinder for TelegramAdapter {
-    async fn begin_bind(&self, host: Arc<dyn ChannelHost>) -> Result<serde_json::Value> {
+    async fn begin_bind(
+        &self,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(
-            host.channels().begin_telegram_bind().await?,
+            channels.begin_telegram_bind().await?,
         )?)
     }
 
     async fn poll_bind(
         &self,
-        host: Arc<dyn ChannelHost>,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
         params: ChannelPollParams,
     ) -> Result<ChannelBindingProgress> {
-        Ok(host
-            .channels()
+        Ok(channels
             .poll_telegram_bind(&params.binding_id)
             .await?
             .into())
@@ -82,8 +85,12 @@ pub struct RunningTelegram {
 
 #[async_trait]
 impl ChannelAdapter for TelegramAdapter {
-    async fn prepare(&self, host: Arc<dyn ChannelHost>) -> Result<PreparedChannel> {
-        let runtime = host.channels().load_telegram().await?;
+    async fn prepare(
+        &self,
+        host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<PreparedChannel> {
+        let runtime = channels.load_telegram().await?;
         let bot = telegram_bot(&runtime.bot_token, runtime.config.tg_proxy.as_deref())?;
         let me = bot.get_me().await?;
         ensure!(
@@ -106,7 +113,7 @@ impl ChannelAdapter for TelegramAdapter {
         let chat_id = ChatId(runtime.secret.bound_chat_id);
         let approvals = Arc::new(Mutex::new(HashMap::new()));
         let conversation = Arc::new(TelegramConversation {
-            host: host.clone(),
+            channels: channels.clone(),
             bot: bot.clone(),
             chat_id,
             state,
@@ -402,7 +409,7 @@ async fn download_media(
 }
 
 struct TelegramConversation {
-    host: Arc<dyn ChannelHost>,
+    channels: Arc<ChannelManager>,
     bot: Bot,
     chat_id: ChatId,
     state: Arc<Mutex<TelegramChannelState>>,
@@ -474,8 +481,7 @@ impl ConversationTransport for TelegramConversation {
             state.selected_session_id = session_id.map(str::to_string);
             state.clone()
         };
-        self.host
-            .channels()
+        self.channels
             .save_state(ChannelKind::Telegram, &snapshot)
             .await
     }

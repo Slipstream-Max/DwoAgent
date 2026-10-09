@@ -12,6 +12,7 @@ base64.workspace = true
 botrs.workspace = true
 chrono.workspace = true
 dwo-agent-service = { path = "../dwo-agent-service" }
+dwo-channel-api = { path = "../dwo-channel-api" }
 dwo-command = { path = "../dwo-command" }
 dwo-context = { path = "../dwo-context" }
 dwo-protocol = { path = "../dwo-protocol" }

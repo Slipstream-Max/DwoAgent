@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use super::ChannelHost;
+use super::{ChannelBindingProgress, ChannelHost, ChannelManager, ChannelPollParams};
 use dwo_command::{parse_command, routes_to_channel_command};
 
 use super::ChannelKind;
@@ -35,8 +35,7 @@ use super::attachments::{
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::gateway::{
-    ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
-    ChannelStarter, PreparedChannel,
+    ChannelAdapter, ChannelBinder, ChannelRuntime, ChannelStarter, PreparedChannel,
 };
 use super::manager::QqChannelState;
 use super::render::render_tool_call;
@@ -235,19 +234,21 @@ pub struct QqAdapter;
 
 #[async_trait]
 impl ChannelBinder for QqAdapter {
-    async fn begin_bind(&self, host: Arc<dyn ChannelHost>) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(
-            host.channels().begin_qq_bind().await?,
-        )?)
+    async fn begin_bind(
+        &self,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(channels.begin_qq_bind().await?)?)
     }
 
     async fn poll_bind(
         &self,
-        host: Arc<dyn ChannelHost>,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
         params: ChannelPollParams,
     ) -> Result<ChannelBindingProgress> {
-        Ok(host
-            .channels()
+        Ok(channels
             .poll_qq_bind(&params.binding_id)
             .await?
             .into())
@@ -274,8 +275,12 @@ pub struct RunningQq {
 
 #[async_trait]
 impl ChannelAdapter for QqAdapter {
-    async fn prepare(&self, host: Arc<dyn ChannelHost>) -> Result<PreparedChannel> {
-        let runtime = host.channels().load_qq().await?;
+    async fn prepare(
+        &self,
+        host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<PreparedChannel> {
+        let runtime = channels.load_qq().await?;
         let token = Token::new(runtime.app_id.clone(), runtime.app_secret.clone());
         let api = build_api(token.clone())?;
         api.get_bot_info().await.context("connect QQ bot")?;
@@ -284,7 +289,7 @@ impl ChannelAdapter for QqAdapter {
         let selected_session_id = state.lock().await.selected_session_id.clone();
         let approvals = Arc::new(Mutex::new(HashMap::new()));
         let conversation = Arc::new(QqConversation {
-            host: host.clone(),
+            channels: channels.clone(),
             api: api.clone(),
             openid: runtime.secret.bound_user_openid.clone(),
             state,
@@ -514,7 +519,7 @@ struct PendingAction {
 }
 
 struct QqConversation {
-    host: Arc<dyn ChannelHost>,
+    channels: Arc<ChannelManager>,
     api: BotApi,
     openid: String,
     state: Arc<Mutex<QqChannelState>>,
@@ -636,8 +641,7 @@ impl ConversationTransport for QqConversation {
             state.selected_session_id = session_id.map(str::to_string);
             state.clone()
         };
-        self.host
-            .channels()
+        self.channels
             .save_state(ChannelKind::Qq, &snapshot)
             .await
     }

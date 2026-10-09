@@ -20,7 +20,7 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::ChannelHost;
+use super::{ChannelBindingProgress, ChannelHost, ChannelManager, ChannelPollParams};
 #[cfg(test)]
 use dwo_command::render_command_help;
 use dwo_command::{parse_command, routes_to_channel_command};
@@ -32,8 +32,7 @@ use super::attachments::{
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::gateway::{
-    ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
-    ChannelStarter, PreparedChannel,
+    ChannelAdapter, ChannelBinder, ChannelRuntime, ChannelStarter, PreparedChannel,
 };
 use super::manager::{FeishuChannelConfig, FeishuChannelState};
 use super::permission::{
@@ -57,19 +56,21 @@ pub struct FeishuAdapter;
 
 #[async_trait]
 impl ChannelBinder for FeishuAdapter {
-    async fn begin_bind(&self, host: Arc<dyn ChannelHost>) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(
-            host.channels().begin_feishu_bind().await?,
-        )?)
+    async fn begin_bind(
+        &self,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(channels.begin_feishu_bind().await?)?)
     }
 
     async fn poll_bind(
         &self,
-        host: Arc<dyn ChannelHost>,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
         params: ChannelPollParams,
     ) -> Result<ChannelBindingProgress> {
-        Ok(host
-            .channels()
+        Ok(channels
             .poll_feishu_bind(&params.binding_id)
             .await?
             .into())
@@ -92,8 +93,12 @@ pub struct RunningFeishu {
 
 #[async_trait]
 impl ChannelAdapter for FeishuAdapter {
-    async fn prepare(&self, host: Arc<dyn ChannelHost>) -> Result<PreparedChannel> {
-        let runtime = host.channels().load_feishu().await?;
+    async fn prepare(
+        &self,
+        host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<PreparedChannel> {
+        let runtime = channels.load_feishu().await?;
         let config = openlark_config(
             &runtime.config,
             runtime.app_id.clone(),
@@ -109,7 +114,7 @@ impl ChannelAdapter for FeishuAdapter {
             open_id: runtime.secret.bound_open_id.clone(),
         };
         let conversation = Arc::new(FeishuConversation {
-            host: host.clone(),
+            channels: channels.clone(),
             api: api.clone(),
             state,
             approvals: approvals.clone(),
@@ -589,7 +594,7 @@ struct FeishuAccess {
 }
 
 struct FeishuConversation {
-    host: Arc<dyn ChannelHost>,
+    channels: Arc<ChannelManager>,
     api: FeishuApi,
     state: Arc<Mutex<FeishuChannelState>>,
     approvals: Arc<PermissionActionStore>,
@@ -655,8 +660,7 @@ impl ConversationTransport for FeishuConversation {
             state.selected_session_id = session_id.map(str::to_string);
             state.clone()
         };
-        self.host
-            .channels()
+        self.channels
             .save_state(ChannelKind::Feishu, &snapshot)
             .await
     }

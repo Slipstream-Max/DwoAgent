@@ -10,7 +10,7 @@ use weixin_agent::{
     MediaInfo, MediaType, MessageContext, MessageHandler, WeixinClient, WeixinConfig,
 };
 
-use super::ChannelHost;
+use super::{ChannelBindingProgress, ChannelHost, ChannelManager, ChannelPollParams};
 use dwo_command::{parse_command, routes_to_channel_command};
 
 use super::ChannelKind;
@@ -22,8 +22,7 @@ use super::attachments::{
 };
 use super::bridge::{ChannelIngress, ConversationId, ConversationTransport};
 use super::gateway::{
-    ChannelAdapter, ChannelBinder, ChannelBindingProgress, ChannelPollParams, ChannelRuntime,
-    ChannelStarter, PreparedChannel,
+    ChannelAdapter, ChannelBinder, ChannelRuntime, ChannelStarter, PreparedChannel,
 };
 use super::manager::WeixinChannelState;
 
@@ -39,19 +38,21 @@ pub struct WeixinAdapter;
 
 #[async_trait]
 impl ChannelBinder for WeixinAdapter {
-    async fn begin_bind(&self, host: Arc<dyn ChannelHost>) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(
-            host.channels().begin_weixin_login().await?,
-        )?)
+    async fn begin_bind(
+        &self,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(channels.begin_weixin_login().await?)?)
     }
 
     async fn poll_bind(
         &self,
-        host: Arc<dyn ChannelHost>,
+        _host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
         params: ChannelPollParams,
     ) -> Result<ChannelBindingProgress> {
-        Ok(host
-            .channels()
+        Ok(channels
             .poll_weixin_login(&params.binding_id, params.verify_code.as_deref())
             .await?
             .into())
@@ -78,14 +79,18 @@ pub struct RunningWeixin {
 
 #[async_trait]
 impl ChannelAdapter for WeixinAdapter {
-    async fn prepare(&self, host: Arc<dyn ChannelHost>) -> Result<PreparedChannel> {
-        let runtime = host.channels().load_weixin().await?;
+    async fn prepare(
+        &self,
+        host: Arc<dyn ChannelHost>,
+        channels: Arc<ChannelManager>,
+    ) -> Result<PreparedChannel> {
+        let runtime = channels.load_weixin().await?;
         let target = runtime.secret.bound_user_id.clone();
         let state = Arc::new(Mutex::new(runtime.state));
         let selected_session_id = state.lock().await.selected_session_id.clone();
         let client_ref = Arc::new(OnceLock::new());
         let conversation = Arc::new(WeixinConversation {
-            host: host.clone(),
+            channels: channels.clone(),
             target: target.clone(),
             state: state.clone(),
             client: client_ref.clone(),
@@ -188,7 +193,7 @@ impl ChannelRuntime for RunningWeixin {
 }
 
 struct WeixinConversation {
-    host: Arc<dyn ChannelHost>,
+    channels: Arc<ChannelManager>,
     target: String,
     state: Arc<Mutex<WeixinChannelState>>,
     client: Arc<OnceLock<Arc<WeixinClient>>>,
@@ -208,15 +213,14 @@ impl WeixinConversation {
             if let Some(sync_buf) = sync_buf {
                 state.adapter.sync_buf = Some(sync_buf.to_string());
             }
-            if let Some(client) = self.client.get() {
-                state.adapter.context_tokens = client.context_tokens().export_all();
-            }
-            state.clone()
-        };
-        self.host
-            .channels()
-            .save_state(ChannelKind::Weixin, &snapshot)
-            .await
+                if let Some(client) = self.client.get() {
+                    state.adapter.context_tokens = client.context_tokens().export_all();
+                }
+                state.clone()
+            };
+            self.channels
+                .save_state(ChannelKind::Weixin, &snapshot)
+                .await
     }
 }
 
@@ -247,8 +251,7 @@ impl ConversationTransport for WeixinConversation {
             state.selected_session_id = session_id.map(str::to_string);
             state.clone()
         };
-        self.host
-            .channels()
+        self.channels
             .save_state(ChannelKind::Weixin, &snapshot)
             .await
     }

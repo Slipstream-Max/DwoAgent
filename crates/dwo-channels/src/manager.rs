@@ -12,7 +12,10 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 use weixin_agent::{LoginStatus, QrLoginSession, StandaloneQrLogin, WeixinConfig};
 
-use super::ChannelKind;
+use super::{
+    ChannelKind, ChannelSummary, FeishuBindProgress, QqBindProgress, TelegramBindProgress,
+    WeixinLoginProgress,
+};
 
 const WEIXIN_CHANNEL: &str = ChannelKind::Weixin.as_str();
 const TELEGRAM_CHANNEL: &str = ChannelKind::Telegram.as_str();
@@ -272,30 +275,10 @@ pub struct QqRuntime {
     pub app_secret: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelSummary {
-    pub name: String,
-    pub enabled: bool,
-    pub connected: bool,
-    pub selected_session_id: Option<String>,
-    pub bound_user_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct WeixinLoginStart {
     pub binding_id: String,
     pub qrcode: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum WeixinLoginProgress {
-    Waiting,
-    Scanned,
-    Confirmed { channel: ChannelSummary },
-    Expired,
-    NeedVerifyCode,
-    Failed { message: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,14 +288,6 @@ pub struct TelegramBindStart {
     pub bot_username: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum TelegramBindProgress {
-    Waiting,
-    Confirmed { channel: ChannelSummary },
-    Expired,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct FeishuBindStart {
     pub binding_id: String,
@@ -320,28 +295,10 @@ pub struct FeishuBindStart {
     pub platform: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum FeishuBindProgress {
-    Waiting,
-    Confirmed { channel: ChannelSummary },
-    Expired,
-    Failed { message: String },
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct QqBindStart {
     pub binding_id: String,
     pub qrcode: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum QqBindProgress {
-    Waiting,
-    Confirmed { channel: ChannelSummary },
-    Expired,
-    Failed { message: String },
 }
 
 struct PendingLogin {
@@ -1265,6 +1222,21 @@ async fn set_private_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 async fn set_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[async_trait::async_trait]
+impl dwo_channel_api::ChannelControl for ChannelManager {
+    async fn list(&self) -> Result<Vec<ChannelSummary>> {
+        ChannelManager::list(self).await
+    }
+
+    async fn summary(&self, channel: ChannelKind) -> Result<ChannelSummary> {
+        ChannelManager::summary(self, channel).await
+    }
+
+    async fn bound_target(&self, channel: ChannelKind) -> Result<String> {
+        ChannelManager::bound_target(self, channel).await
+    }
 }
 
 #[cfg(test)]

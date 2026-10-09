@@ -6,9 +6,8 @@ use std::path::PathBuf;
 /// reported to the model always matches the wrapper the terminal spawns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shell {
-    /// niubash, a native Windows Bash implementation with Windows path
-    /// semantics and direct execution of Windows binaries.
-    NiuBash(PathBuf),
+    /// PowerShell 7 (`pwsh.exe`) on Windows.
+    Pwsh(PathBuf),
     /// POSIX shell on Unix platforms.
     Sh,
 }
@@ -16,7 +15,7 @@ pub enum Shell {
 impl Shell {
     pub fn name(&self) -> &'static str {
         match self {
-            Self::NiuBash(_) => "bash",
+            Self::Pwsh(_) => "pwsh",
             Self::Sh => "sh",
         }
     }
@@ -32,31 +31,39 @@ impl Shell {
 
 #[cfg(windows)]
 fn windows_shell() -> Shell {
-    Shell::NiuBash(find_niubash().unwrap_or_else(|| PathBuf::from("niu.exe")))
+    Shell::Pwsh(find_pwsh().unwrap_or_else(|| PathBuf::from("pwsh.exe")))
 }
 
-/// Locate niubash (`niu.exe`). PATH is checked
-/// first so portable installs and package managers work, followed by the
-/// conventional per-user and machine install locations.
+/// Locate PowerShell 7 (`pwsh.exe`), preferring the copy bundled under
+/// `self-tools` and then PATH, so portable installs and package managers
+/// work, followed by the conventional machine-wide, per-user, and Microsoft
+/// Store install locations.
 #[cfg(windows)]
-fn find_niubash() -> Option<PathBuf> {
+fn find_pwsh() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("PATH") {
-        for directory in std::env::split_paths(&path) {
-            candidates.push(directory.join("niu.exe"));
-        }
-    }
-    for variable in ["ProgramFiles", "LocalAppData"] {
-        if let Some(base) = std::env::var_os(variable) {
-            let base = PathBuf::from(base);
-            candidates.push(base.join("niubash").join("niu.exe"));
-            candidates.push(base.join("Programs").join("niubash").join("niu.exe"));
-        }
-    }
     if let Some(profile) = std::env::var_os("USERPROFILE") {
         let tools = PathBuf::from(profile).join(".dwoagent").join("self-tools");
-        candidates.push(tools.join("niu.exe"));
-        candidates.push(tools.join("niubash").join("niu.exe"));
+        candidates.push(tools.join("pwsh").join("pwsh.exe"));
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for directory in std::env::split_paths(&path) {
+            candidates.push(directory.join("pwsh.exe"));
+        }
+    }
+    if let Some(base) = std::env::var_os("ProgramFiles") {
+        let base = PathBuf::from(base);
+        candidates.push(base.join("PowerShell").join("7").join("pwsh.exe"));
+        candidates.push(base.join("PowerShell").join("7-preview").join("pwsh.exe"));
+    }
+    if let Some(base) = std::env::var_os("LocalAppData") {
+        let base = PathBuf::from(base);
+        candidates.push(
+            base.join("Microsoft")
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe"),
+        );
+        candidates.push(base.join("Microsoft").join("WindowsApps").join("pwsh.exe"));
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
@@ -70,7 +77,7 @@ mod tests {
         let shell = Shell::detect();
         if cfg!(windows) {
             let expected = match &shell {
-                Shell::NiuBash(_) => "bash",
+                Shell::Pwsh(_) => "pwsh",
                 Shell::Sh => unreachable!(),
             };
             assert_eq!(shell.name(), expected);
@@ -82,10 +89,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn niubash_is_the_only_windows_shell() {
-        if let Some(path) = find_niubash() {
+    fn pwsh_is_the_windows_shell_when_present() {
+        if let Some(path) = find_pwsh() {
             assert!(path.is_file());
-            assert_eq!(Shell::detect(), Shell::NiuBash(path));
+            assert_eq!(Shell::detect(), Shell::Pwsh(path));
         }
     }
 }

@@ -189,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_file_edits_in_one_batch_are_all_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let terminal_command = "printf terminal-ok";
+        let terminal_command = "echo terminal-ok";
         let outputs = manager(dir.path().to_path_buf())
             .execute_batch(
                 vec![

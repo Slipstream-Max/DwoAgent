@@ -317,7 +317,8 @@ mod tests {
     use dwo_context::shell::Shell;
 
     fn output_command() -> &'static str {
-        "printf 'done\\n'"
+        // `echo` resolves in both the POSIX shell and PowerShell.
+        "echo done"
     }
 
     #[tokio::test]
@@ -334,8 +335,13 @@ mod tests {
     #[tokio::test]
     async fn exit_drains_output_without_a_trailing_newline() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        let command = if cfg!(windows) {
+            "Write-Host -NoNewline 'tail-without-newline'"
+        } else {
+            "printf 'tail-without-newline'"
+        };
         let snapshot = manager
-            .run("printf 'tail-without-newline'".to_string(), 5_000, 120_000)
+            .run(command.to_string(), 5_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -345,16 +351,15 @@ mod tests {
     #[tokio::test]
     async fn output_larger_than_the_pty_channel_does_not_stall() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        // niubash/winuxcmd does not emulate /dev/zero, and the failing open
-        // used to leave the pipeline hanging inside a live PTY; build the
-        // burst with printf padding instead. It still far exceeds the PTY
-        // channel, the output hard cap, and the model-facing cap.
+        // Build a burst far larger than the PTY channel, the output hard
+        // cap, and the model-facing cap; the tail must still arrive.
+        let command = if cfg!(windows) {
+            "Write-Output ('x' * 1200000); Write-Output 'END-MARKER'"
+        } else {
+            "printf '%1200000s' '' | tr ' ' x; printf 'END-MARKER'"
+        };
         let snapshot = manager
-            .run(
-                "printf '%1200000s' '' | tr ' ' x; printf 'END-MARKER'".to_string(),
-                30_000,
-                120_000,
-            )
+            .run(command.to_string(), 30_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -391,16 +396,15 @@ mod tests {
     #[tokio::test]
     async fn combined_commands_keep_all_output() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
-        // Table rendering (screen-buffer API) used to be dropped when the
-        // shell wrapper appended `; exit`; every later command's output was
-        // silently lost. Regression guard for the wrapper change.
+        // Regression guard for the shell wrapper: output from every segment
+        // must survive (a previous wrapper lost output after `; exit`).
+        let command = if cfg!(windows) {
+            "Write-Output 'TEST1'; Write-Output '===SEP==='; Get-ChildItem prompts; Write-Output '===SEP2==='; Get-ChildItem prompts; Write-Output '===SEP3==='; Get-Content prompts/terminal.md -TotalCount 3"
+        } else {
+            "printf 'TEST1\\n===SEP===\\n'; ls prompts; printf '===SEP2===\\n'; ls prompts; printf '===SEP3===\\n'; head -3 prompts/terminal.md"
+        };
         let snapshot = manager
-            .run(
-                "printf 'TEST1\\n===SEP===\\n'; ls prompts; printf '===SEP2===\\n'; ls prompts; printf '===SEP3===\\n'; head -3 prompts/terminal.md"
-                    .to_string(),
-                10_000,
-                120_000,
-            )
+            .run(command.to_string(), 10_000, 120_000)
             .await
             .unwrap();
         assert_eq!(snapshot.status, "completed");
@@ -476,7 +480,7 @@ mod tests {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let first = manager
             .run(
-                "printf 'first\\n'; sleep 1.5; printf 'second\\n'".to_string(),
+                "echo first; sleep 1.5; echo second".to_string(),
                 5_000,
                 120_000,
             )
@@ -494,7 +498,7 @@ mod tests {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let snapshot = manager
             .run(
-                "printf '%s\\n' \"$LANG\"; printf '中文🙂'".to_string(),
+                "Write-Output $env:LANG; Write-Output '中文🙂'".to_string(),
                 5_000,
                 120_000,
             )
@@ -510,15 +514,14 @@ mod tests {
 
     #[tokio::test]
     async fn pty_input_reaches_the_process() {
-        // Niubash shows a first-start setup wizard when $HOME/.niubashrc is
-        // missing; the wizard would swallow the interactive input below, so
-        // give the shell a throwaway home that already has an rc file.
+        // Point the interactive shell at a throwaway home so it neither
+        // loads the real profile nor writes history into the user profile.
         #[cfg(windows)]
         let (_home, environment) = {
             let home = tempfile::tempdir().unwrap();
-            std::fs::write(home.path().join(".niubashrc"), "").unwrap();
             let path = home.path().to_string_lossy().into_owned();
             let mut environment = std::collections::HashMap::new();
+            environment.insert("APPDATA".to_string(), path.clone());
             environment.insert("HOME".to_string(), path.clone());
             environment.insert("USERPROFILE".to_string(), path);
             (home, environment)
@@ -528,14 +531,17 @@ mod tests {
         let manager =
             TerminalManager::new_with_environment(std::env::current_dir().unwrap(), environment)
                 .unwrap();
-        // The octal printf keeps the literal "PTY-OK" out of the tty echo of
-        // the input line, so only the child executing it can satisfy the
-        // assertion.
+        // The literal "PTY-OK" must never appear in the tty echo of the
+        // input line, so only the child executing it can satisfy the
+        // assertion; both inputs build it from halves at runtime.
         let (command, input) = if cfg!(windows) {
             match Shell::detect() {
-                Shell::NiuBash(program) => (
-                    format!("\"{}\" -i", program.to_string_lossy().replace('\\', "/")),
-                    "printf '\\120\\124\\131\\055\\117\\113\\n'\n".to_string(),
+                Shell::Pwsh(program) => (
+                    format!(
+                        "& \"{}\" -NoLogo -NoProfile",
+                        program.to_string_lossy().replace('\\', "/")
+                    ),
+                    "Write-Output ('PTY-' + 'OK')\r".to_string(),
                 ),
                 Shell::Sh => unreachable!("Windows shell detection returned sh"),
             }
@@ -577,7 +583,7 @@ mod tests {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let started = manager
             .run(
-                "printf 'before-kill\\n'; sleep 30".to_string(),
+                "echo before-kill; sleep 30".to_string(),
                 5_000,
                 120_000,
             )
@@ -592,7 +598,7 @@ mod tests {
     async fn list_does_not_consume_unread_output() {
         let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
         let started = manager
-            .run("sleep 0.5; printf 'later\\n'".to_string(), 100, 120_000)
+            .run("sleep 0.5; echo later".to_string(), 100, 120_000)
             .await
             .unwrap();
         let _ = manager.list().await;

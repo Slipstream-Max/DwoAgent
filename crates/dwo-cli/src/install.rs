@@ -20,8 +20,8 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("runtime/sessions"))?;
     std::fs::create_dir_all(root.join("resource/models"))?;
     std::fs::create_dir_all(root.join("channels"))?;
-    // Bundled runtime dependencies (niubash and Git) live here, separate
-    // from dwo's own executable and resource directories.
+    // Bundled runtime dependencies (PowerShell 7 and Git) live here,
+    // separate from dwo's own executable and resource directories.
     std::fs::create_dir_all(root.join("self-tools"))?;
     write_if_missing(config_path, DEFAULT_PROFILE)?;
     write_if_missing(
@@ -36,17 +36,17 @@ pub(super) fn install(config_path: &Path) -> Result<()> {
 fn install_windows_self_tools(root: &Path) -> Result<()> {
     let tools = root.join("self-tools");
     std::fs::create_dir_all(&tools)?;
-    let (niu_asset, niu_hash, git_asset, git_hash) = if cfg!(target_arch = "aarch64") {
+    let (pwsh_asset, pwsh_hash, git_asset, git_hash) = if cfg!(target_arch = "aarch64") {
         (
-            "niubash-win-arm64.zip",
-            "44736de66acdd4daaab21c64a3f4f09d7ed7d69a780acea7d8364e5a0a307eb8",
+            "PowerShell-7.6.6-win-arm64.zip",
+            "bbde9dda31d148415eccb5fbe1638e6400a144187b006e5b3fd8ec2f39d781be",
             "MinGit-2.55.0.5-arm64.zip",
             "05843f9d6e60306c3ab886799e2c67200caab921571f10512df3493049179ddb",
         )
     } else {
         (
-            "niubash-win-x64.zip",
-            "d08b525f17251792bba0e6ad82b3829084cf158774072573029dd89344992d71",
+            "PowerShell-7.6.6-win-x64.zip",
+            "02fe458be20493fbdf43f61ea20610b811ee6c738ab1676c61b9cfcd1a33c860",
             "MinGit-2.55.0.5-64-bit.zip",
             "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e",
         )
@@ -54,9 +54,9 @@ fn install_windows_self_tools(root: &Path) -> Result<()> {
     let script = r#"
 $ErrorActionPreference = 'Stop'
 $tools = $env:DWO_SELF_TOOLS
-$niuDir = Join-Path $tools 'niubash'
+$pwshDir = Join-Path $tools 'pwsh'
 $gitDir = Join-Path $tools 'git'
-$niuZip = Join-Path $env:TEMP 'dwo-niubash.zip'
+$pwshZip = Join-Path $env:TEMP 'dwo-pwsh.zip'
 $gitZip = Join-Path $env:TEMP 'dwo-mingit.zip'
 
 function Install-Zip($url, $hash, $zip, $destination, $required) {
@@ -92,8 +92,21 @@ function Install-Zip($url, $hash, $zip, $destination, $required) {
 
 # Reuse applications already installed on the user's PATH. Bundled copies
 # are only needed when the host machine has no usable dependency.
-if ($null -eq (Get-Command niu.exe -CommandType Application -ErrorAction SilentlyContinue)) {
-  Install-Zip $env:DWO_NIU_URL $env:DWO_NIU_HASH $niuZip $niuDir 'niu.exe'
+$pwshInstalled = $false
+if ($null -ne (Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+  $pwshInstalled = $true
+}
+foreach ($candidate in @(
+    "$env:ProgramFiles\PowerShell\7\pwsh.exe",
+    "$env:LOCALAPPDATA\Microsoft\PowerShell\7\pwsh.exe",
+    "$env:LOCALAPPDATA\Microsoft\WindowsApps\pwsh.exe")) {
+  if (Test-Path -LiteralPath $candidate) {
+    $pwshInstalled = $true
+    break
+  }
+}
+if (-not $pwshInstalled) {
+  Install-Zip $env:DWO_PWSH_URL $env:DWO_PWSH_HASH $pwshZip $pwshDir 'pwsh.exe'
 }
 if ($null -eq (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue)) {
   Install-Zip $env:DWO_GIT_URL $env:DWO_GIT_HASH $gitZip $gitDir 'git.exe'
@@ -103,10 +116,10 @@ if ($null -eq (Get-Command git.exe -CommandType Application -ErrorAction Silentl
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
         .env("DWO_SELF_TOOLS", &tools)
         .env(
-            "DWO_NIU_URL",
-            format!("https://github.com/unixwin/niubash/releases/download/v1.1.0/{niu_asset}"),
+            "DWO_PWSH_URL",
+            format!("https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/{pwsh_asset}"),
         )
-        .env("DWO_NIU_HASH", niu_hash)
+        .env("DWO_PWSH_HASH", pwsh_hash)
         .env(
             "DWO_GIT_URL",
             format!("https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/{git_asset}"),
@@ -115,7 +128,7 @@ if ($null -eq (Get-Command git.exe -CommandType Application -ErrorAction Silentl
         .status()
         .context("download Windows self-tools")?;
     if !status.success() {
-        bail!("failed to install niubash and Git into {}", tools.display());
+        bail!("failed to install PowerShell 7 and Git into {}", tools.display());
     }
     Ok(())
 }

@@ -29,9 +29,9 @@ fn merge_windows_path(environment: &mut HashMap<String, String>) {
             let root = std::path::PathBuf::from(profile)
                 .join(".dwoagent")
                 .join("self-tools");
-            let niubash = root.join("niubash");
+            let pwsh = root.join("pwsh");
             let git = root.join("git").join("cmd");
-            std::env::join_paths([niubash, git])
+            std::env::join_paths([pwsh, git])
                 .ok()
                 .map(|value| value.to_string_lossy().into_owned())
         })

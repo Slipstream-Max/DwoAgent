@@ -104,6 +104,16 @@ fn shell_invocation(command: &str) -> ShellInvocation {
     }
 }
 
+/// Inlined before every PowerShell command: without explicit UTF-8 setup the
+/// console falls back to the OEM code page and mangles non-ASCII output.
+#[cfg(windows)]
+const PWSH_UTF8_SETUP: &str = concat!(
+    "chcp 65001 > $null; ",
+    "$utf8 = [System.Text.UTF8Encoding]::new(); ",
+    "[Console]::OutputEncoding = $utf8; ",
+    "$OutputEncoding = $utf8; ",
+);
+
 #[cfg(windows)]
 fn windows_shell_invocation(command: &str) -> ShellInvocation {
     // Keep the shell and native children on UTF-8 even when the daemon
@@ -113,9 +123,16 @@ fn windows_shell_invocation(command: &str) -> ShellInvocation {
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
     ];
     match dwo_context::shell::Shell::detect() {
-        dwo_context::shell::Shell::NiuBash(program) => ShellInvocation {
+        dwo_context::shell::Shell::Pwsh(program) => ShellInvocation {
             program: program.display().to_string(),
-            args: vec!["-c".to_string(), command.to_string()],
+            args: vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-Command".to_string(),
+                format!("{PWSH_UTF8_SETUP}{command}; exit $LASTEXITCODE"),
+            ],
             environment: utf8_environment,
         },
         dwo_context::shell::Shell::Sh => unreachable!("Windows shell detection returned sh"),

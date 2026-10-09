@@ -1,6 +1,6 @@
 ---
 name: terminal
-description: Run commands, interact with or poll terminals, and kill them. Every terminal is interactive; commands are sent as input with a trailing newline.
+description: Run commands, interact with or poll terminals, and kill them. Every terminal is interactive; input lines end with `\r` on Windows PowerShell 7 and `\n` on Unix.
 ---
 
 # Use Cases
@@ -11,7 +11,7 @@ Use `terminal` to inspect the workspace, run builds and tests, execute programs,
 
 The terminal always uses the session workspace. There is no `cwd` parameter.
 
-- `command`: Command for a new terminal, or input for an existing `terminal_id` (include a trailing newline). Empty or omitted means poll when `terminal_id` is present.
+- `command`: Command for a new terminal, or input for an existing `terminal_id` (end input with a line terminator: `\r` on Windows PowerShell 7, `\n` on Unix; `\r\n` works on both). Empty or omitted means poll when `terminal_id` is present.
 - `terminal_id`: Existing terminal ID. Empty or omitted means create a new terminal from `command`.
 - `kill`: `true` kills `terminal_id`; `false` means run, input, or poll.
 - `yield_ms`: Maximum wait for this call. Default 60000.
@@ -22,7 +22,7 @@ The terminal always uses the session workspace. There is no `cwd` parameter.
 - `{"command": "cargo build"}` — new terminal, run the command.
 - `{"command": "cargo build", "yield_ms": 3000}` — return after at most 3s.
 - `{"terminal_id": "term-1"}` — poll for incremental output.
-- `{"terminal_id": "term-1", "command": "ls\n"}` — send input to the existing terminal.
+- `{"terminal_id": "term-1", "command": "ls\r\n"}` — send input to the existing terminal.
 - `{"terminal_id": "term-1", "kill": true}` — terminate the terminal.
 
 When the endpoint supports sparse arguments, send only fields used by the selected shape: never send an empty `terminal_id`, `kill: false`, or unchanged defaults. Some endpoints fill every schema field; those completed values are accepted, but `cwd` must never be sent because it is not part of the schema.
@@ -51,4 +51,4 @@ A terminal is bound to the process started by its command — a channel for that
 - While the process is alive and interactive (a persistent shell, a REPL, a command waiting on stdin, or a long-running task), you can keep sending input and polling it.
 - One-shot commands (`cargo test`, `git status`) exit on their own. Once the process exits, the terminal is locked: further input fails with `terminal is not running`; results report a status (`completed`/`error`/`cancelled`) plus `exit_code`; after a short retention period (~5 minutes) the terminal is removed and later calls report `terminal not found`.
 - Never reuse a terminal to start a new command after its process has exited — create a new terminal instead.
-- For continuous use, start a persistent shell (e.g. `bash`) and keep feeding it commands.
+- For continuous use, start a persistent shell (e.g. `bash` on Unix, `pwsh` on Windows) and keep feeding it commands.

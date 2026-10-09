@@ -10,7 +10,7 @@
 | 调用方式 | 作用 |
 | --- | --- |
 | 省略 terminal_id，提供 command | 新建终端并运行命令 |
-| 提供 terminal_id 和 command | 向已有终端写入输入 |
+| 提供 terminal_id 和 command | 向已有终端写入输入（PowerShell 7 以 `\r` 提交回车，`\r\n` 通用；Unix 用 `\n`） |
 | 只提供 terminal_id | 读取增量输出 |
 | terminal_id + kill: true | 终止进程并读取尾部输出 |
 
@@ -18,8 +18,9 @@
 返回给模型的结果最多 20,000 UTF-8 字节。timeout_ms 限制新终端的总时长，yield_ms 限制每次
 等待输出的时间。
 
-命令由统一的 shell 包装执行并强制 UTF-8 输出：Windows 只使用安装阶段准备好的
-niubash（`niu.exe`）；Unix 使用 `sh`。环境快照中的 `shell` 字段与实际使用的 shell 一致。
+命令由统一的 shell 包装执行并强制 UTF-8 输出：Windows 使用 PowerShell 7（`pwsh`）；
+安装阶段优先复用本机已有版本，没有则下载到 `self-tools`，命令包装内联 UTF-8 初始化。
+Unix 使用 `sh`。环境快照中的 `shell` 字段与实际使用的 shell 一致。
 
 ## read_file
 

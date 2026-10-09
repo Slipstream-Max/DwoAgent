@@ -50,6 +50,7 @@ pub(crate) async fn execute(
     }
 
     let mut model_context = Vec::new();
+    let mut model_text = String::new();
     let output = match call.call {
         ToolCall::Terminal(TerminalArgs::Run {
             command,
@@ -64,7 +65,10 @@ pub(crate) async fn execute(
                 Some(TerminalTelemetry::new(id.clone(), context.events.clone())),
             )
             .await
-            .map(terminal_output),
+            .map(|snapshot| {
+                model_text = terminal_model_text(&snapshot);
+                terminal_output(snapshot)
+            }),
         ToolCall::Terminal(TerminalArgs::Input {
             terminal_id,
             data,
@@ -73,17 +77,24 @@ pub(crate) async fn execute(
             .terminals
             .input(&terminal_id, &data, yield_ms)
             .await
-            .map(terminal_output),
+            .map(|snapshot| {
+                model_text = terminal_model_text(&snapshot);
+                terminal_output(snapshot)
+            }),
         ToolCall::Terminal(TerminalArgs::Kill { terminal_id }) => manager
             .terminals
             .kill(&terminal_id)
             .await
-            .map(terminal_output),
+            .map(|snapshot| {
+                model_text = terminal_model_text(&snapshot);
+                terminal_output(snapshot)
+            }),
         ToolCall::FileEdit(args) => manager
             .file_edit
             .execute(args.patch, manager.cwd.clone())
             .await
             .map(|result| {
+                model_text = result.model_text(&manager.cwd);
                 if !result.changes.is_empty() {
                     emit(
                         context,
@@ -155,6 +166,7 @@ pub(crate) async fn execute(
                         },
                     );
                     model_context = result.model_context;
+                    model_text = result.model;
                     result.output
                 })
         }
@@ -169,12 +181,36 @@ pub(crate) async fn execute(
                 })
                 .map_err(anyhow::Error::msg)
         }
+        ToolCall::Questionnaire(request) => {
+            let Some(handler) = &context.questionnaire else {
+                return result_error(&id, &name, "questionnaire handler is not available");
+            };
+            handler(request)
+                .await
+                .map(|response| {
+                    model_text =
+                        "The questionnaire was sent to the user; their answers will arrive as a user message."
+                            .to_string();
+                    json!({
+                        "tool": "questionnaire",
+                        "kind": "other",
+                        "status": "completed",
+                        "questionnaire_id": response.questionnaire_id,
+                    })
+                })
+                .map_err(anyhow::Error::msg)
+        }
     };
 
+    let output = output.unwrap_or_else(|error| {
+        model_text = format!("Error: {error:#}");
+        error_output(&name, format!("{error:#}"))
+    });
     ToolResult {
         tool_call_id: id,
         tool_name: name.clone(),
-        output: output.unwrap_or_else(|error| error_output(&name, format!("{error:#}"))),
+        output,
+        model: model_text,
         model_context,
     }
 }
@@ -278,7 +314,24 @@ fn terminal_output(snapshot: crate::terminal::TerminalSnapshot) -> Value {
     })
 }
 
+fn terminal_model_text(snapshot: &crate::terminal::TerminalSnapshot) -> String {
+    let exit_code = snapshot
+        .exit_code
+        .map_or_else(|| "none".to_string(), |code| code.to_string());
+    let mut text = format!(
+        "terminal {} status={} exit_code={exit_code}",
+        snapshot.terminal_id, snapshot.status
+    );
+    if !snapshot.output.is_empty() {
+        text.push('\n');
+        text.push_str(&snapshot.output);
+    }
+    text
+}
+
 fn blocked_result(id: &str, name: &str, message: impl Into<String>) -> ToolResult {
+    let message = message.into();
+    let model = format!("Blocked by policy: {message}");
     ToolResult {
         tool_call_id: id.to_string(),
         tool_name: name.to_string(),
@@ -286,17 +339,21 @@ fn blocked_result(id: &str, name: &str, message: impl Into<String>) -> ToolResul
             "tool": name,
             "kind": tool_kind(name),
             "status": "blocked_by_policy",
-            "message": message.into(),
+            "message": message,
         }),
+        model,
         model_context: Vec::new(),
     }
 }
 
 fn result_error(id: &str, name: &str, message: impl Into<String>) -> ToolResult {
+    let message = message.into();
+    let model = format!("Error: {message}");
     ToolResult {
         tool_call_id: id.to_string(),
         tool_name: name.to_string(),
         output: error_output(name, message),
+        model,
         model_context: Vec::new(),
     }
 }
@@ -307,6 +364,8 @@ fn result_error_with_code(
     code: &str,
     message: impl Into<String>,
 ) -> ToolResult {
+    let message = message.into();
+    let model = format!("Error: {message}");
     ToolResult {
         tool_call_id: id.to_string(),
         tool_name: name.to_string(),
@@ -315,8 +374,9 @@ fn result_error_with_code(
             "kind": tool_kind(name),
             "status": "error",
             "code": code,
-            "error": message.into(),
+            "error": message,
         }),
+        model,
         model_context: Vec::new(),
     }
 }

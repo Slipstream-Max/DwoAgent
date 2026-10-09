@@ -38,6 +38,7 @@ fn responses_are_stored_item_first_and_provider_private_items_are_trimmed_on_swi
         tool_call_id: "call-1".to_string(),
         tool_name: "terminal".to_string(),
         output: json!({"status":"completed", "output":"cwd"}),
+        model: String::new(),
         model_context: Vec::new(),
     });
 
@@ -477,12 +478,14 @@ fn tool_batch_places_image_context_after_every_tool_result() {
             tool_call_id: "text-call".to_string(),
             tool_name: "read_file".to_string(),
             output: json!({"content":"hello", "start_line":1, "end_line":1}),
+            model: String::new(),
             model_context: Vec::new(),
         },
         ToolResultRecord {
             tool_call_id: "image-call".to_string(),
             tool_name: "read_file".to_string(),
             output: json!({"status":"completed"}),
+            model: String::new(),
             model_context: vec![MessageContent::blocks(vec![ContentBlock::image(
                 "image/png",
                 "aGVsbG8=",
@@ -517,6 +520,7 @@ fn compaction_sends_raw_history_to_summary_and_filters_only_the_reserve() {
         tool_call_id: "call-1".to_string(),
         tool_name: "terminal".to_string(),
         output: json!({"output":"src/main.rs:1:TODO"}),
+        model: String::new(),
         model_context: Vec::new(),
     });
     manager.append_user("continue");
@@ -665,6 +669,7 @@ fn reserve_tool_filter_can_replace_context_without_a_summary_call() {
         tool_call_id: "call-1".to_string(),
         tool_name: "file_edit".to_string(),
         output: json!({"status":"completed", "changes":[{"path":"x", "kind":"add"}]}),
+        model: String::new(),
         model_context: Vec::new(),
     });
 

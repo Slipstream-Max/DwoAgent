@@ -12,6 +12,10 @@ pub enum SessionServiceError {
     TurnNotActive(TurnId),
     #[error("permission request not found: {0}")]
     PermissionNotFound(String),
+    #[error("no questionnaire is waiting for answers")]
+    QuestionnaireNotPending,
+    #[error("invalid questionnaire answers: {0}")]
+    QuestionnaireRejected(String),
     #[error("session is closed: {0}")]
     SessionClosed(SessionId),
     #[error("archived session is read-only: {0}")]

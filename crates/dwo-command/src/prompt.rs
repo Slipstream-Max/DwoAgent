@@ -5,10 +5,12 @@ use dwo_context::{ContentBlock, MessageContent};
 
 const SKILL_COMMAND: &str = "/skill";
 
-pub const COMMAND_DESCRIPTIONS: [(&str, &str); 1] = [(
-    "skill",
-    "Request an available skill by name, optionally followed by a prompt.",
-)];
+/// Prompt-directive descriptions that lack a channel-command counterpart.
+///
+/// `/skill` is exposed as a channel command (bare `/skill` lists the available
+/// skills), so its description lives next to that command; a named
+/// `/skill <name> [prompt]` still works as a prompt directive.
+pub const COMMAND_DESCRIPTIONS: [(&str, &str); 0] = [];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectiveKinds {
@@ -47,7 +49,8 @@ fn starts_with_prompt_directive(text: &str) -> bool {
     let text = text.trim_start();
     [SKILL_COMMAND].into_iter().any(|command| {
         text.strip_prefix(command).is_some_and(|remainder| {
-            remainder.is_empty() || remainder.chars().next().is_some_and(char::is_whitespace)
+            remainder.chars().next().is_some_and(char::is_whitespace)
+                && !remainder.trim().is_empty()
         })
     })
 }
@@ -284,11 +287,17 @@ mod tests {
 
     #[test]
     fn recognizes_only_exact_prompt_directive_prefixes() {
-        assert!(starts_with_prompt_directive(" /skill"));
+        assert!(!starts_with_prompt_directive(" /skill"));
+        assert!(!starts_with_prompt_directive("/skill"));
+        assert!(!starts_with_prompt_directive("/skill "));
+        assert!(starts_with_prompt_directive(" /skill review"));
+        assert!(starts_with_prompt_directive("/skill review"));
         assert!(!starts_with_prompt_directive("/plan review"));
         assert!(!starts_with_prompt_directive("/skills review"));
         assert!(!starts_with_prompt_directive("hello /skill review"));
         assert!(!routes_to_channel_command("/skill review"));
+        assert!(routes_to_channel_command("/skill"));
+        assert!(routes_to_channel_command("/skill "));
         assert!(routes_to_channel_command("/plan"));
         assert!(routes_to_channel_command("/skills review"));
         assert!(routes_to_channel_command("/status"));

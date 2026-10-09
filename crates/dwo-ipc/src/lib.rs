@@ -444,14 +444,28 @@ where
                 "IPC request failed"
             );
         } else {
-            tracing::info!(
-                event = "ipc.request_completed",
-                connection_id = %connection_id,
-                request_id = request_id,
-                method = %request.method,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "IPC request completed"
-            );
+            // 高频轮询（桌面端 list/status 等）在 info 级会淹没日志：
+            // 常规请求记 debug，只有超过 1s 的慢请求才升级到 info。
+            let duration_ms = started.elapsed().as_millis() as u64;
+            if duration_ms >= 1_000 {
+                tracing::info!(
+                    event = "ipc.request_completed",
+                    connection_id = %connection_id,
+                    request_id = request_id,
+                    method = %request.method,
+                    duration_ms = duration_ms,
+                    "slow IPC request completed"
+                );
+            } else {
+                tracing::debug!(
+                    event = "ipc.request_completed",
+                    connection_id = %connection_id,
+                    request_id = request_id,
+                    method = %request.method,
+                    duration_ms = duration_ms,
+                    "IPC request completed"
+                );
+            }
         }
         write_frame(&mut write, &response).await?;
     }

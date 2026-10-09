@@ -123,7 +123,6 @@ pub struct ChannelPollParams {
 pub struct PreparedChannel {
     pub conversation: ConversationId,
     pub replay_turns: usize,
-    pub output_mode: super::manager::ChannelOutputMode,
     pub selected_session_id: Option<String>,
     pub transport: Arc<dyn ConversationTransport>,
     pub starter: Box<dyn ChannelStarter>,
@@ -255,7 +254,6 @@ impl ChannelGateway {
             host,
             prepared.conversation,
             prepared.replay_turns,
-            prepared.output_mode,
             prepared.selected_session_id,
             prepared.transport,
         ));

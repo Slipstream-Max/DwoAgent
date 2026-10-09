@@ -112,6 +112,7 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
     command("session.cancel", MethodRoute::Acp, None),
     query("session.options", MethodRoute::Acp),
     command("session.permission", MethodRoute::Acp, None),
+    command("session.questionnaire", MethodRoute::Acp, None),
     subscription("session.watch", MethodRoute::Acp),
     query("project.list", MethodRoute::Dwo),
     query("project.get", MethodRoute::Dwo),
@@ -376,6 +377,7 @@ mod tests {
     #[test]
     fn route_registry_keeps_chat_on_acp() {
         assert!(method_allowed("acp", "session.prompt"));
+        assert!(method_allowed("acp", "session.questionnaire"));
         assert!(!method_allowed("dwo", "session.prompt"));
         assert!(method_allowed("dwo", "session.archive"));
         assert!(method_allowed("dwo", "session.unarchive"));

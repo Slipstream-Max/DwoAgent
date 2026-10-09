@@ -14,6 +14,7 @@ const MAX_TEXT_OUTPUT_BYTES: usize = 20_000;
 
 pub(crate) struct ReadFileOutput {
     pub output: Value,
+    pub model: String,
     pub model_context: Vec<MessageContent>,
 }
 
@@ -56,6 +57,7 @@ pub(crate) async fn execute(
                     "original_bytes": bytes.len(),
                 }
             }),
+            model: String::new(),
             model_context: vec![MessageContent::blocks(vec![ContentBlock::image(
                 normalized.mime_type,
                 data,
@@ -70,8 +72,10 @@ pub(crate) async fn execute(
     {
         output.insert("encoding".to_string(), json!(encoding));
     }
+    let model = model_text(&path, &output);
     Ok(ReadFileOutput {
         output,
+        model,
         model_context: Vec::new(),
     })
 }
@@ -223,6 +227,28 @@ fn text_page_with_budget(
     Ok(Value::Object(output))
 }
 
+fn model_text(path: &Path, output: &Value) -> String {
+    let total = output["total_lines"].as_u64().unwrap_or(0);
+    if total == 0 {
+        return format!("read {} (empty file)", path.display());
+    }
+    let start = output["start_line"].as_u64().unwrap_or(1);
+    let end = output["end_line"].as_u64().unwrap_or(0);
+    let mut text = format!("read {} (lines {start}-{end} of {total}", path.display());
+    if let Some(encoding) = output.get("encoding").and_then(Value::as_str) {
+        text.push_str(&format!(", {encoding}"));
+    }
+    text.push_str("):\n");
+    text.push_str(output["content"].as_str().unwrap_or(""));
+    if let (Some(cursor), Some(offset)) = (
+        output.get("next_cursor").and_then(Value::as_u64),
+        output.get("next_offset").and_then(Value::as_u64),
+    ) {
+        text.push_str(&format!("\n[continue: cursor={cursor}, offset={offset}]"));
+    }
+    text
+}
+
 fn char_offset_to_byte(text: &str, offset: usize) -> usize {
     text.char_indices()
         .nth(offset)
@@ -274,6 +300,23 @@ mod tests {
         assert_eq!(next["content"], "\nline 4\nline 5");
         assert_eq!(next["next_cursor"], 5);
         assert_eq!(next["next_offset"], 6);
+    }
+
+    #[test]
+    fn model_text_summarizes_the_page_and_next_position() {
+        let long = (1..=6)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first = text_page(&long, 1, 3, 0).unwrap();
+        let text = model_text(Path::new("a.txt"), &first);
+        assert!(text.starts_with("read a.txt (lines 1-3 of 6):\nline 1\nline 2\nline 3"));
+        assert!(text.ends_with("[continue: cursor=3, offset=6]"));
+
+        let last = text_page(&long, 4, 3, 0).unwrap();
+        let text = model_text(Path::new("a.txt"), &last);
+        assert!(!text.contains("continue"));
+        assert_eq!(text, "read a.txt (lines 4-6 of 6):\nline 4\nline 5\nline 6");
     }
 
     #[test]

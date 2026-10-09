@@ -4,7 +4,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use dwo_agent_service::{
     CompactionAccepted, ConfirmationDecision, EndpointId, PromptAccepted, SessionConfigUpdate,
-    SessionId, SessionListItem, SessionListQuery, SessionSnapshot, SessionSubscription, TurnId,
+    RuntimePhase, SessionId, SessionListItem, SessionListQuery, SessionSnapshot,
+    SessionSubscription, TurnId,
 };
 use dwo_channels::{ChannelHost, ChannelManager, ChannelSessionItem, SessionCreateRequest};
 use dwo_context::MessageContent;
@@ -72,10 +73,6 @@ impl ChannelHost for Host {
         let sessions = <Self as ChannelHost>::list_sessions(self, false, None).await?;
         let mut rows = Vec::new();
         for session in sessions {
-            let assignment = self.projects.locate_session(session.session_id.as_str());
-            if project.is_none() && assignment.is_some() {
-                continue;
-            }
             let section = if let Some(project) = &project {
                 let Some(assignment) = project
                     .session_assignments
@@ -92,13 +89,11 @@ impl ChannelHost for Host {
             } else {
                 None
             };
-            let finished = self
-                .service
-                .status(&session.session_id)
-                .await?
-                .last_turn_finished_at_ms
-                .unwrap_or(0);
-            rows.push((section, finished, session));
+            let working = !matches!(
+                session.status,
+                RuntimePhase::Idle | RuntimePhase::Closing
+            );
+            rows.push((section, working, session));
         }
         rows.sort_by(|a, b| {
             a.0.cmp(&b.0)
@@ -108,11 +103,32 @@ impl ChannelHost for Host {
         });
         Ok(rows
             .into_iter()
-            .map(|(section, _, session)| ChannelSessionItem {
+            .map(|(section, working, session)| ChannelSessionItem {
                 session,
                 section: section.map(|(_, name)| name),
+                working,
             })
             .collect())
+    }
+
+    async fn list_skills(&self, session: Option<&SessionId>) -> Result<Vec<(String, String)>> {
+        let cwd = match session {
+            Some(id) => self.service.snapshot(id).await?.record.info.cwd,
+            None => self.profile_root.clone(),
+        };
+        let external = self
+            .profile
+            .read()
+            .expect("profile lock poisoned")
+            .config
+            .external_skills_dirs
+            .clone();
+        let skills = super::skill_api::skill_snapshots(&self.profile_root, &external, &cwd)?
+            .into_iter()
+            .filter(|skill| !skill.name.chars().any(char::is_whitespace))
+            .map(|skill| (skill.name, skill.description))
+            .collect();
+        Ok(skills)
     }
 
     async fn create_session(&self, request: SessionCreateRequest) -> Result<SessionSnapshot> {
@@ -295,7 +311,10 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(host.list_channel_sessions(None).await.unwrap().len(), 1);
+        let inbox = host.list_channel_sessions(None).await.unwrap();
+        assert_eq!(inbox.len(), 3);
+        assert!(inbox.iter().all(|item| !item.working));
+        assert!(host.list_skills(None).await.is_ok());
         assert!(
             <Host as ChannelHost>::create_session(
                 &host,
@@ -335,6 +354,7 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(host.list_channel_sessions(None).await.unwrap().len(), 2);
         host.shutdown().await;
     }
 }

@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::questionnaire::{QuestionnaireRequest, validate_questions};
 use crate::terminal::TerminalId;
 use crate::todo::{TodoRequest, validate_entries};
 
@@ -25,6 +26,7 @@ pub enum ToolCall {
     FileEdit(FileEditArgs),
     ReadFile(ReadFileArgs),
     Todo(TodoRequest),
+    Questionnaire(QuestionnaireRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,7 @@ pub enum ToolIntent {
     FileEdit,
     ReadFile,
     Todo,
+    Questionnaire,
 }
 
 impl ToolCall {
@@ -92,6 +95,7 @@ impl ToolCall {
             Self::FileEdit(_) => ToolIntent::FileEdit,
             Self::ReadFile(_) => ToolIntent::ReadFile,
             Self::Todo(_) => ToolIntent::Todo,
+            Self::Questionnaire(_) => ToolIntent::Questionnaire,
         }
     }
 
@@ -101,6 +105,7 @@ impl ToolCall {
             Self::FileEdit(_) => "file_edit",
             Self::ReadFile(_) => "read_file",
             Self::Todo(_) => "todo",
+            Self::Questionnaire(_) => "questionnaire",
         }
     }
 }
@@ -147,6 +152,10 @@ impl ParsedToolCall {
             "todo" => ToolCall::Todo(
                 parse_todo(&arguments).map_err(|message| parse_error(&id, &name, message))?,
             ),
+            "questionnaire" => ToolCall::Questionnaire(
+                parse_questionnaire(&arguments)
+                    .map_err(|message| parse_error(&id, &name, message))?,
+            ),
             _ => return Err(parse_error(&id, &name, format!("Unknown tool: {name}"))),
         };
         Ok(Self {
@@ -167,6 +176,13 @@ fn parse_todo(args: &Map<String, Value>) -> Result<TodoRequest, String> {
         crate::todo::TodoAction::Update => validate_entries(&mut request.entries)?,
         _ => {}
     }
+    Ok(request)
+}
+
+fn parse_questionnaire(args: &Map<String, Value>) -> Result<QuestionnaireRequest, String> {
+    let mut request: QuestionnaireRequest = serde_json::from_value(Value::Object(args.clone()))
+        .map_err(|error| format!("Invalid questionnaire arguments: {error}"))?;
+    validate_questions(&mut request.questions)?;
     Ok(request)
 }
 

@@ -117,12 +117,11 @@ impl ChannelAdapter for FeishuAdapter {
         let access = FeishuAccess {
             open_id: runtime.secret.bound_open_id,
             chat_id: runtime.secret.bound_chat_id,
-            media_input: runtime.config.media_input,
+            media_input: true,
         };
         Ok(PreparedChannel {
             conversation: ConversationId::new("feishu", access.open_id.clone()),
             replay_turns: runtime.config.replay_turns,
-            output_mode: runtime.config.output_mode,
             selected_session_id,
             transport: conversation,
             starter: Box::new(FeishuStarter {
@@ -600,14 +599,6 @@ struct FeishuConversation {
 impl ConversationTransport for FeishuConversation {
     async fn send_text(&self, text: &str) -> Result<()> {
         self.api.send_text(text).await
-    }
-
-    fn max_text_chars(&self) -> usize {
-        FEISHU_TEXT_CHUNK_CHARS
-    }
-
-    fn defer_tool_call_to_permission(&self, mode: dwo_tools::SessionMode) -> bool {
-        mode == dwo_tools::SessionMode::Confirm
     }
 
     async fn send_permission_request(

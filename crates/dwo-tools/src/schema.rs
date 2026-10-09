@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::call::{DEFAULT_READ_FILE_LINES, MAX_READ_FILE_LINES};
+use crate::questionnaire::{MAX_OPTION_CHARS, MAX_OPTIONS, MAX_QUESTION_CHARS, MAX_QUESTIONS};
 
 pub fn tool_schemas() -> Vec<Value> {
     vec![
@@ -8,6 +9,7 @@ pub fn tool_schemas() -> Vec<Value> {
         read_file_schema(),
         file_edit_schema(),
         todo_schema(),
+        questionnaire_schema(),
     ]
 }
 
@@ -37,6 +39,45 @@ pub fn todo_schema() -> Value {
                 },
                 "required":["action", "entries"],
                 "additionalProperties":false
+            }
+        }
+    })
+}
+
+pub fn questionnaire_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "questionnaire",
+            "description": "Send the user a questionnaire (up to five questions, each with optional choices; set `multiple` on a question to allow selecting several options) and receive their answers as a user message. This tool never starts another turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_QUESTIONS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string", "maxLength": MAX_QUESTION_CHARS},
+                                "options": {
+                                    "type": "array",
+                                    "maxItems": MAX_OPTIONS,
+                                    "items": {"type": "string", "maxLength": MAX_OPTION_CHARS}
+                                },
+                                "multiple": {
+                                    "type": "boolean",
+                                    "description": "Allow selecting more than one option (multi-select)."
+                                }
+                            },
+                            "required": ["question"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": false
             }
         }
     })
@@ -166,6 +207,19 @@ mod tests {
         assert_eq!(parameters["required"], json!(["action", "entries"]));
         assert_eq!(
             parameters["properties"]["entries"]["items"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn questionnaire_schema_requires_non_empty_questions() {
+        let parameters = &questionnaire_schema()["function"]["parameters"];
+        assert_eq!(parameters["required"], json!(["questions"]));
+        assert_eq!(parameters["additionalProperties"], false);
+        assert_eq!(parameters["properties"]["questions"]["minItems"], 1);
+        assert_eq!(parameters["properties"]["questions"]["maxItems"], 5);
+        assert_eq!(
+            parameters["properties"]["questions"]["items"]["additionalProperties"],
             false
         );
     }

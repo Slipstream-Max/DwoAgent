@@ -13,11 +13,10 @@ use tokio::sync::Mutex;
 use super::{ChannelHost, SessionCreateRequest};
 use dwo_command::{ChannelCommand, render_command_help};
 
-use super::manager::ChannelOutputMode;
 use super::render::{
-    OutputSegment, SessionStreamState, display_path, policy_name, render_output_segment,
-    render_session_replay, render_status, render_tool_call, render_user_prompt_segments,
-    short_session_id, short_session_id_str,
+    SessionStreamState, display_path, policy_name, render_questionnaire, render_session_replay,
+    render_status, render_tool_call, render_user_prompt_segments, short_session_id,
+    short_session_id_str,
 };
 
 #[async_trait]
@@ -36,15 +35,6 @@ pub trait ChannelIngress: Send + Sync {
 #[async_trait]
 pub trait ConversationTransport: Send + Sync {
     async fn send_text(&self, text: &str) -> Result<()>;
-    fn max_text_chars(&self) -> usize {
-        4_000
-    }
-    async fn send_segment(&self, segment: &OutputSegment) -> Result<()> {
-        self.send_text(&render_output_segment(segment)).await
-    }
-    fn defer_tool_call_to_permission(&self, _mode: SessionMode) -> bool {
-        false
-    }
     async fn send_permission_request(
         &self,
         _session_id: &SessionId,
@@ -107,7 +97,6 @@ pub struct SessionBridge {
     conversation: ConversationId,
     endpoint: EndpointId,
     replay_turns: usize,
-    output_mode: ChannelOutputMode,
     selected_session_id: Mutex<Option<String>>,
     session_choices: Mutex<HashMap<Option<String>, Vec<super::ChannelSessionItem>>>,
     transport: Arc<dyn ConversationTransport>,
@@ -119,7 +108,6 @@ impl SessionBridge {
         host: Arc<dyn ChannelHost>,
         conversation: ConversationId,
         replay_turns: usize,
-        output_mode: ChannelOutputMode,
         selected_session_id: Option<String>,
         transport: Arc<dyn ConversationTransport>,
     ) -> Self {
@@ -129,7 +117,6 @@ impl SessionBridge {
             conversation,
             endpoint,
             replay_turns,
-            output_mode,
             selected_session_id: Mutex::new(selected_session_id),
             session_choices: Mutex::new(HashMap::new()),
             transport,
@@ -142,57 +129,7 @@ impl SessionBridge {
             ChannelCommand::Help => vec![render_command_help()],
             ChannelCommand::List { scope, page } => {
                 let (project, page) = list_scope(scope, page)?;
-                let cached = self.session_choices.lock().await.get(&project).cloned();
-                let records = if page == 1 || cached.is_none() {
-                    self.host.list_channel_sessions(project.as_deref()).await?
-                } else {
-                    cached.unwrap()
-                };
-                const PAGE_SIZE: usize = 20;
-                let pages = records.len().div_ceil(PAGE_SIZE).max(1);
-                anyhow::ensure!(page <= pages, "Page {page} does not exist (1..={pages})");
-                let selected = self.selected_session_id.lock().await.clone();
-                let mut lines = vec![format!(
-                    "{} — {page}/{pages}",
-                    project.as_deref().unwrap_or("Inbox")
-                )];
-                let mut section = None;
-                for (index, item) in records
-                    .iter()
-                    .enumerate()
-                    .skip((page - 1) * PAGE_SIZE)
-                    .take(PAGE_SIZE)
-                {
-                    if item.section != section {
-                        section = item.section.clone();
-                        if let Some(name) = &section {
-                            lines.push(format!("[{name}]"));
-                        }
-                    }
-                    let record = &item.session;
-                    lines.push(format!(
-                        "{} {}. {} [{}]",
-                        if selected.as_deref() == Some(record.session_id.as_str()) {
-                            "*"
-                        } else {
-                            " "
-                        },
-                        index + 1,
-                        short_session_title(&record.title),
-                        short_session_id(&record.session_id)
-                    ));
-                }
-                if records.is_empty() {
-                    lines.push("No sessions".into());
-                }
-                if page < pages {
-                    lines.push(match &project {
-                        Some(name) => format!("Next: /list \"{name}\" {}", page + 1),
-                        None => format!("Next: /list {}", page + 1),
-                    });
-                }
-                self.session_choices.lock().await.insert(project, records);
-                vec![lines.join("\n")]
+                self.list_session_messages(project, page).await?
             }
             ChannelCommand::New { project, section } => {
                 let snapshot = self
@@ -225,8 +162,15 @@ impl SessionBridge {
                     snapshot.record.info.id, snapshot.record.info.title
                 )]
             }
+            ChannelCommand::Use { session: None, .. } => {
+                let mut messages = self.list_session_messages(None, 1).await?;
+                if let Some(first) = messages.first_mut() {
+                    *first = format!("选择会话：发送 /use <编号> 或 /use <短 ID>\n\n{first}");
+                }
+                messages
+            }
             ChannelCommand::Use {
-                session: reference,
+                session: Some(reference),
                 number,
             } => {
                 let id = if let Some(number) = number {
@@ -253,15 +197,6 @@ impl SessionBridge {
                     .session_snapshot(&self.selected_session_id().await?)
                     .await?;
                 vec![render_status(&snapshot)]
-            }
-            ChannelCommand::Del { session: reference } => {
-                let id = self.resolve_session_reference(&reference).await?;
-                let session_id = SessionId::parse(id.clone()).map_err(anyhow::Error::msg)?;
-                self.host.archive_session(&session_id).await?;
-                if self.selected_session_id.lock().await.as_deref() == Some(id.as_str()) {
-                    self.set_selected_session(None).await?;
-                }
-                vec!["Session archived".to_string()]
             }
             ChannelCommand::Cancel => {
                 self.host
@@ -299,7 +234,7 @@ impl SessionBridge {
                     vec![render_models(&options)]
                 }
             }
-            ChannelCommand::Reasoning { level } => {
+            ChannelCommand::Think { level } => {
                 let id = self.selected_session_id().await?;
                 let options = self.host.session_options(&id).await?;
                 let model = options
@@ -345,6 +280,29 @@ impl SessionBridge {
                                 .join(", ")
                         }
                     )]
+                }
+            }
+            ChannelCommand::Skill => {
+                let selected = self.selected_session_id.lock().await.clone();
+                let session_id = selected
+                    .map(|id| SessionId::parse(id).map_err(anyhow::Error::msg))
+                    .transpose()?;
+                let skills = self.host.list_skills(session_id.as_ref()).await?;
+                if skills.is_empty() {
+                    vec!["No skills available".to_string()]
+                } else {
+                    let mut lines = Vec::with_capacity(skills.len() + 2);
+                    lines.push(format!("Skills ({})", skills.len()));
+                    for (index, (name, description)) in skills.iter().enumerate() {
+                        lines.push(format!(
+                            "{}. {}: {}",
+                            index + 1,
+                            name,
+                            short_skill_description(description)
+                        ));
+                    }
+                    lines.push("Use: /skill <name> [prompt]".to_string());
+                    vec![lines.join("\n")]
                 }
             }
             ChannelCommand::Policy { mode } => {
@@ -461,6 +419,24 @@ impl SessionBridge {
         }
     }
 
+    async fn list_session_messages(
+        &self,
+        project: Option<String>,
+        page: usize,
+    ) -> Result<Vec<String>> {
+        let cached = self.session_choices.lock().await.get(&project).cloned();
+        let records = if page == 1 || cached.is_none() {
+            self.host.list_channel_sessions(project.as_deref()).await?
+        } else {
+            cached.unwrap()
+        };
+        let selected = self.selected_session_id.lock().await.clone();
+        let rendered =
+            render_session_list(&records, project.as_deref(), page, selected.as_deref())?;
+        self.session_choices.lock().await.insert(project, records);
+        Ok(vec![rendered])
+    }
+
     async fn selected_session_id(&self) -> Result<SessionId> {
         let id = self
             .selected_session_id
@@ -506,12 +482,22 @@ impl SessionBridge {
     }
 
     async fn resolve_list_number(&self, project: Option<&str>, number: usize) -> Result<String> {
-        let choices = self.session_choices.lock().await;
-        let id = choices
-            .get(&project.map(str::to_string))
-            .and_then(|rows| number.checked_sub(1).and_then(|i| rows.get(i)));
-        id.map(|item| item.session.session_id.to_string())
-            .context("Number is not in the saved list; run /list for this scope first")
+        let key = project.map(str::to_string);
+        let cached = self.session_choices.lock().await.get(&key).cloned();
+        let rows = match cached {
+            Some(rows) => rows,
+            // 没有快照时按当前列表实时解析：Inbox 是唯一默认列表，不必先 /list。
+            None => {
+                let rows = self.host.list_channel_sessions(project).await?;
+                self.session_choices.lock().await.insert(key, rows.clone());
+                rows
+            }
+        };
+        number
+            .checked_sub(1)
+            .and_then(|index| rows.get(index))
+            .map(|item| item.session.session_id.to_string())
+            .with_context(|| format!("No session #{number} in the list; send /list to see it"))
     }
 
     async fn permission_request(&self, requested: Option<String>) -> Result<String> {
@@ -555,12 +541,10 @@ impl SessionBridge {
             .subscribe_session(id, self.endpoint.clone(), None)
             .await?;
         let transport = self.transport.clone();
-        let output_mode = self.output_mode;
-        let task = tokio::spawn(stream_session_with_mode(
+        let task = tokio::spawn(stream_session(
             transport,
             self.endpoint.clone(),
             id.clone(),
-            output_mode,
             subscription,
         ));
         *observer = Some(SessionObserver { session_id, task });
@@ -580,6 +564,63 @@ fn list_scope(scope: Option<String>, page: Option<usize>) -> Result<(Option<Stri
     };
     anyhow::ensure!(page > 0, "Page numbers start at 1");
     Ok((project, page))
+}
+
+fn render_session_list(
+    records: &[super::ChannelSessionItem],
+    project: Option<&str>,
+    page: usize,
+    selected: Option<&str>,
+) -> Result<String> {
+    const PAGE_SIZE: usize = 20;
+    let pages = records.len().div_ceil(PAGE_SIZE).max(1);
+    anyhow::ensure!(page <= pages, "Page {page} does not exist (1..={pages})");
+    let mut lines = vec![format!(
+        "{} — {page}/{pages}",
+        project.unwrap_or("Inbox")
+    )];
+    let mut section = None;
+    let mut group = None;
+    for (index, item) in records
+        .iter()
+        .enumerate()
+        .skip((page - 1) * PAGE_SIZE)
+        .take(PAGE_SIZE)
+    {
+        if project.is_some() {
+            if item.section != section {
+                section = item.section.clone();
+                if let Some(name) = &section {
+                    lines.push(format!("[{name}]"));
+                }
+            }
+        } else if group != Some(item.working) {
+            group = Some(item.working);
+            lines.push(if item.working { "进行中" } else { "已完成" }.to_string());
+        }
+        let record = &item.session;
+        lines.push(format!(
+            "{} {}. {} [{}]",
+            if selected == Some(record.session_id.as_str()) {
+                "*"
+            } else {
+                " "
+            },
+            index + 1,
+            short_session_title(&record.title),
+            short_session_id(&record.session_id)
+        ));
+    }
+    if records.is_empty() {
+        lines.push("No sessions".into());
+    }
+    if page < pages {
+        lines.push(match project {
+            Some(name) => format!("Next: /list \"{name}\" {}", page + 1),
+            None => format!("Next: /list {}", page + 1),
+        });
+    }
+    Ok(lines.join("\n"))
 }
 
 fn resolve_model<'a>(
@@ -648,6 +689,18 @@ fn short_session_title(title: &str) -> String {
     shortened
 }
 
+fn short_skill_description(description: &str) -> String {
+    let description = description.lines().next().unwrap_or("").trim();
+    if description.is_empty() {
+        return "(no description)".to_string();
+    }
+    let mut shortened = description.chars().take(72).collect::<String>();
+    if description.chars().count() > 72 {
+        shortened.push_str("...");
+    }
+    shortened
+}
+
 fn session_id_matches(id: &SessionId, reference: &str) -> bool {
     let id = id.as_str();
     id.starts_with(reference)
@@ -694,6 +747,89 @@ mod session_reference_tests {
     }
 }
 
+#[cfg(test)]
+mod channel_list_tests {
+    use super::*;
+    use crate::ChannelSessionItem;
+    use dwo_agent_service::{RuntimePhase, SessionListItem};
+    use dwo_tools::SessionMode;
+    use std::path::PathBuf;
+
+    fn item(index: usize, title: &str, working: bool) -> ChannelSessionItem {
+        ChannelSessionItem {
+            session: SessionListItem {
+                session_id: SessionId::parse(format!("session-{index:08}")).unwrap(),
+                cwd: PathBuf::from("C:/workspace"),
+                title: title.to_string(),
+                updated_at: 1_000 + index as u64,
+                status: if working {
+                    RuntimePhase::Running
+                } else {
+                    RuntimePhase::Idle
+                },
+                model: "provider/model".to_string(),
+                reasoning: None,
+                policy: SessionMode::Watch,
+                parent_session_id: None,
+                forked_from: None,
+                last_turn_finished_at_ms: Some(900 + index as u64),
+            },
+            section: None,
+            working,
+        }
+    }
+
+    #[test]
+    fn inbox_lists_working_sessions_first_with_group_headers() {
+        let records = vec![
+            item(1, "Work A", true),
+            item(2, "Work B", true),
+            item(3, "Done C", false),
+        ];
+        let text = render_session_list(&records, None, 1, Some("session-00000002")).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "Inbox — 1/1");
+        assert_eq!(lines[1], "进行中");
+        assert_eq!(lines[2], "  1. Work A [00000001]");
+        assert_eq!(lines[3], "* 2. Work B [00000002]");
+        assert_eq!(lines[4], "已完成");
+        assert_eq!(lines[5], "  3. Done C [00000003]");
+    }
+
+    #[test]
+    fn inbox_pages_report_their_next_page() {
+        let records: Vec<_> = (0..25)
+            .map(|i| item(i + 1, &format!("S{}", i + 1), false))
+            .collect();
+        let page_one = render_session_list(&records, None, 1, None).unwrap();
+        assert!(page_one.contains("Inbox — 1/2"));
+        assert!(page_one.contains("20. S20 [00000020]"));
+        assert!(!page_one.contains("21. S21"));
+        assert!(page_one.ends_with("Next: /list 2"));
+        let page_two = render_session_list(&records, None, 2, None).unwrap();
+        assert!(page_two.contains("Inbox — 2/2"));
+        assert!(page_two.contains("21. S21 [00000021]"));
+        assert!(!page_two.contains("Next: /list"));
+        assert!(render_session_list(&records, None, 3, None).is_err());
+    }
+
+    #[test]
+    fn project_scope_keeps_section_headers() {
+        let mut records = vec![item(1, "A", false), item(2, "B", false)];
+        records[0].section = Some("Development".to_string());
+        let text = render_session_list(&records, Some("My project"), 1, None).unwrap();
+        assert!(text.starts_with("My project — 1/1\n"));
+        assert!(text.contains("[Development]"));
+        assert!(!text.contains("进行中"));
+    }
+
+    #[test]
+    fn empty_inbox_reports_no_sessions() {
+        let text = render_session_list(&[], None, 1, None).unwrap();
+        assert!(text.contains("No sessions"));
+    }
+}
+
 #[async_trait]
 impl ChannelIngress for SessionBridge {
     async fn execute(&self, command: ChannelCommand) -> Result<Vec<String>> {
@@ -727,32 +863,13 @@ fn resolve_permission_request_id(
         .context("No pending permission request")
 }
 
-#[cfg(test)]
 async fn stream_session(
     transport: Arc<dyn ConversationTransport>,
     endpoint: EndpointId,
     session_id: SessionId,
-    subscription: dwo_agent_service::SessionSubscription,
-) {
-    stream_session_with_mode(
-        transport,
-        endpoint,
-        session_id,
-        ChannelOutputMode::Final,
-        subscription,
-    )
-    .await;
-}
-
-async fn stream_session_with_mode(
-    transport: Arc<dyn ConversationTransport>,
-    endpoint: EndpointId,
-    session_id: SessionId,
-    output_mode: ChannelOutputMode,
     mut subscription: dwo_agent_service::SessionSubscription,
 ) {
     let mut stream = SessionStreamState::default();
-    let mut session_mode = subscription.snapshot.record.info.mode;
     loop {
         let Some(event) = subscription.events.recv().await else {
             break;
@@ -767,36 +884,15 @@ async fn stream_session_with_mode(
                 send_user_prompt(&transport, &content).await;
             }
             SessionEventPayload::AssistantCompleted {
-                reasoning,
-                content,
-                tool_calls,
-                ..
+                content, tool_calls, ..
             } => {
-                if output_mode == ChannelOutputMode::Full {
-                    stream.remember_reasoning(reasoning);
-                    for reasoning in stream.take_reasoning(transport.max_text_chars()) {
-                        send_segment(&transport, &reasoning).await;
-                    }
-                    for call in &tool_calls {
-                        stream.remember_tool(call.clone());
-                    }
-                    stream.remember_full_response(content, &tool_calls);
-                    send_ready_full_responses(&transport, &mut stream).await;
-                } else {
-                    stream.remember_response(content);
-                    for call in tool_calls {
-                        stream.remember_tool(call);
-                    }
+                stream.remember_response(content);
+                for call in tool_calls {
+                    stream.remember_tool(call);
                 }
             }
             SessionEventPayload::ToolStarted { call, .. } => {
-                let defer_to_permission = transport.defer_tool_call_to_permission(session_mode);
-                if output_mode == ChannelOutputMode::Full && !defer_to_permission {
-                    send_segment(&transport, &OutputSegment::ToolCall(call.clone())).await;
-                    stream.mark_tool_presented(&call.tool_call_id);
-                }
                 stream.remember_tool(call);
-                send_ready_full_responses(&transport, &mut stream).await;
             }
             SessionEventPayload::ToolUpdated { call, .. } => {
                 stream.remember_tool(call);
@@ -823,84 +919,47 @@ async fn stream_session_with_mode(
                         error = %format!("{error:#}"),
                         "send permission request failed"
                     );
-                } else if output_mode == ChannelOutputMode::Full {
-                    stream.mark_tool_presented(&permission.tool_call_id);
-                    send_ready_full_responses(&transport, &mut stream).await;
+                }
+            }
+            SessionEventPayload::QuestionnaireRequested {
+                questionnaire_id,
+                questions,
+                ..
+            } => {
+                // 问卷是**单向通知**：只发出去，不等回复、不判「跳过 / 取消」
+                // ——用户后面回什么都是普通消息；正式作答只存在于 ACP v2。
+                if stream.mark_questionnaire_sent(&questionnaire_id) {
+                    send(&transport, &render_questionnaire(&questions)).await;
                 }
             }
             SessionEventPayload::ToolCompleted { result, .. } => {
-                if output_mode == ChannelOutputMode::Full
-                    && !stream.tool_was_presented(&result.tool_call_id)
-                    && let Some(call) = stream.tool(&result.tool_call_id).cloned()
-                {
-                    send_segment(&transport, &OutputSegment::ToolCall(call)).await;
-                    stream.mark_tool_presented(&result.tool_call_id);
-                    send_ready_full_responses(&transport, &mut stream).await;
-                }
                 stream.forget_tool(&result.tool_call_id);
             }
             SessionEventPayload::TurnCompleted { .. } => {
-                if output_mode == ChannelOutputMode::Full {
-                    for response in stream.take_all_full_responses() {
-                        send_segment(&transport, &response).await;
-                    }
-                } else if let Some(response) = stream.take_response() {
+                if let Some(response) = stream.take_response() {
                     send(&transport, &response).await;
                 }
                 stream.finish_turn();
             }
             SessionEventPayload::TurnCancelled { .. } => {
-                if output_mode == ChannelOutputMode::Full {
-                    for response in stream.take_all_full_responses() {
-                        send_segment(&transport, &response).await;
+                match stream.take_response() {
+                    Some(response) => {
+                        send(&transport, &format!("{response}\n\nTurn cancelled")).await;
                     }
-                    send(&transport, "Turn cancelled").await;
-                } else {
-                    stream.remember_response("Turn cancelled".to_string());
-                    if let Some(response) = stream.take_response() {
-                        send(&transport, &response).await;
-                    }
+                    None => send(&transport, "Turn cancelled").await,
                 }
                 stream.finish_turn();
             }
             SessionEventPayload::TurnFailed { error, .. } => {
-                if output_mode == ChannelOutputMode::Full {
-                    for response in stream.take_all_full_responses() {
-                        send_segment(&transport, &response).await;
-                    }
-                    send(&transport, &format!("Turn failed: {error}")).await;
-                } else {
-                    stream.remember_response(format!("Turn failed: {error}"));
-                    if let Some(response) = stream.take_response() {
-                        send(&transport, &response).await;
-                    }
+                let marker = format!("Turn failed: {error}");
+                match stream.take_response() {
+                    Some(response) => send(&transport, &format!("{response}\n\n{marker}")).await,
+                    None => send(&transport, &marker).await,
                 }
                 stream.finish_turn();
             }
-            SessionEventPayload::ConfigChanged { config } => {
-                session_mode = config.mode;
-            }
             _ => {}
         }
-    }
-}
-
-async fn send_ready_full_responses(
-    transport: &Arc<dyn ConversationTransport>,
-    stream: &mut SessionStreamState,
-) {
-    for response in stream.take_ready_full_responses() {
-        send_segment(transport, &response).await;
-    }
-}
-
-async fn send_segment(transport: &Arc<dyn ConversationTransport>, segment: &OutputSegment) {
-    if let Err(error) = transport.send_segment(segment).await {
-        tracing::warn!(
-            event = "channel.message_send_failed",
-            error = %format!("{error:#}"),
-            "send channel message failed"
-        );
     }
 }
 
@@ -942,7 +1001,6 @@ mod tests {
     struct FakeTransport {
         messages: Mutex<Vec<String>>,
         selected: Mutex<Option<String>>,
-        defer_to_permission: bool,
     }
 
     #[async_trait]
@@ -950,10 +1008,6 @@ mod tests {
         async fn send_text(&self, text: &str) -> Result<()> {
             self.messages.lock().await.push(text.to_string());
             Ok(())
-        }
-
-        fn defer_tool_call_to_permission(&self, mode: SessionMode) -> bool {
-            self.defer_to_permission && mode == SessionMode::Confirm
         }
 
         async fn send_permission_request(
@@ -1052,6 +1106,7 @@ mod tests {
                 turn_id: turn_id.clone(),
                 origin: EndpointId::new(),
                 content: MessageContent::text("question"),
+                source: None,
             },
             SessionEventPayload::AssistantCompleted {
                 message_id: MessageId::new(),
@@ -1081,6 +1136,72 @@ mod tests {
         assert_eq!(
             *transport.messages.lock().await,
             ["User: question", "answer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_stream_forwards_questionnaire_as_a_message() {
+        let transport = Arc::new(FakeTransport::default());
+        let session_id = SessionId::parse("session-test").unwrap();
+        let turn_id = TurnId::parse("turn-test").unwrap();
+        let record = SessionRecord::new(
+            session_id.clone(),
+            "Test".to_string(),
+            dwo_agent_service::SessionWorkspace::External {
+                pwd: PathBuf::from("."),
+            },
+            PathBuf::from("."),
+            SessionMode::Confirm,
+            SessionLlmSettings::default(),
+        );
+        let (events_tx, events) = tokio::sync::mpsc::channel(8);
+        let subscription = SessionSubscription {
+            snapshot: SessionSnapshot {
+                record,
+                transcript: Vec::<ClientTranscriptEvent>::new(),
+                checkpoint_cursor: 0,
+                usage: SessionUsageSnapshot { used: 1, size: 2 },
+                phase: RuntimePhase::Running,
+                active_turn_id: Some(turn_id.clone()),
+                active_step: None,
+                partial_message: String::new(),
+                active_tool_calls: Vec::new(),
+                pending_permission: None,
+                terminal_views: Vec::new(),
+                live_terminal_ids: Vec::new(),
+                seq: 0,
+            },
+            events,
+        };
+        let task = tokio::spawn(stream_session(
+            transport.clone(),
+            EndpointId::new(),
+            session_id.clone(),
+            subscription,
+        ));
+        let questions = vec![dwo_tools::QuestionnaireQuestion {
+            question: "继续吗？".to_string(),
+            options: vec!["继续".to_string(), "停".to_string()],
+            multiple: false,
+        }];
+        events_tx
+            .send(dwo_agent_service::SessionEvent {
+                seq: 1,
+                session_id: session_id.clone(),
+                payload: SessionEventPayload::QuestionnaireRequested {
+                    questionnaire_id: "questionnaire-1".to_string(),
+                    turn_id,
+                    questions: questions.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        drop(events_tx);
+        task.await.unwrap();
+
+        assert_eq!(
+            *transport.messages.lock().await,
+            [render_questionnaire(&questions)]
         );
     }
 
@@ -1117,10 +1238,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_replay_preserves_thinking_tool_answer_step_order() {
+    async fn final_stream_sends_only_the_last_assistant_message() {
         let transport = Arc::new(FakeTransport::default());
-        let session_id = SessionId::parse("session-full-order").unwrap();
-        let turn_id = TurnId::parse("turn-full-order").unwrap();
+        let session_id = SessionId::parse("session-final-last").unwrap();
+        let turn_id = TurnId::parse("turn-final-last").unwrap();
         let call = ActiveToolCall {
             tool_call_id: "call-1".to_string(),
             tool_name: "terminal".to_string(),
@@ -1134,11 +1255,10 @@ mod tests {
             SessionMode::FullAccess,
             events,
         );
-        let task = tokio::spawn(stream_session_with_mode(
+        let task = tokio::spawn(stream_session(
             transport.clone(),
             EndpointId::new(),
             session_id.clone(),
-            ChannelOutputMode::Full,
             subscription,
         ));
         send_events(
@@ -1155,16 +1275,7 @@ mod tests {
                 },
                 SessionEventPayload::ToolStarted {
                     turn_id: turn_id.clone(),
-                    call: call.clone(),
-                },
-                SessionEventPayload::ToolCompleted {
-                    turn_id: turn_id.clone(),
-                    result: dwo_tools::ToolResult {
-                        tool_call_id: call.tool_call_id.clone(),
-                        tool_name: call.tool_name.clone(),
-                        output: json!({"status":"completed"}),
-                        model_context: Vec::new(),
-                    },
+                    call,
                 },
                 SessionEventPayload::AssistantCompleted {
                     message_id: MessageId::new(),
@@ -1181,26 +1292,14 @@ mod tests {
         drop(events_tx);
         task.await.unwrap();
 
-        assert_eq!(
-            *transport.messages.lock().await,
-            [
-                "🧠 Thinking:\nfirst thought",
-                "🔧Tool Call:\n```\necho hi\n```\ntool call id：call-1",
-                "first answer",
-                "🧠 Thinking:\nfinal thought",
-                "final answer",
-            ]
-        );
+        assert_eq!(*transport.messages.lock().await, ["final answer"]);
     }
 
     #[tokio::test]
-    async fn confirm_card_replaces_the_duplicate_full_replay_tool_message() {
-        let transport = Arc::new(FakeTransport {
-            defer_to_permission: true,
-            ..Default::default()
-        });
-        let session_id = SessionId::parse("session-confirm-card").unwrap();
-        let turn_id = TurnId::parse("turn-confirm-card").unwrap();
+    async fn permission_request_is_forwarded_in_final_mode() {
+        let transport = Arc::new(FakeTransport::default());
+        let session_id = SessionId::parse("session-permission").unwrap();
+        let turn_id = TurnId::parse("turn-permission").unwrap();
         let call = ActiveToolCall {
             tool_call_id: "call-1".to_string(),
             tool_name: "terminal".to_string(),
@@ -1214,25 +1313,16 @@ mod tests {
             SessionMode::Confirm,
             events,
         );
-        let task = tokio::spawn(stream_session_with_mode(
+        let task = tokio::spawn(stream_session(
             transport.clone(),
             EndpointId::new(),
             session_id.clone(),
-            ChannelOutputMode::Full,
             subscription,
         ));
         send_events(
             &events_tx,
             &session_id,
             [
-                SessionEventPayload::AssistantCompleted {
-                    message_id: MessageId::new(),
-                    thought_message_id: MessageId::new(),
-                    turn_id: turn_id.clone(),
-                    content: "answer after permission".to_string(),
-                    reasoning: Some("inspect first".to_string()),
-                    tool_calls: vec![call.clone()],
-                },
                 SessionEventPayload::ToolStarted {
                     turn_id: turn_id.clone(),
                     call,
@@ -1252,42 +1342,25 @@ mod tests {
         drop(events_tx);
         task.await.unwrap();
 
-        assert_eq!(
-            *transport.messages.lock().await,
-            [
-                "🧠 Thinking:\ninspect first",
-                "CARD:call-1",
-                "answer after permission",
-            ]
-        );
+        assert_eq!(*transport.messages.lock().await, ["CARD:call-1"]);
     }
 
     #[tokio::test]
-    async fn confirm_card_transport_still_shows_tools_that_need_no_permission() {
-        let transport = Arc::new(FakeTransport {
-            defer_to_permission: true,
-            ..Default::default()
-        });
-        let session_id = SessionId::parse("session-confirm-hosted").unwrap();
-        let turn_id = TurnId::parse("turn-confirm-hosted").unwrap();
-        let call = ActiveToolCall {
-            tool_call_id: "search-1".to_string(),
-            tool_name: "web_search".to_string(),
-            raw_input: json!({"query":"latest release"}),
-            status: "in_progress".to_string(),
-        };
+    async fn cancelled_turn_flushes_the_last_message_with_a_marker() {
+        let transport = Arc::new(FakeTransport::default());
+        let session_id = SessionId::parse("session-cancel").unwrap();
+        let turn_id = TurnId::parse("turn-cancel").unwrap();
         let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let subscription = test_subscription(
             session_id.clone(),
             turn_id.clone(),
-            SessionMode::Confirm,
+            SessionMode::FullAccess,
             events,
         );
-        let task = tokio::spawn(stream_session_with_mode(
+        let task = tokio::spawn(stream_session(
             transport.clone(),
             EndpointId::new(),
             session_id.clone(),
-            ChannelOutputMode::Full,
             subscription,
         ));
         send_events(
@@ -1298,24 +1371,11 @@ mod tests {
                     message_id: MessageId::new(),
                     thought_message_id: MessageId::new(),
                     turn_id: turn_id.clone(),
-                    content: "search answer".to_string(),
-                    reasoning: Some("search first".to_string()),
-                    tool_calls: vec![call.clone()],
+                    content: "partial answer".to_string(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
                 },
-                SessionEventPayload::ToolStarted {
-                    turn_id: turn_id.clone(),
-                    call: call.clone(),
-                },
-                SessionEventPayload::ToolCompleted {
-                    turn_id: turn_id.clone(),
-                    result: dwo_tools::ToolResult {
-                        tool_call_id: call.tool_call_id,
-                        tool_name: call.tool_name,
-                        output: json!({"status":"completed"}),
-                        model_context: Vec::new(),
-                    },
-                },
-                SessionEventPayload::TurnCompleted { turn_id },
+                SessionEventPayload::TurnCancelled { turn_id },
             ],
         )
         .await;
@@ -1324,11 +1384,7 @@ mod tests {
 
         assert_eq!(
             *transport.messages.lock().await,
-            [
-                "🧠 Thinking:\nsearch first",
-                "🔧Tool Call:\n```\n{\n  \"query\": \"latest release\"\n}\n```\ntool call id：search-1",
-                "search answer",
-            ]
+            ["partial answer\n\nTurn cancelled"]
         );
     }
 

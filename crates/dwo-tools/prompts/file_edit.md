@@ -71,7 +71,8 @@ Within an update hunk:
 - `+` adds a line.
 - `@@` starts a hunk.
 - `@@ context` finds an anchor, then matches the hunk after that anchor. Do not repeat the anchor in the hunk body.
-- Blank context lines may be completely empty or contain a single leading space. Use `+` or `-` explicitly when adding or removing a blank line.
+- Blank context lines may be completely empty or contain a single leading space. Use `+` or `-` explicitly when adding or removing a blank line. Never list the same existing blank line as context twice: when inserting between two blocks separated by one blank line, keep that blank as context once and write any additional blank line with `+`, or the hunk will require more blank lines than the file has and will not match.
+- Hunks are matched in the order written with a forward-only search cursor. List hunks in ascending file order; a hunk targeting text earlier in the file than a previous hunk's match can never match.
 - `*** End of File` requires the hunk to match at the end of the file.
 
 ## Replace File
@@ -126,6 +127,7 @@ A parse error, invalid target, or filesystem error returns an error result for t
 - Every file written by Add, Update, Replace, or Move is encoded as UTF-8 without a BOM.
 - Updates follow Codex apply-patch text behavior and normally finish with a final newline.
 - Hunk matching tries exact text first, then tolerates trailing whitespace, surrounding whitespace, and common Unicode punctuation differences.
+- If a hunk reports `Update hunk did not match target file`, first check that hunks are in ascending file order, then compare its "Expected lines:" against the file, blank-line counts included; the search cursor never moves backwards.
 - Replace File matching is literal and does not use Update File's fuzzy matching.
 - File operations are applied in patch order. If a later operation fails, earlier successful operations remain applied.
 - Keep related multi-file changes in one patch when they form one coherent edit.

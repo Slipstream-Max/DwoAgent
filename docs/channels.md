@@ -14,38 +14,26 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
-    outputMode: final
-    markdownFilter: true
-    mediaInput: true
   telegram:
     enabled: false
     replayTurns: 5
-    outputMode: final
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
-    mediaInput: true
   feishu:
     enabled: false
     replayTurns: 5
-    outputMode: final
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
-    mediaInput: true
   qq:
     enabled: false
     replayTurns: 5
-    outputMode: final
-    mediaInput: true
 ~~~
 
 | 字段 | 作用 |
 | --- | --- |
 | enabled | 是否启动 adapter；改动后会热重启对应 channel |
 | replayTurns | /use 切换 Session 时回放最近多少个完成 turn，范围 0..=10 |
-| outputMode | final 只发最终回答；full 还发 reasoning、tool-call 和阶段性回答 |
-| mediaInput | 是否接收图片和文件；关闭后只处理文本 |
-| markdownFilter | 仅微信使用；把 Markdown 转成微信可读文本 |
 | botTokenEnv | Telegram token 所在的环境变量名 |
 | tgProxy | Telegram 使用的 HTTP/HTTPS 代理 |
 | appIdEnv / appSecretEnv | 飞书/Lark 凭据所在的环境变量名 |
@@ -114,6 +102,7 @@ QQ channel 目前只支持单用户 C2C 私聊，不支持群聊，也不需要�
 
 二维码返回的 AppID、AppSecret 和用户 OpenID 保存在 channels/qq/secret.yaml。
 QQ 出站文件首版限制为 20 MiB。
+出站文本消息按 QQ 富文本（markdown）发送，以便渲染加粗、链接、表格等格式。
 
 ## 消息如何进入 Session
 
@@ -122,6 +111,7 @@ QQ 出站文件首版限制为 20 MiB。
 - 仅发送图片或文件也是有效 prompt。
 - confirm 模式下直接发送 /allow 或 /deny 处理当前权限请求。
 - /cancel 才会中断当前 turn；发送新消息只会排队，不会取消工具。
+- 每个回合只在结束时发送最后一条回答；取消或失败时发送该条并附 `Turn cancelled` / `Turn failed` 标记。
 - 普通回答会由 adapter 自动发送；主动发送才使用 dwo channel ... send-message/send-file。
 
 命令完整语法见 [Slash Commands](slash-commands.md)，CLI 发送和管理命令见 [CLI 命令参考](cli.md)。

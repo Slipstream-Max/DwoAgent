@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,10 +10,13 @@ use agent_client_protocol::schema::v1;
 use agent_client_protocol::schema::v2::{
     AgentCapabilities, AgentMessage, AgentThought, AvailableCommand, AvailableCommandInput,
     AvailableCommandsUpdate, CancelSessionNotification, CloseSessionRequest, CloseSessionResponse,
-    ConfigOptionUpdate, Content as ToolContent, ContentBlock, ContentChunk, DeleteSessionRequest,
-    DeleteSessionResponse, Diff, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
+    CompleteElicitationNotification, ConfigOptionUpdate, Content as ToolContent, ContentBlock,
+    ContentChunk, CreateElicitationRequest, DeleteSessionRequest, DeleteSessionResponse, Diff,
+    ElicitationAction, ElicitationContentValue, ElicitationSessionScope, EmbeddedResourceResource,
+    ForkSessionRequest, ForkSessionResponse,
     IdleStateUpdate, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    ListSessionsResponse, NewSessionRequest, NewSessionResponse, OtherElicitationMode,
+    PermissionOption,
     PermissionOptionKind, PromptCapabilities, PromptEmbeddedContextCapabilities,
     PromptImageCapabilities, PromptRequest, PromptResponse, ReplayFrom, RequestPermissionOutcome,
     RequestPermissionRequest, ResourceLink, ResumeSessionRequest, ResumeSessionResponse,
@@ -761,7 +764,7 @@ async fn run_prompt(
             if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
                 let prompt = serde_json::to_value(prompt_blocks)
                     .unwrap_or_else(|_| Value::Array(Vec::new()));
-                send_user_message(&cx, &session_id, message_id, &prompt);
+                send_user_message(&cx, &session_id, message_id, &prompt, None);
             }
         }
         Err(error) => {
@@ -972,6 +975,27 @@ async fn activate_observer(
             replay_snapshot_state(cx, session_id, snapshot);
         }
     }
+    if let Some(value) = prepared.snapshot.as_ref() {
+        let state = value.get("snapshot").unwrap_or(value);
+        if let Some(pending) = state
+            .get("record")
+            .and_then(|record| record.get("pending_questionnaire"))
+            .filter(|pending| !pending.is_null())
+            && let Some(questionnaire_id) = pending.get("id").and_then(Value::as_str)
+        {
+            spawn_questionnaire_delivery(
+                runtime,
+                cx,
+                session_id,
+                &prepared.observer.endpoint_id,
+                questionnaire_id.to_string(),
+                pending
+                    .get("questions")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new())),
+            );
+        }
+    }
     let Some(mut events) = prepared.events.take() else {
         return Ok(prepared.observer);
     };
@@ -1062,14 +1086,17 @@ async fn handle_session_event(
             }
         }
         "user_prompt_submitted" => {
-            if payload.get("origin").and_then(Value::as_str) == Some(endpoint_id) {
+            let source = payload.get("source").and_then(Value::as_str);
+            if source.is_none()
+                && payload.get("origin").and_then(Value::as_str) == Some(endpoint_id)
+            {
                 return;
             }
             if let (Some(message_id), Some(content)) = (
                 payload.get("message_id").and_then(Value::as_str),
                 payload.get("content"),
             ) {
-                send_user_message(cx, session_id, message_id, content);
+                send_user_message(cx, session_id, message_id, content, source);
             }
         }
         "assistant_completed" => send_assistant_completed(cx, session_id, payload),
@@ -1124,6 +1151,30 @@ async fn handle_session_event(
                 }
                 Ok(())
             });
+        }
+        "questionnaire_requested" => {
+            if let Some(questionnaire_id) =
+                payload.get("questionnaire_id").and_then(Value::as_str)
+            {
+                spawn_questionnaire_delivery(
+                    runtime,
+                    cx,
+                    session_id,
+                    endpoint_id,
+                    questionnaire_id.to_string(),
+                    payload
+                        .get("questions")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new())),
+                );
+            }
+        }
+        "questionnaire_resolved" => {
+            if let Some(questionnaire_id) =
+                payload.get("questionnaire_id").and_then(Value::as_str)
+            {
+                send_elicitation_complete(cx, questionnaire_id);
+            }
         }
         "permission_resolved" => send_state(
             cx,
@@ -1418,6 +1469,117 @@ async fn resolve_permission(
     Ok(())
 }
 
+fn spawn_questionnaire_delivery(
+    runtime: &AcpRuntime,
+    cx: &AcpConnection,
+    session_id: &str,
+    endpoint_id: &str,
+    questionnaire_id: String,
+    questions: Value,
+) {
+    let task_runtime = runtime.clone();
+    let task_cx = cx.clone();
+    let task_session_id = session_id.to_string();
+    let task_endpoint_id = endpoint_id.to_string();
+    let _ = cx.inner.clone().spawn(async move {
+        if let Err(error) = deliver_questionnaire(
+            &task_runtime,
+            &task_cx,
+            &task_session_id,
+            &task_endpoint_id,
+            &questionnaire_id,
+            questions,
+        )
+        .await
+        {
+            tracing::warn!(
+                event = "acp.questionnaire_failed",
+                error = %format!("{error:#}"),
+                "ACP questionnaire delivery failed"
+            );
+        }
+        Ok(())
+    });
+}
+
+async fn deliver_questionnaire(
+    runtime: &AcpRuntime,
+    cx: &AcpConnection,
+    session_id: &str,
+    endpoint_id: &str,
+    questionnaire_id: &str,
+    questions: Value,
+) -> Result<()> {
+    if cx.protocol != AcpProtocol::V2 {
+        tracing::debug!(
+            event = "acp.questionnaire_skipped",
+            "questionnaires require ACP v2"
+        );
+        return Ok(());
+    }
+    let question_count = questions.as_array().map(Vec::len).unwrap_or(0);
+    let mut fields = BTreeMap::new();
+    fields.insert("questionnaireId".to_string(), json!(questionnaire_id));
+    fields.insert("questions".to_string(), questions);
+    let mode = OtherElicitationMode::new(
+        "_dwo_questionnaire",
+        ElicitationSessionScope::new(session_id),
+        fields,
+    );
+    let request = CreateElicitationRequest::new(mode, format!("请回答 {question_count} 个问题"));
+    let response = match cx.inner.send_request_to(Client, request).block_task().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(
+                event = "acp.questionnaire_unsupported",
+                error = %format!("{error:#}"),
+                "client did not answer the questionnaire elicitation"
+            );
+            return Ok(());
+        }
+    };
+    let answers = match response.action {
+        ElicitationAction::Accept(accept) => accept
+            .content
+            .and_then(|content| content.get("answers").cloned())
+            .and_then(|value| match value {
+                ElicitationContentValue::StringArray(answers) => Some(answers),
+                _ => None,
+            }),
+        _ => None,
+    };
+    let params = match answers {
+        Some(answers) if answers.len() == question_count => json!({
+            "session_id": session_id,
+            "endpoint_id": endpoint_id,
+            "questionnaire_id": questionnaire_id,
+            "answers": answers,
+        }),
+        _ => json!({
+            "session_id": session_id,
+            "endpoint_id": endpoint_id,
+            "questionnaire_id": questionnaire_id,
+            "skip": true,
+        }),
+    };
+    if let Err(error) = runtime.request("session.questionnaire", params).await {
+        tracing::warn!(
+            event = "acp.questionnaire_answer_failed",
+            error = %format!("{error:#}"),
+            "submit questionnaire answer failed"
+        );
+    }
+    Ok(())
+}
+
+fn send_elicitation_complete(cx: &AcpConnection, questionnaire_id: &str) {
+    if cx.protocol != AcpProtocol::V2 {
+        return;
+    }
+    let notification = CompleteElicitationNotification::new(questionnaire_id.to_string());
+    let _ = cx.inner.send_notification_to(Client, notification);
+}
+
 fn send_update(cx: &AcpConnection, session_id: &str, update: SessionUpdate) {
     match cx.protocol {
         AcpProtocol::V1 => {
@@ -1566,14 +1728,18 @@ async fn load_status_snapshot(
     Ok(serde_json::from_value(value)?)
 }
 
-fn send_user_message(cx: &AcpConnection, session_id: &str, message_id: &str, content: &Value) {
-    send_update(
-        cx,
-        session_id,
-        SessionUpdate::UserMessage(
-            UserMessage::new(message_id.to_string()).content(acp_content_blocks(content)),
-        ),
-    );
+fn send_user_message(
+    cx: &AcpConnection,
+    session_id: &str,
+    message_id: &str,
+    content: &Value,
+    source: Option<&str>,
+) {
+    let mut update = UserMessage::new(message_id.to_string()).content(acp_content_blocks(content));
+    if let Some(source) = source {
+        update = update.meta(user_message_meta(source));
+    }
+    send_update(cx, session_id, SessionUpdate::UserMessage(update));
 }
 
 fn send_agent_chunk(cx: &AcpConnection, session_id: &str, message_id: &str, text: &str) {
@@ -1725,6 +1891,13 @@ fn notification_meta(category: &str, level: &str, data: Value) -> serde_json::Ma
             "level": level,
             "data": data,
         }),
+    )])
+}
+
+fn user_message_meta(source: &str) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(
+        "dwo".to_string(),
+        json!({"kind": "user_message", "source": source}),
     )])
 }
 
@@ -2088,7 +2261,13 @@ fn replay_snapshot(cx: &AcpConnection, session_id: &str, value: &Value) {
             match kind {
                 Some("user_prompt_submitted") => {
                     if let Some(message_id) = payload.get("message_id").and_then(Value::as_str) {
-                        send_user_message(cx, session_id, message_id, &payload["content"]);
+                        send_user_message(
+                            cx,
+                            session_id,
+                            message_id,
+                            &payload["content"],
+                            payload.get("source").and_then(Value::as_str),
+                        );
                     }
                 }
                 Some("assistant_delta") => {

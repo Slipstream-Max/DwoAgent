@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwo_context::{ContentBlock, MessageContent, SessionContext};
-use dwo_tools::{SessionMode, TodoEntry, TodoEntryStatus};
+use dwo_tools::{QuestionnaireQuestion, SessionMode, TodoEntry, TodoEntryStatus};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -52,6 +52,14 @@ macro_rules! string_id {
 
 string_id!(SessionId, "session-");
 
+string_id!(QuestionnaireId, "questionnaire-");
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingQuestionnaire {
+    pub id: QuestionnaireId,
+    pub questions: Vec<QuestionnaireQuestion>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
     pub id: String,
@@ -88,6 +96,8 @@ pub struct SessionRecord {
     pub context: SessionContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_plan: Option<ExecutionPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_questionnaire: Option<PendingQuestionnaire>,
     #[serde(default, skip_serializing_if = "is_false")]
     auto_title_pending: bool,
 }
@@ -196,12 +206,14 @@ impl SessionRecord {
         context: SessionContext,
         auto_title_pending: bool,
         current_plan: Option<ExecutionPlan>,
+        pending_questionnaire: Option<PendingQuestionnaire>,
     ) -> Self {
         Self {
             info,
             llm,
             context,
             current_plan,
+            pending_questionnaire,
             auto_title_pending,
         }
     }
@@ -235,6 +247,7 @@ impl SessionRecord {
             llm,
             context: SessionContext::default(),
             current_plan: None,
+            pending_questionnaire: None,
             auto_title_pending: false,
         }
     }

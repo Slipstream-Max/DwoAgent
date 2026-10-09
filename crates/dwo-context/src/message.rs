@@ -408,7 +408,7 @@ impl ContextMessage {
     pub fn tool(result: &ToolResultRecord) -> Self {
         Self {
             role: MessageRole::Tool,
-            content: result.output.to_string().into(),
+            content: result.model_text().into(),
             reasoning: None,
             tool_calls: Vec::new(),
             response_item: None,
@@ -458,8 +458,20 @@ pub struct ToolResultRecord {
     pub tool_call_id: String,
     pub tool_name: String,
     pub output: Value,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_context: Vec<MessageContent>,
+}
+
+impl ToolResultRecord {
+    pub fn model_text(&self) -> String {
+        if self.model.is_empty() {
+            self.output.to_string()
+        } else {
+            self.model.clone()
+        }
+    }
 }
 
 fn response_call_id(item: &Value) -> Option<&str> {

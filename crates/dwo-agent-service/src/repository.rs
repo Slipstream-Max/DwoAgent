@@ -13,8 +13,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    ClientTranscriptEvent, ExecutionPlan, SessionId, SessionInfo, SessionLlmSettings,
-    SessionRecord, SessionWorkspace,
+    ClientTranscriptEvent, ExecutionPlan, PendingQuestionnaire, SessionId, SessionInfo,
+    SessionLlmSettings, SessionRecord, SessionWorkspace,
 };
 
 pub const SESSION_META_FILE: &str = "session.json";
@@ -155,6 +155,8 @@ struct PersistedSessionMetadata {
     auto_title_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_plan: Option<ExecutionPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_questionnaire: Option<PendingQuestionnaire>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,6 +230,7 @@ impl PersistedSessionMetadata {
             llm: record.llm.clone(),
             auto_title_pending: record.auto_title_pending(),
             current_plan: record.current_plan.clone(),
+            pending_questionnaire: record.pending_questionnaire.clone(),
         }
     }
 }
@@ -340,6 +343,7 @@ impl FsSessionRepository {
             context,
             metadata.auto_title_pending,
             metadata.current_plan,
+            metadata.pending_questionnaire,
         ))
     }
 

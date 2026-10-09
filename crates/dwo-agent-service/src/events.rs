@@ -1,8 +1,15 @@
+use dwo_tools::QuestionnaireQuestion;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{EndpointId, MessageContent, MessageId, SessionId, SessionRecord, TurnId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMessageSource {
+    Questionnaire,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +116,8 @@ pub enum SessionEventPayload {
         turn_id: TurnId,
         origin: EndpointId,
         content: MessageContent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<UserMessageSource>,
     },
     TurnStarted {
         turn_id: TurnId,
@@ -145,6 +154,14 @@ pub enum SessionEventPayload {
         content: String,
         reasoning: String,
         error_kind: String,
+    },
+    QuestionnaireRequested {
+        questionnaire_id: String,
+        turn_id: TurnId,
+        questions: Vec<QuestionnaireQuestion>,
+    },
+    QuestionnaireResolved {
+        questionnaire_id: String,
     },
     Notification {
         message_id: MessageId,

@@ -11,6 +11,7 @@ use crate::ToolEventHandler;
 use crate::call::ParsedToolCall;
 use crate::file_edit::FileEditManager;
 use crate::policy::{SessionMode, ToolPolicyEngine};
+use crate::questionnaire::QuestionnaireHandler;
 use crate::result::ToolResult;
 use crate::terminal::TerminalManager;
 use crate::todo::TodoHandler;
@@ -42,6 +43,7 @@ pub struct ExecutionContext {
     pub allow_image_input: bool,
     pub events: Option<ToolEventHandler>,
     pub todo: Option<TodoHandler>,
+    pub questionnaire: Option<QuestionnaireHandler>,
 }
 
 impl ExecutionContext {
@@ -52,6 +54,7 @@ impl ExecutionContext {
             allow_image_input: false,
             events: None,
             todo: None,
+            questionnaire: None,
         }
     }
 }
@@ -341,5 +344,79 @@ mod tests {
         assert_eq!(serialized["tool_call_id"], "image");
         assert_eq!(serialized["tool_name"], "read_file");
         assert_eq!(serialized["output"]["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn questionnaire_calls_flow_through_the_session_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path().to_path_buf());
+        let call = || {
+            ParsedToolCall::parse(json!({
+                "id":"ask",
+                "name":"questionnaire",
+                "arguments":{"questions":[{"question":"Which model?","options":["a","b"]}]}
+            }))
+            .unwrap()
+        };
+
+        let missing = manager
+            .execute(call(), &ExecutionContext::new(SessionMode::FullAccess))
+            .await;
+        assert_eq!(missing.output["status"], "error");
+        assert!(
+            missing.output["error"]
+                .as_str()
+                .is_some_and(|error| { error.contains("questionnaire handler is not available") })
+        );
+
+        let mut delivered = ExecutionContext::new(SessionMode::FullAccess);
+        delivered.questionnaire = Some(Arc::new(
+            |request: crate::questionnaire::QuestionnaireRequest| {
+                Box::pin(async move {
+                    assert_eq!(request.questions.len(), 1);
+                    assert_eq!(request.questions[0].question, "Which model?");
+                    Ok(crate::questionnaire::QuestionnaireResponse {
+                        questionnaire_id: "questionnaire-1".to_string(),
+                    })
+                })
+            },
+        ));
+        let sent = manager.execute(call(), &delivered).await;
+        assert_eq!(sent.output["status"], "completed");
+        assert_eq!(sent.output["questionnaire_id"], "questionnaire-1");
+        assert!(sent.model.contains("sent to the user"));
+
+        let mut rejected = ExecutionContext::new(SessionMode::FullAccess);
+        rejected.questionnaire = Some(Arc::new(|_: crate::questionnaire::QuestionnaireRequest| {
+            Box::pin(
+                async move { Err("a questionnaire is already waiting for answers".to_string()) },
+            )
+        }));
+        let error = manager.execute(call(), &rejected).await;
+        assert_eq!(error.output["status"], "error");
+        assert!(
+            error.output["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("already waiting"))
+        );
+    }
+
+    #[tokio::test]
+    async fn questionnaire_arguments_are_validated() {
+        let error = ParsedToolCall::parse(json!({
+            "id":"ask",
+            "name":"questionnaire",
+            "arguments":{"questions":[]}
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("at least one question"));
+
+        let error = ParsedToolCall::parse(json!({
+            "id":"ask",
+            "name":"questionnaire",
+            "arguments":{"questions":[{"question":"q","options":["a","a"]}]}
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("unique"));
     }
 }

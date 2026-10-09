@@ -208,6 +208,7 @@ providers:
         tool_call_id: call_id,
         tool_name: "lookup_code".to_string(),
         output: json!({"code":"A-17"}),
+        model: String::new(),
         model_context: Vec::new(),
     });
     messages = context.into_context().messages;

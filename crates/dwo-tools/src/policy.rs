@@ -101,6 +101,7 @@ impl ToolPolicyEngine {
                 }
             },
             ToolIntent::Todo => Authorization::Allow,
+            ToolIntent::Questionnaire => Authorization::Allow,
         }
     }
 

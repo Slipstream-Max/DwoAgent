@@ -1,0 +1,4 @@
+# Use LLVM lld-link (bundled with the VS build tools, available in the dev shell)
+# instead of MSVC link.exe for faster linking of the daemon binary.
+[target.aarch64-pc-windows-msvc]
+linker = "lld-link"

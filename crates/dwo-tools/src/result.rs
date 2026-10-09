@@ -8,6 +8,8 @@ pub struct ToolResult {
     pub tool_name: String,
     pub output: Value,
     #[serde(skip)]
+    pub model: String,
+    #[serde(skip)]
     pub model_context: Vec<MessageContent>,
 }
 
@@ -17,6 +19,7 @@ impl ToolResult {
             tool_call_id: self.tool_call_id.clone(),
             tool_name: self.tool_name.clone(),
             output: self.output.clone(),
+            model: self.model.clone(),
             model_context: self.model_context.clone(),
         }
     }

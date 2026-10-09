@@ -28,29 +28,20 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
-    outputMode: final
-    markdownFilter: true
-    mediaInput: true
   telegram:
     enabled: false
     replayTurns: 5
-    outputMode: final
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
-    mediaInput: true
   feishu:
     enabled: false
     replayTurns: 5
-    outputMode: final
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
-    mediaInput: true
   qq:
     enabled: false
     replayTurns: 5
-    outputMode: final
-    mediaInput: true
 
 websocket:
   enabled: false
@@ -176,9 +167,6 @@ Profile 在这里列出所有字段；平台绑定、收发行为和故障排查
 | --- | --- | --- | --- |
 | 全部 | enabled | 必填 | 是否启动 Adapter |
 | 全部 | replayTurns | 必填，0..=10 | /use 后回放的完成 Turn 数 |
-| 全部 | outputMode | 默认 final | final 或 full；微信只能 final |
-| 全部 | mediaInput | 默认 true | 是否接收图片和文件 |
-| 微信 | markdownFilter | 必填 | 是否转换 Assistant Markdown |
 | Telegram | botTokenEnv | 必填且非空 | Bot Token 的环境变量名 |
 | Telegram | tgProxy | 默认 null | http:// 或 https:// 代理 |
 | 飞书/Lark | appIdEnv | 必填且非空 | App ID 的环境变量名 |

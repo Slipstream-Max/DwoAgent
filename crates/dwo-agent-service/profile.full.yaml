@@ -31,13 +31,6 @@ channels:
     # Valid range: 0..=10.
     replayTurns: 5
 
-    # Apply the Weixin markdown compatibility filter to assistant responses.
-    outputMode: final
-    markdownFilter: true
-
-    # Download inbound images/files and submit structured content blocks.
-    mediaInput: true
-
   telegram:
     # Telegram support is private-chat only. The daemon owns one long-polling
     # runtime when enabled, bound, and the token environment variable exists.
@@ -48,14 +41,10 @@ channels:
     replayTurns: 5
 
     # Environment variable containing the BotFather token.
-    outputMode: final
     botTokenEnv: TELEGRAM_BOT_TOKEN
 
     # Optional HTTP proxy used only for Telegram Bot API and media downloads.
     tgProxy: null
-
-    # Download inbound photos, documents, and videos as structured resources.
-    mediaInput: true
 
   feishu:
     # Feishu/Lark support uses the platform WebSocket long connection and is
@@ -68,15 +57,11 @@ channels:
     replayTurns: 5
 
     # Environment variables containing enterprise application credentials.
-    outputMode: final
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
 
     # feishu uses open.feishu.cn; lark uses open.larksuite.com.
     platform: feishu
-
-    # Download inbound images and files as structured resources.
-    mediaInput: true
 
   qq:
     # QQ Bot is private C2C only. Credentials are persisted by QR binding in
@@ -86,10 +71,6 @@ channels:
     # Number of completed turns replayed after selecting an existing session.
     # Valid range: 0..=10.
     replayTurns: 5
-    outputMode: final
-
-    # Download inbound attachments and submit structured resources.
-    mediaInput: true
 
 
 # Remote ACP and management RPC. Tokens are generated under

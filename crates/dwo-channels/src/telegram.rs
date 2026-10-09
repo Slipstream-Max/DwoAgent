@@ -115,12 +115,11 @@ impl ChannelAdapter for TelegramAdapter {
         let access = TelegramAccess {
             user_id: runtime.secret.bound_user_id,
             chat_id: runtime.secret.bound_chat_id,
-            media_input: runtime.config.media_input,
+            media_input: true,
         };
         Ok(PreparedChannel {
             conversation: ConversationId::new("telegram", runtime.secret.bound_user_id.to_string()),
             replay_turns: runtime.config.replay_turns,
-            output_mode: runtime.config.output_mode,
             selected_session_id,
             transport: conversation,
             starter: Box::new(TelegramStarter {
@@ -414,14 +413,6 @@ struct TelegramConversation {
 impl ConversationTransport for TelegramConversation {
     async fn send_text(&self, text: &str) -> Result<()> {
         send_chunks(&self.bot, self.chat_id, text).await
-    }
-
-    fn max_text_chars(&self) -> usize {
-        TELEGRAM_TEXT_CHUNK_CHARS
-    }
-
-    fn defer_tool_call_to_permission(&self, mode: dwo_tools::SessionMode) -> bool {
-        mode == dwo_tools::SessionMode::Confirm
     }
 
     async fn send_permission_request(

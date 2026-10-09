@@ -989,6 +989,22 @@ impl SessionService {
             .await
     }
 
+    pub async fn answer_questionnaire(
+        &self,
+        id: &SessionId,
+        origin: EndpointId,
+        questionnaire_id: Option<String>,
+        reply: crate::QuestionnaireReply,
+    ) -> Result<crate::QuestionnaireReceipt, SessionServiceError> {
+        let lock = self.mutation_lock(id).await;
+        let _mutation = lock.lock().await;
+        self.ensure_active(id).await?;
+        self.load(id)
+            .await?
+            .answer_questionnaire(origin, questionnaire_id, reply)
+            .await
+    }
+
     pub async fn publish_notification(
         &self,
         id: &SessionId,

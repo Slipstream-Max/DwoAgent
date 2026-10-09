@@ -5,9 +5,9 @@ ACP（stdio 和 WebSocket /acp）和消息 Channel 共用以下命令。WebSocke
 | 命令 | ACP | 微信/Telegram/飞书/QQ |
 | --- | --- | --- |
 | /cancel、/compact、/resume、/fork、/status | 支持 | 支持 |
-| /skill <name> [prompt] | 支持 | 支持 |
-| /help、/list、/new、/use、/del | 不支持 | 支持 |
-| /model、/reasoning、/policy | 使用客户端配置选项 | 支持 |
+| /skill、/skill <name> [prompt] | 支持 | 支持 |
+| /help、/list、/new、/use | 不支持 | 支持 |
+| /model、/think、/policy | 使用客户端配置选项 | 支持 |
 | /allow、/deny | 使用客户端权限交互 | 支持 |
 
 ## 共同命令
@@ -25,7 +25,8 @@ ACP v1 客户端仍可能在本地命令返回后把按钮显示为发送，后�
 ACP 协议的 `session/resume` 只重新连接会话，不等同于 `/resume`。
 
 `/skill <name> [prompt]` 是唯一的 Prompt Directive，会展开为指定 Skill 的引用并交给模型。
-它支持出现在正文中和重复出现；未知 Skill 或单独的 `/skill` 保持原文。ACP 发布可用 Skill 补全。
+它支持出现在正文中和重复出现；未知 Skill 保持原文。单独的 `/skill` 在 Channel 中是命令，
+直接返回可用技能列表（ACP 不识别，按普通文本处理）。ACP 发布可用 Skill 补全。
 
 ## Channel 会话管理
 
@@ -39,24 +40,24 @@ ACP 协议的 `session/resume` 只重新连接会话，不等同于 `/resume`。
 /new "我的项目"
 /new "我的项目" "开发"
 
+/use
 /use 短ID
 /use 1
 /use "我的项目" 1
-/del 会话
 ```
 
-`/list` 默认显示 Inbox：所有未归档且未归属项目的顶层会话，按最近一次 Turn 结束时间倒序。
-尚未执行的会话排在后面，同时间按更新时间倒序。项目列表按分区组织，分区内使用相同排序。
+`/list` 默认显示 Inbox：所有未归档的顶层会话（含已归属项目的会话），按「进行中优先、
+活跃时间倒序」排序，并分为「进行中 / 已完成」两段。项目列表按分区组织，分区内同样排序。
 每页 20 条，编号跨页连续；第 1 页刷新列表，后续页与 `/use` 复用该范围的列表快照，防止后台排序变化导致选错。
+没有快照时（例如直接 `/use 3`），编号会按当前列表实时解析并记住，无需先 `/list`。
 Inbox 和各项目的编号互相独立；`/use 1` 始终使用最近的 Inbox 列表。纯数字项目名可用 `/list "123" 1` 指定。
 
 `/new` 创建无项目归属的 work（Managed Workspace）会话；指定项目时使用项目的默认未分类分区，
 第二个参数指定分区。创建后自动选中。项目/分区名必须精确匹配；不存在或重名会报错，不自动创建。
 名称带空格时用引号包起来。
 
-`/del` 按 Inbox 序号、短 ID 或完整 ID 归档会话，保留历史，不永久删除。
-运行中的会话需要先 `/cancel`，待空闲后再归档。归档当前会话后清除 Channel 的选中状态。
-`/help` 显示命令列表。
+`/use` 支持编号或短 ID；不带参数时直接列出会话供选择。归档入口已收回 CLI：
+`dwo session archive <id>`（Channel 不再暴露 `/del`）。`/help` 显示命令列表。
 
 ## Channel 配置与权限
 
@@ -65,8 +66,8 @@ Inbox 和各项目的编号互相独立；`/use 1` 始终使用最近的 Inbox �
 | /model | 按 provider 分组列出可用模型，显示当前模型 |
 | /model model | 使用唯一的模型名称或模型 ID 切换；重名时报错 |
 | /model provider/model | 按 provider 与模型 ID/名称精确切换 |
-| /reasoning | 列出当前模型支持的强度和当前有效值；未显式设置时显示模型默认值 |
-| /reasoning level | 校验并设置支持的强度；off 仅在模型支持时可用 |
+| /think | 列出当前模型支持的强度和当前有效值；未显式设置时显示模型默认值 |
+| /think level | 校验并设置支持的强度；off 仅在模型支持时可用 |
 | /policy | 列出 full_access、confirm、watch，并显示当前值 |
 | /policy mode | 修改权限模式 |
 | /allow [id] | 批准当前或指定权限请求 |

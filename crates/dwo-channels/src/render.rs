@@ -4,22 +4,8 @@ use dwo_agent_service::{
 pub use dwo_command::session_status::{display_path, policy_name};
 pub use dwo_command::session_status::{short_session_id, short_session_id_str};
 use dwo_context::ContentBlock;
-use std::collections::{HashMap, HashSet, VecDeque};
-
-#[derive(Clone, Debug)]
-pub enum OutputSegment {
-    Thinking(String),
-    ToolCall(ActiveToolCall),
-    Answer(String),
-}
-
-pub fn render_output_segment(segment: &OutputSegment) -> String {
-    match segment {
-        OutputSegment::Thinking(text) => render_reasoning(text),
-        OutputSegment::ToolCall(call) => render_tool_call(call, "tool call id", &call.tool_call_id),
-        OutputSegment::Answer(text) => text.clone(),
-    }
-}
+use dwo_tools::QuestionnaireQuestion;
+use std::collections::{HashMap, HashSet};
 
 pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
     let max_chars = max_chars.max(1);
@@ -118,7 +104,7 @@ pub fn render_session_replay(snapshot: &SessionSnapshot, turns: usize) -> Vec<St
 struct ReplayTurn {
     turn_id: dwo_agent_service::TurnId,
     prompts: Vec<String>,
-    responses: Vec<String>,
+    last_response: Option<String>,
 }
 
 fn render_running_turn_replay(snapshot: &SessionSnapshot) -> Option<String> {
@@ -198,7 +184,7 @@ fn render_replay_turns(
             grouped.push(ReplayTurn {
                 turn_id: turn_id.clone(),
                 prompts: Vec::new(),
-                responses: Vec::new(),
+                last_response: None,
             });
         }
         let turn = grouped.last_mut().expect("replay turn was just inserted");
@@ -211,7 +197,7 @@ fn render_replay_turns(
             SessionEventPayload::AssistantCompleted { content, .. }
                 if !content.trim().is_empty() =>
             {
-                turn.responses.push(content.trim().to_string());
+                turn.last_response = Some(content.trim().to_string());
             }
             _ => {}
         }
@@ -221,15 +207,15 @@ fn render_replay_turns(
         .into_iter()
         .filter(|turn| excluded_turn_id.is_none_or(|excluded| turn.turn_id != *excluded))
         .filter_map(|turn| {
-            if turn.prompts.is_empty() && turn.responses.is_empty() {
+            if turn.prompts.is_empty() && turn.last_response.is_none() {
                 return None;
             }
             let mut sections = Vec::new();
             if !turn.prompts.is_empty() {
                 sections.push(format!("User:\n{}", turn.prompts.join("\n\n")));
             }
-            if !turn.responses.is_empty() {
-                sections.push(format!("Assistant:\n{}", turn.responses.join("\n\n")));
+            if let Some(response) = &turn.last_response {
+                sections.push(format!("Assistant:\n{response}"));
             }
             Some(sections.join("\n\n"))
         })
@@ -239,91 +225,23 @@ fn render_replay_turns(
 
 #[derive(Default)]
 pub struct SessionStreamState {
-    reasoning: Vec<String>,
-    responses: Vec<String>,
+    last_response: Option<String>,
     tools: HashMap<String, ActiveToolCall>,
     permission_messages: HashSet<String>,
-    presented_tools: HashSet<String>,
-    pending_full_responses: VecDeque<PendingFullResponse>,
-}
-
-struct PendingFullResponse {
-    content: String,
-    tool_call_ids: HashSet<String>,
+    questionnaires_sent: HashSet<String>,
 }
 
 impl SessionStreamState {
-    pub fn remember_reasoning(&mut self, reasoning: Option<String>) {
-        let Some(reasoning) = reasoning else {
-            return;
-        };
-        let reasoning = reasoning.trim();
-        if !reasoning.is_empty() {
-            self.reasoning.push(reasoning.to_string());
-        }
-    }
-
-    pub fn take_reasoning(&mut self, max_message_chars: usize) -> Vec<OutputSegment> {
-        let reasoning = std::mem::take(&mut self.reasoning).join("\n\n");
-        split_reasoning(&reasoning, max_message_chars)
-    }
-
+    /// 每个 AssistantCompleted 都覆盖上一条：只留最后的回答。
     pub fn remember_response(&mut self, content: String) {
         let content = content.trim();
         if !content.is_empty() {
-            self.responses.push(content.to_string());
+            self.last_response = Some(content.to_string());
         }
     }
 
     pub fn take_response(&mut self) -> Option<String> {
-        let response = std::mem::take(&mut self.responses).join("\n\n");
-        (!response.is_empty()).then_some(response)
-    }
-
-    pub fn remember_full_response(&mut self, content: String, tool_calls: &[ActiveToolCall]) {
-        let content = content.trim();
-        if content.is_empty() {
-            return;
-        }
-        self.pending_full_responses.push_back(PendingFullResponse {
-            content: content.to_string(),
-            tool_call_ids: tool_calls
-                .iter()
-                .map(|call| call.tool_call_id.clone())
-                .collect(),
-        });
-    }
-
-    pub fn mark_tool_presented(&mut self, tool_call_id: &str) {
-        self.presented_tools.insert(tool_call_id.to_string());
-    }
-
-    pub fn tool_was_presented(&self, tool_call_id: &str) -> bool {
-        self.presented_tools.contains(tool_call_id)
-    }
-
-    pub fn take_ready_full_responses(&mut self) -> Vec<OutputSegment> {
-        let mut responses = Vec::new();
-        while self.pending_full_responses.front().is_some_and(|response| {
-            response
-                .tool_call_ids
-                .iter()
-                .all(|id| self.presented_tools.contains(id))
-        }) {
-            let response = self
-                .pending_full_responses
-                .pop_front()
-                .expect("front response was present");
-            responses.push(OutputSegment::Answer(response.content));
-        }
-        responses
-    }
-
-    pub fn take_all_full_responses(&mut self) -> Vec<OutputSegment> {
-        self.pending_full_responses
-            .drain(..)
-            .map(|response| OutputSegment::Answer(response.content))
-            .collect()
+        self.last_response.take()
     }
 
     pub fn remember_tool(&mut self, call: ActiveToolCall) {
@@ -338,18 +256,22 @@ impl SessionStreamState {
         self.permission_messages.insert(tool_call_id.to_string())
     }
 
+    /// 问卷是单向通知：同一个 id 只发一次（防重复投递；id 全生命周期
+    /// 唯一，不随 turn 清）。
+    pub fn mark_questionnaire_sent(&mut self, questionnaire_id: &str) -> bool {
+        self.questionnaires_sent
+            .insert(questionnaire_id.to_string())
+    }
+
     pub fn forget_tool(&mut self, tool_call_id: &str) {
         self.tools.remove(tool_call_id);
         self.permission_messages.remove(tool_call_id);
     }
 
     pub fn finish_turn(&mut self) {
-        self.reasoning.clear();
-        self.responses.clear();
+        self.last_response = None;
         self.tools.clear();
         self.permission_messages.clear();
-        self.presented_tools.clear();
-        self.pending_full_responses.clear();
     }
 }
 
@@ -373,26 +295,26 @@ pub fn render_tool_call(call: &ActiveToolCall, id_label: &str, id: &str) -> Stri
     format!("🔧Tool Call:\n{}\n{id_label}：{id}", fenced(&content))
 }
 
-pub fn render_reasoning(reasoning: &str) -> String {
-    format!("🧠 Thinking:\n{}", reasoning.trim())
-}
-
-fn split_reasoning(reasoning: &str, max_message_chars: usize) -> Vec<OutputSegment> {
-    let mut remaining = reasoning.trim();
-    let mut chunks = Vec::new();
-    let label_chars = render_reasoning("").chars().count();
-    let content_chars = max_message_chars.saturating_sub(label_chars).max(1);
-    while !remaining.is_empty() {
-        let boundary = remaining
-            .char_indices()
-            .nth(content_chars)
-            .map(|(index, _)| index)
-            .unwrap_or(remaining.len());
-        let (chunk, rest) = remaining.split_at(boundary);
-        chunks.push(OutputSegment::Thinking(chunk.to_string()));
-        remaining = rest.trim_start();
+/// 问卷消息——channel 侧是**单向通知**：发出去就不管了。用户回不回、
+/// 回什么都是普通消息；正式作答 / 跳过只存在于 ACP v2 客户端。
+pub fn render_questionnaire(questions: &[QuestionnaireQuestion]) -> String {
+    let mut lines = vec![format!("📋 问卷 · {} 题", questions.len())];
+    for (index, question) in questions.iter().enumerate() {
+        lines.push(String::new());
+        let suffix = if question.multiple {
+            "（可多选）"
+        } else {
+            ""
+        };
+        lines.push(format!("{}. {}{suffix}", index + 1, question.question));
+        for (option_index, option) in question.options.iter().enumerate() {
+            let letter = char::from(b'A' + option_index as u8);
+            lines.push(format!("   {letter}. {option}"));
+        }
     }
-    chunks
+    lines.push(String::new());
+    lines.push("想作答可直接回复（如：1A 2B）；不回也没关系。".to_string());
+    lines.join("\n")
 }
 
 fn fenced(content: &str) -> String {
@@ -416,55 +338,48 @@ mod tests {
     use dwo_agent_service::{
         EndpointId, MessageId, SessionId, SessionLlmSettings, SessionRecord, SessionUsageSnapshot,
     };
-    use dwo_tools::SessionMode;
+    use dwo_tools::{QuestionnaireQuestion, SessionMode};
     use serde_json::json;
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn responses_are_buffered_in_commit_order() {
+    fn responses_keep_only_the_last_message() {
         let mut stream = SessionStreamState::default();
         stream.remember_response("先检查项目".to_string());
         stream.remember_response("  ".to_string());
         stream.remember_response("检查完成".to_string());
 
-        assert_eq!(
-            stream.take_response().as_deref(),
-            Some("先检查项目\n\n检查完成")
-        );
+        assert_eq!(stream.take_response().as_deref(), Some("检查完成"));
         assert_eq!(stream.take_response(), None);
     }
 
     #[test]
-    fn reasoning_is_buffered_and_cleared_with_a_turn() {
-        let mut stream = SessionStreamState::default();
-        stream.remember_reasoning(Some("first thought".to_string()));
-        stream.remember_reasoning(Some("  ".to_string()));
-        stream.remember_reasoning(Some("second thought".to_string()));
+    fn questionnaire_renders_questions_options_and_hint() {
+        let questions = vec![
+            QuestionnaireQuestion {
+                question: "翻页用着怎么样？".to_string(),
+                options: vec!["顺手".to_string(), "要调".to_string()],
+                multiple: false,
+            },
+            QuestionnaireQuestion {
+                question: "还要加什么？".to_string(),
+                options: vec!["键盘操作".to_string()],
+                multiple: true,
+            },
+        ];
 
-        let reasoning = stream
-            .take_reasoning(1_800)
-            .iter()
-            .map(render_output_segment)
-            .collect::<Vec<_>>();
-        assert_eq!(reasoning, ["🧠 Thinking:\nfirst thought\n\nsecond thought"]);
-        assert!(stream.take_reasoning(1_800).is_empty());
-
-        stream.remember_reasoning(Some("next turn".to_string()));
-        stream.finish_turn();
-        assert!(stream.take_reasoning(1_800).is_empty());
+        assert_eq!(
+            render_questionnaire(&questions),
+            "📋 问卷 · 2 题\n\n1. 翻页用着怎么样？\n   A. 顺手\n   B. 要调\n\n2. 还要加什么？（可多选）\n   A. 键盘操作\n\n想作答可直接回复（如：1A 2B）；不回也没关系。"
+        );
     }
 
     #[test]
-    fn long_reasoning_repeats_the_label_for_each_chunk() {
-        let chunks = split_reasoning(&"思".repeat(2_000), 1_800);
-        assert_eq!(chunks.len(), 2);
-        let chunks = chunks.iter().map(render_output_segment).collect::<Vec<_>>();
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.starts_with("🧠 Thinking:\n"))
-        );
-        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 1_800));
+    fn questionnaires_are_delivered_once_per_id() {
+        let mut stream = SessionStreamState::default();
+        assert!(stream.mark_questionnaire_sent("questionnaire-1"));
+        assert!(!stream.mark_questionnaire_sent("questionnaire-1"));
+        assert!(stream.mark_questionnaire_sent("questionnaire-2"));
     }
 
     #[test]
@@ -519,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_groups_user_and_responses_by_turn() {
+    fn replay_keeps_only_the_last_response_per_turn() {
         let first = dwo_agent_service::TurnId::new();
         let second = dwo_agent_service::TurnId::new();
         let transcript = vec![
@@ -528,6 +443,7 @@ mod tests {
                 turn_id: first.clone(),
                 origin: EndpointId::new(),
                 content: MessageContent::text("first question"),
+                source: None,
             }),
             ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
                 message_id: MessageId::new(),
@@ -550,6 +466,7 @@ mod tests {
                 turn_id: second.clone(),
                 origin: EndpointId::new(),
                 content: MessageContent::text("second question"),
+                source: None,
             }),
             ClientTranscriptEvent::new(SessionEventPayload::AssistantCompleted {
                 message_id: MessageId::new(),
@@ -567,7 +484,7 @@ mod tests {
         );
         assert_eq!(
             render_replay_turns(&transcript, 10, None)[0],
-            "User:\nfirst question\n\nAssistant:\nintermediate\n\nfirst answer"
+            "User:\nfirst question\n\nAssistant:\nfirst answer"
         );
     }
 
@@ -592,6 +509,7 @@ mod tests {
                     turn_id: turn_id.clone(),
                     origin: EndpointId::new(),
                     content: MessageContent::text("inspect the project"),
+                    source: None,
                 }),
                 ClientTranscriptEvent::new(SessionEventPayload::AssistantReasoningDelta {
                     message_id: MessageId::new(),

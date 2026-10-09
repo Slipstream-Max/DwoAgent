@@ -1590,29 +1590,20 @@ channels:
   weixin:
     enabled: true
     replayTurns: 5
-    outputMode: final
-    markdownFilter: true
-    mediaInput: true
   telegram:
     enabled: false
     replayTurns: 5
-    outputMode: final
     botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
-    mediaInput: true
   feishu:
     enabled: false
     replayTurns: 5
-    outputMode: final
     appIdEnv: FEISHU_APP_ID
     appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
-    mediaInput: true
   qq:
     enabled: false
     replayTurns: 5
-    outputMode: final
-    mediaInput: true
 websocket:
   enabled: false
   bind: 127.0.0.1

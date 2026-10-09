@@ -36,20 +36,15 @@ pub enum ChannelCommand {
     },
     #[command(about = "Copy the selected session into a new session.")]
     Fork,
-    #[command(about = "Select by number, short ID, or full ID and replay recent turns.")]
+    #[command(about = "Select by number or short ID and replay recent turns; bare /use lists sessions.")]
     Use {
         #[arg(value_name = "SESSION")]
-        session: String,
+        session: Option<String>,
         #[arg(value_name = "NUMBER")]
         number: Option<usize>,
     },
     #[command(about = "Show the selected session state.")]
     Status,
-    #[command(about = "Archive by Inbox number, short ID, or full ID.")]
-    Del {
-        #[arg(value_name = "SESSION")]
-        session: String,
-    },
     #[command(about = "Cancel the active turn.")]
     Cancel,
     #[command(about = "Compact the selected session context.")]
@@ -62,10 +57,12 @@ pub enum ChannelCommand {
         name: Option<String>,
     },
     #[command(about = "List supported reasoning efforts or change the current effort.")]
-    Reasoning {
+    Think {
         #[arg(value_name = "LEVEL|off")]
         level: Option<String>,
     },
+    #[command(about = "List skills; use /skill <name> [prompt] to run one.")]
+    Skill,
     #[command(about = "Show or change the tool permission policy.")]
     Policy {
         #[arg(value_name = "full_access|confirm|watch")]
@@ -188,12 +185,16 @@ fn split_command_line(input: &str) -> Result<Vec<String>> {
 }
 
 fn render_command_error(error: clap::Error) -> String {
-    error
+    let rendered = error
         .to_string()
         .replace("Usage: channel ", "Usage: /")
         .replace("Usage: channel", "Usage: /help")
         .trim()
-        .to_string()
+        .to_string();
+    rendered
+        .strip_prefix("error: ")
+        .map(ToString::to_string)
+        .unwrap_or(rendered)
 }
 
 #[cfg(test)]
@@ -217,12 +218,17 @@ mod tests {
     }
 
     #[test]
-    fn command_help_includes_management_and_prompt_directives() {
+    fn command_help_lists_every_command() {
         let help = render_command_help();
         assert!(help.starts_with("These commands are supported:\n\n"));
         assert!(help.contains("/help - Display this command list."));
         assert!(help.contains("/compact - Compact the selected session context."));
-        assert!(help.contains("/skill - Request an available skill by name"));
+        assert!(help.contains("/skill - List skills; use /skill <name> [prompt] to run one."));
+        assert!(help.contains(
+            "/think - List supported reasoning efforts or change the current effort."
+        ));
+        assert!(!help.contains("/reasoning"));
+        assert!(!help.contains("/del"));
     }
 
     #[test]
@@ -266,12 +272,21 @@ mod tests {
     fn session_commands_accept_short_references() {
         assert!(matches!(
             parse_command("/use 2").unwrap(),
-            ChannelCommand::Use { session, number: None } if session == "2"
+            ChannelCommand::Use { session: Some(session), number: None } if session == "2"
         ));
         assert!(matches!(
-            parse_command("/del abc12345").unwrap(),
-            ChannelCommand::Del { session } if session == "abc12345"
+            parse_command("/use abc12345").unwrap(),
+            ChannelCommand::Use { session: Some(session), number: None } if session == "abc12345"
         ));
+        assert!(matches!(
+            parse_command("/use").unwrap(),
+            ChannelCommand::Use {
+                session: None,
+                number: None
+            }
+        ));
+        assert!(parse_command("/del abc12345").is_err());
+        assert!(parse_command("/archive abc12345").is_err());
     }
 
     #[test]
@@ -281,8 +296,16 @@ mod tests {
             ChannelCommand::Model { name: None }
         ));
         assert!(matches!(
-            parse_command("/reasoning").unwrap(),
-            ChannelCommand::Reasoning { level: None }
+            parse_command("/think").unwrap(),
+            ChannelCommand::Think { level: None }
+        ));
+        assert!(matches!(
+            parse_command("/think high").unwrap(),
+            ChannelCommand::Think { level: Some(level) } if level == "high"
+        ));
+        assert!(matches!(
+            parse_command("/skill").unwrap(),
+            ChannelCommand::Skill
         ));
         assert!(
             matches!(parse_command("/list 2").unwrap(), ChannelCommand::List { scope: Some(s), page: None } if s == "2")
@@ -291,20 +314,24 @@ mod tests {
             matches!(parse_command(r#"/list "My project" 3"#).unwrap(), ChannelCommand::List { scope: Some(s), page: Some(3) } if s == "My project")
         );
         assert!(
-            matches!(parse_command(r#"/use "My project" 21"#).unwrap(), ChannelCommand::Use { session, number: Some(21) } if session == "My project")
+            matches!(parse_command(r#"/use "My project" 21"#).unwrap(), ChannelCommand::Use { session: Some(session), number: Some(21) } if session == "My project")
         );
         assert!(!render_command_help().contains("/plan"));
     }
 
     #[test]
-    fn platform_command_menu_includes_prompt_directives() {
+    fn platform_command_menu_lists_channel_commands() {
         assert!(command_descriptions().contains(&(
             "new".to_string(),
             "Create and select a session.".to_string()
         )));
         assert!(command_descriptions().contains(&(
             "skill".to_string(),
-            "Request an available skill by name, optionally followed by a prompt.".to_string()
+            "List skills; use /skill <name> [prompt] to run one.".to_string()
+        )));
+        assert!(command_descriptions().contains(&(
+            "think".to_string(),
+            "List supported reasoning efforts or change the current effort.".to_string()
         )));
     }
 }

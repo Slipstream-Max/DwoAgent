@@ -563,6 +563,7 @@ mod tests {
             tool_call_id: "call-1".to_string(),
             tool_name: "terminal".to_string(),
             output: json!({"status":"ok"}),
+            model: String::new(),
             model_context: Vec::new(),
         };
         let input = provider_input(

@@ -9,7 +9,10 @@ use dwo_context::{
     PendingContextMessage, SessionContext, SystemPromptBuilder,
 };
 use dwo_model_client::{ModelClient, ModelClientError, ModelReply, ModelSelection};
-use dwo_tools::{ConfirmationDecision, TodoAction, TodoRequest, TodoResponse, ToolManager};
+use dwo_tools::{
+    ConfirmationDecision, QuestionnaireQuestion, QuestionnaireRequest, QuestionnaireResponse,
+    TodoAction, TodoRequest, TodoResponse, ToolManager,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -21,13 +24,14 @@ use crate::error::SessionServiceError;
 use crate::events::{
     ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, CompactionTrigger, FileChange,
     NotificationLevel, RuntimePhase, SessionEvent, SessionEventPayload, SessionNotification,
-    SessionSnapshot, SessionSubscription, SessionUsageSnapshot, TerminalView, project_tool_call,
+    SessionSnapshot, SessionSubscription, SessionUsageSnapshot, TerminalView, UserMessageSource,
+    project_tool_call,
 };
 use crate::permission::{PermissionRequestEnvelope, PermissionRequester, PermissionState};
 use crate::repository::SessionRepository;
 use crate::session_record::{
-    ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionRecord, SessionUpdate,
-    SessionWorkspace, title_from_user_content,
+    ExecutionPlan, PendingQuestionnaire, QuestionnaireId, SessionConfig, SessionConfigUpdate,
+    SessionRecord, SessionUpdate, SessionWorkspace, title_from_user_content,
 };
 use crate::session_service::SessionDeletionHook;
 use crate::turn::{self, TurnExecution, TurnOutcome, TurnUpdate};
@@ -113,11 +117,29 @@ enum PromptInput {
     Internal {
         content: MessageContent,
     },
+    QuestionnaireReply {
+        origin: EndpointId,
+        content: MessageContent,
+    },
 }
 
 struct PromptReceipt {
     turn_id: TurnId,
     message_id: Option<MessageId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuestionnaireReply {
+    Answers { answers: Vec<String> },
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionnaireReceipt {
+    pub questionnaire_id: String,
+    pub turn_id: TurnId,
+    pub message_id: Option<MessageId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +158,11 @@ pub(crate) enum ActorEvent {
         turn_id: TurnId,
         request: TodoRequest,
         completed: oneshot::Sender<Result<TodoResponse, String>>,
+    },
+    Questionnaire {
+        turn_id: TurnId,
+        request: QuestionnaireRequest,
+        completed: oneshot::Sender<Result<QuestionnaireResponse, String>>,
     },
     CompactionFinished {
         compaction_id: String,
@@ -336,6 +363,24 @@ impl SessionHandle {
             .map_err(|_| SessionServiceError::SessionClosed(self.id.clone()))?
     }
 
+    pub(crate) async fn answer_questionnaire(
+        &self,
+        origin: EndpointId,
+        questionnaire_id: Option<String>,
+        reply: QuestionnaireReply,
+    ) -> Result<QuestionnaireReceipt, SessionServiceError> {
+        let (response, wait) = oneshot::channel();
+        self.send(SessionRequest::AnswerQuestionnaire {
+            origin,
+            questionnaire_id,
+            reply,
+            response,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| SessionServiceError::SessionClosed(self.id.clone()))?
+    }
+
     async fn send(&self, request: SessionRequest) -> Result<(), SessionServiceError> {
         self.request
             .send(request)
@@ -396,6 +441,12 @@ enum SessionRequest {
         request_id: String,
         decision: ConfirmationDecision,
         response: oneshot::Sender<Result<(), SessionServiceError>>,
+    },
+    AnswerQuestionnaire {
+        origin: EndpointId,
+        questionnaire_id: Option<String>,
+        reply: QuestionnaireReply,
+        response: oneshot::Sender<Result<QuestionnaireReceipt, SessionServiceError>>,
     },
     Unload {
         response: oneshot::Sender<Result<(), SessionServiceError>>,
@@ -836,6 +887,17 @@ impl SessionActor {
             } => {
                 let _ = response.send(self.respond_permission(responder, request_id, decision));
             }
+            SessionRequest::AnswerQuestionnaire {
+                origin,
+                questionnaire_id,
+                reply,
+                response,
+            } => {
+                let _ = response.send(
+                    self.answer_questionnaire(origin, questionnaire_id, reply)
+                        .await,
+                );
+            }
             SessionRequest::Unload { response } => {
                 return self.unload(response).await;
             }
@@ -864,9 +926,14 @@ impl SessionActor {
                 self.record.info.id.clone(),
             ));
         }
+        let source = match &input {
+            PromptInput::QuestionnaireReply { .. } => Some(UserMessageSource::Questionnaire),
+            _ => None,
+        };
         let (content, is_user, origin) = match input {
             PromptInput::User { origin, content } => (content, true, Some(origin)),
             PromptInput::Internal { content } => (content, false, None),
+            PromptInput::QuestionnaireReply { origin, content } => (content, true, Some(origin)),
         };
         if is_user && self.record.info.ephemeral && self.record.info.completed {
             return Err(SessionServiceError::InvalidConfig(format!(
@@ -908,6 +975,7 @@ impl SessionActor {
                     turn_id: turn_id.clone(),
                     origin,
                     content: content.clone(),
+                    source,
                 })
                 .await?;
             }
@@ -982,6 +1050,7 @@ impl SessionActor {
                     turn_id: turn_id.clone(),
                     origin,
                     content: content.clone(),
+                    source,
                 })
                 .await?;
             }
@@ -1033,6 +1102,60 @@ impl SessionActor {
         Ok(PromptReceipt {
             turn_id,
             message_id,
+        })
+    }
+
+    async fn answer_questionnaire(
+        &mut self,
+        origin: EndpointId,
+        questionnaire_id: Option<String>,
+        reply: QuestionnaireReply,
+    ) -> Result<QuestionnaireReceipt, SessionServiceError> {
+        let Some(pending) = self.record.pending_questionnaire.clone() else {
+            return Err(SessionServiceError::QuestionnaireNotPending);
+        };
+        if let Some(expected) = questionnaire_id
+            && expected != pending.id.as_str()
+        {
+            return Err(SessionServiceError::QuestionnaireNotPending);
+        }
+        let content = match reply {
+            QuestionnaireReply::Answers { answers } => {
+                questionnaire_reply_text(&pending.questions, &answers)
+                    .map_err(SessionServiceError::QuestionnaireRejected)?
+            }
+            QuestionnaireReply::Skip => "用户跳过了问卷。".to_string(),
+        };
+        self.record.pending_questionnaire = None;
+        let receipt = match self
+            .prompt(PromptInput::QuestionnaireReply {
+                origin,
+                content: MessageContent::text(content),
+            })
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.record.pending_questionnaire = Some(pending);
+                return Err(error);
+            }
+        };
+        let mut updated = self.record.clone();
+        updated.touch();
+        if let Err(error) = self.repository.save(&updated).await {
+            self.record.pending_questionnaire = Some(pending);
+            return Err(error.into());
+        }
+        self.record = updated;
+        let _ = self
+            .record_event(SessionEventPayload::QuestionnaireResolved {
+                questionnaire_id: pending.id.to_string(),
+            })
+            .await;
+        Ok(QuestionnaireReceipt {
+            questionnaire_id: pending.id.to_string(),
+            turn_id: receipt.turn_id,
+            message_id: receipt.message_id,
         })
     }
 
@@ -1842,6 +1965,47 @@ impl SessionActor {
                 };
                 let _ = completed.send(result);
             }
+            ActorEvent::Questionnaire {
+                turn_id,
+                request,
+                completed,
+            } => {
+                let result = if self
+                    .active
+                    .as_ref()
+                    .is_none_or(|active| active.id != turn_id)
+                {
+                    Err("turn is no longer active".to_string())
+                } else if self.record.pending_questionnaire.is_some() {
+                    Err("a questionnaire is already waiting for answers".to_string())
+                } else {
+                    let id = QuestionnaireId::new();
+                    let questions = request.questions;
+                    let mut updated = self.record.clone();
+                    updated.pending_questionnaire = Some(PendingQuestionnaire {
+                        id: id.clone(),
+                        questions: questions.clone(),
+                    });
+                    updated.touch();
+                    match self.repository.save(&updated).await {
+                        Ok(()) => {
+                            self.record = updated;
+                            let _ = self
+                                .record_event(SessionEventPayload::QuestionnaireRequested {
+                                    questionnaire_id: id.to_string(),
+                                    turn_id,
+                                    questions,
+                                })
+                                .await;
+                            Ok(QuestionnaireResponse {
+                                questionnaire_id: id.to_string(),
+                            })
+                        }
+                        Err(error) => Err(format!("persist questionnaire: {error:#}")),
+                    }
+                };
+                let _ = completed.send(result);
+            }
             ActorEvent::CompactionFinished {
                 compaction_id,
                 result,
@@ -2571,6 +2735,35 @@ mod reasoning_mode_tests {
     }
 }
 
+fn questionnaire_reply_text(
+    questions: &[QuestionnaireQuestion],
+    answers: &[String],
+) -> Result<String, String> {
+    if answers.len() != questions.len() {
+        let expected = questions.len();
+        let actual = answers.len();
+        return Err(format!(
+            "questionnaire expects {expected} {}, got {actual}",
+            if expected == 1 { "answer" } else { "answers" }
+        ));
+    }
+    let parts = questions
+        .iter()
+        .zip(answers)
+        .enumerate()
+        .map(|(index, (question, answer))| {
+            let answer = answer.trim();
+            let answer = if answer.is_empty() {
+                "（未作答）"
+            } else {
+                answer
+            };
+            format!("问题{}：{}\n回答：{}", index + 1, question.question, answer)
+        })
+        .collect::<Vec<_>>();
+    Ok(parts.join("\n\n"))
+}
+
 fn title_source(content: &MessageContent) -> Option<String> {
     content.as_blocks().iter().find_map(|block| {
         let ContentBlock::Text { text, .. } = block else {
@@ -2644,6 +2837,38 @@ mod title_tests {
                 .chars()
                 .count(),
             40
+        );
+    }
+}
+
+#[cfg(test)]
+mod questionnaire_tests {
+    use super::*;
+
+    fn question(text: &str) -> QuestionnaireQuestion {
+        QuestionnaireQuestion {
+            question: text.to_string(),
+            options: Vec::new(),
+            multiple: false,
+        }
+    }
+
+    #[test]
+    fn formats_question_answers() {
+        let questions = vec![question("Pick one"), question("Anything else?")];
+        let text = questionnaire_reply_text(&questions, &["a".to_string(), String::new()]).unwrap();
+        assert_eq!(
+            text,
+            "问题1：Pick one\n回答：a\n\n问题2：Anything else?\n回答：（未作答）"
+        );
+    }
+
+    #[test]
+    fn rejects_answer_count_mismatch() {
+        let questions = vec![question("Pick one")];
+        assert_eq!(
+            questionnaire_reply_text(&questions, &[]).unwrap_err(),
+            "questionnaire expects 1 answer, got 0"
         );
     }
 }

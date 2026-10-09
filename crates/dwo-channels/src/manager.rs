@@ -23,32 +23,12 @@ const QQ_CHANNEL: &str = ChannelKind::Qq.as_str();
 pub struct WeixinChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
-    #[serde(default)]
-    pub output_mode: ChannelOutputMode,
-    pub markdown_filter: bool,
-    #[serde(default = "default_true")]
-    pub media_input: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChannelOutputMode {
-    #[default]
-    Final,
-    Full,
 }
 
 impl WeixinChannelConfig {
     fn validate(&self) -> Result<()> {
         if self.replay_turns > 10 {
             bail!("channels.weixin.replayTurns must be at most 10");
-        }
-        if self.output_mode != ChannelOutputMode::Final {
-            bail!("channels.weixin.outputMode only supports final");
         }
         Ok(())
     }
@@ -82,13 +62,9 @@ pub type QqChannelState = ChannelState;
 pub struct TelegramChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
-    #[serde(default)]
-    pub output_mode: ChannelOutputMode,
     pub bot_token_env: String,
     #[serde(default)]
     pub tg_proxy: Option<String>,
-    #[serde(default = "default_true")]
-    pub media_input: bool,
 }
 
 impl TelegramChannelConfig {
@@ -137,13 +113,9 @@ impl FeishuPlatform {
 pub struct FeishuChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
-    #[serde(default)]
-    pub output_mode: ChannelOutputMode,
     pub app_id_env: String,
     pub app_secret_env: String,
     pub platform: FeishuPlatform,
-    #[serde(default = "default_true")]
-    pub media_input: bool,
 }
 
 impl FeishuChannelConfig {
@@ -166,10 +138,6 @@ impl FeishuChannelConfig {
 pub struct QqChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
-    #[serde(default)]
-    pub output_mode: ChannelOutputMode,
-    #[serde(default = "default_true")]
-    pub media_input: bool,
 }
 
 impl QqChannelConfig {
@@ -1023,13 +991,12 @@ impl ChannelManager {
     }
 
     pub async fn begin_weixin_login(&self) -> Result<WeixinLoginStart> {
-        let settings = self
-            .weixin
+        self.weixin
             .as_ref()
             .context("channels.weixin is not configured in profile.yaml")?;
         let config = WeixinConfig::builder()
             .token("")
-            .markdown_filter(settings.markdown_filter)
+            .markdown_filter(false)
             .build()?;
         let login = StandaloneQrLogin::new(&config);
         let existing = self.existing_weixin_tokens().await?;
@@ -1305,15 +1272,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_mode_is_the_only_supported_channel_output_field() {
-        let full = serde_yaml::from_str::<QqChannelConfig>(
-            "enabled: true\nreplayTurns: 1\noutputMode: full\nmediaInput: true\n",
-        )
-        .unwrap();
-        assert_eq!(full.output_mode, ChannelOutputMode::Full);
+    fn output_mode_field_is_no_longer_accepted() {
+        let with_mode = serde_yaml::from_str::<QqChannelConfig>(
+            "enabled: true\nreplayTurns: 1\noutputMode: final\n",
+        );
+        assert!(with_mode.is_err(), "outputMode must no longer be accepted");
 
         let old = serde_yaml::from_str::<QqChannelConfig>(
-            "enabled: true\nreplayTurns: 1\nreplayMode: full\nmediaInput: true\n",
+            "enabled: true\nreplayTurns: 1\nreplayMode: full\n",
         );
         assert!(old.is_err(), "replayMode must not be accepted");
     }
@@ -1324,7 +1290,6 @@ mod tests {
             r#"
 enabled: true
 replayTurns: 5
-markdownFilter: true
 "#,
         )
         .unwrap();
@@ -1336,7 +1301,7 @@ markdownFilter: true
         assert_eq!(summary.len(), 1);
         assert!(summary[0].enabled);
         assert!(!summary[0].connected);
-        assert!(manager.weixin.as_ref().unwrap().media_input);
+        assert_eq!(manager.weixin.as_ref().unwrap().replay_turns, 5);
     }
 
     #[tokio::test]
@@ -1345,7 +1310,6 @@ markdownFilter: true
             r#"
 enabled: true
 replayTurns: 5
-markdownFilter: true
 flushIntervalMs: 10
 "#,
         )
@@ -1366,7 +1330,6 @@ flushIntervalMs: 10
             r#"
 enabled: true
 replayTurns: 11
-markdownFilter: true
 "#,
         )
         .unwrap();
@@ -1386,7 +1349,6 @@ markdownFilter: true
             r#"
 enabled: true
 replayTurns: 3
-markdownFilter: false
 "#,
         )
         .unwrap();
@@ -1447,7 +1409,6 @@ enabled: true
 replayTurns: 4
 botTokenEnv: DWO_TEST_MISSING_TELEGRAM_TOKEN
 tgProxy: http://127.0.0.1:7890
-mediaInput: true
 "#,
         )
         .unwrap();
@@ -1516,7 +1477,6 @@ enabled: true
 replayTurns: 4
 botTokenEnv: TELEGRAM_BOT_TOKEN
 tgProxy: ""
-mediaInput: true
 "#,
         )
         .unwrap();
@@ -1539,7 +1499,6 @@ replayTurns: 5
 appIdEnv: DWO_TEST_MISSING_FEISHU_APP_ID
 appSecretEnv: DWO_TEST_MISSING_FEISHU_APP_SECRET
 platform: lark
-mediaInput: true
 "#,
         )
         .unwrap();
@@ -1599,7 +1558,6 @@ mediaInput: true
             r#"
 enabled: true
 replayTurns: 5
-mediaInput: true
 "#,
         )
         .unwrap();
@@ -1665,7 +1623,6 @@ replayTurns: 5
 appIdEnv: ""
 appSecretEnv: FEISHU_APP_SECRET
 platform: feishu
-mediaInput: true
 "#,
         )
         .unwrap();

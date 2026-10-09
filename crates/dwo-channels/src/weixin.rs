@@ -93,16 +93,15 @@ impl ChannelAdapter for WeixinAdapter {
         Ok(PreparedChannel {
             conversation: ConversationId::new("weixin", target.clone()),
             replay_turns: runtime.config.replay_turns,
-            output_mode: runtime.config.output_mode,
             selected_session_id,
             transport: conversation.clone(),
             starter: Box::new(WeixinStarter {
                 host,
                 target,
-                media_input: runtime.config.media_input,
+                media_input: true,
                 bot_token: runtime.secret.bot_token,
                 base_url: runtime.secret.base_url,
-                markdown_filter: runtime.config.markdown_filter,
+                markdown_filter: false,
                 state,
                 client_ref,
                 conversation,

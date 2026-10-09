@@ -35,16 +35,19 @@ pub use events::{
     ActiveStepSnapshot, ActiveToolCall, ClientTranscriptEvent, CompactionTrigger, FileChange,
     NotificationLevel, PendingPermission, RuntimePhase, SessionEvent, SessionEventPayload,
     SessionNotification, SessionSnapshot, SessionStatusSnapshot, SessionSubscription,
-    SessionUsageSnapshot, TerminalTurnStatus,
+    SessionUsageSnapshot, TerminalTurnStatus, UserMessageSource,
 };
 pub use profile::{
     AgentProfileConfig, LoadedAgentProfile, LogLevel, LoggingConfig, WebsocketConfig, load_profile,
 };
 pub use repository::{FsSessionRepository, MemorySessionRepository, SessionRepository};
-pub use session::{CompactionAccepted, EndpointId, MessageId, PromptAccepted, SessionHandle};
+pub use session::{
+    CompactionAccepted, EndpointId, MessageId, PromptAccepted, QuestionnaireReceipt,
+    QuestionnaireReply, SessionHandle,
+};
 pub use session_record::{
-    ExecutionPlan, SessionConfig, SessionConfigUpdate, SessionId, SessionInfo, SessionLlmSettings,
-    SessionRecord, SessionUpdate, SessionWorkspace,
+    ExecutionPlan, PendingQuestionnaire, QuestionnaireId, SessionConfig, SessionConfigUpdate,
+    SessionId, SessionInfo, SessionLlmSettings, SessionRecord, SessionUpdate, SessionWorkspace,
 };
 pub use session_service::{
     NewSession, SessionDeletionHook, SessionListItem, SessionListPage, SessionListQuery,

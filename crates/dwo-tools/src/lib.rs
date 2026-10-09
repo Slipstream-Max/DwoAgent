@@ -7,6 +7,7 @@ pub mod images;
 pub mod manager;
 pub mod policy;
 pub mod prompt;
+pub mod questionnaire;
 mod read_file;
 pub mod result;
 pub mod schema;
@@ -21,6 +22,9 @@ pub use manager::{
     ConfirmationDecision, ConfirmationHandler, ConfirmationRequest, ExecutionContext, ToolManager,
 };
 pub use policy::{Authorization, CommandRule, PolicyConfig, SessionMode, ToolPolicyEngine};
+pub use questionnaire::{
+    QuestionnaireHandler, QuestionnaireQuestion, QuestionnaireRequest, QuestionnaireResponse,
+};
 pub use result::ToolResult;
 pub use telemetry::{ToolEvent, ToolEventHandler};
 pub use terminal::{TerminalId, TerminalManager};

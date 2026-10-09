@@ -40,6 +40,8 @@ pub struct SessionCreateRequest {
 pub struct ChannelSessionItem {
     pub session: SessionListItem,
     pub section: Option<String>,
+    /// 会话当前有活跃回合；Inbox 视图用它分组「进行中 / 已完成」。
+    pub working: bool,
 }
 
 #[async_trait]
@@ -54,6 +56,8 @@ pub trait ChannelHost: Send + Sync {
     ) -> Result<Vec<SessionListItem>>;
     async fn list_channel_sessions(&self, project: Option<&str>)
     -> Result<Vec<ChannelSessionItem>>;
+    /// 可用技能快照（`name, description`），按扫描顺序。
+    async fn list_skills(&self, session: Option<&SessionId>) -> Result<Vec<(String, String)>>;
     async fn session_options(&self, id: &SessionId) -> Result<dwo_protocol::SessionOptions>;
     async fn create_session(&self, request: SessionCreateRequest) -> Result<SessionSnapshot>;
     async fn subscribe_session(

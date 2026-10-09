@@ -67,6 +67,18 @@ pub(super) struct PromptParam {
 }
 
 #[derive(Deserialize)]
+pub(super) struct QuestionnaireParam {
+    pub(super) session_id: String,
+    pub(super) endpoint_id: String,
+    #[serde(default)]
+    pub(super) questionnaire_id: Option<String>,
+    #[serde(default)]
+    pub(super) answers: Option<Vec<String>>,
+    #[serde(default)]
+    pub(super) skip: bool,
+}
+
+#[derive(Deserialize)]
 struct SessionCommandParam {
     session_id: String,
     endpoint_id: String,
@@ -356,6 +368,28 @@ impl Host {
                     "session_id": session_id,
                     "message_id": accepted.message_id,
                     "turn_id": accepted.turn_id,
+                }))
+            }
+            "session.questionnaire" => {
+                let params: QuestionnaireParam = serde_json::from_value(params)?;
+                let id = SessionId::parse(params.session_id).map_err(anyhow::Error::msg)?;
+                let endpoint = EndpointId::parse(params.endpoint_id).map_err(anyhow::Error::msg)?;
+                let reply = match (params.answers, params.skip) {
+                    (Some(answers), false) => {
+                        dwo_agent_service::QuestionnaireReply::Answers { answers }
+                    }
+                    (None, true) => dwo_agent_service::QuestionnaireReply::Skip,
+                    _ => anyhow::bail!("provide either answers or skip"),
+                };
+                let receipt = self
+                    .service
+                    .answer_questionnaire(&id, endpoint, params.questionnaire_id, reply)
+                    .await?;
+                Ok(json!({
+                    "session_id": id,
+                    "questionnaire_id": receipt.questionnaire_id,
+                    "turn_id": receipt.turn_id,
+                    "message_id": receipt.message_id,
                 }))
             }
             "session.compact" => {

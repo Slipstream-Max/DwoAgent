@@ -512,6 +512,34 @@ mod tests {
         assert!(snapshot.output.contains("中文🙂"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn formatted_tables_do_not_swallow_later_output() {
+        let manager = TerminalManager::new(std::env::current_dir().unwrap()).unwrap();
+        // PowerShell renders object tables asynchronously; an `exit` in the
+        // shell wrapper used to truncate the table and every later write.
+        let snapshot = manager
+            .run(
+                "Get-ChildItem prompts | Select-Object Name, Length; Write-Output 'AFTER-TABLE'"
+                    .to_string(),
+                10_000,
+                120_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, "completed");
+        assert!(
+            snapshot.output.contains("terminal.md"),
+            "table output lost: {:?}",
+            snapshot.output
+        );
+        assert!(
+            snapshot.output.contains("AFTER-TABLE"),
+            "later output lost: {:?}",
+            snapshot.output
+        );
+    }
+
     #[tokio::test]
     async fn pty_input_reaches_the_process() {
         // Point the interactive shell at a throwaway home so it neither

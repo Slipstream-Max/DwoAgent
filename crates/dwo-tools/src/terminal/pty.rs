@@ -125,13 +125,17 @@ fn windows_shell_invocation(command: &str) -> ShellInvocation {
     match dwo_context::shell::Shell::detect() {
         dwo_context::shell::Shell::Pwsh(program) => ShellInvocation {
             program: program.display().to_string(),
+            // `exit` truncates pending formatted output: object tables render
+            // asynchronously and would be lost together with every later
+            // write. End the script naturally and set the process exit code
+            // instead.
             args: vec![
                 "-NoLogo".to_string(),
                 "-NoProfile".to_string(),
                 "-ExecutionPolicy".to_string(),
                 "Bypass".to_string(),
                 "-Command".to_string(),
-                format!("{PWSH_UTF8_SETUP}{command}; exit $LASTEXITCODE"),
+                format!("{PWSH_UTF8_SETUP}{command}; $host.SetShouldExit([int]$LASTEXITCODE)"),
             ],
             environment: utf8_environment,
         },

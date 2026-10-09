@@ -66,7 +66,7 @@ async fn request_model(
             attempt = retry + 1,
             "model request started"
         );
-        let (response, partial_content, partial_reasoning) = {
+        let (response, partial_content, partial_reasoning, progressed) = {
             let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
             let actor = turn.actor.clone();
             let turn_id = turn.turn_id.clone();
@@ -81,6 +81,7 @@ async fn request_model(
             tokio::pin!(model_call);
             let mut partial_content = String::new();
             let mut partial_reasoning = String::new();
+            let mut progressed = false;
             let response = loop {
                 tokio::select! {
                     biased;
@@ -92,6 +93,7 @@ async fn request_model(
                                 event,
                                 &mut partial_content,
                                 &mut partial_reasoning,
+                                &mut progressed,
                             );
                         }
                         break response;
@@ -103,11 +105,12 @@ async fn request_model(
                             event,
                             &mut partial_content,
                             &mut partial_reasoning,
+                            &mut progressed,
                         );
                     }
                 }
             };
-            (response, partial_content, partial_reasoning)
+            (response, partial_content, partial_reasoning, progressed)
         };
         match response {
             Ok(reply) => {
@@ -147,7 +150,7 @@ async fn request_model(
                     turn_id: turn.turn_id.clone(),
                     status,
                 });
-                retry += 1;
+                retry = next_retry_attempt(retry, progressed);
                 let Some(info) = retry_info(&error, retry) else {
                     if retry > 1 {
                         turn.emit(TurnUpdate::Notification {
@@ -210,7 +213,11 @@ fn emit_model_event(
     event: ModelStreamEvent,
     partial_content: &mut String,
     partial_reasoning: &mut String,
+    progressed: &mut bool,
 ) {
+    // Any streamed event proves this attempt actually connected and produced
+    // output, which counts as progress for the retry schedule.
+    *progressed = true;
     let emit = |event| {
         let _ = actor.send(ActorEvent::Turn(event));
     };
@@ -260,4 +267,26 @@ fn is_context_length_exceeded(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ModelClientError>()
         .is_some_and(ModelClientError::is_context_length_exceeded)
+}
+
+/// The retry counter tracks consecutive failures. A failed attempt that still
+/// streamed output resolved its disconnect — the retry continues from the
+/// partial content — so the next interruption is a new incident and starts a
+/// fresh retry schedule; only attempts that fail without producing anything
+/// keep escalating.
+fn next_retry_attempt(retry: u32, progressed: bool) -> u32 {
+    if progressed { 1 } else { retry + 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_retry_attempt;
+
+    #[test]
+    fn progress_restarts_the_retry_schedule() {
+        assert_eq!(next_retry_attempt(0, false), 1);
+        assert_eq!(next_retry_attempt(3, false), 4);
+        assert_eq!(next_retry_attempt(3, true), 1);
+        assert_eq!(next_retry_attempt(0, true), 1);
+    }
 }

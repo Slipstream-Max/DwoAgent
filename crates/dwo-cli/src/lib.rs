@@ -9,9 +9,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use dwo_acp as acp;
-use dwo_channels::{
-    self, ChannelKind, FeishuBindProgress, QqBindProgress, TelegramBindProgress,
-    WeixinLoginProgress,
+use dwo_channel_api::{
+    ChannelKind, FeishuBindProgress, QqBindProgress, TelegramBindProgress, WeixinLoginProgress,
 };
 use dwo_host::automation::{
     AutomationJob, AutomationJobStatus, AutomationNewBehavior, AutomationRunRecord,
@@ -1316,7 +1315,7 @@ async fn bind_weixin(config_path: &Path) -> Result<()> {
     output::line(format_args!("{rendered_qr}"))?;
     let mut verify_code: Option<String> = None;
     loop {
-        tokio::time::sleep(dwo_channels::BIND_POLL_INTERVAL).await;
+        tokio::time::sleep(dwo_channel_api::BIND_POLL_INTERVAL).await;
         let progress = ipc::request_dwo(
             config_path,
             "channel.weixin.poll",
@@ -1493,7 +1492,7 @@ async fn bind_telegram(config_path: &Path) -> Result<()> {
     output::line(format_args!("/bind {code}\n"))?;
     output::line(format_args!("Waiting for Telegram binding confirmation..."))?;
     loop {
-        tokio::time::sleep(dwo_channels::BIND_POLL_INTERVAL).await;
+        tokio::time::sleep(dwo_channel_api::BIND_POLL_INTERVAL).await;
         let progress = ipc::request_dwo(
             config_path,
             "channel.telegram.poll",
@@ -1530,7 +1529,7 @@ async fn bind_feishu(config_path: &Path) -> Result<()> {
         "Waiting for {product} binding confirmation..."
     ))?;
     loop {
-        tokio::time::sleep(dwo_channels::BIND_POLL_INTERVAL).await;
+        tokio::time::sleep(dwo_channel_api::BIND_POLL_INTERVAL).await;
         let progress = ipc::request_dwo(
             config_path,
             "channel.feishu.poll",
@@ -1561,7 +1560,7 @@ async fn bind_qq(config_path: &Path) -> Result<()> {
     output::line(format_args!("{rendered_qr}"))?;
     output::line(format_args!("Waiting for QQ binding confirmation..."))?;
     loop {
-        tokio::time::sleep(dwo_channels::BIND_POLL_INTERVAL).await;
+        tokio::time::sleep(dwo_channel_api::BIND_POLL_INTERVAL).await;
         let progress = ipc::request_dwo(
             config_path,
             "channel.qq.poll",

@@ -340,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn automation_crud_updates_project_and_runtime_together() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let project: dwo_project::Project = serde_json::from_value(
             host.handle_method(
                 "project.create",
@@ -419,7 +419,7 @@ mod tests {
     async fn automation_run_returns_after_the_run_is_queued() {
         let profile = tempfile::tempdir().unwrap();
         let config = write_test_profile(profile.path());
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let project: dwo_project::Project = serde_json::from_value(
             host.handle_method(
                 "project.create",
@@ -487,7 +487,7 @@ mod tests {
     async fn host_resolves_global_and_project_scope_and_deletes_bound_configs() {
         let root = tempfile::tempdir().unwrap();
         let config = write_test_profile(root.path());
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let unassigned = host.create_session(Default::default()).await.unwrap();
         let job = json!({"name": "same-name", "enabled": false,
             "schedule": {"cron": "0 9 * * *"}, "session": {"mode": "new", "behavior": "once"}, "prompt": "test"});
@@ -552,7 +552,7 @@ mod tests {
         assert!(host.projects.locate_session(assigned.as_str()).is_none());
         host.shutdown().await;
         drop(host);
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         assert_eq!(host.automation.list(&None).await.len(), 2);
         host.shutdown().await;
     }

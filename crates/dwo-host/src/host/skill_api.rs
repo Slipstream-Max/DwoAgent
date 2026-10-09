@@ -293,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn installs_a_skill_file_tree_without_losing_binary_resources() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let asset = [0_u8, 1, 2, 255];
         let result = host
             .handle_method(
@@ -333,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_skills_stay_inside_skills_and_out_of_the_catalog() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         host.handle_method(
             "skill.install",
             json!({

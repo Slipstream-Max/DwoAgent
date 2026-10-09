@@ -3175,7 +3175,7 @@ mod tests {
         std::fs::write(root.path().join("resource/prompts/System.md"), "Test agent").unwrap();
         let config = root.path().join("profile.yaml");
         std::fs::write(&config, format!("policyMode: full_access\nmodel:\n  default:\n    model: deepseek/deepseek-v4-pro\n  providers:\n    deepseek:\n      baseUrl: http://{address}/v1\n      apiKey: test\n")).unwrap();
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let id = host
             .create_session(dwo_host::HostSessionOptions {
                 title: Some("ACP v2 controls".into()),
@@ -3514,7 +3514,7 @@ mod tests {
         std::fs::write(root.path().join("resource/prompts/System.md"), "Test agent").unwrap();
         let config = root.path().join("profile.yaml");
         std::fs::write(&config, format!("policyMode: full_access\nmodel:\n  default:\n    model: deepseek/deepseek-v4-pro\n  providers:\n    deepseek:\n      baseUrl: http://{address}/v1\n      apiKey: test\n")).unwrap();
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let id = host
             .create_session(dwo_host::HostSessionOptions {
                 title: Some("Test".into()),

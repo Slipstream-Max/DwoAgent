@@ -13,7 +13,7 @@ chrono-tz.workspace = true
 cron.workspace = true
 dunce = "1.0"
 dwo-agent-service = { path = "../dwo-agent-service" }
-dwo-channels = { path = "../dwo-channels" }
+dwo-channel-api = { path = "../dwo-channel-api" }
 dwo-command = { path = "../dwo-command" }
 dwo-context = { path = "../dwo-context" }
 dwo-file-guard = { path = "../dwo-file-guard" }
@@ -32,4 +32,5 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+dwo-channels = { path = "../dwo-channels" }
 tempfile.workspace = true

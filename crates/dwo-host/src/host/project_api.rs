@@ -465,7 +465,7 @@ mod tests {
                 "initial",
             ],
         );
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let project = host
             .handle_method("project.create", json!({"pwd": repo}))
             .await

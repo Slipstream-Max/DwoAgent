@@ -677,7 +677,7 @@ model:
     #[tokio::test]
     async fn watch_writes_snapshot_before_waiting_for_events() {
         let profile = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(profile.path()))
+        let host = Host::build(&write_test_profile(profile.path()), dwo_channels::default_factory())
             .await
             .unwrap();
         let session_id = host
@@ -716,7 +716,7 @@ model:
     #[tokio::test]
     async fn idle_management_subscription_detaches_on_eof_without_host_shutdown() {
         let profile = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(profile.path()))
+        let host = Host::build(&write_test_profile(profile.path()), dwo_channels::default_factory())
             .await
             .unwrap();
         let (client, server) = tokio::io::duplex(8192);

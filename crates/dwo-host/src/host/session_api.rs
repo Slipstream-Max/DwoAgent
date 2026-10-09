@@ -986,7 +986,7 @@ mod tests {
         )
         .unwrap();
 
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let expanded = host
             .expand_prompt_directives(
                 &project,
@@ -1019,7 +1019,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_from_forks_a_direct_child_and_rejects_to() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let parent_id = host
             .create_session(HostSessionOptions {
                 title: Some("parent".to_string()),
@@ -1094,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn subsessions_cannot_create_further_subsessions() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let parent_id = host
             .create_session(HostSessionOptions::default())
             .await
@@ -1161,7 +1161,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_can_create_a_session_directly_in_a_project_section() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let project = host
             .handle_method(
                 "project.create",
@@ -1210,7 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn set_regenerate_title_without_messages_reports_a_clear_error() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let id = host
             .create_session(HostSessionOptions::default())
             .await
@@ -1233,7 +1233,7 @@ mod tests {
     async fn unassigned_sessions_have_independent_workspaces_and_cleanup_owned_resources() {
         let profile = tempfile::tempdir().unwrap();
         let config = write_test_profile(profile.path());
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
 
         let generated_id = host
             .create_session(HostSessionOptions::default())
@@ -1344,7 +1344,7 @@ mod tests {
         let config = write_test_profile(profile.path());
         let project_pwd = profile.path().join("shared-project");
         std::fs::create_dir_all(&project_pwd).unwrap();
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let project = host
             .handle_method(
                 "project.create",
@@ -1368,7 +1368,7 @@ mod tests {
         assert!(metadata["info"].get("cwd").is_none());
         assert_eq!(metadata["info"]["workspace"]["kind"], "external");
 
-        let reloaded = Host::build(&config).await.unwrap();
+        let reloaded = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let snapshot = reloaded.service.snapshot(&session_id).await.unwrap();
         assert_eq!(
             snapshot.record.info.cwd,
@@ -1396,7 +1396,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_children_inherit_worktree_and_managed_parent_directories() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let project = host
             .projects
             .create(dwo_project::CreateProject {
@@ -1462,7 +1462,7 @@ mod tests {
     async fn archive_survives_reload_and_blocks_service_mutations() {
         let root = tempfile::tempdir().unwrap();
         let config = write_test_profile(root.path());
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let id = host.create_session(Default::default()).await.unwrap();
         let cwd = host.service.snapshot(&id).await.unwrap().record.info.cwd;
         assert!(host.delete_session(&id).await.is_err());
@@ -1512,7 +1512,7 @@ mod tests {
         );
         host.shutdown().await;
         drop(host);
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         assert!(host.service.is_archived(&id).await.unwrap());
         assert_eq!(host.service.list(query).await.unwrap().sessions.len(), 1);
         host.delete_session(&id).await.unwrap();
@@ -1524,7 +1524,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_creation_resolves_defaults_inheritance_and_explicit_overrides() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         let parent = host
             .create_session(HostSessionOptions {
                 model: Some("deepseek/deepseek-v4-pro".into()),

@@ -27,7 +27,7 @@ model:
 async fn model_option_reload_notifies_existing_session_subscribers() {
     let root = tempfile::tempdir().unwrap();
     let config = write_test_profile(root.path());
-    let host = Host::build(&config).await.unwrap();
+    let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
     let id = host
         .create_session(HostSessionOptions::default())
         .await
@@ -113,7 +113,7 @@ async fn model_option_reload_notifies_existing_session_subscribers() {
 #[tokio::test]
 async fn transport_request_ids_deduplicate_side_effects() {
     let root = tempfile::tempdir().unwrap();
-    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
     let first = host
         .handle_request(
             "client-a",
@@ -178,7 +178,7 @@ async fn transport_request_ids_deduplicate_side_effects() {
 #[tokio::test]
 async fn transport_request_cache_stays_bounded_under_client_load() {
     let root = tempfile::tempdir().unwrap();
-    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         for index in 0..2048 {
             host.handle_request(
@@ -205,7 +205,7 @@ async fn runtime_state_files_stay_locked_while_the_host_runs() {
     let profile_root = std::fs::canonicalize(root.path()).unwrap();
     let workspace = profile_root.join("locked-workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    let host = Host::build(&write_test_profile(&profile_root))
+    let host = Host::build(&write_test_profile(&profile_root), dwo_channels::default_factory())
         .await
         .unwrap();
     let locked = dwo_file_guard::capability() == dwo_file_guard::Capability::DenyWrite;
@@ -312,7 +312,7 @@ fn find_session_directory(root: &Path, session_id: &str) -> PathBuf {
 #[tokio::test]
 async fn missing_external_workspace_is_tolerated_in_list_and_repaired_on_load() {
     let root = tempfile::tempdir().unwrap();
-    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
     let cwd = root.path().join("vanishing-workdir");
     std::fs::create_dir_all(&cwd).unwrap();
     let id = host
@@ -347,7 +347,7 @@ async fn missing_external_workspace_is_tolerated_in_list_and_repaired_on_load() 
 #[tokio::test]
 async fn project_folder_loss_relocates_the_project_and_rebinds_sessions() {
     let root = tempfile::tempdir().unwrap();
-    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
     let project_pwd = root.path().join("project-root");
     std::fs::create_dir_all(&project_pwd).unwrap();
     let project = host
@@ -444,7 +444,7 @@ async fn project_folder_loss_relocates_the_project_and_rebinds_sessions() {
 #[tokio::test]
 async fn project_pwd_change_rebinds_all_sessions() {
     let root = tempfile::tempdir().unwrap();
-    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
     let first_dir = root.path().join("project-one");
     let second_dir = root.path().join("project-two");
     std::fs::create_dir_all(&first_dir).unwrap();
@@ -515,7 +515,7 @@ async fn project_pwd_change_rebinds_all_sessions() {
 #[tokio::test]
 async fn failed_project_repair_keeps_the_link_and_retries_on_the_next_load() {
     let root = tempfile::tempdir().unwrap();
-    let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+    let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
     let project_pwd = root.path().join("retrying-project");
     std::fs::create_dir_all(&project_pwd).unwrap();
     let project = host

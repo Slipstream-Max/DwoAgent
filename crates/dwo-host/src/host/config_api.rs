@@ -73,7 +73,7 @@ mod tests {
     async fn gui_configuration_round_trips_without_exposing_secrets() {
         let root = tempfile::tempdir().unwrap();
         let config = crate::host::tests::write_test_profile(root.path());
-        let host = Host::build(&config).await.unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory()).await.unwrap();
         let existing = host
             .create_session(super::super::HostSessionOptions::default())
             .await

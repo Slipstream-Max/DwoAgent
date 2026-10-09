@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::automation::AutomationRuntime;
-use dwo_channels::{ChannelGateway, ChannelManager};
+use dwo_channel_api::{ChannelControl, ChannelFactory, ChannelGatewayApi};
 mod automation_api;
 mod channel_api;
 mod channel_host;
@@ -40,10 +40,11 @@ pub use websocket_api::WebsocketRuntime;
 pub struct Host {
     service: Arc<SessionService>,
     sessions: Arc<session_manager::SessionManager>,
-    pub channel_gateway: Arc<ChannelGateway>,
+    pub channel_gateway: RwLock<Arc<dyn ChannelGatewayApi>>,
     pub automation: Arc<AutomationRuntime>,
     projects: Arc<ProjectService>,
-    channels: RwLock<Arc<ChannelManager>>,
+    channels: RwLock<Arc<dyn ChannelControl>>,
+    channel_factory: Arc<dyn ChannelFactory>,
     profile_root: PathBuf,
     runtime_protection: dwo_file_guard::Protection,
     config_manager: ConfigManager,
@@ -233,7 +234,10 @@ pub(crate) struct ConfigSnapshot {
 }
 
 impl Host {
-    pub async fn build(config_path: impl AsRef<Path>) -> Result<Arc<Self>> {
+    pub async fn build(
+        config_path: impl AsRef<Path>,
+        factory: Arc<dyn ChannelFactory>,
+    ) -> Result<Arc<Self>> {
         let profile_root = profile_root(config_path.as_ref())?;
         let runtime_protection = dwo_file_guard::Protection::install(
             &profile_root,
@@ -269,8 +273,9 @@ impl Host {
         );
         let repository =
             Arc::new(FsSessionRepository::new(profile_root.join("runtime/sessions")).await?);
-        let channels =
-            Arc::new(ChannelManager::new(&profile_root, &runtime_profile.config.channels).await?);
+        let bundle = factory
+            .create(&profile_root, &runtime_profile.config.channels)
+            .await?;
         let service = Arc::new(SessionService::from_profile(
             repository,
             profile,
@@ -375,10 +380,11 @@ impl Host {
         let host = Arc::new(Self {
             service,
             sessions,
-            channel_gateway: Arc::new(ChannelGateway::new()),
+            channel_gateway: RwLock::new(bundle.gateway),
             automation,
             projects,
-            channels: RwLock::new(channels),
+            channels: RwLock::new(bundle.control),
+            channel_factory: factory,
             profile_root: profile_root.clone(),
             runtime_protection,
             config_manager,
@@ -389,7 +395,7 @@ impl Host {
             request_cache: tokio::sync::Mutex::new(HashMap::new()),
             websocket_running: AtomicBool::new(false),
         });
-        host.channel_gateway.start_all(host.clone()).await;
+        host.gateway().start_all(host.clone()).await;
         host.start_profile_watcher();
         host.automation.start();
         Ok(host)
@@ -400,7 +406,8 @@ impl Host {
     }
 
     pub async fn shutdown(&self) {
-        tokio::join!(self.channel_gateway.stop_all(), self.service.shutdown());
+        let gateway = self.gateway();
+        tokio::join!(gateway.stop_all(), self.service.shutdown());
         self.runtime_protection.release();
     }
 
@@ -580,9 +587,11 @@ impl Host {
             .channels
             != runtime_profile.config.channels;
         let replacement_channels = if channels_changed {
-            Some(Arc::new(
-                ChannelManager::new(&self.profile_root, &runtime_profile.config.channels).await?,
-            ))
+            Some(
+                self.channel_factory
+                    .create(&self.profile_root, &runtime_profile.config.channels)
+                    .await?,
+            )
         } else {
             None
         };
@@ -595,13 +604,17 @@ impl Host {
         );
         crate::logging::reload(&runtime_profile.config.logging)?;
 
-        if let Some(channels) = replacement_channels {
-            self.channel_gateway.stop_all().await;
+        if let Some(bundle) = replacement_channels {
+            self.gateway().stop_all().await;
             *self
                 .channels
                 .write()
-                .expect("channel manager lock poisoned") = channels;
-            self.channel_gateway.start_all(self.clone()).await;
+                .expect("channel manager lock poisoned") = bundle.control;
+            *self
+                .channel_gateway
+                .write()
+                .expect("channel gateway lock poisoned") = bundle.gateway;
+            self.gateway().start_all(self.clone()).await;
         }
 
         *self.profile.write().expect("profile lock poisoned") = runtime_profile;

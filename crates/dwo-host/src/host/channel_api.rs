@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::Host;
-use dwo_channels::{ChannelKind, ChannelManager, ChannelPollParams};
+use dwo_channel_api::{ChannelControl, ChannelGatewayApi, ChannelKind, ChannelPollParams};
 
 #[derive(serde::Deserialize)]
 struct SendMessageParam {
@@ -45,10 +45,17 @@ pub(crate) fn managed_channel_action(method: &str) -> Option<(ChannelKind, Manag
 }
 
 impl Host {
-    pub(crate) fn channels(&self) -> Arc<ChannelManager> {
+    pub(crate) fn channels(&self) -> Arc<dyn ChannelControl> {
         self.channels
             .read()
             .expect("channel manager lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn gateway(&self) -> Arc<dyn ChannelGatewayApi> {
+        self.channel_gateway
+            .read()
+            .expect("channel gateway lock poisoned")
             .clone()
     }
 
@@ -119,7 +126,7 @@ impl Host {
         channel: ChannelKind,
     ) -> Result<Value> {
         let result = self
-            .channel_gateway
+            .gateway()
             .begin_bind(channel, self.clone())
             .await?;
         self.events
@@ -137,14 +144,14 @@ impl Host {
         params: ChannelPollParams,
     ) -> Result<Value> {
         Ok(serde_json::to_value(
-            self.channel_gateway
+            self.gateway()
                 .poll_bind(channel, self.clone(), params)
                 .await?,
         )?)
     }
 
     pub(crate) async fn channel_unbind(self: &Arc<Self>, channel: ChannelKind) -> Result<Value> {
-        let unbound = self.channel_gateway.unbind(channel, self.clone()).await?;
+        let unbound = self.gateway().unbind(channel, self.clone()).await?;
         self.events
             .publish(
                 "channel.status",
@@ -229,7 +236,7 @@ impl Host {
         text: String,
     ) -> Result<Value> {
         let target = self.channels().bound_target(channel).await?;
-        self.channel_gateway.send_message(channel, &text).await?;
+        self.gateway().send_message(channel, &text).await?;
         Ok(json!({"sent": true, "to": target}))
     }
 
@@ -239,12 +246,12 @@ impl Host {
         path: PathBuf,
     ) -> Result<Value> {
         let target = self.channels().bound_target(channel).await?;
-        self.channel_gateway.send_file(channel, &path).await?;
+        self.gateway().send_file(channel, &path).await?;
         Ok(json!({"sent": true, "to": target, "path": path}))
     }
 
     pub(crate) async fn channel_remove(self: &Arc<Self>, channel: ChannelKind) -> Result<Value> {
-        let removed = self.channel_gateway.unbind(channel, self.clone()).await?;
+        let removed = self.gateway().unbind(channel, self.clone()).await?;
         self.events
             .publish(
                 "channel.status",

@@ -1,13 +1,11 @@
 use std::path::Path;
-use std::sync::Arc;
-
 use anyhow::Result;
 use dwo_agent_service::{
     CompactionAccepted, ConfirmationDecision, EndpointId, PromptAccepted, SessionConfigUpdate,
     RuntimePhase, SessionId, SessionListItem, SessionListQuery, SessionSnapshot,
     SessionSubscription, TurnId,
 };
-use dwo_channels::{ChannelHost, ChannelManager, ChannelSessionItem, SessionCreateRequest};
+use dwo_channel_api::{ChannelHost, ChannelSessionItem, SessionCreateRequest};
 use dwo_context::MessageContent;
 
 use super::{Host, HostSessionOptions};
@@ -16,13 +14,6 @@ use super::{Host, HostSessionOptions};
 impl ChannelHost for Host {
     fn profile_root_path(&self) -> &Path {
         &self.profile_root
-    }
-
-    fn channels(&self) -> Arc<ChannelManager> {
-        self.channels
-            .read()
-            .expect("channel manager lock poisoned")
-            .clone()
     }
 
     async fn list_sessions(
@@ -243,7 +234,10 @@ mod tests {
     #[tokio::test]
     async fn channel_creation_scopes_and_archive_preserve_sessions() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(super::super::tests::write_test_profile(root.path()))
+        let host = Host::build(
+            super::super::tests::write_test_profile(root.path()),
+            dwo_channels::default_factory(),
+        )
             .await
             .unwrap();
         let project = host

@@ -1276,7 +1276,10 @@ jobs:
     #[tokio::test]
     async fn session_modes_share_creation_and_reject_archived_bindings() {
         let root = tempfile::tempdir().unwrap();
-        let host = crate::Host::build(&crate::host::tests::write_test_profile(root.path()))
+        let host = crate::Host::build(
+                &crate::host::tests::write_test_profile(root.path()),
+                dwo_channels::default_factory(),
+            )
             .await
             .unwrap();
         let runtime = &host.automation;
@@ -1330,7 +1333,10 @@ jobs:
     #[tokio::test]
     async fn project_custom_path_and_fixed_targets_keep_their_directory_and_assignment() {
         let root = tempfile::tempdir().unwrap();
-        let host = crate::Host::build(&crate::host::tests::write_test_profile(root.path()))
+        let host = crate::Host::build(
+                &crate::host::tests::write_test_profile(root.path()),
+                dwo_channels::default_factory(),
+            )
             .await
             .unwrap();
         let runtime = &host.automation;

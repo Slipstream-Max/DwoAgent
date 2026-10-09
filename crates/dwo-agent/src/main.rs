@@ -25,7 +25,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         }
     };
     let result = async {
-        let host = dwo_host::Host::build(&config_path).await?;
+        let host = dwo_host::Host::build(&config_path, dwo_channels::default_factory()).await?;
         tracing::info!(
             event = "daemon.ready",
             endpoint = %dwo_ipc::endpoint(&config_path),

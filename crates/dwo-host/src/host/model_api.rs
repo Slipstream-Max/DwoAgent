@@ -385,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn provider_list_reports_a_configured_key_without_exposing_it() {
         let root = tempfile::tempdir().unwrap();
-        let host = Host::build(&write_test_profile(root.path())).await.unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
         host.handle_method(
             "provider.upsert",
             json!({

@@ -26,3 +26,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+dwo-channels = { path = "../dwo-channels" }

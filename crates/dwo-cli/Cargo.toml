@@ -11,7 +11,7 @@ chrono.workspace = true
 clap.workspace = true
 dwo-acp = { path = "../dwo-acp" }
 dwo-agent-service = { path = "../dwo-agent-service" }
-dwo-channels = { path = "../dwo-channels" }
+dwo-channel-api = { path = "../dwo-channel-api" }
 dwo-host = { path = "../dwo-host" }
 dwo-ipc = { path = "../dwo-ipc" }
 dwo-tools = { path = "../dwo-tools" }

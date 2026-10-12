@@ -11,6 +11,7 @@ use dwo_agent_service::{
 use open_lark::auth::AuthService;
 use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
 use open_lark::communication::im::v1::message::models::ReceiveIdType;
+use open_lark::communication::im::v1::message::patch::PatchMessageCardRequest;
 use open_lark::communication::im::v1::message::resource::get::{
     GetMessageResourceRequest, MessageResourceType,
 };
@@ -35,8 +36,10 @@ use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelRuntime, ChannelStarter, PreparedChannel,
 };
 use super::manager::{FeishuChannelConfig, FeishuChannelState};
+use super::markdown::{FenceState, balance_fences};
 use super::permission::{
-    PermissionAction, PermissionActionStore, new_action_id, remove_group, take_action,
+    PermissionAction, PermissionActionStore, PermissionCard, PermissionCardStore, new_action_id,
+    put_card, remove_group, take_action, take_card,
 };
 use super::render::render_tool_call;
 use super::render::split_message;
@@ -49,7 +52,8 @@ Only use `dwo channel feishu send-file <path>` when the user explicitly asks you
 
 Use `dwo channel feishu --help` to inspect the available commands."#;
 
-const FEISHU_TEXT_CHUNK_CHARS: usize = 20_000;
+// 卡片 JSON 有约 30KB 大小上限，多字节文本按 3 字节/字符留足余量。
+const FEISHU_TEXT_CHUNK_CHARS: usize = 8_000;
 const RECENT_MESSAGE_LIMIT: usize = 256;
 
 pub struct FeishuAdapter;
@@ -82,6 +86,7 @@ struct FeishuStarter {
     api: FeishuApi,
     access: FeishuAccess,
     approvals: Arc<PermissionActionStore>,
+    cards: Arc<PermissionCardStore>,
 }
 
 pub struct RunningFeishu {
@@ -109,6 +114,7 @@ impl ChannelAdapter for FeishuAdapter {
         let state = Arc::new(Mutex::new(runtime.state));
         let selected_session_id = state.lock().await.selected_session_id.clone();
         let approvals = Arc::new(Mutex::new(HashMap::new()));
+        let cards: Arc<PermissionCardStore> = Arc::new(Mutex::new(HashMap::new()));
         let api = FeishuApi {
             config,
             open_id: runtime.secret.bound_open_id.clone(),
@@ -118,6 +124,7 @@ impl ChannelAdapter for FeishuAdapter {
             api: api.clone(),
             state,
             approvals: approvals.clone(),
+            cards: cards.clone(),
         });
         let access = FeishuAccess {
             open_id: runtime.secret.bound_open_id,
@@ -134,6 +141,7 @@ impl ChannelAdapter for FeishuAdapter {
                 api,
                 access,
                 approvals,
+                cards,
             }),
         })
     }
@@ -158,6 +166,7 @@ impl ChannelStarter for FeishuStarter {
             self.api.clone(),
             self.access.clone(),
             self.approvals,
+            self.cards,
             payload_rx,
             cancel.child_token(),
         ));
@@ -201,13 +210,18 @@ pub fn openlark_config(
     app_id: String,
     app_secret: String,
 ) -> open_lark::Config {
-    open_lark::Config::builder()
+    let config = open_lark::Config::builder()
         .app_id(app_id)
         .app_secret(app_secret)
         .base_url(settings.platform.base_url())
         .enable_token_cache(true)
         .req_timeout(Duration::from_secs(30))
-        .build()
+        .build();
+    // `CommunicationClient::new` 直接吃裸 config 时不会像统一 `Client` 那样自动
+    // 装 token provider —— 发消息会报 `NoOpTokenProvider 未实现 token 获取逻辑`
+    // （2026-10-10 实测：绑定成功但回执发不出去）。按官方推荐的两步法显式挂上
+    // 带缓存的实现：先建「基础 Config」，再注入「业务 Config」，避免循环引用。
+    config.with_token_provider(open_lark::auth::AuthTokenProvider::new(config.clone()))
 }
 
 pub async fn validate_credentials(config: &open_lark::Config) -> Result<()> {
@@ -256,6 +270,7 @@ async fn run_messages(
     api: FeishuApi,
     access: FeishuAccess,
     approvals: Arc<PermissionActionStore>,
+    cards: Arc<PermissionCardStore>,
     mut payload_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     cancel: CancellationToken,
 ) {
@@ -273,20 +288,38 @@ async fn run_messages(
                 if action.open_id != access.open_id || action.chat_id != access.chat_id {
                     continue;
                 }
-                if let Some(pending) = take_action(&approvals, &action.action_id).await
-                    && let Err(error) = ingress
+                if let Some(pending) = take_action(&approvals, &action.action_id).await {
+                    tracing::info!(
+                        event = "channel.feishu_permission_action",
+                        allowed = pending.allowed,
+                        "Feishu permission action received"
+                    );
+                    if let Err(error) = ingress
                         .resolve_permission(
                             &pending.session_id,
                             &pending.request_id,
                             pending.allowed,
                         )
                         .await
-                {
-                    tracing::debug!(
-                        event = "channel.feishu_permission_already_resolved",
-                        error = %format!("{error:#}"),
-                        "Feishu permission action lost the cross-channel race"
-                    );
+                    {
+                        tracing::debug!(
+                            event = "channel.feishu_permission_already_resolved",
+                            error = %format!("{error:#}"),
+                            "Feishu permission action lost the cross-channel race"
+                        );
+                    }
+                    // 卡片收口：去掉按钮、标上结果 —— 按过就不能再按。
+                    if let Some(card) = take_card(&cards, &pending.group_id).await
+                        && let Err(error) = api
+                            .close_permission_card(&card.message_id, &card.text, pending.allowed)
+                            .await
+                    {
+                        tracing::warn!(
+                            event = "channel.feishu_card_patch_failed",
+                            error = %format!("{error:#}"),
+                            "close Feishu permission card failed"
+                        );
+                    }
                 }
                 continue;
             }
@@ -514,8 +547,8 @@ impl FeishuApi {
         Ok(())
     }
 
-    async fn send_permission_card(&self, text: &str, allow: &str, deny: &str) -> Result<()> {
-        CreateMessageRequest::new(self.config.clone())
+    async fn send_permission_card(&self, text: &str, allow: &str, deny: &str) -> Result<String> {
+        let sent = CreateMessageRequest::new(self.config.clone())
             .receive_id_type(ReceiveIdType::OpenId)
             .execute(CreateMessageBody {
                 receive_id: self.open_id.clone(),
@@ -525,6 +558,37 @@ impl FeishuApi {
             })
             .await
             .context("send Feishu permission card")?;
+        Ok(sent["message_id"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// 收口那张权限卡片：去掉按钮、标上结果 —— 「按过就不能再按」。
+    async fn close_permission_card(
+        &self,
+        message_id: &str,
+        text: &str,
+        allowed: bool,
+    ) -> Result<()> {
+        // 没记到 message id 的老卡片就跳过（结果在会话里还有上下文）。
+        if message_id.is_empty() {
+            return Ok(());
+        }
+        let status = if allowed {
+            "✅ **已允许**"
+        } else {
+            "⛔ **已拒绝**"
+        };
+        let card = serde_json::json!({
+            "schema": "2.0",
+            "config": {"update_multi": true},
+            "body": {"elements": [
+                {"tag": "markdown", "content": format!("{status}\n{text}")}
+            ]}
+        });
+        PatchMessageCardRequest::new(self.config.clone())
+            .message_id(message_id)
+            .execute(serde_json::json!({"content": serde_json::to_string(&card)?}))
+            .await
+            .context("patch Feishu permission card")?;
         Ok(())
     }
 }
@@ -536,6 +600,20 @@ struct FeishuAction {
 }
 
 fn feishu_permission_card(text: &str, allow: &str, deny: &str) -> serde_json::Value {
+    let button = |label: &str, element_id: &str, kind: &str, action_id: &str| {
+        serde_json::json!({
+            "tag": "button",
+            "element_id": element_id,
+            "text": {"tag": "plain_text", "content": label},
+            "type": kind,
+            "width": "fill",
+            "size": "medium",
+            "behaviors": [{
+                "type": "callback",
+                "value": {"action_id": action_id}
+            }]
+        })
+    };
     serde_json::json!({
         "schema": "2.0",
         "config": {"update_multi": true},
@@ -543,27 +621,39 @@ fn feishu_permission_card(text: &str, allow: &str, deny: &str) -> serde_json::Va
             "elements": [
                 {"tag": "markdown", "content": text},
                 {
-                    "tag": "button",
-                    "element_id": "allow_button",
-                    "text": {"tag": "plain_text", "content": "允许"},
-                    "type": "primary_filled",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {"action_id": allow}
-                    }]
-                },
-                {
-                    "tag": "button",
-                    "element_id": "deny_button",
-                    "text": {"tag": "plain_text", "content": "拒绝"},
-                    "type": "danger_filled",
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {"action_id": deny}
-                    }]
+                    "tag": "column_set",
+                    "flex_mode": "none",
+                    "horizontal_spacing": "8px",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [
+                                button("允许", "allow_button", "primary_filled", allow)
+                            ]
+                        },
+                        {
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [
+                                button("拒绝", "deny_button", "danger_filled", deny)
+                            ]
+                        }
+                    ]
                 }
             ]
         }
+    })
+}
+
+/// 出站正文的 markdown 卡片壳 —— 飞书 text 消息不认 markdown，卡片认。
+fn feishu_markdown_card(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": {"update_multi": true},
+        "body": {"elements": [{"tag": "markdown", "content": text}]}
     })
 }
 
@@ -571,13 +661,28 @@ pub async fn send_text_to(config: &open_lark::Config, open_id: &str, text: &str)
     if text.is_empty() {
         bail!("Feishu message must not be empty");
     }
-    let client = CommunicationClient::new(config.clone());
+    let mut fence = FenceState::default();
     for chunk in split_logical_message(text) {
-        client
-            .im
-            .send_text(MessageRecipient::open_id(open_id), chunk)
+        // 正文原样包成 markdown 卡片；围栏被切在两半时补平。
+        // 失败不回退 —— 记 ERROR 并抛出。
+        let balanced = balance_fences(&chunk, &mut fence);
+        CreateMessageRequest::new(config.clone())
+            .receive_id_type(ReceiveIdType::OpenId)
+            .execute(CreateMessageBody {
+                receive_id: open_id.to_string(),
+                msg_type: "interactive".to_string(),
+                content: serde_json::to_string(&feishu_markdown_card(&balanced))?,
+                uuid: None,
+            })
             .await
-            .context("send Feishu text message")?;
+            .inspect_err(|error| {
+                tracing::error!(
+                    event = "channel.feishu_message_failed",
+                    error = %format!("{error:#}"),
+                    "Feishu markdown card failed"
+                );
+            })
+            .context("send Feishu markdown card")?;
     }
     Ok(())
 }
@@ -598,6 +703,7 @@ struct FeishuConversation {
     api: FeishuApi,
     state: Arc<Mutex<FeishuChannelState>>,
     approvals: Arc<PermissionActionStore>,
+    cards: Arc<PermissionCardStore>,
 }
 
 #[async_trait]
@@ -616,6 +722,7 @@ impl ConversationTransport for FeishuConversation {
         let deny = new_action_id()?;
         let group_id = new_action_id()?;
         let expires_at = Instant::now() + Duration::from_secs(10 * 60);
+        let text = render_tool_call(call, "request id", &permission.request_id);
         {
             let mut approvals = self.approvals.lock().await;
             approvals.retain(|_, action| Instant::now() < action.expires_at);
@@ -642,16 +749,27 @@ impl ConversationTransport for FeishuConversation {
         }
         let result = self
             .api
-            .send_permission_card(
-                &render_tool_call(call, "request id", &permission.request_id),
-                &allow,
-                &deny,
-            )
+            .send_permission_card(&text, &allow, &deny)
             .await;
-        if result.is_err() {
-            remove_group(&self.approvals, &group_id).await;
+        match result {
+            Ok(message_id) => {
+                put_card(
+                    &self.cards,
+                    &group_id,
+                    PermissionCard {
+                        message_id,
+                        text,
+                        expires_at,
+                    },
+                )
+                .await;
+                Ok(())
+            }
+            Err(error) => {
+                remove_group(&self.approvals, &group_id).await;
+                Err(error)
+            }
         }
-        result
     }
 
     async fn save_selected_session(&self, session_id: Option<&str>) -> Result<()> {
@@ -997,16 +1115,30 @@ mod tests {
     #[test]
     fn permission_card_contains_allow_and_deny_action_ids() {
         let card = feishu_permission_card("tool", "allow-id", "deny-id");
+        assert_eq!(card["body"]["elements"][0]["tag"], "markdown");
+        assert_eq!(card["body"]["elements"][1]["tag"], "column_set");
+        let columns = &card["body"]["elements"][1]["columns"];
         assert_eq!(
-            card["body"]["elements"][1]["behaviors"][0]["value"]["action_id"],
+            columns[0]["elements"][0]["behaviors"][0]["value"]["action_id"],
             "allow-id"
         );
         assert_eq!(
-            card["body"]["elements"][2]["behaviors"][0]["value"]["action_id"],
+            columns[1]["elements"][0]["behaviors"][0]["value"]["action_id"],
             "deny-id"
         );
-        assert_eq!(card["body"]["elements"][1]["tag"], "button");
-        assert_eq!(card["body"]["elements"][2]["tag"], "button");
+        assert_eq!(columns[0]["elements"][0]["tag"], "button");
+        assert_eq!(columns[1]["elements"][0]["tag"], "button");
+    }
+
+    #[test]
+    fn markdown_card_wraps_outbound_text() {
+        let card = feishu_markdown_card("**加粗**\n\n```rust\nlet a = 1;\n```");
+        assert_eq!(card["schema"], "2.0");
+        assert_eq!(card["body"]["elements"][0]["tag"], "markdown");
+        assert_eq!(
+            card["body"]["elements"][0]["content"],
+            "**加粗**\n\n```rust\nlet a = 1;\n```"
+        );
     }
 
     #[test]

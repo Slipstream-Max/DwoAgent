@@ -27,6 +27,7 @@ use super::gateway::{
     ChannelAdapter, ChannelBinder, ChannelRuntime, ChannelStarter, PreparedChannel,
 };
 use super::manager::{TelegramChannelState, telegram_bot};
+use super::markdown::{FenceState, balance_fences};
 use super::permission::{
     PermissionAction, PermissionActionStore, new_action_id, remove_group, take_action,
 };
@@ -74,6 +75,7 @@ struct TelegramStarter {
     host: Arc<dyn ChannelHost>,
     access: TelegramAccess,
     approvals: Arc<PermissionActionStore>,
+    rich: Arc<RichMessageSender>,
 }
 
 pub struct RunningTelegram {
@@ -81,6 +83,7 @@ pub struct RunningTelegram {
     chat_id: ChatId,
     task: tokio::task::JoinHandle<()>,
     shutdown: teloxide::dispatching::ShutdownToken,
+    rich: Arc<RichMessageSender>,
 }
 
 #[async_trait]
@@ -112,12 +115,16 @@ impl ChannelAdapter for TelegramAdapter {
         let selected_session_id = state.lock().await.selected_session_id.clone();
         let chat_id = ChatId(runtime.secret.bound_chat_id);
         let approvals = Arc::new(Mutex::new(HashMap::new()));
+        let rich = Arc::new(RichMessageSender::new(
+            &runtime.bot_token,
+            runtime.config.tg_proxy.as_deref(),
+        )?);
         let conversation = Arc::new(TelegramConversation {
             channels: channels.clone(),
-            bot: bot.clone(),
             chat_id,
             state,
             approvals: approvals.clone(),
+            rich: rich.clone(),
         });
         let access = TelegramAccess {
             user_id: runtime.secret.bound_user_id,
@@ -134,6 +141,7 @@ impl ChannelAdapter for TelegramAdapter {
                 host,
                 access,
                 approvals,
+                rich,
             }),
         })
     }
@@ -145,6 +153,7 @@ impl ChannelStarter for TelegramStarter {
         self: Box<Self>,
         ingress: Arc<dyn ChannelIngress>,
     ) -> Result<Box<dyn ChannelRuntime>> {
+        let rich = self.rich.clone();
         let handler = dptree::entry()
             .branch(Update::filter_message().endpoint(handle_message))
             .branch(Update::filter_callback_query().endpoint(handle_callback_query));
@@ -153,7 +162,8 @@ impl ChannelStarter for TelegramStarter {
                 self.host,
                 ingress,
                 self.access,
-                self.approvals
+                self.approvals,
+                rich
             ])
             .build();
         let shutdown = dispatcher.shutdown_token();
@@ -165,6 +175,7 @@ impl ChannelStarter for TelegramStarter {
             chat_id: ChatId(self.access.chat_id),
             task,
             shutdown,
+            rich: self.rich,
         }))
     }
 }
@@ -185,7 +196,7 @@ impl ChannelRuntime for RunningTelegram {
     }
 
     async fn send_message(&self, text: &str) -> Result<()> {
-        send_chunks(&self.bot, self.chat_id, text).await
+        send_chunks(&self.rich, self.chat_id, text, None).await
     }
 
     async fn send_file(&self, path: &Path) -> Result<()> {
@@ -212,6 +223,7 @@ async fn handle_message(
     host: Arc<dyn ChannelHost>,
     ingress: Arc<dyn ChannelIngress>,
     access: TelegramAccess,
+    rich: Arc<RichMessageSender>,
 ) -> TelegramHandlerResult {
     let Some(user) = message.from.as_ref() else {
         return Ok(());
@@ -244,11 +256,17 @@ async fn handle_message(
     match result {
         Ok(messages) => {
             for text in messages {
-                send_chunks(&bot, message.chat.id, &text).await?;
+                send_chunks(&rich, message.chat.id, &text, None).await?;
             }
         }
         Err(error) => {
-            send_chunks(&bot, message.chat.id, &format!("dwoagent error: {error:#}")).await?;
+            send_chunks(
+                &rich,
+                message.chat.id,
+                &format!("dwoagent error: {error:#}"),
+                None,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -410,16 +428,16 @@ async fn download_media(
 
 struct TelegramConversation {
     channels: Arc<ChannelManager>,
-    bot: Bot,
     chat_id: ChatId,
     state: Arc<Mutex<TelegramChannelState>>,
     approvals: Arc<PermissionActionStore>,
+    rich: Arc<RichMessageSender>,
 }
 
 #[async_trait]
 impl ConversationTransport for TelegramConversation {
     async fn send_text(&self, text: &str) -> Result<()> {
-        send_chunks(&self.bot, self.chat_id, text).await
+        send_chunks(&self.rich, self.chat_id, text, None).await
     }
 
     async fn send_permission_request(
@@ -460,14 +478,13 @@ impl ConversationTransport for TelegramConversation {
             InlineKeyboardButton::callback("允许", allow),
             InlineKeyboardButton::callback("拒绝", deny),
         ]]);
-        let result = self
-            .bot
-            .send_message(
-                self.chat_id,
-                render_tool_call(call, "request id", &permission.request_id),
-            )
-            .reply_markup(keyboard)
-            .await;
+        let result = send_chunks(
+            &self.rich,
+            self.chat_id,
+            &render_tool_call(call, "request id", &permission.request_id),
+            Some(keyboard),
+        )
+        .await;
         if result.is_err() {
             remove_group(&self.approvals, &group_id).await;
         }
@@ -493,22 +510,106 @@ fn split_logical_message(text: &str) -> Vec<String> {
     split_message(text, TELEGRAM_TEXT_CHUNK_CHARS)
 }
 
-async fn send_chunks(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
+async fn send_chunks(
+    rich: &RichMessageSender,
+    chat_id: ChatId,
+    text: &str,
+    markup: Option<InlineKeyboardMarkup>,
+) -> Result<()> {
     if chat_id.0 <= 0 {
         bail!("Telegram private chat id must be positive");
     }
-    let mut first_error = None;
+    let mut fence = FenceState::default();
     for chunk in split_logical_message(text) {
-        if let Err(error) = bot.send_message(chat_id, chunk).await
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
+        // 围栏跨段补平后原样走 Rich message：markdown 是唯一事实来源，
+        // 不转换、不回退 —— 发送失败就记 ERROR 并抛出。
+        let balanced = balance_fences(&chunk, &mut fence);
+        rich.send_markdown(chat_id, &balanced, markup.as_ref())
+            .await
+            .inspect_err(|error| {
+                tracing::error!(
+                    event = "channel.telegram_message_failed",
+                    chat_id = chat_id.0,
+                    error = %format!("{error:#}"),
+                    "Telegram rich message failed"
+                );
+            })?;
     }
-    if let Some(error) = first_error {
-        return Err(error.into());
-    }
+    tracing::info!(
+        event = "channel.telegram_rich_message_sent",
+        chat_id = chat_id.0,
+        "Telegram rich messages sent"
+    );
     Ok(())
+}
+
+/// 直连 Bot API 发 Rich message —— teloxide 0.13 尚未封装
+/// `sendRichMessage` 方法。发送失败不回退：记 ERROR 并抛给调用方。
+struct RichMessageSender {
+    client: reqwest::Client,
+    token: String,
+}
+
+impl RichMessageSender {
+    fn new(token: &str, proxy: Option<&str>) -> Result<Self> {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30));
+        // 空串按「没配代理」处理：直连（和 teloxide 客户端保持一致）。
+        if let Some(proxy) = proxy.filter(|proxy| !proxy.trim().is_empty()) {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .with_context(|| format!("configure Telegram HTTP proxy {proxy}"))?,
+            );
+        }
+        Ok(Self {
+            client: builder.build()?,
+            token: token.to_string(),
+        })
+    }
+
+    /// 发送一条 rich message；非 2xx 或 `ok != true` 一律算失败。
+    async fn send_markdown(
+        &self,
+        chat_id: ChatId,
+        markdown: &str,
+        markup: Option<&InlineKeyboardMarkup>,
+    ) -> Result<()> {
+        let url = format!("https://api.telegram.org/bot{}/sendRichMessage", self.token);
+        let response = self
+            .client
+            .post(url)
+            .json(&rich_message_body(chat_id, markdown, markup)?)
+            .send()
+            .await?;
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await?;
+        if !status.is_success()
+            || payload.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        {
+            let description = payload
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown error");
+            bail!("sendRichMessage rejected ({status}): {description}");
+        }
+        Ok(())
+    }
+}
+
+fn rich_message_body(
+    chat_id: ChatId,
+    markdown: &str,
+    markup: Option<&InlineKeyboardMarkup>,
+) -> Result<serde_json::Value> {
+    let mut body = serde_json::json!({
+        "chat_id": chat_id.0,
+        "rich_message": {"markdown": markdown},
+    });
+    if let Some(markup) = markup {
+        body["reply_markup"] = serde_json::to_value(markup)?;
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -535,6 +636,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(state.selected_session_id.as_deref(), Some("session-test"));
+    }
+
+    #[test]
+    fn rich_message_body_carries_markdown() {
+        let body = rich_message_body(ChatId(7), "| a | b |\n| --- | --- |", None).unwrap();
+        assert_eq!(body["chat_id"].as_i64(), Some(7));
+        assert_eq!(
+            body["rich_message"]["markdown"].as_str(),
+            Some("| a | b |\n| --- | --- |")
+        );
+        assert!(body.get("reply_markup").is_none());
     }
 
     #[tokio::test]

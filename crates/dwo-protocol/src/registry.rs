@@ -226,6 +226,11 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         MethodRoute::Dwo,
         Some("config.changed"),
     ),
+    command(
+        "model.set_subagent",
+        MethodRoute::Dwo,
+        Some("config.changed"),
+    ),
     command("model.upsert", MethodRoute::Dwo, Some("config.changed")),
     command("model.remove", MethodRoute::Dwo, Some("config.changed")),
     query("provider.list", MethodRoute::Dwo),
@@ -265,6 +270,8 @@ pub const METHOD_SPECS: &[MethodSpec] = &[
         MethodRoute::Dwo,
         Some("channel.status"),
     ),
+    command("channel.<kind>.token", MethodRoute::Dwo, None),
+    command("channel.<kind>.credentials", MethodRoute::Dwo, None),
     command(
         "channel.<kind>.begin",
         MethodRoute::Dwo,
@@ -382,6 +389,8 @@ mod tests {
         assert!(method_allowed("dwo", "session.archive"));
         assert!(method_allowed("dwo", "session.unarchive"));
         assert!(method_allowed("dwo", "channel.telegram.status"));
+        assert!(method_allowed("dwo", "channel.telegram.token"));
+        assert!(method_allowed("dwo", "channel.feishu.credentials"));
         assert!(method_allowed("dwo", "websocket.status"));
         assert!(!method_allowed("dwo", "channel.unknown.status"));
     }

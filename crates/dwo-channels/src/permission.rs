@@ -41,3 +41,25 @@ pub async fn remove_group(store: &PermissionActionStore, group_id: &str) {
         .await
         .retain(|_, action| action.group_id != group_id);
 }
+
+/// 一张已发出的权限卡片（飞书专属）：点击解完权限后要靠它把卡片收口 ——
+/// 去掉按钮、标上结果（「按过就不能再按」）。
+pub struct PermissionCard {
+    pub message_id: String,
+    pub text: String,
+    pub expires_at: Instant,
+}
+
+pub type PermissionCardStore = Mutex<HashMap<String, PermissionCard>>;
+
+pub async fn put_card(store: &PermissionCardStore, group_id: &str, card: PermissionCard) {
+    let mut store = store.lock().await;
+    store.retain(|_, card| Instant::now() < card.expires_at);
+    store.insert(group_id.to_string(), card);
+}
+
+pub async fn take_card(store: &PermissionCardStore, group_id: &str) -> Option<PermissionCard> {
+    let mut store = store.lock().await;
+    store.retain(|_, card| Instant::now() < card.expires_at);
+    store.remove(group_id)
+}

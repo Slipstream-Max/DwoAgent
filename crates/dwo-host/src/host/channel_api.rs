@@ -17,12 +17,26 @@ struct SendFileParam {
     path: PathBuf,
 }
 
+#[derive(serde::Deserialize)]
+struct ChannelTokenParam {
+    token: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelCredentialsParam {
+    app_id: String,
+    app_secret: String,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ManagedChannelAction {
     Status,
     Enable,
     Disable,
     Config,
+    Token,
+    Credentials,
     SendMessage,
     SendFile,
     Remove,
@@ -36,6 +50,8 @@ pub(crate) fn managed_channel_action(method: &str) -> Option<(ChannelKind, Manag
         "enable" => ManagedChannelAction::Enable,
         "disable" => ManagedChannelAction::Disable,
         "config" => ManagedChannelAction::Config,
+        "token" => ManagedChannelAction::Token,
+        "credentials" => ManagedChannelAction::Credentials,
         "send_message" => ManagedChannelAction::SendMessage,
         "send_file" => ManagedChannelAction::SendFile,
         "remove" => ManagedChannelAction::Remove,
@@ -76,6 +92,15 @@ impl Host {
                 }
                 ManagedChannelAction::Config => {
                     self.channel_config(channel, params.get("config").cloned())
+                        .await
+                }
+                ManagedChannelAction::Token => {
+                    let params: ChannelTokenParam = serde_json::from_value(params)?;
+                    self.channel_save_token(channel, &params.token).await
+                }
+                ManagedChannelAction::Credentials => {
+                    let params: ChannelCredentialsParam = serde_json::from_value(params)?;
+                    self.channel_save_credentials(channel, &params.app_id, &params.app_secret)
                         .await
                 }
                 ManagedChannelAction::SendMessage => {
@@ -152,6 +177,8 @@ impl Host {
 
     pub(crate) async fn channel_unbind(self: &Arc<Self>, channel: ChannelKind) -> Result<Value> {
         let unbound = self.gateway().unbind(channel, self.clone()).await?;
+        // 解绑即关：不留 `enabled=true` 的孤儿位（profile 不变量）。
+        self.disable_after_unbind(channel).await?;
         self.events
             .publish(
                 "channel.status",
@@ -166,17 +193,42 @@ impl Host {
         Ok(value)
     }
 
+    /// 解绑 / 移除之后把 `enabled` 落回 false；渠道根本没配置就啥也不用做。
+    async fn disable_after_unbind(self: &Arc<Self>, channel: ChannelKind) -> Result<()> {
+        let configured = self
+            .profile
+            .read()
+            .expect("profile lock poisoned")
+            .config
+            .channels
+            .contains_key(channel.as_str());
+        if configured {
+            self.channel_set_enabled(channel, false).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn channel_set_enabled(
         self: &Arc<Self>,
         channel: ChannelKind,
         enabled: bool,
     ) -> Result<Value> {
         let name = channel.as_str().to_string();
+        // 不变量：enable 只允许用在**绑定过**的渠道上（否则就是那个
+        // 「开着但啥也干不了」的骗人位）——和 profile 加载时的校验一个口径。
+        if enabled {
+            let summary = self.channels().summary(channel).await?;
+            anyhow::ensure!(
+                summary.bound_user_id.is_some(),
+                "channel is not bound: bind it before enabling"
+            );
+        }
         self.edit_profile(|profile| {
+            // 管理面不要求先手写 profile 段：没配置就从默认配置开始。
             let entry = profile
                 .channels
-                .get_mut(&name)
-                .context("channel is not configured")?;
+                .entry(name.clone())
+                .or_insert_with(|| dwo_channel_api::default_channel_config(&name));
             let object = entry
                 .as_mapping_mut()
                 .context("channel config must be an object")?;
@@ -203,7 +255,8 @@ impl Host {
     ) -> Result<Value> {
         let name = channel.as_str().to_string();
         let Some(config) = config else {
-            return Ok(self
+            // 未配置的渠道按默认配置回：管理面直接打开设置页就能继续配置。
+            let value = self
                 .profile
                 .read()
                 .expect("profile lock poisoned")
@@ -211,11 +264,19 @@ impl Host {
                 .channels
                 .get(&name)
                 .cloned()
-                .map(|value| serde_json::to_value(value).unwrap_or(Value::Null))
-                .unwrap_or(Value::Null));
+                .unwrap_or_else(|| dwo_channel_api::default_channel_config(&name));
+            return Ok(serde_json::to_value(value).unwrap_or(Value::Null));
         };
         let yaml: serde_yaml::Value = serde_json::from_value(config)?;
         anyhow::ensure!(yaml.is_mapping(), "channel config must be an object");
+        // 写回整条配置也不行绕过「enable 要绑定」那道门。
+        if yaml.get("enabled").and_then(|value| value.as_bool()) == Some(true) {
+            let summary = self.channels().summary(channel).await?;
+            anyhow::ensure!(
+                summary.bound_user_id.is_some(),
+                "channel is not bound: cannot write enabled=true"
+            );
+        }
         self.edit_profile(|profile| {
             profile.channels.insert(name.clone(), yaml.clone());
             Ok(())
@@ -228,6 +289,37 @@ impl Host {
             )
             .await;
         Ok(json!({"channel": name, "updated": true}))
+    }
+
+    pub(crate) async fn channel_save_token(
+        &self,
+        channel: ChannelKind,
+        token: &str,
+    ) -> Result<Value> {
+        anyhow::ensure!(!token.trim().is_empty(), "token must not be empty");
+        self.gateway().save_token(channel, token).await?;
+        Ok(json!({"saved": true}))
+    }
+
+    pub(crate) async fn channel_save_credentials(
+        &self,
+        channel: ChannelKind,
+        app_id: &str,
+        app_secret: &str,
+    ) -> Result<Value> {
+        anyhow::ensure!(
+            channel == ChannelKind::Feishu,
+            "channel {} does not support credential storage",
+            channel.as_str()
+        );
+        anyhow::ensure!(
+            !app_id.trim().is_empty() && !app_secret.trim().is_empty(),
+            "app id / secret must not be empty"
+        );
+        self.gateway()
+            .save_feishu_credentials(app_id, app_secret)
+            .await?;
+        Ok(json!({"saved": true}))
     }
 
     pub(crate) async fn channel_send_message(
@@ -252,6 +344,8 @@ impl Host {
 
     pub(crate) async fn channel_remove(self: &Arc<Self>, channel: ChannelKind) -> Result<Value> {
         let removed = self.gateway().unbind(channel, self.clone()).await?;
+        // 同上：没有绑定就不许留着 `enabled=true`。
+        self.disable_after_unbind(channel).await?;
         self.events
             .publish(
                 "channel.status",
@@ -285,6 +379,10 @@ mod tests {
             assert!(matches!(
                 managed_channel_action(&method("remove")),
                 Some((found, ManagedChannelAction::Remove)) if found == channel
+            ));
+            assert!(matches!(
+                managed_channel_action(&method("token")),
+                Some((found, ManagedChannelAction::Token)) if found == channel
             ));
             assert!(managed_channel_action(&method("begin")).is_none());
         }

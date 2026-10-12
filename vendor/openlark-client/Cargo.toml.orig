@@ -1,0 +1,94 @@
+[package]
+name = "openlark-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "OpenLark 高级客户端 - 统一入口点和轻量级服务注册表"
+repository.workspace = true
+homepage.workspace = true
+keywords = ["feishu", "lark", "api", "sdk", "client"]
+categories = ["api-bindings", "web-programming", "development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core dependencies
+openlark-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# WebSocket dependencies
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+lark-websocket-protobuf = { workspace = true, optional = true }
+url = { workspace = true }
+prost = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+
+# P0 Phase 1 业务模块依赖
+openlark-auth = { workspace = true, optional = true }
+openlark-communication = { workspace = true, optional = true }
+openlark-docs = { workspace = true, optional = true }
+openlark-cardkit = { workspace = true, optional = true }
+openlark-meeting = { workspace = true, optional = true }
+openlark-security = { workspace = true, optional = true }
+
+# Phase 2+ 模块依赖
+openlark-hr = { workspace = true, optional = true }
+openlark-ai = { workspace = true, optional = true }
+openlark-workflow = { workspace = true, optional = true }
+openlark-platform = { workspace = true, optional = true }
+openlark-application = { workspace = true, optional = true }
+openlark-helpdesk = { workspace = true, optional = true }
+openlark-mail = { workspace = true, optional = true }
+openlark-bot = { workspace = true, optional = true }
+openlark-analytics = { workspace = true, optional = true }
+openlark-user = { workspace = true, optional = true }
+
+[features]
+default = ["auth", "communication"]
+
+# === 服务功能 ===
+auth = ["dep:openlark-auth"]
+communication = ["auth", "dep:openlark-communication"]
+# `docs` 至少要保证 `client.docs.ccm` 可用；更细粒度能力由上层 crate 再继续展开。
+docs = [
+    "auth",
+    "dep:openlark-docs",
+    "openlark-docs/ccm-core",
+]
+cardkit = ["auth", "dep:openlark-cardkit"]
+security = ["auth", "dep:openlark-security"]
+hr = ["auth", "dep:openlark-hr"]
+ai = ["auth", "dep:openlark-ai"]
+meeting = ["auth", "dep:openlark-meeting"]
+workflow = ["auth", "dep:openlark-workflow"]
+platform = ["auth", "dep:openlark-platform"]
+application = ["auth", "dep:openlark-application"]
+helpdesk = ["auth", "dep:openlark-helpdesk"]
+mail = ["auth", "dep:openlark-mail"]
+bot = ["auth", "dep:openlark-bot"]
+analytics = ["auth", "dep:openlark-analytics"]
+user = ["auth", "dep:openlark-user"]
+
+# === 技术特性 ===
+websocket = ["tokio-tungstenite", "futures-util", "lark-websocket-protobuf", "prost", "reqwest", "log"]
+
+# === 功能组合 ===
+core-layer = ["communication", "docs", "security"]
+
+p0-services = ["communication", "docs", "security"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = { workspace = true }
+rstest = { workspace = true }
+tempfile = { workspace = true }
+mockall = { workspace = true }

@@ -37,6 +37,15 @@ impl WeixinChannelConfig {
     }
 }
 
+impl Default for WeixinChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            replay_turns: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelState<T = EmptyChannelState> {
@@ -65,7 +74,6 @@ pub type QqChannelState = ChannelState;
 pub struct TelegramChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
-    pub bot_token_env: String,
     #[serde(default)]
     pub tg_proxy: Option<String>,
 }
@@ -74,9 +82,6 @@ impl TelegramChannelConfig {
     fn validate(&self) -> Result<()> {
         if self.replay_turns > 10 {
             bail!("channels.telegram.replayTurns must be at most 10");
-        }
-        if self.bot_token_env.trim().is_empty() {
-            bail!("channels.telegram.botTokenEnv must not be empty");
         }
         if self
             .tg_proxy
@@ -92,6 +97,16 @@ impl TelegramChannelConfig {
             bail!("channels.telegram.tgProxy must use an http:// or https:// URL");
         }
         Ok(())
+    }
+}
+
+impl Default for TelegramChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            replay_turns: 5,
+            tg_proxy: None,
+        }
     }
 }
 
@@ -116,8 +131,6 @@ impl FeishuPlatform {
 pub struct FeishuChannelConfig {
     pub enabled: bool,
     pub replay_turns: usize,
-    pub app_id_env: String,
-    pub app_secret_env: String,
     pub platform: FeishuPlatform,
 }
 
@@ -126,13 +139,17 @@ impl FeishuChannelConfig {
         if self.replay_turns > 10 {
             bail!("channels.feishu.replayTurns must be at most 10");
         }
-        if self.app_id_env.trim().is_empty() {
-            bail!("channels.feishu.appIdEnv must not be empty");
-        }
-        if self.app_secret_env.trim().is_empty() {
-            bail!("channels.feishu.appSecretEnv must not be empty");
-        }
         Ok(())
+    }
+}
+
+impl Default for FeishuChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            replay_turns: 5,
+            platform: FeishuPlatform::Feishu,
+        }
     }
 }
 
@@ -152,37 +169,76 @@ impl QqChannelConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for QqChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            replay_turns: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TelegramSecret {
+    /// 向导在绑定流程里填的 bot token —— 跟微信 / QQ 对齐：凭据都住 secret.yaml。
+    #[serde(default)]
+    pub bot_token: Option<String>,
+    #[serde(default)]
     pub bot_id: u64,
+    #[serde(default)]
     pub bot_username: String,
+    #[serde(default)]
     pub bound_user_id: u64,
+    #[serde(default)]
     pub bound_chat_id: i64,
 }
 
 impl TelegramSecret {
+    fn token(&self) -> Option<&str> {
+        self.bot_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
+
+    /// 四个身份字段齐了才算绑上（向导第 1 步只写 token，不写身份）。
+    fn is_bound(&self) -> bool {
+        self.bot_id != 0
+            && !self.bot_username.trim().is_empty()
+            && self.bound_user_id != 0
+            && self.bound_chat_id > 0
+    }
+
     fn validate(&self) -> Result<()> {
-        if self.bot_id == 0 {
-            bail!("channels.telegram secret field botId must be positive");
+        if self.bot_token.is_some() && self.token().is_none() {
+            bail!("channels.telegram secret field botToken must not be empty");
         }
-        if self.bot_username.trim().is_empty() {
-            bail!("channels.telegram secret field botUsername must not be empty");
-        }
-        if self.bound_user_id == 0 {
-            bail!("channels.telegram secret field boundUserId must be positive");
-        }
-        if self.bound_chat_id <= 0 {
-            bail!("channels.telegram secret field boundChatId must be a private chat id");
+        let untouched = self.bot_id == 0
+            && self.bot_username.trim().is_empty()
+            && self.bound_user_id == 0
+            && self.bound_chat_id == 0;
+        if !self.is_bound() && !untouched {
+            bail!(
+                "channels.telegram secret must either be a complete binding \
+                 or hold only the bot token"
+            );
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FeishuSecret {
+    /// 向导第 2 步填的 App ID / Secret —— 跟微信 / QQ / Telegram 对齐：凭据都住 secret.yaml。
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub app_secret: Option<String>,
+    #[serde(default)]
     pub bound_open_id: String,
+    #[serde(default)]
     pub bound_chat_id: String,
 }
 
@@ -210,12 +266,50 @@ impl QqSecret {
 }
 
 impl FeishuSecret {
+    fn credentials(&self) -> Option<(String, String)> {
+        let app_id = self
+            .app_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let app_secret = self
+            .app_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        Some((app_id.to_string(), app_secret.to_string()))
+    }
+
+    /// open_id + chat_id 齐了才算绑上（向导第 2 步只写凭据，不写身份）。
+    fn is_bound(&self) -> bool {
+        !self.bound_open_id.trim().is_empty() && !self.bound_chat_id.trim().is_empty()
+    }
+
     fn validate(&self) -> Result<()> {
-        if self.bound_open_id.trim().is_empty() {
-            bail!("channels.feishu secret field boundOpenId must not be empty");
+        if self
+            .app_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("channels.feishu secret field appId must not be empty");
         }
-        if self.bound_chat_id.trim().is_empty() {
-            bail!("channels.feishu secret field boundChatId must not be empty");
+        if self
+            .app_secret
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("channels.feishu secret field appSecret must not be empty");
+        }
+        if self.app_id.is_some() != self.app_secret.is_some() {
+            bail!("channels.feishu secret must provide both appId and appSecret");
+        }
+        if self.is_bound() {
+            return Ok(());
+        }
+        let untouched =
+            self.bound_open_id.trim().is_empty() && self.bound_chat_id.trim().is_empty();
+        if !untouched {
+            bail!("channels.feishu secret must have both boundOpenId and boundChatId, or neither");
         }
         Ok(())
     }
@@ -301,9 +395,35 @@ pub struct QqBindStart {
     pub qrcode: String,
 }
 
+/// 拉一枪微信二维码 —— 上游这枪**没有超时兜底**（`weixin-agent` 的
+/// `api_post` 传的是 `timeout=None`，连接一进黑洞就会无限挂）。这儿包一层：
+/// 每枪 15s，失败再补一枪，两枪都不行就把错误抛回去。
+async fn request_weixin_qrcode(
+    login: &StandaloneQrLogin,
+    existing: &[String],
+) -> Result<QrLoginSession> {
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=2 {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, login.start(None, existing)).await {
+            Ok(Ok(session)) => return Ok(session),
+            Ok(Err(error)) => {
+                tracing::warn!(attempt, error = %error, "weixin qrcode request failed");
+                last_error = Some(error.into());
+            }
+            Err(_) => {
+                tracing::warn!(attempt, "weixin qrcode request timed out");
+                last_error = Some(anyhow::anyhow!("weixin qrcode request timed out"));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("weixin qrcode request failed")))
+}
+
 struct PendingLogin {
     session: QrLoginSession,
     config: WeixinConfig,
+    created_at: Instant,
 }
 
 struct PendingTelegramBind {
@@ -363,6 +483,11 @@ impl ChannelStore {
 
     async fn save_secret(&self, secret: &impl Serialize) -> Result<()> {
         self.save(&self.secret_path(), secret).await
+    }
+
+    /// 读 secret（不存在就交一份默认值）——telegram 的向导第 1 步会先只写 token。
+    async fn load_secret_or_default<T: serde::de::DeserializeOwned + Default>(&self) -> Result<T> {
+        read_yaml_or_default(&self.secret_path()).await
     }
 
     async fn save(&self, path: &Path, value: &impl Serialize) -> Result<()> {
@@ -465,18 +590,67 @@ impl ChannelManager {
         Ok(manager)
     }
 
-    pub async fn list(&self) -> Result<Vec<ChannelSummary>> {
-        let configured = [
-            (ChannelKind::Weixin, self.weixin.is_some()),
-            (ChannelKind::Telegram, self.telegram.is_some()),
-            (ChannelKind::Feishu, self.feishu.is_some()),
-            (ChannelKind::Qq, self.qq.is_some()),
-        ];
-        let mut summaries = Vec::with_capacity(configured.len());
-        for (channel, is_configured) in configured {
-            if is_configured {
-                summaries.push(self.summary(channel).await?);
+    /// profile 不变量：`enabled: true` 只允许出现在**绑定过**的渠道上。
+    ///
+    /// 三条写入路径已经把门守住了（`channel_set_enabled` 要求有绑定、
+    /// 解绑 / 移除会自动关开关、配置写回也不许塞 `enabled=true`）——
+    /// 这儿兜手工改 profile.yaml 的底：不合法就直接报错，别带病启动。
+    pub(crate) fn validate_enabled_bindings(&self) -> Result<()> {
+        for (name, enabled) in [
+            (WEIXIN_CHANNEL, self.weixin.as_ref().map(|config| config.enabled)),
+            (
+                TELEGRAM_CHANNEL,
+                self.telegram.as_ref().map(|config| config.enabled),
+            ),
+            (FEISHU_CHANNEL, self.feishu.as_ref().map(|config| config.enabled)),
+            (QQ_CHANNEL, self.qq.as_ref().map(|config| config.enabled)),
+        ] {
+            if enabled != Some(true) {
+                continue;
             }
+            let secret_path = self.root.join(name).join("secret.yaml");
+            if !secret_path.is_file() {
+                bail!(
+                    "channels.{name}: enabled=true without a bound account \
+                     (bind it first, or set enabled=false)"
+                );
+            }
+            if name == TELEGRAM_CHANNEL {
+                // Telegram 光绑上还不够：向导第 1 步存的 token 也得在，运行时才拿得动。
+                let source = std::fs::read_to_string(&secret_path)
+                    .with_context(|| format!("read {}", secret_path.display()))?;
+                let secret: TelegramSecret = serde_yaml::from_str(&source)
+                    .with_context(|| format!("parse {}", secret_path.display()))?;
+                secret.validate()?;
+                anyhow::ensure!(
+                    secret.is_bound() && secret.token().is_some(),
+                    "channels.{name}: enabled=true without a bound account and a saved bot \
+                     token (bind it first, or set enabled=false)"
+                );
+            }
+            if name == FEISHU_CHANNEL {
+                // 飞书同理：绑定齐 + 凭据都在（向导两步都走完）才能真的跑起来。
+                let source = std::fs::read_to_string(&secret_path)
+                    .with_context(|| format!("read {}", secret_path.display()))?;
+                let secret: FeishuSecret = serde_yaml::from_str(&source)
+                    .with_context(|| format!("parse {}", secret_path.display()))?;
+                secret.validate()?;
+                anyhow::ensure!(
+                    secret.is_bound() && secret.credentials().is_some(),
+                    "channels.{name}: enabled=true without a bound account and saved credentials \
+                     (finish the bind wizard first, or set enabled=false)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list(&self) -> Result<Vec<ChannelSummary>> {
+        // 管理面永远列全四家：没写进 profile 的渠道也汇报（默认态），
+        // 桌面端才能从零开始绑定 / 启用 / 改配置。
+        let mut summaries = Vec::with_capacity(ChannelKind::ALL.len());
+        for channel in ChannelKind::ALL {
+            summaries.push(self.summary(channel).await?);
         }
         Ok(summaries)
     }
@@ -485,10 +659,8 @@ impl ChannelManager {
         let store = self.store(channel);
         match channel {
             ChannelKind::Weixin => {
-                let config = self
-                    .weixin
-                    .as_ref()
-                    .context("channels.weixin is not configured")?;
+                // 未配置也算一条：开关按 false 汇报。
+                let enabled = self.weixin.as_ref().is_some_and(|config| config.enabled);
                 let state: WeixinChannelState = store.load_runtime().await?;
                 let (connected, bound_user_id) = if store.secret_path().is_file() {
                     let secret = store.load_secret::<WeixinSecret>().await?;
@@ -499,63 +671,60 @@ impl ChannelManager {
                 };
                 Ok(ChannelSummary {
                     name: WEIXIN_CHANNEL.to_string(),
-                    enabled: config.enabled,
+                    enabled,
                     connected,
                     selected_session_id: state.selected_session_id,
                     bound_user_id,
                 })
             }
             ChannelKind::Telegram => {
-                let config = self
-                    .telegram
-                    .as_ref()
-                    .context("channels.telegram is not configured")?;
+                let enabled = self.telegram.as_ref().is_some_and(|config| config.enabled);
                 let state: TelegramChannelState = store.load_runtime().await?;
                 let (connected, bound_user_id) = if store.secret_path().is_file() {
                     let secret = store.load_secret::<TelegramSecret>().await?;
                     secret.validate()?;
-                    (
-                        resolve_env(&config.bot_token_env).is_ok(),
-                        Some(secret.bound_user_id.to_string()),
-                    )
+                    if secret.is_bound() {
+                        (secret.token().is_some(), Some(secret.bound_user_id.to_string()))
+                    } else {
+                        // 向导第 1 步只写了 token，还没绑定。
+                        (false, None)
+                    }
                 } else {
                     (false, None)
                 };
                 Ok(ChannelSummary {
                     name: TELEGRAM_CHANNEL.to_string(),
-                    enabled: config.enabled,
+                    enabled,
                     connected,
                     selected_session_id: state.selected_session_id,
                     bound_user_id,
                 })
             }
             ChannelKind::Feishu => {
-                let config = self
-                    .feishu
-                    .as_ref()
-                    .context("channels.feishu is not configured")?;
+                let enabled = self.feishu.as_ref().is_some_and(|config| config.enabled);
                 let state: FeishuChannelState = store.load_runtime().await?;
                 let (connected, bound_user_id) = if store.secret_path().is_file() {
                     let secret = store.load_secret::<FeishuSecret>().await?;
                     secret.validate()?;
-                    (
-                        resolve_env(&config.app_id_env).is_ok()
-                            && resolve_env(&config.app_secret_env).is_ok(),
-                        Some(secret.bound_open_id),
-                    )
+                    if secret.is_bound() {
+                        (true, Some(secret.bound_open_id))
+                    } else {
+                        // 向导第 2 步只写了凭据，还没绑定。
+                        (false, None)
+                    }
                 } else {
                     (false, None)
                 };
                 Ok(ChannelSummary {
                     name: FEISHU_CHANNEL.to_string(),
-                    enabled: config.enabled,
+                    enabled,
                     connected,
                     selected_session_id: state.selected_session_id,
                     bound_user_id,
                 })
             }
             ChannelKind::Qq => {
-                let config = self.qq.as_ref().context("channels.qq is not configured")?;
+                let enabled = self.qq.as_ref().is_some_and(|config| config.enabled);
                 let state: QqChannelState = store.load_runtime().await?;
                 let (connected, bound_user_id) = if store.secret_path().is_file() {
                     let secret = store.load_secret::<QqSecret>().await?;
@@ -566,7 +735,7 @@ impl ChannelManager {
                 };
                 Ok(ChannelSummary {
                     name: QQ_CHANNEL.to_string(),
-                    enabled: config.enabled,
+                    enabled,
                     connected,
                     selected_session_id: state.selected_session_id,
                     bound_user_id,
@@ -611,16 +780,67 @@ impl ChannelManager {
         self.store(channel).save_runtime(state).await
     }
 
+    /// 向导读 telegram 的 bot token —— 住在渠道目录的 `secret.yaml` 里
+    /// （跟微信 / QQ 一致；没存过就报 `is not set`，向导据此分流回第 1 步）。
+    pub async fn load_telegram_token(&self) -> Result<String> {
+        let secret: TelegramSecret = self
+            .store(ChannelKind::Telegram)
+            .load_secret_or_default()
+            .await?;
+        secret
+            .token()
+            .map(str::to_string)
+            .context("telegram bot token is not set")
+    }
+
+    /// 向导存 telegram 的 bot token（绑定流程第一步；写进 secret.yaml，不进 profile）。
+    pub async fn save_telegram_token(&self, token: &str) -> Result<()> {
+        anyhow::ensure!(!token.trim().is_empty(), "bot token must not be empty");
+        let store = self.store(ChannelKind::Telegram);
+        let mut secret: TelegramSecret = store.load_secret_or_default().await?;
+        secret.bot_token = Some(token.to_string());
+        secret.validate()?;
+        store.save_secret(&secret).await
+    }
+
+    /// 绑定向导第 2 步：把飞书的 App ID / Secret 存进渠道目录（跟别的家同屋）。
+    pub async fn save_feishu_credentials(&self, app_id: &str, app_secret: &str) -> Result<()> {
+        anyhow::ensure!(
+            !app_id.trim().is_empty() && !app_secret.trim().is_empty(),
+            "app id / secret must not be empty"
+        );
+        let store = self.store(ChannelKind::Feishu);
+        let mut secret: FeishuSecret = store.load_secret_or_default().await?;
+        secret.app_id = Some(app_id.to_string());
+        secret.app_secret = Some(app_secret.to_string());
+        secret.validate()?;
+        store.save_secret(&secret).await
+    }
+
+    /// 向导 / 运行时读飞书的凭据 —— 住在渠道目录的 `secret.yaml` 里。
+    async fn load_feishu_credentials(&self) -> Result<(String, String)> {
+        let secret: FeishuSecret = self
+            .store(ChannelKind::Feishu)
+            .load_secret_or_default()
+            .await?;
+        secret
+            .credentials()
+            .context("feishu App ID / Secret are not set — 在飞书绑定向导第 2 步填入后再试")
+    }
+
     pub async fn load_telegram(&self) -> Result<TelegramRuntime> {
         let config = self
             .telegram
             .clone()
             .context("channels.telegram is not configured")?;
-        let bot_token = resolve_env(&config.bot_token_env)
-            .with_context(|| format!("resolve channels.telegram.{}", config.bot_token_env))?;
         let store = self.store(ChannelKind::Telegram);
         let secret: TelegramSecret = store.load_secret().await?;
         secret.validate()?;
+        anyhow::ensure!(secret.is_bound(), "channels.telegram is not bound yet");
+        let bot_token = secret
+            .token()
+            .context("telegram bot token is not set")?
+            .to_string();
         Ok(TelegramRuntime {
             state: store.load_runtime().await?,
             config,
@@ -634,13 +854,13 @@ impl ChannelManager {
             .feishu
             .clone()
             .context("channels.feishu is not configured")?;
-        let app_id = resolve_env(&config.app_id_env)
-            .with_context(|| format!("resolve channels.feishu.{}", config.app_id_env))?;
-        let app_secret = resolve_env(&config.app_secret_env)
-            .with_context(|| format!("resolve channels.feishu.{}", config.app_secret_env))?;
         let store = self.store(ChannelKind::Feishu);
         let secret: FeishuSecret = store.load_secret().await?;
         secret.validate()?;
+        anyhow::ensure!(secret.is_bound(), "channels.feishu is not bound yet");
+        let (app_id, app_secret) = secret
+            .credentials()
+            .context("feishu App ID / Secret are not set")?;
         Ok(FeishuRuntime {
             state: store.load_runtime().await?,
             config,
@@ -665,14 +885,17 @@ impl ChannelManager {
     }
 
     pub async fn begin_telegram_bind(&self) -> Result<TelegramBindStart> {
-        let config = self
-            .telegram
-            .as_ref()
-            .context("channels.telegram is not configured in profile.yaml")?;
-        let token = resolve_env(&config.bot_token_env)
-            .with_context(|| format!("resolve channels.telegram.{}", config.bot_token_env))?;
-        let bot = telegram_bot(&token, config.tg_proxy.as_deref())?;
-        let me = bot.get_me().await?;
+        // 未配置的渠道也能从管理面直接走绑定：配置缺省按默认值来。
+        let config = self.telegram.clone().unwrap_or_default();
+        let proxy = config.tg_proxy.as_deref();
+        let token = self.load_telegram_token().await?;
+        let bot = telegram_probe_bot(&token, proxy)?;
+        let me = bot.get_me().await.map_err(|error| {
+            anyhow::anyhow!(
+                "{}",
+                telegram_connect_hint(&anyhow::Error::new(error), proxy)
+            )
+        })?;
         let binding_id = format!("binding-{}", Uuid::new_v4());
         let code = Uuid::new_v4().simple().to_string()[..8].to_ascii_uppercase();
         let bot_username = me.username().to_string();
@@ -745,7 +968,10 @@ impl ChannelManager {
             .limit(1)
             .timeout(0)
             .await?;
+        // token（向导第 1 步存的）和身份字段合成一份完整 secret。
+        let bot_token = self.load_telegram_token().await?;
         self.save_telegram(TelegramSecret {
+            bot_token: Some(bot_token),
             bot_id,
             bot_username,
             bound_user_id,
@@ -768,15 +994,10 @@ impl ChannelManager {
     }
 
     pub async fn begin_feishu_bind(&self) -> Result<FeishuBindStart> {
-        let settings = self
-            .feishu
-            .as_ref()
-            .context("channels.feishu is not configured in profile.yaml")?;
-        let app_id = resolve_env(&settings.app_id_env)
-            .with_context(|| format!("resolve channels.feishu.{}", settings.app_id_env))?;
-        let app_secret = resolve_env(&settings.app_secret_env)
-            .with_context(|| format!("resolve channels.feishu.{}", settings.app_secret_env))?;
-        let config = super::feishu::openlark_config(settings, app_id, app_secret);
+        // 未配置也能直接绑定：平台按默认来（向导第 1 步会写回）；凭据读 secret.yaml。
+        let settings = self.feishu.clone().unwrap_or_default();
+        let (app_id, app_secret) = self.load_feishu_credentials().await?;
+        let config = super::feishu::openlark_config(&settings, app_id, app_secret);
         super::feishu::validate_credentials(&config).await?;
 
         let binding_id = format!("binding-{}", Uuid::new_v4());
@@ -843,17 +1064,29 @@ impl ChannelManager {
                 .expect("checked Feishu binding exists");
             binding.task.abort();
             drop(pending);
-            self.save_feishu(FeishuSecret {
-                bound_open_id: bound_open_id.clone(),
-                bound_chat_id,
-            })
-            .await?;
-            super::feishu::send_text_to(
+            // 身份字段接在向导第 2 步存的凭据上（同一份 secret.yaml）。
+            let mut secret: FeishuSecret = self
+                .store(ChannelKind::Feishu)
+                .load_secret_or_default()
+                .await?;
+            secret.bound_open_id = bound_open_id.clone();
+            secret.bound_chat_id = bound_chat_id;
+            self.save_feishu(secret).await?;
+            // 身份已经落盘：回执发送失败（网络抖动这类）只记日志，别把整单绑定
+            // 判死；正常路径下回执会真的发出去 —— provider 在 `openlark_config`
+            // 里挂好（2026-10-10 实测：缺 provider 时这里一挂，界面就只剩红字）。
+            if let Err(error) = super::feishu::send_text_to(
                 &binding.config,
                 &bound_open_id,
                 "Feishu channel bound to this private chat",
             )
-            .await?;
+            .await
+            {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "feishu bound, but the confirmation message failed"
+                );
+            }
             let channel = self
                 .list()
                 .await?
@@ -879,9 +1112,6 @@ impl ChannelManager {
     }
 
     pub async fn begin_qq_bind(&self) -> Result<QqBindStart> {
-        self.qq
-            .as_ref()
-            .context("channels.qq is not configured in profile.yaml")?;
         let task = super::qq::create_bind_task().await?;
         let binding_id = format!("binding-{}", Uuid::new_v4());
         let qrcode = super::qq::bind_qr_url(&task.task_id);
@@ -948,23 +1178,38 @@ impl ChannelManager {
     }
 
     pub async fn begin_weixin_login(&self) -> Result<WeixinLoginStart> {
-        self.weixin
-            .as_ref()
-            .context("channels.weixin is not configured in profile.yaml")?;
         let config = WeixinConfig::builder()
             .token("")
             .markdown_filter(false)
             .build()?;
         let login = StandaloneQrLogin::new(&config);
         let existing = self.existing_weixin_tokens().await?;
-        let session = login.start(None, &existing).await?;
+        self.prune_pending_weixin().await;
+        let session = request_weixin_qrcode(&login, &existing).await?;
         let binding_id = format!("binding-{}", Uuid::new_v4());
         let qrcode = session.qrcode_img_content.clone();
         self.pending_weixin.lock().await.insert(
             binding_id.clone(),
-            Arc::new(Mutex::new(PendingLogin { session, config })),
+            Arc::new(Mutex::new(PendingLogin {
+                session,
+                config,
+                created_at: Instant::now(),
+            })),
         );
         Ok(WeixinLoginStart { binding_id, qrcode })
+    }
+
+    /// 取消（或一直没人 poll）之后留下的登录会话，超过 QR 该活的时间就收掉 ——
+    /// 别在 `pending_weixin` 里攒僵尸。
+    async fn prune_pending_weixin(&self) {
+        const MAX_AGE: Duration = Duration::from_secs(15 * 60);
+        let now = Instant::now();
+        let mut pending = self.pending_weixin.lock().await;
+        pending.retain(|_, slot| match slot.try_lock() {
+            // 正被 poll 的别动。
+            Err(_) => true,
+            Ok(login) => now.saturating_duration_since(login.created_at) < MAX_AGE,
+        });
     }
 
     pub async fn poll_weixin_login(
@@ -1104,13 +1349,15 @@ impl ChannelManager {
             ),
             ChannelKind::Feishu => {
                 let available =
-                    if let Some(config) = self.feishu.as_ref().filter(|config| config.enabled) {
+                    if self.feishu.as_ref().is_some_and(|config| config.enabled) {
                         store
                             .load_secret::<FeishuSecret>()
                             .await
-                            .is_ok_and(|secret| secret.validate().is_ok())
-                            && resolve_env(&config.app_id_env).is_ok()
-                            && resolve_env(&config.app_secret_env).is_ok()
+                            .is_ok_and(|secret| {
+                                secret.validate().is_ok()
+                                    && secret.is_bound()
+                                    && secret.credentials().is_some()
+                            })
                     } else {
                         false
                     };
@@ -1153,14 +1400,73 @@ impl ChannelManager {
 }
 
 pub fn telegram_bot(token: &str, proxy: Option<&str>) -> Result<Bot> {
+    Ok(Bot::with_client(
+        token.to_string(),
+        telegram_client(proxy, false)?,
+    ))
+}
+
+/// 绑定向导专用的客户端：带连接/总超时，保证「测试连接」几秒内必然有结论。
+/// 运行时长轮询用的 `telegram_bot` 不能带总超时（会掐断 getUpdates）。
+fn telegram_probe_bot(token: &str, proxy: Option<&str>) -> Result<Bot> {
+    Ok(Bot::with_client(
+        token.to_string(),
+        telegram_client(proxy, true)?,
+    ))
+}
+
+fn telegram_client(proxy: Option<&str>, probe: bool) -> Result<reqwest::Client> {
     let mut client = reqwest::Client::builder();
-    if let Some(proxy) = proxy {
+    if probe {
+        client = client
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(12));
+    }
+    // 空串按「没配代理」处理：直连。
+    if let Some(proxy) = proxy.filter(|proxy| !proxy.trim().is_empty()) {
         client = client.proxy(
             reqwest::Proxy::all(proxy)
                 .with_context(|| format!("configure Telegram HTTP proxy {proxy}"))?,
         );
     }
-    Ok(Bot::with_client(token.to_string(), client.build()?))
+    Ok(client.build()?)
+}
+
+/// 把原始网络错误翻成向导里能直接展示的人话。
+fn telegram_connect_hint(error: &anyhow::Error, proxy: Option<&str>) -> String {
+    let detail = format!("{error:#}");
+    let lowered = detail.to_ascii_lowercase();
+    let proxy_note = match proxy {
+        Some(proxy) => format!("当前代理 {proxy}"),
+        None => "当前未设置代理（直连）".to_string(),
+    };
+    if lowered.contains("invalid token")
+        || lowered.contains("invalidtoken")
+        || lowered.contains("unauthorized")
+        || lowered.contains("401")
+    {
+        return "Bot Token 无效：请和 @BotFather 里给的 token 完整核对一遍。".to_string();
+    }
+    if lowered.contains("refused") || lowered.contains("10061") {
+        return format!(
+            "{proxy_note}：连接被拒绝——检查代理软件是否开着、地址端口是否填对；\
+             如果本来就是直连，说明当前网络直连不通，需要配代理。"
+        );
+    }
+    if lowered.contains("timed out") || lowered.contains("timeout") {
+        return format!("{proxy_note}：连接超时——网络到 Telegram 不通，检查代理后重试。");
+    }
+    if lowered.contains("dns") || lowered.contains("lookup") || lowered.contains("resolve") {
+        return format!("{proxy_note}：域名解析失败——直连很容易这样，建议配置代理。");
+    }
+    if lowered.contains("tls")
+        || lowered.contains("handshake")
+        || lowered.contains("eof")
+        || lowered.contains("connection closed")
+    {
+        return format!("{proxy_note}：连接被重置（TLS 握手失败）——通常需要代理。");
+    }
+    format!("{proxy_note}：连接失败——{detail}")
 }
 
 fn telegram_bind_identity(update: &Update, code: &str) -> Option<(u64, i64)> {
@@ -1178,14 +1484,6 @@ fn telegram_bind_identity(update: &Update, code: &str) -> Option<(u64, i64)> {
         && parts.next() == Some(code)
         && parts.next().is_none())
     .then_some((user.id.0, message.chat.id.0))
-}
-
-fn resolve_env(name: &str) -> Result<String> {
-    let value = std::env::var(name).with_context(|| format!("environment variable {name}"))?;
-    if value.trim().is_empty() {
-        bail!("environment variable {name} is empty");
-    }
-    Ok(value)
 }
 
 async fn read_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -1270,10 +1568,108 @@ replayTurns: 5
         let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
 
         let summary = manager.list().await.unwrap();
-        assert_eq!(summary.len(), 1);
-        assert!(summary[0].enabled);
-        assert!(!summary[0].connected);
+        assert_eq!(summary.len(), 4, "管理面永远列全四家");
+        let weixin = summary
+            .iter()
+            .find(|channel| channel.name == WEIXIN_CHANNEL)
+            .unwrap();
+        assert!(weixin.enabled);
+        assert!(!weixin.connected);
         assert_eq!(manager.weixin.as_ref().unwrap().replay_turns, 5);
+    }
+
+    #[tokio::test]
+    async fn channels_are_listed_even_when_unconfigured() {
+        let root = tempfile::tempdir().unwrap();
+        let channels = BTreeMap::new();
+        let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
+
+        let summaries = manager.list().await.unwrap();
+        assert_eq!(summaries.len(), 4, "管理面永远列全四家");
+        for summary in &summaries {
+            assert!(!summary.enabled, "{} 未配置时不该是启用态", summary.name);
+            assert!(!summary.connected);
+            assert!(summary.bound_user_id.is_none());
+        }
+
+        // 默认配置（首次启用 / 改设置时写回 profile 的那份）。
+        let feishu = dwo_channel_api::default_channel_config(FEISHU_CHANNEL);
+        assert_eq!(
+            feishu.get("platform").and_then(|value| value.as_str()),
+            Some("feishu")
+        );
+        assert!(feishu.get("appIdEnv").is_none(), "凭据字段不进配置");
+
+        // 未配置的渠道也能直接进绑定流程：按默认配置来（telegram 缺 token 先报
+        // 「is not set」，而不是「not configured」）。
+        let error = manager.begin_telegram_bind().await.unwrap_err();
+        assert!(format!("{error:#}").contains("is not set"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn enabled_requires_a_bound_secret_in_the_profile() {
+        let profile = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+enabled: true
+replayTurns: 5
+"#,
+        )
+        .unwrap();
+        let channels = BTreeMap::from([(WEIXIN_CHANNEL.to_string(), profile)]);
+        let root = tempfile::tempdir().unwrap();
+        let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
+
+        let error = manager
+            .validate_enabled_bindings()
+            .err()
+            .expect("unbound enabled=true must be rejected");
+        assert!(format!("{error:#}").contains("enabled=true without a bound account"));
+
+        let secret_dir = root.path().join("channels").join(WEIXIN_CHANNEL);
+        tokio::fs::create_dir_all(&secret_dir).await.unwrap();
+        tokio::fs::write(secret_dir.join("secret.yaml"), "bound_user_id: user\n")
+            .await
+            .unwrap();
+        manager.validate_enabled_bindings().unwrap();
+    }
+
+    #[tokio::test]
+    async fn telegram_token_lives_in_the_channel_secret_not_the_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+enabled: false
+replayTurns: 5
+tgProxy: null
+"#,
+        )
+        .unwrap();
+        let channels = BTreeMap::from([(TELEGRAM_CHANNEL.to_string(), profile)]);
+        // token 不在 profile 里：配置里没有它的任何字段，照样能启动。
+        let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
+
+        let missing = manager.load_telegram_token().await.unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("is not set"),
+            "向导靠这个标记分流回第 1 步"
+        );
+
+        manager.save_telegram_token("123:abc").await.unwrap();
+        assert_eq!(manager.load_telegram_token().await.unwrap(), "123:abc");
+        // 跟微信 / QQ 对齐：token 就住渠道目录的 secret.yaml。
+        let stored = tokio::fs::read_to_string(
+            root.path()
+                .join("channels")
+                .join("telegram")
+                .join("secret.yaml"),
+        )
+        .await
+        .unwrap();
+        assert!(stored.contains("123:abc"));
+
+        // 解绑 / 移除会连凭据一起清掉（对齐微信 / QQ：重绑重新填）。
+        manager.store(ChannelKind::Telegram).remove().await.unwrap();
+        assert!(manager.load_telegram_token().await.is_err());
     }
 
     #[tokio::test]
@@ -1379,7 +1775,6 @@ replayTurns: 3
             r#"
 enabled: true
 replayTurns: 4
-botTokenEnv: DWO_TEST_MISSING_TELEGRAM_TOKEN
 tgProxy: http://127.0.0.1:7890
 "#,
         )
@@ -1389,10 +1784,12 @@ tgProxy: http://127.0.0.1:7890
         let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
 
         let summary = manager.list().await.unwrap();
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].name, TELEGRAM_CHANNEL);
-        assert!(!summary[0].connected);
-        assert!(summary[0].bound_user_id.is_none());
+        let telegram = summary
+            .iter()
+            .find(|channel| channel.name == TELEGRAM_CHANNEL)
+            .unwrap();
+        assert!(!telegram.connected);
+        assert!(telegram.bound_user_id.is_none());
 
         let state = TelegramChannelState {
             selected_session_id: Some("session-test".to_string()),
@@ -1402,8 +1799,16 @@ tgProxy: http://127.0.0.1:7890
             .save_state(ChannelKind::Telegram, &state)
             .await
             .unwrap();
+        // 向导第 1 步：token 先写进 secret.yaml（对齐微信 / QQ：凭据住渠道目录）。
+        manager.save_telegram_token("123:abc").await.unwrap();
+        assert!(
+            manager.validate_enabled_bindings().is_err(),
+            "只有 token、还没绑上，enabled=true 的守卫应当拦住"
+        );
+        // 绑定确认：token 与四个身份字段合成一份完整 secret。
         manager
             .save_telegram(TelegramSecret {
+                bot_token: Some("123:abc".to_string()),
                 bot_id: 7,
                 bot_username: "dwo_test_bot".to_string(),
                 bound_user_id: 12345,
@@ -1411,6 +1816,7 @@ tgProxy: http://127.0.0.1:7890
             })
             .await
             .unwrap();
+        manager.validate_enabled_bindings().unwrap();
         manager
             .save_state(ChannelKind::Telegram, &state)
             .await
@@ -1422,18 +1828,24 @@ tgProxy: http://127.0.0.1:7890
             .await
             .unwrap();
         assert!(secret_source.contains("boundUserId: 12345"));
-        assert!(!secret_source.contains("botToken"));
+        assert!(secret_source.contains("botToken"));
+        assert!(secret_source.contains("123:abc"));
         let summary = manager.list().await.unwrap();
-        assert_eq!(summary[0].bound_user_id.as_deref(), Some("12345"));
-        assert!(!summary[0].connected, "the token environment is absent");
+        let telegram = summary
+            .iter()
+            .find(|channel| channel.name == TELEGRAM_CHANNEL)
+            .unwrap();
+        assert_eq!(telegram.bound_user_id.as_deref(), Some("12345"));
+        assert!(telegram.connected, "token 和绑定都在 secret.yaml 里");
         let capability = dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
             .into_iter()
             .find(|capability| capability.name == TELEGRAM_CHANNEL)
             .unwrap()
             .content;
         assert!(capability.contains("dwo channel telegram send-file"));
-        assert!(!capability.contains("DWO_TEST_MISSING_TELEGRAM_TOKEN"));
+        assert!(!capability.contains("123:abc"), "凭据不进能力提示");
         manager.remove(ChannelKind::Telegram).await.unwrap();
+        assert!(manager.load_telegram_token().await.is_err());
         assert!(
             dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
                 .into_iter()
@@ -1447,7 +1859,6 @@ tgProxy: http://127.0.0.1:7890
             r#"
 enabled: true
 replayTurns: 4
-botTokenEnv: TELEGRAM_BOT_TOKEN
 tgProxy: ""
 "#,
         )
@@ -1468,8 +1879,6 @@ tgProxy: ""
             r#"
 enabled: true
 replayTurns: 5
-appIdEnv: DWO_TEST_MISSING_FEISHU_APP_ID
-appSecretEnv: DWO_TEST_MISSING_FEISHU_APP_SECRET
 platform: lark
 "#,
         )
@@ -1484,6 +1893,8 @@ platform: lark
 
         manager
             .save_feishu(FeishuSecret {
+                app_id: Some("cli_test".to_string()),
+                app_secret: Some("secret_test".to_string()),
                 bound_open_id: "ou_user".to_string(),
                 bound_chat_id: "oc_chat".to_string(),
             })
@@ -1506,22 +1917,66 @@ platform: lark
             .unwrap();
         assert!(secret_source.contains("boundOpenId: ou_user"));
         assert!(secret_source.contains("boundChatId: oc_chat"));
-        assert!(!secret_source.contains("appSecret"));
+        assert!(secret_source.contains("appSecret: secret_test"));
         let summary = manager.list().await.unwrap();
-        assert_eq!(summary[0].bound_user_id.as_deref(), Some("ou_user"));
-        assert!(
-            !summary[0].connected,
-            "the credential environment is absent"
-        );
+        let feishu = summary
+            .iter()
+            .find(|channel| channel.name == FEISHU_CHANNEL)
+            .unwrap();
+        assert_eq!(feishu.bound_user_id.as_deref(), Some("ou_user"));
+        assert!(feishu.connected, "凭据和绑定都在 secret 里");
+        let capability = dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
+            .into_iter()
+            .find(|capability| capability.name == FEISHU_CHANNEL)
+            .expect("绑定齐 + 凭据在的飞书渠道应当露出能力");
+        assert!(capability.content.contains("dwo channel feishu send-file"));
+        assert!(!capability.content.contains("secret_test"), "凭据不进能力提示");
+
+        manager.remove(ChannelKind::Feishu).await.unwrap();
+        assert!(!store.secret_path().exists());
+        assert!(!store.runtime_path().exists());
         assert!(
             dwo_context::ChannelCapabilitySnapshot::runtime(&manager.profile_root)
                 .into_iter()
                 .all(|capability| capability.name != FEISHU_CHANNEL)
         );
+    }
 
-        manager.remove(ChannelKind::Feishu).await.unwrap();
-        assert!(!store.secret_path().exists());
-        assert!(!store.runtime_path().exists());
+    #[tokio::test]
+    async fn feishu_credentials_live_in_the_secret() {
+        let root = tempfile::tempdir().unwrap();
+        let channels = BTreeMap::new();
+        let manager = ChannelManager::new(root.path(), &channels).await.unwrap();
+
+        let missing = manager.load_feishu_credentials().await.unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("are not set"),
+            "向导靠这个标记分流回第 2 步"
+        );
+
+        // 向导第 2 步：凭据进 secret.yaml（跟微信 / QQ / Telegram 同屋）。
+        manager
+            .save_feishu_credentials("cli_test", "secret_test")
+            .await
+            .unwrap();
+        let secret: FeishuSecret = manager
+            .store(ChannelKind::Feishu)
+            .load_secret()
+            .await
+            .unwrap();
+        assert_eq!(secret.app_id.as_deref(), Some("cli_test"));
+        assert!(secret.credentials().is_some());
+        assert!(!secret.is_bound());
+
+        // 重存覆盖旧值（重新走一遍向导第 2 步）。
+        manager
+            .save_feishu_credentials("cli_next", "secret_next")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.load_feishu_credentials().await.unwrap().0,
+            "cli_next"
+        );
     }
 
     #[tokio::test]

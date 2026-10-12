@@ -167,3 +167,17 @@ impl From<QqBindProgress> for ChannelBindingProgress {
         }
     }
 }
+
+/// 未配置渠道的默认配置：管理面永远列全四家，首次绑定 / 启用 / 改设置时
+/// 由 host 把这份默认值写回 profile 的 `channels.<name>` 段。
+///
+/// 取值跟 `dwo init` 模板一致：开关关着、回放 5 轮；飞书用标准的两个
+/// 环境变量名；telegram 代理缺省直连。
+pub fn default_channel_config(name: &str) -> serde_yaml::Value {
+    let source = match ChannelKind::parse(name) {
+        Some(ChannelKind::Telegram) => "enabled: false\nreplayTurns: 5\ntgProxy: null\n",
+        Some(ChannelKind::Feishu) => "enabled: false\nreplayTurns: 5\nplatform: feishu\n",
+        _ => "enabled: false\nreplayTurns: 5\n",
+    };
+    serde_yaml::from_str(source).expect("default channel config is valid YAML")
+}

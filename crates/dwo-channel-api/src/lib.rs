@@ -12,5 +12,5 @@ pub use traits::{ChannelBundle, ChannelControl, ChannelFactory, ChannelGatewayAp
 pub use types::{
     BIND_POLL_INTERVAL, ChannelBindingProgress, ChannelKind, ChannelPollParams, ChannelSessionItem,
     ChannelSummary, FeishuBindProgress, QqBindProgress, SessionCreateRequest, TelegramBindProgress,
-    WeixinLoginProgress,
+    WeixinLoginProgress, default_channel_config,
 };

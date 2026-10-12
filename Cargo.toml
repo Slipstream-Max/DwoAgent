@@ -54,6 +54,7 @@ openlark = { version = "0.18", default-features = false, features = ["communicat
 portable-pty = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 qr2term = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -73,3 +74,10 @@ uuid = { version = "1", features = ["v4"] }
 weixin-agent = "0.2"
 winapi = "0.3.9"
 windows-sys = "0.61"
+
+[patch.crates-io]
+# openlark-client 0.18.0 原版把 `type=card` 的飞书卡片回调帧直接丢掉
+# （frame_handler.rs "Card frame received, skipping"）—— 卡片按钮怎么点
+# daemon 都收不到。这里补一版本地客制：card 帧并进 event 的派发路径
+# （见 vendor/openlark-client）。升级 openlark 或原版修复后即可删掉。
+openlark-client = { path = "vendor/openlark-client" }

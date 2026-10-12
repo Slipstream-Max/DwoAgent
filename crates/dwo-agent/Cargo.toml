@@ -15,6 +15,7 @@ dwo-channels = { path = "../dwo-channels" }
 dwo-host = { path = "../dwo-host" }
 dwo-ipc = { path = "../dwo-ipc" }
 dwo-websocket = { path = "../dwo-websocket" }
+rustls.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

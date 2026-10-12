@@ -9,6 +9,9 @@ Channel 是消息平台适配器：它把微信、Telegram、飞书/Lark 或 QQ 
 
 Channel 字段在 [Profile 配置](profile.md) 的 channels 段出现。最小示例：
 
+桌面端和 `dwo channel list` **始终列出四个渠道**：没写进 `channels` 段的渠道按默认值展示
+（未绑定 / 未启用），绑定、启用、改设置时会按需把默认配置写回 profile——不需要先手写段。
+
 ~~~yaml
 channels:
   weixin:
@@ -17,13 +20,10 @@ channels:
   telegram:
     enabled: false
     replayTurns: 5
-    botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
   feishu:
     enabled: false
     replayTurns: 5
-    appIdEnv: FEISHU_APP_ID
-    appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
   qq:
     enabled: false
@@ -34,12 +34,11 @@ channels:
 | --- | --- |
 | enabled | 是否启动 adapter；改动后会热重启对应 channel |
 | replayTurns | /use 切换 Session 时回放最近多少个完成 turn，范围 0..=10 |
-| botTokenEnv | Telegram token 所在的环境变量名 |
 | tgProxy | Telegram 使用的 HTTP/HTTPS 代理 |
-| appIdEnv / appSecretEnv | 飞书/Lark 凭据所在的环境变量名 |
 | platform | feishu（国内）或 lark（海外） |
 
-凭据从环境变量读取，不要写进 profile 或提交到仓库。
+渠道凭据不进 profile：凭据（telegram token、飞书 App ID / Secret 等）都由绑定流程写入
+channels/<channel>/secret.yaml；别把凭据提交到仓库。
 
 启用后检查：
 
@@ -66,13 +65,14 @@ dwo channel <weixin|telegram|feishu|qq> status
 Telegram 使用 Bot API long polling，不需要 webhook 或公网地址。
 
 1. 在 BotFather 创建 bot，取得 token。
-2. 将 token 放入 botTokenEnv 指向的环境变量。
+2. 在 Telegram 渠道页粘贴并保存 token（存入 channels/telegram/secret.yaml）。
 3. 开启 channels.telegram.enabled；需要代理时设置 tgProxy。
 4. 重启 daemon，运行 dwo channel telegram bind。
 5. 在 bot 私聊中发送终端显示的一次性 /bind <code>。
 6. 用 dwo channel telegram status 确认绑定。
 
-绑定文件只保存 bot 标识和 user/chat，不保存 token。photo、document、video 会下载到
+token、bot 标识和 user/chat 都保存在 channels/telegram/secret.yaml（跟微信 / QQ 一致）。
+photo、document、video 会下载到
 runtime/attachments/telegram/<date>/<session-id>/，再作为 resource link 交给模型。
 
 ### 飞书 / Lark
@@ -83,12 +83,13 @@ runtime/attachments/telegram/<date>/<session-id>/，再作为 resource link 交�
 2. 选择长连接事件订阅，订阅 im.message.receive_v1。
 3. 开通接收消息、以应用身份发送消息、获取消息资源和上传图片/文件所需权限。
 4. 发布应用，让目标用户可以私聊机器人。
-5. 设置 appIdEnv 和 appSecretEnv 指定的两个环境变量。
-6. 使用 platform: feishu（国内）或 platform: lark（海外）。
-7. 重启 daemon，运行 dwo channel feishu bind，在私聊中发送 /bind <code>。
-8. 用 dwo channel feishu status 确认绑定。
+5. 在桌面端「绑定」向导里选平台（飞书 = 国内 / Lark = 海外），填 App ID / App Secret
+   （凭据写入 channels/feishu/secret.yaml；平台写回 profile 的 platform）。
+6. 在私聊里向机器人发送向导给出的 /bind <code>。
+7. 用 dwo channel feishu status 确认绑定。
 
-绑定文件只保存 open_id 和 chat_id。入站 text、image、file 会作为 prompt 或 resource link
+凭据（App ID / Secret）和绑定信息（open_id / chat_id）都在
+channels/feishu/secret.yaml。入站 text、image、file 会作为 prompt 或 resource link
 提交给模型。
 
 ### QQ Bot

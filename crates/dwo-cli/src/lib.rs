@@ -1592,13 +1592,10 @@ channels:
   telegram:
     enabled: false
     replayTurns: 5
-    botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
   feishu:
     enabled: false
     replayTurns: 5
-    appIdEnv: FEISHU_APP_ID
-    appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
   qq:
     enabled: false

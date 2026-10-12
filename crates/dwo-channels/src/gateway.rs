@@ -147,6 +147,23 @@ impl ChannelGateway {
         self.channels.remove(channel).await
     }
 
+    /// 向导把 bot token 存进渠道目录（`channels/telegram/secret.yaml`，跟微信 / QQ 对齐）。
+    pub async fn save_token(&self, channel: ChannelKind, token: &str) -> Result<()> {
+        anyhow::ensure!(
+            channel == ChannelKind::Telegram,
+            "channel {} does not support token storage",
+            channel.as_str()
+        );
+        self.channels.save_telegram_token(token).await
+    }
+
+    /// 绑定向导第 2 步：飞书的 App ID / Secret 存进渠道目录（凭据不进 profile）。
+    pub async fn save_feishu_credentials(&self, app_id: &str, app_secret: &str) -> Result<()> {
+        self.channels
+            .save_feishu_credentials(app_id, app_secret)
+            .await
+    }
+
     pub async fn start_all(&self, host: Arc<dyn ChannelHost>) {
         let channels = match self.channels.list().await {
             Ok(channels) => channels,
@@ -313,6 +330,14 @@ impl dwo_channel_api::ChannelGatewayApi for ChannelGateway {
 
     async fn unbind(&self, channel: ChannelKind, host: Arc<dyn ChannelHost>) -> Result<bool> {
         ChannelGateway::unbind(self, channel, host).await
+    }
+
+    async fn save_token(&self, channel: ChannelKind, token: &str) -> Result<()> {
+        ChannelGateway::save_token(self, channel, token).await
+    }
+
+    async fn save_feishu_credentials(&self, app_id: &str, app_secret: &str) -> Result<()> {
+        ChannelGateway::save_feishu_credentials(self, app_id, app_secret).await
     }
 
     async fn start_all(&self, host: Arc<dyn ChannelHost>) {

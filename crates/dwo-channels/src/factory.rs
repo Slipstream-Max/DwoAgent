@@ -19,6 +19,9 @@ impl ChannelFactory for DefaultChannelFactory {
         channels: &BTreeMap<String, serde_yaml::Value>,
     ) -> Result<ChannelBundle> {
         let manager = Arc::new(ChannelManager::new(profile_root, channels).await?);
+        // profile 的不变量在这儿收口：不合法（比如手工把未绑定渠道改成
+        // enabled=true）直接报错，别带病启动。
+        manager.validate_enabled_bindings()?;
         let gateway = Arc::new(ChannelGateway::new(manager.clone()));
         let control: Arc<dyn ChannelControl> = manager;
         let gateway: Arc<dyn ChannelGatewayApi> = gateway;

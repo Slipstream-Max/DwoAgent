@@ -83,6 +83,10 @@ pub trait ChannelGatewayApi: Send + Sync {
         params: ChannelPollParams,
     ) -> Result<ChannelBindingProgress>;
     async fn unbind(&self, channel: ChannelKind, host: Arc<dyn ChannelHost>) -> Result<bool>;
+    /// 向导把渠道凭据（telegram 的 bot token）存进渠道自己的目录；不进 profile。
+    async fn save_token(&self, channel: ChannelKind, token: &str) -> Result<()>;
+    /// 绑定向导把飞书的 App ID / Secret 存进渠道目录（`channels/feishu/secret.yaml`）。
+    async fn save_feishu_credentials(&self, app_id: &str, app_secret: &str) -> Result<()>;
     async fn start_all(&self, host: Arc<dyn ChannelHost>);
     async fn stop_all(&self);
     async fn send_message(&self, channel: ChannelKind, text: &str) -> Result<()>;

@@ -13,7 +13,7 @@ pub use client::ConfiguredModelClient;
 pub use config::{
     AgentModelConfig, AgentModelEntry, AgentProviderConfig, DefaultModelConfig, ModelCapabilities,
     ModelCatalog, ModelClientConfig, ModelConfig, ModelFamilySpec, ModelSpec, ProviderConfig,
-    ReasoningEffort, ReasoningSummary, RequestPolicy,
+    ReasoningEffort, ReasoningSummary, RequestPolicy, SubagentModelConfig,
 };
 pub use error::ModelClientError;
 pub use retry::{

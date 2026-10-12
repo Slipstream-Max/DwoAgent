@@ -86,6 +86,12 @@ model:
     model: deepseek/deepseek-v4-pro
     reasoning: high
 
+  # Optional default model for new subsessions. Omit it so children inherit
+  # the model of the session that created them.
+  # subagent:
+  #   model: deepseek/deepseek-flash
+  #   reasoning: low
+
   # Agent context policy default; an explicit provider model may override it.
   compactionTriggerRatio: 0.5
 

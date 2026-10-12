@@ -18,6 +18,8 @@ pub(crate) struct SessionManager {
     projects: Arc<ProjectService>,
     root: PathBuf,
     defaults: RwLock<(SessionLlmSettings, SessionMode)>,
+    /// Resolved `model.subagent` defaults for new child sessions.
+    subagent: RwLock<Option<SessionLlmSettings>>,
 }
 
 impl SessionManager {
@@ -27,6 +29,7 @@ impl SessionManager {
         root: PathBuf,
         llm: SessionLlmSettings,
         mode: SessionMode,
+        subagent: Option<SessionLlmSettings>,
     ) -> Self {
         Self {
             lifecycle: Mutex::new(()),
@@ -34,6 +37,7 @@ impl SessionManager {
             projects,
             root,
             defaults: RwLock::new((llm, mode)),
+            subagent: RwLock::new(subagent),
         }
     }
 
@@ -44,11 +48,27 @@ impl SessionManager {
             .clone()
     }
 
-    pub(crate) fn apply_defaults(&self, llm: SessionLlmSettings, mode: SessionMode) {
+    pub(crate) fn subagent(&self) -> Option<SessionLlmSettings> {
+        self.subagent
+            .read()
+            .expect("session subagent lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn apply_defaults(
+        &self,
+        llm: SessionLlmSettings,
+        mode: SessionMode,
+        subagent: Option<SessionLlmSettings>,
+    ) {
         *self
             .defaults
             .write()
             .expect("session defaults lock poisoned") = (llm, mode);
+        *self
+            .subagent
+            .write()
+            .expect("session subagent lock poisoned") = subagent;
     }
 
     pub(crate) async fn assign(
@@ -181,10 +201,25 @@ impl SessionManager {
         }
         let llm = match options.model {
             Some(model) => SessionLlmSettings::new(model, options.reasoning),
-            None => SessionLlmSettings::new(
-                inherited_llm.model,
-                options.reasoning.or(inherited_llm.reasoning),
-            ),
+            None => {
+                // New child sessions start from the configured subagent model; without
+                // one they keep inheriting the parent.
+                let subagent = if options.parent_session_id.is_some() {
+                    self.subagent()
+                } else {
+                    None
+                };
+                match subagent {
+                    Some(subagent) => SessionLlmSettings::new(
+                        subagent.model,
+                        options.reasoning.or(subagent.reasoning),
+                    ),
+                    None => SessionLlmSettings::new(
+                        inherited_llm.model,
+                        options.reasoning.or(inherited_llm.reasoning),
+                    ),
+                }
+            }
         };
         let result = async {
             if workspace == SessionWorkspace::Managed {

@@ -55,6 +55,10 @@ impl Host {
                 let params: SetDefaultParams = serde_json::from_value(params)?;
                 self.model_set_default(params).await
             }
+            ("model", "set_subagent") => {
+                let params: SetSubagentParams = serde_json::from_value(params)?;
+                self.model_set_subagent(params).await
+            }
             ("model", "upsert") => {
                 let entry: dwo_agent_service::AgentModelEntry = serde_json::from_value(
                     params.get("model").cloned().context("model is required")?,
@@ -144,6 +148,28 @@ impl Host {
         })
         .await?;
         Ok(json!({"default": self.model_get_default()?}))
+    }
+
+    /// `model.set_subagent`: model new subsessions start from; `model: null` clears it.
+    async fn model_set_subagent(self: &Arc<Self>, params: SetSubagentParams) -> Result<Value> {
+        anyhow::ensure!(
+            params.model.is_some() || params.reasoning.is_none(),
+            "subagent reasoning requires a subagent model"
+        );
+        self.edit_profile(|profile| {
+            profile.model.subagent =
+                params
+                    .model
+                    .as_ref()
+                    .map(|model| dwo_agent_service::DefaultModelConfig {
+                        model: model.clone(),
+                        reasoning: params.reasoning.clone(),
+                    });
+            Ok(())
+        })
+        .await?;
+        let profile = self.profile.read().expect("profile lock poisoned");
+        Ok(json!({"subagent": subagent_value(profile.config.model.subagent.as_ref())}))
     }
 
     pub(crate) async fn model_upsert(
@@ -369,12 +395,33 @@ struct SetDefaultParams {
     compaction_trigger_ratio: Option<f64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetSubagentParams {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
 fn default_model_value(config: &dwo_agent_service::AgentModelConfig) -> Value {
     json!({
         "model": config.default.model,
         "reasoning": config.default.reasoning,
         "compactionTriggerRatio": config.compaction_trigger_ratio,
+        "subagent": subagent_value(config.subagent.as_ref()),
     })
+}
+
+/// GUI view of `model.subagent`: `null` means unset (children inherit the parent).
+pub(super) fn subagent_value(subagent: Option<&dwo_agent_service::DefaultModelConfig>) -> Value {
+    match subagent {
+        Some(subagent) => json!({
+            "model": subagent.model,
+            "reasoning": subagent.reasoning,
+        }),
+        None => Value::Null,
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +458,57 @@ mod tests {
             .unwrap();
         assert_eq!(providers["private"]["apiKeyConfigured"], true);
         assert!(providers["private"].get("apiKey").is_none());
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subagent_defaults_round_trip_through_the_gui_api() {
+        let root = tempfile::tempdir().unwrap();
+        let host = Host::build(&write_test_profile(root.path()), dwo_channels::default_factory()).await.unwrap();
+
+        let before = host
+            .handle_method("model.get_default", json!({}))
+            .await
+            .unwrap();
+        assert!(before["subagent"].is_null());
+
+        let updated = host
+            .handle_method(
+                "model.set_subagent",
+                json!({"model": "deepseek/deepseek-flash", "reasoning": "low"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated["subagent"]["model"], "deepseek/deepseek-flash");
+        assert_eq!(updated["subagent"]["reasoning"], "low");
+
+        let defaults = host
+            .handle_method("model.get_default", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(defaults["subagent"]["model"], "deepseek/deepseek-flash");
+        let snapshot = serde_json::to_value(host.config_snapshot(0)).unwrap();
+        assert_eq!(snapshot["subagentModel"], "deepseek/deepseek-flash");
+        assert_eq!(snapshot["subagentReasoning"], "low");
+
+        // Clearing goes back to inheriting the parent session.
+        let cleared = host
+            .handle_method("model.set_subagent", json!({"model": null}))
+            .await
+            .unwrap();
+        assert!(cleared["subagent"].is_null());
+        let snapshot = serde_json::to_value(host.config_snapshot(0)).unwrap();
+        assert!(snapshot["subagentModel"].is_null());
+
+        // Unknown models are rejected without sticking.
+        let error = host
+            .handle_method(
+                "model.set_subagent",
+                json!({"model": "deepseek/deepseek-v9"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("subagent"));
         host.shutdown().await;
     }
 }

@@ -368,9 +368,19 @@ pub struct DefaultModelConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentModelConfig {
     pub default: DefaultModelConfig,
+    /// Default model for new subsessions; `None` keeps inheriting the parent.
+    #[serde(default)]
+    pub subagent: Option<DefaultModelConfig>,
     #[serde(default = "default_compaction_trigger_ratio")]
     pub compaction_trigger_ratio: f64,
     pub providers: IndexMap<String, AgentProviderConfig>,
+}
+
+/// Resolved `model.subagent`: the model new subsessions start from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentModelConfig {
+    pub model: String,
+    pub reasoning: Option<String>,
 }
 
 impl AgentModelConfig {
@@ -404,7 +414,20 @@ impl AgentModelConfig {
                 "model.default.model references unknown provider {default_provider}"
             )));
         }
-        validate_identifier(default_model_id, "default model id")
+        validate_identifier(default_model_id, "default model id")?;
+        if let Some(subagent) = &self.subagent {
+            let (subagent_provider, subagent_model_id) = split_model_ref(&subagent.model)?;
+            if let Some(reasoning) = &subagent.reasoning {
+                validate_identifier(reasoning, "model.subagent.reasoning")?;
+            }
+            if !self.providers.contains_key(subagent_provider) {
+                return Err(ModelClientError::config(format!(
+                    "model.subagent.model references unknown provider {subagent_provider}"
+                )));
+            }
+            validate_identifier(subagent_model_id, "subagent model id")?;
+        }
+        Ok(())
     }
 }
 
@@ -541,6 +564,7 @@ impl AgentModelEntry {
 pub struct ModelClientConfig {
     pub default_model: String,
     pub default_reasoning: Option<String>,
+    pub subagent: Option<SubagentModelConfig>,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub models: IndexMap<String, ModelConfig>,
 }
@@ -670,9 +694,45 @@ impl ModelClientConfig {
             })
             .transpose()?;
 
+        let subagent = agent
+            .subagent
+            .as_ref()
+            .map(|subagent| -> Result<SubagentModelConfig, ModelClientError> {
+                let config = models.get(&subagent.model).ok_or_else(|| {
+                    ModelClientError::config(format!(
+                        "model.subagent.model references unavailable model {}",
+                        subagent.model
+                    ))
+                })?;
+                let reasoning = subagent
+                    .reasoning
+                    .as_deref()
+                    .map(|reasoning| -> Result<String, ModelClientError> {
+                        let effort = ReasoningEffort::parse(reasoning).ok_or_else(|| {
+                            ModelClientError::config(format!(
+                                "unknown reasoning effort {reasoning}"
+                            ))
+                        })?;
+                        if !config.reasoning_efforts.contains(&effort) {
+                            return Err(ModelClientError::config(format!(
+                                "subagent model {} does not support reasoning effort {reasoning}",
+                                subagent.model
+                            )));
+                        }
+                        Ok(effort.as_str().to_string())
+                    })
+                    .transpose()?;
+                Ok(SubagentModelConfig {
+                    model: subagent.model.clone(),
+                    reasoning,
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             default_model,
             default_reasoning,
+            subagent,
             providers,
             models,
         })

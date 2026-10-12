@@ -629,6 +629,79 @@ providers:
 }
 
 #[test]
+fn subagent_model_defaults_resolve_and_validate() {
+    let catalog = ModelCatalog::builtin().unwrap();
+    let agent = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: deepseek/deepseek-v4-pro
+  reasoning: max
+subagent:
+  model: deepseek/deepseek-flash
+  reasoning: low
+providers:
+  deepseek:
+    apiKeyEnv: DEEPSEEK_API_KEY
+"#,
+    )
+    .unwrap();
+    let resolved = ModelClientConfig::resolve(&catalog, &agent).unwrap();
+    let subagent = resolved.subagent.expect("subagent defaults resolved");
+    assert_eq!(subagent.model, "deepseek/deepseek-flash");
+    assert_eq!(subagent.reasoning.as_deref(), Some("low"));
+
+    // Without `subagent` new subsessions keep inheriting their parent.
+    let inheriting = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: deepseek/deepseek-v4-pro
+providers:
+  deepseek:
+"#,
+    )
+    .unwrap();
+    assert!(
+        ModelClientConfig::resolve(&catalog, &inheriting)
+            .unwrap()
+            .subagent
+            .is_none()
+    );
+
+    let unknown = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: deepseek/deepseek-v4-pro
+subagent:
+  model: deepseek/deepseek-v9
+providers:
+  deepseek:
+"#,
+    )
+    .unwrap();
+    let error = ModelClientConfig::resolve(&catalog, &unknown).unwrap_err();
+    assert!(error.to_string().contains("model.subagent.model"));
+
+    let unsupported = AgentModelConfig::from_yaml(
+        r#"
+default:
+  model: deepseek/deepseek-v4-pro
+subagent:
+  model: deepseek/deepseek-flash
+  reasoning: xhigh
+providers:
+  deepseek:
+"#,
+    )
+    .unwrap();
+    let error = ModelClientConfig::resolve(&catalog, &unsupported).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not support reasoning effort")
+    );
+}
+
+#[test]
 fn custom_provider_maps_display_names_and_multiple_families() {
     let catalog = ModelCatalog::builtin().unwrap();
     let agent = AgentModelConfig::from_yaml(

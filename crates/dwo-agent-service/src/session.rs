@@ -2422,6 +2422,7 @@ mod terminal_view_tests {
         let model = crate::ConfiguredModelClient::from_resolved(crate::ModelClientConfig {
             default_model: "test".into(),
             default_reasoning: None,
+            subagent: None,
             providers: Default::default(),
             models: Default::default(),
         })

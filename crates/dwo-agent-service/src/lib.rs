@@ -27,7 +27,7 @@ pub use dwo_model_client::{
     DefaultModelConfig, FinishReason, ModelCapabilities, ModelCatalog, ModelClient,
     ModelClientConfig, ModelClientError, ModelConfig, ModelFamilySpec, ModelLimits, ModelReply,
     ModelSelection, ModelSpec, ModelStreamEvent, ModelUsage, ProviderConfig, RequestPolicy,
-    StreamToolCall, SummaryReply,
+    StreamToolCall, SubagentModelConfig, SummaryReply,
 };
 pub use dwo_tools::{ConfirmationDecision, ConfirmationRequest, SessionMode};
 pub use error::SessionServiceError;

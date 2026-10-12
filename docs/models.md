@@ -2,7 +2,8 @@
 
 本文回答一个问题：配置好 Provider 以后，怎样让 Dwo 认识一个模型。
 
-Profile 中的 model.default、model.compactionTriggerRatio 和 model.providers 是运行配置，
+Profile 中的 model.default、model.subagent、model.compactionTriggerRatio 和
+model.providers 是运行配置，
 字段说明在 [Profile 配置](profile.md#model)。本文只讲 Model List、模型能力和新模型接入。
 
 ## 内置模型

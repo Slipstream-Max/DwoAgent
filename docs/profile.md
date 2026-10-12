@@ -19,6 +19,9 @@ model:
   default:
     model: deepseek/deepseek-v4-pro
     reasoning: auto
+  subagent:
+    model: deepseek/deepseek-flash
+    reasoning: low
   compactionTriggerRatio: 0.8
   providers:
     deepseek:
@@ -31,13 +34,10 @@ channels:
   telegram:
     enabled: false
     replayTurns: 5
-    botTokenEnv: TELEGRAM_BOT_TOKEN
     tgProxy: null
   feishu:
     enabled: false
     replayTurns: 5
-    appIdEnv: FEISHU_APP_ID
-    appSecretEnv: FEISHU_APP_SECRET
     platform: feishu
   qq:
     enabled: false
@@ -112,6 +112,28 @@ model:
 
 单个部署模型可以覆盖 compactionTriggerRatio。
 
+### subagent
+
+`model.subagent` 可选：配置后，新建子会话（含 Fork）没显式指定时默认用它，
+方便「强模型规划、便宜模型执行」。
+
+~~~yaml
+model:
+  default:
+    model: deepseek/deepseek-v4-pro
+    reasoning: high
+  subagent:
+    model: deepseek/deepseek-flash
+    reasoning: low
+~~~
+
+| 字段 | 必填 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| subagent.model | 否 | 无 | provider/modelId，必须存在于解析后的模型列表 |
+| subagent.reasoning | 否 | 模型默认值 | 同 default.reasoning，以该模型声明为准 |
+
+省略 `subagent` 时行为不变：新子会话继承父会话的模型和 reasoning。
+
 ### providers
 
 官方 Family 可以只写凭据：
@@ -167,15 +189,14 @@ Profile 在这里列出所有字段；平台绑定、收发行为和故障排查
 | --- | --- | --- | --- |
 | 全部 | enabled | 必填 | 是否启动 Adapter |
 | 全部 | replayTurns | 必填，0..=10 | /use 后回放的完成 Turn 数 |
-| Telegram | botTokenEnv | 必填且非空 | Bot Token 的环境变量名 |
 | Telegram | tgProxy | 默认 null | http:// 或 https:// 代理 |
-| 飞书/Lark | appIdEnv | 必填且非空 | App ID 的环境变量名 |
-| 飞书/Lark | appSecretEnv | 必填且非空 | App Secret 的环境变量名 |
+| Telegram | 无凭据字段 | - | token 与绑定信息存入 channels/telegram/secret.yaml |
 | 飞书/Lark | platform | 必填 | feishu 或 lark |
+| 飞书/Lark | 无凭据字段 | - | App ID / Secret 由绑定向导写入 channels/feishu/secret.yaml |
 | QQ | 无凭据字段 | - | 凭据通过二维码绑定后写入 Secret 文件 |
 
-Token、App ID 和 App Secret 不应直接写入 Profile。QQ 例外：二维码绑定返回的 AppID/AppSecret
-由 daemon 保存到私有的 channels/qq/secret.yaml。
+渠道凭据不写进 Profile：token / App ID / App Secret 都由绑定流程保存到各渠道目录下的
+私有 channels/<channel>/secret.yaml。
 
 ## websocket
 

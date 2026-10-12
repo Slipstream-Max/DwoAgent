@@ -437,6 +437,18 @@ final class DwoRpcClient {
         requestId: requestId,
       );
 
+  /// 设置新子会话默认模型；`model` 传 null 表示清除（新子会话跟随父会话）。
+  Future<JsonObject> setSubagentModel({
+    String? model,
+    String? reasoning,
+    String? requestId,
+  }) =>
+      call(
+        'model.set_subagent',
+        params: {'model': model, 'reasoning': reasoning},
+        requestId: requestId,
+      );
+
   Future<JsonObject> upsertModel(
     String provider,
     String name,

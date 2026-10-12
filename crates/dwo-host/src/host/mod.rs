@@ -83,6 +83,8 @@ struct RuntimeProfile {
     config: dwo_agent_service::AgentProfileConfig,
     model_options: Vec<SessionModelOption>,
     available_models: Vec<AvailableModel>,
+    /// Resolved `model.subagent` defaults for new subsessions.
+    subagent: Option<SessionLlmSettings>,
 }
 
 impl RuntimeProfile {
@@ -144,6 +146,9 @@ impl RuntimeProfile {
                     }
                 })
                 .collect(),
+            subagent: loaded.models.subagent.as_ref().map(|subagent| {
+                SessionLlmSettings::new(subagent.model.clone(), subagent.reasoning.clone())
+            }),
         }
     }
 
@@ -231,6 +236,8 @@ pub(crate) struct ConfigSnapshot {
     external_skills_dirs: Vec<PathBuf>,
     external_rule_files: Vec<PathBuf>,
     compaction_trigger_ratio: f64,
+    subagent_model: Option<String>,
+    subagent_reasoning: Option<String>,
 }
 
 impl Host {
@@ -264,6 +271,7 @@ impl Host {
         let source = config_manager.fingerprint()?;
         let runtime_profile = RuntimeProfile::from_loaded(source, &profile);
         let (default_model, default_reasoning, default_mode) = runtime_profile.defaults();
+        let subagent_defaults = runtime_profile.subagent.clone();
         let projects = Arc::new(ProjectService::open(profile_root.join("runtime/projects"))?);
         let resolver_root = profile_root.clone();
         let workspace_resolver = Arc::new(
@@ -369,6 +377,7 @@ impl Host {
             profile_root.clone(),
             SessionLlmSettings::new(default_model, default_reasoning),
             default_mode,
+            subagent_defaults,
         ));
         let automation = AutomationRuntime::new(
             service.clone(),
@@ -596,11 +605,13 @@ impl Host {
             None
         };
         let (default_model, default_reasoning, default_mode) = runtime_profile.defaults();
+        let subagent_defaults = runtime_profile.subagent.clone();
 
         self.service.apply_profile(loaded)?;
         self.sessions.apply_defaults(
             SessionLlmSettings::new(default_model, default_reasoning),
             default_mode,
+            subagent_defaults,
         );
         crate::logging::reload(&runtime_profile.config.logging)?;
 

@@ -43,6 +43,8 @@ archive。清理前运行 session keep 可以将它转换为持久 Session。
 ## 配置继承和权限
 
 新建或 Fork 时默认继承父 Session 的 cwd、policy、model 和 reasoning，也可以用选项覆盖。
+配置 `model.subagent` 后，新子会话（含 Fork）默认改用它的模型和 reasoning；
+显式传 `--model` / `--reasoning` 仍优先。
 权限只能收紧：
 
 ~~~text

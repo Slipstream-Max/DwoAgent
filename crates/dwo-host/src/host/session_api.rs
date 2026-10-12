@@ -1573,4 +1573,87 @@ mod tests {
         }
         host.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn prompt_creation_applies_the_subagent_model_to_new_children() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_test_profile(root.path());
+        std::fs::write(
+            &config,
+            r#"policyMode: confirm
+model:
+  default:
+    model: deepseek/deepseek-v4-pro
+    reasoning: high
+  subagent:
+    model: deepseek/deepseek-flash
+    reasoning: low
+  providers:
+    deepseek:
+"#,
+        )
+        .unwrap();
+        let host = Host::build(&config, dwo_channels::default_factory())
+            .await
+            .unwrap();
+
+        // Root sessions still start from the default model.
+        let root_id = host
+            .create_session(HostSessionOptions::default())
+            .await
+            .unwrap();
+        let record = host.service.snapshot(&root_id).await.unwrap().record;
+        assert_eq!(record.llm.model, "deepseek/deepseek-v4-pro");
+        assert_eq!(record.llm.reasoning.as_deref(), Some("high"));
+
+        // Children start from `model.subagent`; explicit options still win.
+        let cases = [
+            (json!({}), "deepseek/deepseek-flash", Some("low")),
+            (
+                json!({"reasoning": "high"}),
+                "deepseek/deepseek-flash",
+                Some("high"),
+            ),
+            (
+                json!({"model": "deepseek/deepseek-v4-pro", "reasoning": "max"}),
+                "deepseek/deepseek-v4-pro",
+                Some("max"),
+            ),
+        ];
+        let mut child = None;
+        for (extra, model, reasoning) in cases {
+            let mut input = json!({"endpoint_id": "test", "message": "unused"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let params = serde_json::from_value(input).unwrap();
+            let (id, parent) = host
+                .resolve_prompt_session(&params, Some(root_id.clone()))
+                .await
+                .unwrap();
+            assert_eq!(parent.as_ref(), Some(&root_id));
+            let record = host.service.snapshot(&id).await.unwrap().record;
+            assert_eq!(record.llm.model, model);
+            assert_eq!(record.llm.reasoning.as_deref(), reasoning);
+            child = Some(id);
+        }
+
+        // Forks of a child are new subsessions too: without `--model` they follow
+        // the configured subagent defaults instead of copying the source session.
+        let fork = serde_json::from_value(json!({
+            "endpoint_id": "test",
+            "message": "unused",
+            "from_session_id": child.unwrap().to_string(),
+        }))
+        .unwrap();
+        let (fork_id, _) = host
+            .resolve_prompt_session(&fork, Some(root_id.clone()))
+            .await
+            .unwrap();
+        let record = host.service.snapshot(&fork_id).await.unwrap().record;
+        assert_eq!(record.llm.model, "deepseek/deepseek-flash");
+        assert_eq!(record.llm.reasoning.as_deref(), Some("low"));
+        host.shutdown().await;
+    }
 }

@@ -13,6 +13,8 @@ impl Host {
             external_skills_dirs,
             external_rule_files,
             compaction_trigger_ratio,
+            subagent_model,
+            subagent_reasoning,
         ) = {
             let profile = self.profile.read().expect("profile lock poisoned");
             (
@@ -24,6 +26,18 @@ impl Host {
                 profile.config.external_skills_dirs.clone(),
                 profile.config.external_rule_files.clone(),
                 profile.config.model.compaction_trigger_ratio,
+                profile
+                    .config
+                    .model
+                    .subagent
+                    .as_ref()
+                    .map(|subagent| subagent.model.clone()),
+                profile
+                    .config
+                    .model
+                    .subagent
+                    .as_ref()
+                    .and_then(|subagent| subagent.reasoning.clone()),
             )
         };
         ConfigSnapshot {
@@ -37,6 +51,8 @@ impl Host {
             external_skills_dirs,
             external_rule_files,
             compaction_trigger_ratio,
+            subagent_model,
+            subagent_reasoning,
         }
     }
 
